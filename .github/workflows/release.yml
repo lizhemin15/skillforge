@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser-simple:
+    name: 交叉编译并发布
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 注入版本信息
+        id: vars
+        run: |
+          echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: 构建
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          MOD=github.com/lizhemin15/skillforge/internal/version
+          ext=""
+          [ "$GOOS" = "windows" ] && ext=".exe"
+          out="skillforge-${{ steps.vars.outputs.version }}-${GOOS}-${GOARCH}${ext}"
+
+          go build -trimpath \
+            -ldflags "-s -w \
+              -X ${MOD}.Version=${{ steps.vars.outputs.version }} \
+              -X ${MOD}.Commit=${{ steps.vars.outputs.commit }} \
+              -X ${MOD}.Date=${{ steps.vars.outputs.date }}" \
+            -o "$out" ./cmd/server
+
+          sha256sum "$out" > "$out.sha256"
+          ls -lh "$out"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: skillforge-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            skillforge-*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: 创建 GitHub Release
+    needs: goreleaser-simple
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 下载全部产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 列出产物
+        run: ls -lh dist
+
+      - name: 生成 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

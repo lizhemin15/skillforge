@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: vet / test / build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum || {
+            echo "::error::go.mod / go.sum 不是 tidy 状态，请本地执行 go mod tidy 后提交"
+            exit 1
+          }
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt check
+        run: |
+          fmt=$(gofmt -l .)
+          if [ -n "$fmt" ]; then
+            echo "::error::以下文件未格式化，请执行 gofmt -w ."
+            echo "$fmt"
+            exit 1
+          fi
+
+      - name: Unit tests
+        run: go test -race -count=1 ./...
+
+      - name: Build
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o skillforge ./cmd/server
+          ls -lh skillforge
+
+      - name: Smoke test (启动 + 健康探测)
+        run: |
+          mkdir -p /tmp/sfdata
+          SKILLFORGE_DATA_DIR=/tmp/sfdata SKILLFORGE_ADDR=:8092 \
+            SKILLFORGE_JWT_SECRET=ci-smoke-secret-not-real SKILLFORGE_ADMIN_PASS=ci-pass \
+            ./skillforge &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8092/api/skills >/dev/null 2>&1; then
+              echo "服务已就绪（第 ${i} 次探测）"
+              curl -fsS http://127.0.0.1:8092/api/skills
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::服务 30 秒内未就绪"
+          exit 1
+
+      - name: Stop server
+        if: always()
+        run: pkill -f '/skillforge' || true

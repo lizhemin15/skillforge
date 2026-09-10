@@ -1,0 +1,28 @@
+# ---- 编译产物 ----
+/skillforge
+/skillforge.bak.*
+/docgen-test
+*.exe
+*.test
+
+# ---- 运行时数据（技能内容 + SQLite 库）----
+# 默认 SKILLFORGE_DATA_DIR 就是仓库根目录，所以这些必须挡住
+/skills/**
+!/skills/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+/data/
+
+# ---- 机密：真实环境变量文件绝不能进仓库 ----
+skillforge.env
+deploy.env
+.env
+.env.*
+
+# ---- 开发笔记（内部调试记录，不入库）----
+/memory/
+
+# ---- 其它 ----
+.DS_Store
+*.log

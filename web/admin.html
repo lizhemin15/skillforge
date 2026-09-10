@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SkillForge · 管理端</title>
+  <link rel="stylesheet" href="/assets/css/style.css?v=20260908B">
+  <link rel="stylesheet" href="/assets/vendor/codemirror/lib/codemirror.min.css?v=20260908A">
+  <link rel="stylesheet" href="/assets/vendor/codemirror/addon/fold/foldgutter.min.css?v=20260908A">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23111418'/><rect x='9' y='9' width='6' height='14' rx='2' fill='%23c8ccd2'/><rect x='17' y='9' width='6' height='14' rx='2' fill='%23757c86'/></svg>">
+</head>
+<body>
+<div class="layout">
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <a href="/" class="brand"><span class="dot"></span>SkillForge<small>管理端</small></a>
+      <nav class="nav"><a href="/" class="ghost">← 返回</a></nav>
+    </div>
+  </header>
+
+  <main>
+    <!-- LOGIN -->
+    <div class="admin-wrap" id="login-view">
+      <div class="card">
+        <h1>登录管理端</h1>
+        <p class="sub">仅用于配置 LLM 与训练新技能</p>
+        <form id="login-form">
+          <div class="field">
+            <label>用户名</label>
+            <input type="text" id="lg-user" autocomplete="username" required>
+          </div>
+          <div class="field">
+            <label>密码</label>
+            <input type="password" id="lg-pass" autocomplete="current-password" required>
+          </div>
+          <button type="submit" class="btn primary" style="width:100%">登 录</button>
+          <div class="msg" id="login-msg"></div>
+        </form>
+      </div>
+    </div>
+
+    <!-- SHELL -->
+    <div class="container admin-shell hidden" id="shell" style="display:none">
+      <div class="admin-tabs">
+        <button class="active" data-tab="llm">LLM 服务</button>
+        <button data-tab="skills">技能管理</button>
+      </div>
+
+      <!-- Tab: LLM -->
+      <div class="tab-pane" id="tab-llm">
+        <div class="admin-grid">
+          <div class="card">
+            <h3>已配置的服务</h3>
+            <p class="card-sub">修改立即生效，无需重启</p>
+            <div id="prov-list"></div>
+            <div class="msg" id="prov-msg"></div>
+          </div>
+          <div class="card">
+            <h3>添加 / 编辑服务</h3>
+            <p class="card-sub">兼容任意 OpenAI-format 端点（DeepSeek / 通义 / Claude / OpenAI…）</p>
+            <form id="llm-form">
+              <input type="hidden" id="llm-id" value="0">
+              <div class="field"><label>提供方名称</label><input type="text" id="llm-name" placeholder="如 DeepSeek" required></div>
+              <div class="field"><label>API Base URL</label><input type="url" id="llm-base" placeholder="https://api.deepseek.com" required></div>
+              <div class="field"><label>模型</label><input type="text" id="llm-model" placeholder="deepseek-chat" required></div>
+              <div class="field"><label>API Key</label><input type="password" id="llm-key" placeholder="sk-…" required></div>
+              <button type="submit" class="btn primary" id="llm-save">保存</button>
+              <button type="button" class="btn ghost" id="llm-cancel" style="display:none">取消</button>
+              <div class="msg" id="llm-msg"></div>
+            </form>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab: Skills -->
+      <div class="tab-pane hidden" id="tab-skills" style="display:none">
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start">
+            <div>
+              <h3>技能管理</h3>
+              <p class="card-sub">点击「编辑」可像管理知识库一样维护技能：改提示词 / 模板 / 需求，增删范文，管理上传的原始素材</p>
+            </div>
+            <button class="btn primary" onclick="window.newSkillView()">+ 新建技能</button>
+          </div>
+          <div id="skill-manage-list"></div>
+        </div>
+      </div>
+
+      <!-- Skill knowledge-base detail modal -->
+      <div class="modal-mask hidden" id="skill-detail-mask" style="display:none" onclick="if(event.target===this)closeSkillDetail()">
+        <div class="modal modal-wide" id="skill-detail">
+          <div class="modal-head">
+            <div>
+              <h3 id="sd-title">技能详情</h3>
+              <div class="card-sub" id="sd-sub"></div>
+            </div>
+            <button class="icon-btn" onclick="closeSkillDetail()">✕</button>
+          </div>
+          <div id="sd-body"></div>
+        </div>
+      </div>
+
+      <!-- New skill modal -->
+      <div class="modal-mask hidden" id="skill-new-mask" style="display:none" onclick="if(event.target===this)closeNewSkill()">
+        <div class="modal" id="skill-new">
+          <div class="modal-head">
+            <h3>新建技能</h3>
+            <button class="icon-btn" onclick="closeNewSkill()">✕</button>
+          </div>
+          <div class="ns-seg">
+            <button type="button" class="ns-seg-btn active" data-ns="train" onclick="window.nsTab('train')">AI 训练生成</button>
+            <button type="button" class="ns-seg-btn" data-ns="manual" onclick="window.nsTab('manual')">手动创建</button>
+          </div>
+
+          <!-- AI train view -->
+          <div id="ns-view-train">
+            <p class="card-sub" style="margin-top:8px">上传参考文件 + 描述需求，AI 自动提炼成完整写作技能（需 1–2 分钟）</p>
+            <form id="train-form">
+              <div class="field"><label>技能名称</label><input type="text" id="tr-name" placeholder="如 公司新闻通稿" required></div>
+              <div class="field"><label>分类（可选）</label><input type="text" id="tr-cat" placeholder="如 企业宣传"></div>
+              <div class="field"><label>一句话描述</label><input type="text" id="tr-desc" placeholder="这个技能用来写什么" required></div>
+              <div class="field">
+                <label>参考文件</label>
+                <div class="drop" id="tr-drop">点击或拖入参考文件（范文 / 风格指南 / 要求，支持多文件）</div>
+                <input type="file" id="tr-file" multiple style="display:none">
+                <div class="file-tags" id="tr-tags"></div>
+              </div>
+              <div class="field">
+                <label>写作要求</label>
+                <textarea id="tr-req" placeholder="请描述这套文章的核心要求：受众、结构、篇幅、语言风格、段落组织、避讳点……尽量具体"></textarea>
+              </div>
+              <button type="submit" class="btn primary" id="tr-go">
+                <span id="tr-spin" class="spin" style="display:none"></span>
+                <span id="tr-txt">开始训练</span>
+              </button>
+              <div class="log" id="tr-log" style="margin-top:16px;display:none"></div>
+              <div class="result" id="tr-result" style="display:none"></div>
+            </form>
+          </div>
+
+          <!-- manual view -->
+          <div id="ns-view-manual" style="display:none">
+            <div class="field"><label>标识 slug（小写英文，如 annual-report）</label><input type="text" id="ns-slug" placeholder="annual-report" required></div>
+            <div class="field"><label>名称</label><input type="text" id="ns-name" placeholder="如 年度工作报告" required></div>
+            <div class="field"><label>分类（可选）</label><input type="text" id="ns-cat" placeholder="如 公文"></div>
+            <div class="field"><label>描述（可选）</label><input type="text" id="ns-desc" placeholder="一句话说明这个技能写什么"></div>
+            <div class="field"><label>初始提示词（可选，可留空后编辑）</label><textarea id="ns-prompt" rows="5" placeholder="# 写作技能"></textarea></div>
+            <button class="btn primary" onclick="window.doNewSkill()">创建</button>
+            <div class="msg" id="ns-msg"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <footer><div class="container"><span>SkillForge · 管理端</span></div></footer>
+</div>
+<div class="toast" id="toast"></div>
+<script src="/assets/vendor/codemirror/lib/codemirror.min.js?v=20260908A"></script>
+<script src="/assets/vendor/codemirror/mode/markdown/markdown.min.js?v=20260908A"></script>
+<script src="/assets/vendor/codemirror/mode/xml/xml.min.js?v=20260908A"></script>
+<script src="/assets/vendor/codemirror/addon/edit/closebrackets.min.js?v=20260908A"></script>
+<script src="/assets/vendor/codemirror/addon/edit/matchbrackets.min.js?v=20260908A"></script>
+<script src="/assets/vendor/codemirror/addon/selection/active-line.min.js?v=20260908A"></script>
+<script src="/assets/vendor/codemirror/addon/display/autorefresh.min.js?v=20260908A"></script>
+<script src="/assets/vendor/codemirror/addon/display/placeholder.min.js?v=20260908A"></script>
+<script src="/assets/vendor/codemirror/addon/fold/foldcode.min.js?v=20260908A"></script>
+<script src="/assets/vendor/codemirror/addon/fold/foldgutter.min.js?v=20260908A"></script>
+<script src="/assets/js/admin.js?v=20260909B"></script>
+</body>
+</html>

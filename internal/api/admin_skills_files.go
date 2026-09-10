@@ -1,0 +1,379 @@
+package api
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"mime/multipart"
+	"net/http"
+	"path"
+	"strings"
+	"time"
+
+	"github.com/lizhemin15/skillforge/internal/model"
+)
+
+// ===== Knowledge-base style skill file management =====
+// Admin can treat a skill's knowledge pack like a managed knowledge base:
+// list/read/edit/delete its content files, upload new source material,
+// add examples, edit metadata, and create skills manually.
+
+// ListSkillFiles returns the full file tree of a skill's knowledge pack.
+func (a *Admin) ListSkillFiles(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	files, err := a.store.ListFiles(slug)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"files": files})
+}
+
+// ReadSkillFile returns the content of one managed file.
+func (a *Admin) ReadSkillFile(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	rel := r.URL.Query().Get("path")
+	// download mode: stream raw bytes with attachment headers
+	if r.URL.Query().Get("download") == "1" {
+		content, err := a.store.ReadFileBytes(slug, rel)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		name := rel
+		if idx := lastSlash(rel); idx >= 0 {
+			name = rel[idx+1:]
+		}
+		w.Header().Set("Content-Disposition", "attachment; filename="+name)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(content))
+		return
+	}
+	// preview-extract mode: for binary extractable docs (docx/xlsx/pptx/pdf),
+	// read raw bytes and return extracted text synchronously for inline preview.
+	if r.URL.Query().Get("preview") == "1" {
+		f, err := a.store.ReadFile(slug, rel)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if !f.Binary || !extractableExt(rel) {
+			writeJSON(w, http.StatusOK, map[string]any{"previewable": false})
+			return
+		}
+		raw, err := a.store.ReadFileBytes(slug, rel)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		text, xerr := a.extractDoc(rel, raw)
+		if xerr != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"previewable": true, "error": xerr.Error(), "text": ""})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"previewable": true, "text": text, "mime": f.Mime})
+		return
+	}
+	f, err := a.store.ReadFile(slug, rel)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, f)
+}
+
+func lastSlash(s string) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == '/' {
+			return i
+		}
+	}
+	return -1
+}
+
+// WriteSkillFile creates/overwrites an editable file in the skill pack.
+func (a *Admin) WriteSkillFile(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	var body struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+	if err := readBody(r, &body); err != nil || body.Path == "" {
+		writeErr(w, http.StatusBadRequest, "需要 path 与 content")
+		return
+	}
+	if err := a.store.WriteFile(slug, body.Path, body.Content); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// AddSkillExample appends a new example article to the skill.
+func (a *Admin) AddSkillExample(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	var body struct {
+		Content string `json:"content"`
+	}
+	if err := readBody(r, &body); err != nil || body.Content == "" {
+		writeErr(w, http.StatusBadRequest, "需要 content")
+		return
+	}
+	rel, err := a.store.AddExample(slug, body.Content)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": rel})
+}
+
+// DeleteSkillFile removes an example file from the skill pack.
+func (a *Admin) DeleteSkillFile(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	rel := r.URL.Query().Get("path")
+	if rel == "" {
+		writeErr(w, http.StatusBadRequest, "需要 path")
+		return
+	}
+	if err := a.store.DeleteFile(slug, rel); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// UpdateSkillMeta edits name/description/category of an existing skill.
+func (a *Admin) UpdateSkillMeta(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	var body struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Category    string `json:"category"`
+	}
+	if err := readBody(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体无效")
+		return
+	}
+	if err := a.store.UpdateSkillMeta(slug, body.Name, body.Description, body.Category); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// UploadSkillFile adds new raw source/reference material to the skill (~ multipart).
+func (a *Admin) UploadSkillFile(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	if err := r.ParseMultipartForm(20 << 20); err != nil {
+		writeErr(w, http.StatusBadRequest, "multipart 解析失败: "+err.Error())
+		return
+	}
+	file, hdr, err := r.FormFile("file")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "需要 file 字段")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 20<<20))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "读取文件失败")
+		return
+	}
+	rel := "source/" + sanitizeFilename(hdr.Filename)
+	if err := a.store.WriteFileRaw(slug, rel, data); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// If it's a document format we can extract text from, parse it asynchronously
+	// and land the text as source/<base>.txt next to the raw file. Non-blocking:
+	// extraction failure never fails the upload — the raw file stays for download.
+	if extractableExt(hdr.Filename) {
+		go a.extractAndLand(slug, hdr.Filename, data)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": rel})
+}
+
+// extractableExt reports whether a filename is a document we can pull text from.
+func extractableExt(name string) bool {
+	switch strings.ToLower(path.Ext(name)) {
+	case ".pdf", ".docx", ".xlsx", ".pptx", ".txt", ".md", ".csv":
+		return true
+	case ".doc", ".xls", ".ppt", ".docm", ".xlsm", ".pptm":
+		return true // legacy Office sent to ocrd for best-effort handling
+	}
+	return false
+}
+
+func sanitizeFilename(name string) string {
+	name = strings.ReplaceAll(name, "\\", "/")
+	name = path.Base(name)
+	name = strings.Map(func(r rune) rune {
+		if r == '/' || r == '\\' || r == 0 {
+			return '_'
+		}
+		return r
+	}, name)
+	if name == "" || name == "." || name == ".." {
+		return "file.txt"
+	}
+	return strings.TrimSpace(name)
+}
+
+// extractAndLand sends a document (PDF/docx/xlsx/etc.) to the extraction
+// microservice and writes the extracted text into source/<base>.txt (next to
+// the raw file). Best-effort: any failure is logged but never fails the caller.
+// Runs in its own goroutine.
+func (a *Admin) extractAndLand(slug, filename string, data []byte) {
+	if a.ocrURL == "" {
+		return
+	}
+	start := time.Now()
+	base := strings.TrimSuffix(path.Base(filename), path.Ext(filename))
+	if base == "" {
+		base = "extracted"
+	}
+	text, err := a.extractDoc(filename, data)
+	if err != nil {
+		log.Printf("[extract] %s/%s 解析失败: %v (%.1fs)", slug, filename, err, time.Since(start).Seconds())
+		return
+	}
+	land := "source/" + base + ".txt"
+	if err := a.store.WriteFile(slug, land, text); err != nil {
+		log.Printf("[extract] %s/%s 落地文本失败: %v", slug, land, err)
+		return
+	}
+	log.Printf("[extract] %s/%s -> %s (%d chars, %.1fs)", slug, filename, land, len(text), time.Since(start).Seconds())
+}
+
+// extractDoc calls the ocrd microservice (POST /extract) and returns the text.
+func (a *Admin) extractDoc(filename string, data []byte) (string, error) {
+	client := &http.Client{Timeout: 300 * time.Second}
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	name := path.Base(filename)
+	if name == "" {
+		name = "scan"
+	}
+	fw, err := mw.CreateFormFile("file", name)
+	if err != nil {
+		return "", err
+	}
+	if _, err := fw.Write(data); err != nil {
+		return "", err
+	}
+	if err := mw.Close(); err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest(http.MethodPost, a.ocrURL+"/extract", &buf)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		OK   bool   `json:"ok"`
+		Text string `json:"text"`
+		Err  string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if !out.OK {
+		return "", fmt.Errorf("解析服务: %s", out.Err)
+	}
+	return strings.TrimSpace(out.Text), nil
+}
+
+// RawSkillFile streams a managed file's raw bytes with the correct Content-Type,
+// so previews (<iframe> for PDF, <img> for images) render without JSON wrapping.
+func (a *Admin) RawSkillFile(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	rel := r.URL.Query().Get("path")
+	content, err := a.store.ReadFileBytes(slug, rel)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	name := rel
+	if idx := lastSlash(rel); idx >= 0 {
+		name = rel[idx+1:]
+	}
+	w.Header().Set("Content-Type", mimeTypeFor(rel))
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Disposition", "inline; filename="+name)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(content)
+}
+
+func mimeTypeFor(rel string) string {
+	ext := strings.ToLower(path.Ext(rel))
+	switch ext {
+	case ".pdf":
+		return "application/pdf"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".svg":
+		return "image/svg+xml"
+	case ".bmp":
+		return "image/bmp"
+	}
+	return "application/octet-stream"
+}
+
+// CreateSkill manually creates a brand-new skill (non-LLM).
+func (a *Admin) CreateSkill(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Slug         string        `json:"slug"`
+		Name         string        `json:"name"`
+		Description  string        `json:"description"`
+		Category     string        `json:"category"`
+		Params       []model.Param `json:"input_params"`
+		SystemPrompt string        `json:"system_prompt"`
+	}
+	if err := readBody(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体无效")
+		return
+	}
+	if body.Slug == "" || body.Name == "" {
+		writeErr(w, http.StatusBadRequest, "需要 slug 与 name")
+		return
+	}
+	if body.Params == nil {
+		body.Params = []model.Param{}
+	}
+	sk := &model.Skill{
+		Slug:        body.Slug,
+		Name:        body.Name,
+		Description: body.Description,
+		Category:    firstNonEmptyS(body.Category, "general"),
+		Enabled:     true,
+	}
+	if err := a.store.CreateSkill(sk, body.Params, body.SystemPrompt); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "slug": body.Slug})
+}
+
+func firstNonEmptyS(vals ...string) string {
+	for _, v := range vals {
+		if len(v) > 0 {
+			return v
+		}
+	}
+	return ""
+}
