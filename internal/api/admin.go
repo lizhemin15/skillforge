@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,10 +26,18 @@ type Admin struct {
 	eng    *agent.Engine // chat engine; kept in sync with the live LLM
 	mu     sync.Mutex    // serialize training to one run (simple)
 	ocrURL string        // scanned-PDF OCR microservice base URL (empty = disabled)
+	// toolAllow 是拉取模型清单时的内网白名单，与 http_request 工具同源同策略
+	// （同一个 SKILLFORGE_TOOL_HTTP_ALLOW）。两处各写一套规则迟早会不一致。
+	toolAllow []string
 }
 
 func NewAdmin(s *store.SkillStore, g *skillgen.Generator) *Admin {
-	return &Admin{store: s, gen: g, ocrURL: "http://127.0.0.1:8093"}
+	return &Admin{
+		store:     s,
+		gen:       g,
+		ocrURL:    "http://127.0.0.1:8093",
+		toolAllow: splitList(os.Getenv("SKILLFORGE_TOOL_HTTP_ALLOW")),
+	}
 }
 
 // SetEngine links the chat engine so LLM hot-swaps also reach it.
@@ -149,17 +158,31 @@ func (a *Admin) UpsertLLM(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "请求体无效")
 		return
 	}
-	if c.Provider == "" || c.APIKey == "" || c.Model == "" {
-		writeErr(w, http.StatusBadRequest, "provider / api_key / model 不能为空")
+	if c.Provider == "" || c.Model == "" {
+		writeErr(w, http.StatusBadRequest, "provider / model 不能为空")
 		return
 	}
-	// If the client sent a masked key on update (unchanged), keep existing.
-	if strings.HasSuffix(c.APIKey, "…") || c.APIKey == "••••" {
-		if c.ID > 0 {
-			if old, err := a.store.GetLLM(c.ID); err == nil {
+	// 编辑已保存的服务时，前端不回传 key（密钥框里是掩码，重传等于把掩码存进库）。
+	// 这个兜底必须排在 key 校验之前 —— 否则「只改个模型名再保存」这个最普通的
+	// 操作会被 400 拒掉，用户看到的是「不能为空」，实际字段就摆在眼前。
+	// 同一条记录也沿用 is_active：表单里没有「停用」这个语义，
+	// 让一次保存把正在使用的服务悄悄停掉，整个 LLM 会直接不可用。
+	if c.ID > 0 {
+		if old, err := a.store.GetLLM(c.ID); err == nil {
+			if isMaskedKey(c.APIKey) {
 				c.APIKey = old.APIKey
 			}
+			if c.BaseURL == "" {
+				c.BaseURL = old.BaseURL
+			}
+			if !c.IsActive {
+				c.IsActive = old.IsActive
+			}
 		}
+	}
+	if c.APIKey == "" {
+		writeErr(w, http.StatusBadRequest, "请填写 API Key（编辑已保存的服务时留空即沿用原 key）")
+		return
 	}
 	id, err := a.store.UpsertLLMConfig(&c)
 	if err != nil {

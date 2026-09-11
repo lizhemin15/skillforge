@@ -217,3 +217,58 @@ func isPublicIP(ip net.IP) bool {
 	}
 	return true
 }
+
+// ===== 供其他包复用的防护型请求入口 =====
+//
+// 管理端「自动拉取模型列表」需要向用户填写的任意地址发请求，风险与 http_request 工具完全一致。
+// 与其在那里重写一遍（迟早漏掉某一环），不如把校验与请求收敛到同一处实现。
+
+// GuardURL 校验目标地址是否允许访问：仅 http/https，且默认禁止环回/私网/链路本地等内网地址。
+// allow 为内网白名单（精确主机名或 CIDR），空 = 一律禁止内网。
+func GuardURL(rawURL string, allow []string) error {
+	t := &HTTPRequestTool{cfg: HTTPConfig{AllowHosts: allow}}
+	return t.guard(rawURL)
+}
+
+// GuardedGet 发起带 SSRF 防护的 GET：入口校验一次，且每一跳重定向都重新校验。
+// 返回状态码与响应体（最多 maxBody 字节，默认 1MB）。
+func GuardedGet(ctx context.Context, rawURL string, headers map[string]string, allow []string, timeout time.Duration, maxBody int64) (int, []byte, error) {
+	if maxBody <= 0 {
+		maxBody = 1 << 20
+	}
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	if err := GuardURL(rawURL, allow); err != nil {
+		return 0, nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("构造请求失败: %w", err)
+	}
+	req.Header.Set("User-Agent", "SkillForge-Admin/1.0")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	cli := &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(r *http.Request, via []*http.Request) error {
+			// 重定向是绕开 SSRF 防护的经典手法：必须逐跳复检。
+			// 例如允许列表里的公网域名 302 到 169.254.169.254（云元数据）。
+			if len(via) >= 5 {
+				return errors.New("重定向次数过多")
+			}
+			return GuardURL(r.URL.String(), allow)
+		},
+	}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+	return resp.StatusCode, body, nil
+}

@@ -62,7 +62,15 @@
               <input type="hidden" id="llm-id" value="0">
               <div class="field"><label>提供方名称</label><input type="text" id="llm-name" placeholder="如 DeepSeek" required></div>
               <div class="field"><label>API Base URL</label><input type="url" id="llm-base" placeholder="https://api.deepseek.com" required></div>
-              <div class="field"><label>模型</label><input type="text" id="llm-model" placeholder="deepseek-chat" required></div>
+              <div class="field">
+                <label>模型</label>
+                <div style="display:flex;gap:8px;align-items:center">
+                  <input type="text" id="llm-model" list="llm-model-list" autocomplete="off" placeholder="deepseek-chat" required style="flex:1;min-width:0">
+                  <button type="button" class="btn ghost" id="llm-fetch-models" style="white-space:nowrap">获取模型</button>
+                </div>
+                <datalist id="llm-model-list"></datalist>
+                <p class="dim" style="margin:6px 0 0;font-size:12px">点「获取模型」自动拉取清单后可下拉选择，也可直接手填模型名</p>
+              </div>
               <div class="field"><label>API Key</label><input type="password" id="llm-key" placeholder="sk-…" required></div>
               <button type="submit" class="btn primary" id="llm-save">保存</button>
               <button type="button" class="btn ghost" id="llm-cancel" style="display:none">取消</button>
@@ -166,6 +174,6 @@
 <script src="/assets/vendor/codemirror/addon/display/placeholder.min.js?v=20260908A"></script>
 <script src="/assets/vendor/codemirror/addon/fold/foldcode.min.js?v=20260908A"></script>
 <script src="/assets/vendor/codemirror/addon/fold/foldgutter.min.js?v=20260908A"></script>
-<script src="/assets/js/admin.js?v=20260909B"></script>
+<script src="/assets/js/admin.js?v=20260911B"></script>
 </body>
 </html>

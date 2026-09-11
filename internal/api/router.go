@@ -104,6 +104,7 @@ func (h *Handler) Routes() *http.ServeMux {
 
 	// ---- admin API ----
 	mux.HandleFunc("POST /api/login", h.Auth.Login)
+	mux.HandleFunc("POST /api/admin/llms/models", h.Auth.Middleware(h.Admin.ListProviderModels))
 	mux.HandleFunc("GET /api/admin/llms", h.Auth.Middleware(h.Admin.ListLLM))
 	mux.HandleFunc("POST /api/admin/llms", h.Auth.Middleware(h.Admin.UpsertLLM))
 	mux.HandleFunc("POST /api/admin/llms/active", h.Auth.Middleware(h.Admin.SetActiveLLM))

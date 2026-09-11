@@ -99,13 +99,14 @@
     const c = (j.configs || []).find(x => x.id === id);
     if (!c) return;
     $('llm-id').value = c.id;
-    $('llm-name').value = c.name || '';
+    $('llm-name').value = c.provider || ''; // 后端只有 provider（显示名），没有 name 字段
     $('llm-base').value = c.base_url || '';
     $('llm-model').value = c.model || '';
     $('llm-key').value = '••••••••'; // masked placeholder
     $('llm-key').placeholder = '留空保持不变';
     $('llm-key').required = false;
     $('llm-cancel').style.display = 'inline-flex';
+    $('llm-model-list').innerHTML = ''; // 换了服务，上一个的模型清单留着会误导
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
   window.useProv = async (id) => {
@@ -119,6 +120,39 @@
     const j = await r.json();
     if (r.ok) { toast('已删除', 'ok'); loadProviders(); } else toast(j.error || '删除失败', 'err');
   };
+  // ---------- LLM: 自动获取模型清单 ----------
+  // 手打模型名是最大的低级错误来源（差一个字符就 400），所以支持一键从 provider 拉取。
+  // 用 datalist 而不是 <select>：既能下拉挑，也能手填 provider 没列出来的名字。
+  $('llm-fetch-models').addEventListener('click', async () => {
+    const msg = $('llm-msg');
+    const btn = $('llm-fetch-models');
+    const base = $('llm-base').value.trim();
+    if (!base) { msg.className = 'msg err'; msg.textContent = '请先填写 API Base URL'; return; }
+    btn.disabled = true; btn.textContent = '获取中…';
+    msg.className = 'msg'; msg.textContent = '正在从该服务拉取模型清单…';
+    try {
+      const r = await fetch('/api/admin/llms/models', {
+        method: 'POST', headers: authHdr(),
+        body: JSON.stringify({
+          id: parseInt($('llm-id').value || '0') || 0,
+          base_url: base,
+          api_key: $('llm-key').value, // 编辑态这里是掩码，后端会自动回退用库里已存的 key
+        }),
+      });
+      const j = await r.json();
+      if (!r.ok) { msg.className = 'msg err'; msg.textContent = j.error || '获取失败'; return; }
+      const list = j.models || [];
+      $('llm-model-list').innerHTML = list.map(m => `<option value="${esc(m)}"></option>`).join('');
+      if (list.length === 1 && !$('llm-model').value) $('llm-model').value = list[0];
+      msg.className = 'msg ok';
+      msg.textContent = `拉到 ${list.length} 个模型（来源 ${j.endpoint}）。点模型输入框可下拉选择，也可继续手填`;
+    } catch (err) {
+      msg.className = 'msg err'; msg.textContent = '网络错误';
+    } finally {
+      btn.disabled = false; btn.textContent = '获取模型';
+    }
+  });
+
   $('llm-cancel').addEventListener('click', () => {
     $('llm-form').reset(); $('llm-id').value = 0; $('llm-cancel').style.display = 'none';
     $('llm-key').required = true; $('llm-key').placeholder = 'sk-…';
@@ -129,11 +163,16 @@
     const isNew = $('llm-id').value === '0';
     const payload = {
       id: isNew ? 0 : parseInt($('llm-id').value),
-      name: $('llm-name').value,
+      // 字段名必须和 model.LLMConfig 的 json tag 对齐：后端 readBody 用
+      // DisallowUnknownFields 解码，多一个/错一个名字就是 400「请求体无效」，
+      // 报错地点离原因很远。（这里曾经发的是 name，后端只有 provider，导致保存必失败。）
+      provider: $('llm-name').value.trim(),
       base_url: $('llm-base').value.trim().replace(/\/+$/, ''),
       model: $('llm-model').value,
       api_key: $('llm-key').value,
-      is_active: false
+      // 新增即启用；编辑时不表态（false），由后端沿用该记录原有的启用状态，
+      // 免得「改个模型名」顺手把正在用的服务停掉。
+      is_active: isNew
     };
     // if masked placeholder on update, skip key
     if (!isNew && ($('llm-key').value === '••••••••' || $('llm-key').value === '')) delete payload.api_key;
@@ -143,7 +182,8 @@
       const r = await fetch('/api/admin/llms', { method: 'POST', headers: authHdr(), body: JSON.stringify(payload) });
       const j = await r.json();
       if (!r.ok) { msg.className = 'msg err'; msg.textContent = j.error || '保存失败'; return; }
-      msg.className = 'msg ok'; msg.textContent = '已保存并自动切换';
+      // 别再说「已保存并自动切换」——编辑态后端是沿用原状态，根本没切换，骗人。
+      msg.className = 'msg ok'; msg.textContent = isNew ? '已保存并启用' : '已保存';
       $('llm-form').reset(); $('llm-id').value = 0; $('llm-cancel').style.display = 'none';
       $('llm-key').required = true; $('llm-key').placeholder = 'sk-…';
       loadProviders();
