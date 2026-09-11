@@ -1,7 +1,10 @@
 package docgen
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -77,6 +80,77 @@ func TestPDFFontCoversRealDocumentContent(t *testing.T) {
 			t.Fatalf("font %s lost ASCII digit %q", path, d)
 		}
 	}
+}
+
+// TestScanTTFFontsFiltersAndSorts 校验目录扫描只收 .ttf、跳过 gopdf 无法加载的
+// 集合/OTF 字体，并且输出有序（保证同一台机器上选出的字体可复现）。
+func TestScanTTFFontsFiltersAndSorts(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel string, n int) string {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, make([]byte, n), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	write("b.ttf", 4)
+	write("sub/d.ttf", 4)
+	write("a.ttf", 4)
+	write("skip.ttc", 4) // 字体集合：gopdf 不支持
+	write("skip.otf", 4) // CFF 轮廓：gopdf 不支持
+	write("note.txt", 4)
+
+	got := scanTTFFonts([]string{root, "/路径不存在/忽略", ""})
+	want := []string{
+		filepath.Join(root, "a.ttf"),
+		filepath.Join(root, "b.ttf"),
+		filepath.Join(root, "sub", "d.ttf"),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("扫描到 %d 个字体 %v，期望 %d 个 %v", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("第 %d 个应为 %s，实际 %s（要求有序输出）", i, want[i], got[i])
+		}
+	}
+}
+
+// TestResolvePDFFontEnvOverride 校验 SKILLFORGE_PDF_FONT_FILE 生效：
+// 指到真实字体时必须用它；指到不存在的路径时必须优雅回落到正常探测，而不是崩或者静默变空。
+func TestResolvePDFFontEnvOverride(t *testing.T) {
+	restore := func() {
+		pdfFontOnce = sync.Once{}
+		pdfFontPath, pdfFontMissing = "", nil
+	}
+	good := PDFFontPath()
+	if good == "" {
+		t.Skip("本机无可用 PDF 字体，跳过（CI 会安装字体后执行）")
+	}
+
+	t.Run("指定真实字体则采用", func(t *testing.T) {
+		t.Setenv(pdfFontFileEnv, good)
+		restore()
+		defer restore()
+		if got := PDFFontPath(); got != good {
+			t.Fatalf("%s=%s 时应选用该字体，实际 %s", pdfFontFileEnv, good, got)
+		}
+		if miss := PDFFontMissingRunes(); len(miss) != 0 {
+			t.Fatalf("本机字体 %s 缺字符: %q", good, string(miss))
+		}
+	})
+
+	t.Run("指定不存在的路径则优雅回落", func(t *testing.T) {
+		t.Setenv(pdfFontFileEnv, filepath.Join(t.TempDir(), "not-there.ttf"))
+		restore()
+		defer restore()
+		if got := PDFFontPath(); got != good {
+			t.Fatalf("路径无效时应回落到正常探测（期望 %s），实际 %s", good, got)
+		}
+	})
 }
 
 // TestBuildPDFKeepsDigits 直接生成 PDF 并确认生成的字节流里包含数字字形。

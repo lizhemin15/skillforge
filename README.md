@@ -106,6 +106,7 @@ SKILLFORGE_DATA_DIR=/opt/skillforge/data ./skillforge
 | `SKILLFORGE_PUBLIC_URL` | `http://localhost:8092` | 对外地址，用于生成下载链接 |
 | `SKILLFORGE_ADMIN_USER` | `admin` | 管理员账号 |
 | `SKILLFORGE_ADMIN_PASS` | `skillforge123` | 管理员密码（环境变量值始终为准） |
+| `SKILLFORGE_PDF_FONT_FILE` | 空 | 强制指定 PDF 渲染字体（`.ttf`），留空则自动探测 |
 | `SKILLFORGE_JWT_SECRET` | `change-me-...` | JWT 签名密钥，**务必改成随机串** |
 | `SKILLFORGE_LLM_PROVIDER` | 空 | LLM 供应商标识 |
 | `SKILLFORGE_LLM_BASE_URL` | 空 | OpenAI 兼容 base_url |
@@ -199,7 +200,16 @@ skills/<slug>/
 - **续改**：在同一份已填好的 docx 上继续改值、加行、删行，保留原有格式
 - **合计重算**：按明细行「数量 × 单价」重算合计，同时刷新大写金额与旧值清理
 
-> **PDF 字体注意**：PDF 渲染需要一个同时覆盖中文与 ASCII（数字、字母）的 TrueType 字体。程序会在运行时遍历候选字体并**实测字符覆盖率**，因此请确保目标机器安装了覆盖完整的 CJK 字体（如 `fonts-arphic-gbsn00lp`）。纯 CJK fallback 字体（如 `DroidSansFallbackFull.ttf`）**缺 ASCII 数字**，会导致 PDF 里数字全部消失。
+> **PDF 字体注意**：PDF 渲染需要一个同时覆盖中文与 ASCII（数字、字母）的 TrueType 字体。程序会在运行时按「环境变量指定 → 内置候选 → 扫描系统字体目录」的顺序**实测字符覆盖率**，只有真正覆盖数字的字体才会被采用（未覆盖的字符会被 gopdf 静默渲染成空白，历史上正是这个原因让 PDF 里的金额全部消失）。
+>
+> ```bash
+> # 部署机器上装一个全覆盖的 .ttf 字体（Debian/Ubuntu）
+> apt-get install -y fonts-arphic-gbsn00lp fonts-arphic-gkai00mp
+> # 字体装在非常规路径时，直接指定：
+> SKILLFORGE_PDF_FONT_FILE=/path/to/your.ttf
+> ```
+>
+> ⚠️ gopdf **不能加载** `.ttc`（字体集合）与 `.otf`（CFF 轮廓）——若系统里只有 `NotoSansCJK-Regular.ttc`，PDF 生成仍然会失败并给出明确报错，请改用 `.ttf` 字体。
 
 ---
 

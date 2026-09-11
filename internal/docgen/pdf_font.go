@@ -1,9 +1,12 @@
 package docgen
 
 import (
+	"io/fs"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/signintech/gopdf"
@@ -36,6 +39,20 @@ var pdfFontCandidates = []string{
 	"/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
 }
 
+// pdfFontScanDirs 是固定候选全部未「全覆盖」时，做一次目录扫描的搜索根。
+//
+// 为什么需要扫描：固定候选只覆盖 Debian/Ubuntu 的路径，换个发行版（Alpine / Arch /
+// 自编译环境）或运维把字体装在别处，7 个常量路径就会全部 miss，PDF 生成直接失败。
+// 扫到之后仍然**逐个实测覆盖率**，不假设「文件名带 CJK 就一定能用」。
+var pdfFontScanDirs = []string{
+	"/usr/share/fonts",
+	"/usr/local/share/fonts",
+	"/usr/share/X11/fonts",
+	"/Library/Fonts",
+	"/System/Library/Fonts",
+	"/opt/homebrew/share/fonts",
+}
+
 // pdfRequiredSample 是字体必须覆盖的「门槛字符集」。任何 PDF 都可能出现数字、
 // 拉丁字母和半角标点，所以这些是硬要求；中文部分取公文/合同/报价单高频字。
 const pdfRequiredSample = "0123456789" +
@@ -46,6 +63,9 @@ const pdfRequiredSample = "0123456789" +
 	"产品报价单数量单价小计合计金额元万仟佰拾壹贰叁肆伍陆柒捌玖零年月日" +
 	"云服务器技术支持人民币大写备注：，。！？、（）【】《》；“”‘’—…" +
 	"合同甲方乙方签署日期编号部门姓名地址电话邮箱项目名称规格型号单位总计"
+
+// pdfFontFileEnv 允许运维强制指定字体文件，跳过全部探测（用于字体装在非常规路径）。
+const pdfFontFileEnv = "SKILLFORGE_PDF_FONT_FILE"
 
 var (
 	pdfFontOnce    sync.Once
@@ -97,38 +117,113 @@ func dedupRunes(in []rune) []rune {
 	return out
 }
 
-// resolvePDFFont 挑选第一个「门槛字符集全覆盖」的候选字体；若无，则取缺字最少的那个
+// scanTTFFonts 在给定根目录下递归收集 .ttf 文件。
+//
+// 跳过 .ttc（字体集合）与 .otf（CFF 轮廓）：gopdf 加载这两种会报
+// "Unrecognized file (font) format"，收进来只会白跑一趟探测。
+func scanTTFFonts(roots []string) []string {
+	var out []string
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		if _, err := os.Stat(root); err != nil {
+			continue
+		}
+		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			if strings.EqualFold(filepath.Ext(path), ".ttf") {
+				out = append(out, path)
+			}
+			return nil
+		})
+	}
+	sort.Strings(out) // 排序保证同一台机器上选出的字体可复现
+	if len(out) > maxScannedFonts {
+		out = out[:maxScannedFonts]
+	}
+	return out
+}
+
+// maxScannedFonts 给目录扫描的探测次数封顶，避免字体极多的机器上首次调用过慢。
+const maxScannedFonts = 120
+
+// resolvePDFFont 挑选第一个「门槛字符集全覆盖」的字体；若无，则取缺字最少的那个
 // 并 WARN 记录缺了哪些字符。结果被缓存，只在进程内探测一次。
+//
+// 挑选顺序：
+//  1. SKILLFORGE_PDF_FONT_FILE 指定的字体（运维强制，不满足则报错而不是静默降级）
+//  2. pdfFontCandidates 固定候选（按观感排序）
+//  3. 扫描 pdfFontScanDirs 找到的 .ttf（覆盖非 Debian 路径 / 自定义安装）
 //
 // 返回 (字体路径, 该字体相对门槛字符集的缺失字符)。路径为空表示系统里找不到任何可用字体。
 func resolvePDFFont() (string, []rune) {
 	pdfFontOnce.Do(func() {
-		bestMissCount := -1
-		for _, cand := range pdfFontCandidates {
-			if _, err := os.Stat(cand); err != nil {
-				continue
+		// 1) 运维显式指定：尊重它，但也要实测覆盖率（配错了必须说出来，不能装作没事）
+		if forced := os.Getenv(pdfFontFileEnv); forced != "" {
+			miss, err := probeFontCoverage(forced, pdfRequiredSample)
+			if err != nil {
+				log.Printf("[docgen/pdf] ERROR %s=%s 无法加载: %v", pdfFontFileEnv, forced, err)
+			} else {
+				pdfFontPath, pdfFontMissing = forced, miss
+				if len(miss) == 0 {
+					log.Printf("[docgen/pdf] font resolved by %s: %s", pdfFontFileEnv, forced)
+				} else {
+					log.Printf("[docgen/pdf] WARN %s=%s 缺 %d 个字符: %q",
+						pdfFontFileEnv, forced, len(miss), string(miss))
+				}
+				return
 			}
+		}
+
+		bestMissCount := -1
+
+		// 尝试一个候选：全通则立即定案；否则只记录「目前缺得最少」的那个。
+		tryOne := func(cand string) (done bool) {
 			miss, err := probeFontCoverage(cand, pdfRequiredSample)
 			if err != nil {
-				// .ttc 集合格式等不可加载的情况走这里，属预期，降级为 debug 级噪音
+				// .ttc / .otf 等不可加载的情况走这里，属预期，降为噪音
 				log.Printf("[docgen/pdf] font candidate unusable: %s: %v", cand, err)
-				continue
+				return false
 			}
 			if len(miss) == 0 {
 				pdfFontPath, pdfFontMissing = cand, nil
 				log.Printf("[docgen/pdf] font resolved: %s (full coverage)", cand)
-				return
+				return true
 			}
 			if bestMissCount < 0 || len(miss) < bestMissCount {
 				bestMissCount, pdfFontPath, pdfFontMissing = len(miss), cand, miss
 			}
+			return false
 		}
+
+		// 2) 固定候选
+		for _, cand := range pdfFontCandidates {
+			if _, err := os.Stat(cand); err != nil {
+				continue
+			}
+			if tryOne(cand) {
+				return
+			}
+		}
+
+		// 3) 扫描系统字体目录，找一个全覆盖的（固定候选全都只能部分覆盖时才走到这里）
+		for _, cand := range scanTTFFonts(pdfFontScanDirs) {
+			if tryOne(cand) {
+				return
+			}
+		}
+
 		if pdfFontPath != "" {
-			log.Printf("[docgen/pdf] WARN no candidate covers all required glyphs; "+
+			log.Printf("[docgen/pdf] WARN no font covers all required glyphs; "+
 				"falling back to %s, %d missing rune(s): %q — these will render as blank",
 				pdfFontPath, len(pdfFontMissing), string(pdfFontMissing))
 		} else {
-			log.Printf("[docgen/pdf] ERROR no usable CJK font found among %d candidates", len(pdfFontCandidates))
+			log.Printf("[docgen/pdf] ERROR no usable CJK font found; "+
+				"install one (e.g. apt-get install fonts-arphic-gbsn00lp) "+
+				"or point %s to a .ttf file", pdfFontFileEnv)
 		}
 	})
 	return pdfFontPath, pdfFontMissing

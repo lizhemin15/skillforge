@@ -27,6 +27,15 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      # PDF 生成依赖真正的 .ttf 中文字体：gopdf 无法加载 .ttc（字体集合）和
+      # .otf（CFF 轮廓），而 runner 默认一个 CJK 字体都没有——不装这一步
+      # 「PDF 字体必须覆盖数字」的回归测试会直接失败（这本身是正确行为）。
+      - name: 安装中文字体（PDF 生成依赖）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-arphic-gbsn00lp fonts-arphic-gkai00mp
+          fc-list 2>/dev/null | grep -i arphic || true
+
       - name: Verify go.mod is tidy
         run: |
           go mod tidy
