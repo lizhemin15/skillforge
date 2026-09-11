@@ -26,6 +26,20 @@
   --ds-shadow-card:         0 0 0 1px #f1f5f9, 0 2px 4px rgba(0,0,0,.05), 0 12px 24px rgba(0,0,0,.05);
   --ds-radius-panel:        16px;
 
+  /* —— 毛玻璃四件套：逐条抄自 www.deepseek.com 的实测 computed 值 ——
+     blur(12px) + 半透白底 + 亮白描边(2px) + 大范围柔和投影；saturate 让背后的雾状渐变更"有颜色" */
+  --ds-glass-blur:        12px;
+  --ds-glass-blur-sm:     8px;
+  --ds-glass-sat:         150%;
+  --ds-glass-bg:          rgba(255,255,255,.20);  /* 大玻璃卡（官网输入框同款） */
+  --ds-glass-bg-strong:   rgba(255,255,255,.40);  /* 胶囊 / 小按钮（官网 ds-btn-secondary 同款） */
+  --ds-glass-bg-panel:    rgba(255,255,255,.55);  /* 面板 / 浮层 / 侧栏 */
+  --ds-glass-bg-solid:    rgba(255,255,255,.72);  /* 气泡：留一点透，但保证正文可读 */
+  --ds-glass-edge:        rgba(255,255,255,.80);  /* 2px 亮白边 = 玻璃"反光棱" */
+  --ds-glass-edge-cool:   rgba(9,45,78,.18);      /* 1px 冷灰边 = 官网胶囊描边 */
+  --ds-glass-shadow:      0 0 1px rgba(0,0,0,.20), 0 0 4px rgba(0,0,0,.02), 0 12px 32px rgba(0,0,0,.08);
+  --ds-glass-shadow-sm:   0 0 1px rgba(0,0,0,.14), 0 6px 18px rgba(0,0,0,.06);
+
   /* —— 应用层别名：老变量指到 DeepSeek 值 —— */
   --bg:        var(--ds-color-bg-page);
   --bg-soft:   hsla(0,0%,100%,.55);
@@ -74,9 +88,8 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; }
 body {
-  background:
-    radial-gradient(900px 480px at 50% -14%, rgba(120,150,220,.16) 0%, rgba(120,150,220,0) 62%),
-    var(--bg);
+  /* 环境渐变交给 .ds-bg 图层（见文件末尾「毛玻璃层」），这里只留兜底底色 */
+  background: var(--bg);
   color: var(--text);
   font-family: var(--sans);
   font-size: 14.5px;
@@ -1017,4 +1030,424 @@ select.ch-field-ctl { appearance: none; }
 }
 @media (min-width: 901px) {
   .sb-toggle { display: none; }
+}
+
+/* ============================================================
+   毛玻璃层 (Glassmorphism) — 复刻 www.deepseek.com
+   ------------------------------------------------------------
+   官网的"毛玻璃感"不是靠涂 blur 得来的，而是两件事的合力：
+     ① 背后有一层雾状渐变（canvas blob）可被"透"出来；
+     ② 玻璃面 = blur(12px) + 半透白底 + 2px 亮白描边 + 大范围柔投影。
+   本文件原来只有 ① 的一条 alpha .16 极淡 radial，等于没有；
+   所以下面先补背景层 .ds-bg，再统一把各个面升级成真玻璃。
+   全部纯 CSS，不引外部资源（离线部署要求）。
+   ============================================================ */
+
+/* —— ① 背景层：毛玻璃的"成因"。fixed + z-index:-1，落在 body 背景之上、内容之下 —— */
+.ds-bg {
+  position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none;
+  background: linear-gradient(180deg, #eef3fb 0%, #f7f8fb 38%, #f9f8f8 62%, #f4f3f9 100%);
+}
+.ds-bg > i {
+  position: absolute; display: block; border-radius: 50%;
+  will-change: transform; transform: translateZ(0);
+}
+/* 顶部偏左：白色光晕（官网左上那团亮） */
+.ds-bg > i:nth-child(1) {
+  width: 62vw; height: 62vw; min-width: 620px; min-height: 620px;
+  top: -34vw; left: -6vw;
+  background: radial-gradient(circle at 50% 50%, rgba(255,255,255,.98) 0%, rgba(255,255,255,.55) 42%, rgba(255,255,255,0) 70%);
+  animation: ds-drift-a 34s ease-in-out infinite alternate;
+}
+/* 右上：淡紫蓝（官网右上那抹冷色） */
+.ds-bg > i:nth-child(2) {
+  width: 54vw; height: 54vw; min-width: 540px; min-height: 540px;
+  top: -16vw; right: -16vw;
+  background: radial-gradient(circle at 50% 50%, rgba(146,170,235,.52) 0%, rgba(146,170,235,.24) 46%, rgba(146,170,235,0) 72%);
+  animation: ds-drift-b 41s ease-in-out infinite alternate;
+}
+/* 底部：淡丁香紫——会话界面输入区在底部，这里必须有色可透，玻璃才看得见 */
+.ds-bg > i:nth-child(3) {
+  width: 58vw; height: 58vw; min-width: 580px; min-height: 580px;
+  bottom: -30vw; left: 12vw;
+  background: radial-gradient(circle at 50% 50%, rgba(178,168,238,.40) 0%, rgba(178,168,238,.18) 48%, rgba(178,168,238,0) 74%);
+  animation: ds-drift-c 47s ease-in-out infinite alternate;
+}
+@keyframes ds-drift-a {
+  from { transform: translate3d(0,0,0) scale(1); }
+  to   { transform: translate3d(4vw,3vw,0) scale(1.08); }
+}
+@keyframes ds-drift-b {
+  from { transform: translate3d(0,0,0) scale(1.04); }
+  to   { transform: translate3d(-5vw,4vw,0) scale(1); }
+}
+@keyframes ds-drift-c {
+  from { transform: translate3d(0,0,0) scale(1); }
+  to   { transform: translate3d(6vw,-3vw,0) scale(1.1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ds-bg > i { animation: none !important; }
+}
+
+/* —— ② 玻璃面：统一四条（blur / 半透白 / 亮边 / 柔影）。逐面调材料厚度。 —— */
+
+/* 签名件：输入框 —— 官网 ds-glass-card 同款：.2 底 + 2px 亮白边 + 24px 圆角 */
+.ch-input-box {
+  background: var(--ds-glass-bg);
+  -webkit-backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  border: 2px solid var(--ds-glass-edge);
+  border-radius: var(--radius-card);
+  box-shadow: var(--ds-glass-shadow);
+}
+.ch-input-box:focus-within {
+  border-color: rgba(255,255,255,.95);
+  background: rgba(255,255,255,.42);
+  box-shadow: var(--ds-glass-shadow), 0 0 0 3px rgba(77,107,254,.12);
+}
+/* 输入区外壳：当"磨砂纱"，压在滚动内容之上 */
+.ch-input-bar {
+  background: rgba(255,255,255,.42);
+  -webkit-backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+}
+
+/* 顶栏 */
+header.topbar {
+  background: rgba(255,255,255,.52);
+  -webkit-backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  border-bottom: 1px solid rgba(255,255,255,.6);
+  box-shadow: 0 1px 0 rgba(0,0,0,.04);
+}
+
+/* 侧边栏导轨 */
+.sb {
+  background: rgba(255,255,255,.44);
+  -webkit-backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  border-right: 1px solid rgba(255,255,255,.6);
+}
+.sb-new {
+  background: var(--ds-glass-bg-strong);
+  -webkit-backdrop-filter: blur(var(--ds-glass-blur-sm)) saturate(var(--ds-glass-sat));
+  backdrop-filter: blur(var(--ds-glass-blur-sm)) saturate(var(--ds-glass-sat));
+  border: 1px solid var(--ds-glass-edge-cool);
+  border-radius: 12px;
+  box-shadow: var(--ds-glass-shadow-sm);
+}
+.sb-new:hover { background: rgba(255,255,255,.62); }
+
+/* 场景卡：玻璃卡 + 亮边 */
+.ch-card {
+  background: var(--ds-glass-bg-strong);
+  -webkit-backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  border: 1px solid var(--ds-glass-edge);
+  border-radius: var(--radius-card);
+  box-shadow: var(--ds-glass-shadow-sm);
+}
+.ch-card:hover {
+  background: rgba(255,255,255,.62);
+  border-color: rgba(77,107,254,.5);
+  box-shadow: var(--ds-glass-shadow), 0 0 0 3px rgba(77,107,254,.08);
+}
+.ch-card .ch-card-ic {
+  background: rgba(255,255,255,.55);
+  border: 1px solid var(--ds-glass-edge);
+  -webkit-backdrop-filter: blur(var(--ds-glass-blur-sm));
+  backdrop-filter: blur(var(--ds-glass-blur-sm));
+}
+
+/* 胶囊：官网 ds-btn-secondary 同款 .4 底 + 冷灰描边 */
+.ch-sug, .ch-btn, .ch-skill-pill, .ch-tr-pill {
+  background: var(--ds-glass-bg-strong);
+  -webkit-backdrop-filter: blur(var(--ds-glass-blur-sm)) saturate(var(--ds-glass-sat));
+  backdrop-filter: blur(var(--ds-glass-blur-sm)) saturate(var(--ds-glass-sat));
+  border: 1px solid var(--ds-glass-edge-cool);
+}
+.ch-sug:hover { background: rgba(255,255,255,.66); }
+
+/* 欢迎徽标 */
+.ch-w-badge {
+  background: rgba(255,255,255,.5);
+  -webkit-backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  border: 1px solid var(--ds-glass-edge);
+  box-shadow: var(--ds-glass-shadow-sm);
+}
+
+/* 气泡：留一点透（.72）保住正文可读性，不做成纯磨砂以免糊 */
+.ch-msg.assistant .ch-bubble {
+  background: var(--ds-glass-bg-solid);
+  -webkit-backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  border: 1px solid var(--ds-glass-edge);
+  box-shadow: var(--ds-glass-shadow-sm);
+}
+
+/* 工具轨迹面板 / 附件卡 */
+.ch-trace {
+  background: var(--ds-glass-bg-panel);
+  -webkit-backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  border: 1px solid var(--ds-glass-edge);
+  border-radius: var(--radius);
+  box-shadow: var(--ds-glass-shadow-sm);
+}
+.atx-link {
+  background: var(--ds-glass-bg-strong);
+  -webkit-backdrop-filter: blur(var(--ds-glass-blur-sm)) saturate(var(--ds-glass-sat));
+  backdrop-filter: blur(var(--ds-glass-blur-sm)) saturate(var(--ds-glass-sat));
+  border: 1px solid var(--ds-glass-edge);
+  border-radius: 14px;
+  box-shadow: var(--ds-glass-shadow-sm);
+}
+.atx-link:hover { background: rgba(255,255,255,.62); box-shadow: var(--ds-glass-shadow); }
+
+/* 弹层：材料最厚（面板），遮罩加深模糊 */
+.modal-mask {
+  background: rgba(28,30,38,.22);
+  -webkit-backdrop-filter: blur(6px) saturate(120%);
+  backdrop-filter: blur(6px) saturate(120%);
+}
+.modal {
+  background: var(--ds-glass-bg-panel);
+  -webkit-backdrop-filter: blur(20px) saturate(var(--ds-glass-sat));
+  backdrop-filter: blur(20px) saturate(var(--ds-glass-sat));
+  border: 1px solid var(--ds-glass-edge);
+  border-radius: var(--radius-card);
+  box-shadow: 0 0 1px rgba(0,0,0,.2), 0 24px 64px rgba(0,0,0,.16);
+}
+
+/* 管理端：文件树/列表也吃同一套材料 */
+.kb-list, .kb-panel, .kb-editor {
+  background: var(--ds-glass-bg-strong);
+  -webkit-backdrop-filter: blur(var(--ds-glass-blur-sm)) saturate(var(--ds-glass-sat));
+  backdrop-filter: blur(var(--ds-glass-blur-sm)) saturate(var(--ds-glass-sat));
+  border-color: var(--ds-glass-edge);
+}
+
+/* ============================================================
+   毛玻璃层 · 第二轮强化
+   ------------------------------------------------------------
+   第一轮已让玻璃"透色"，但背景是平滑渐变 → 没有高频细节可被 blur 抹开，
+   看着仍是"半透色块"而非"磨砂"。两处补强：
+     ① 背景加噪点颗粒：颗粒是高频细节，被 backdrop-filter 一抹平就成了雾面，
+        这是磨砂玻璃唯一不可伪造的视觉证据。
+     ② 玻璃面加镜面高光：真实玻璃不是一块均匀的半透白，而是斜向一道光。
+   仍为纯 CSS/SVG 内联，零外部请求。
+   ============================================================ */
+
+/* ① 颗粒层：叠在渐变色块之上 */
+.ds-bg::after {
+  content: ''; position: absolute; inset: 0; pointer-events: none;
+  opacity: .30;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+}
+
+/* ② 镜面高光：给玻璃面叠一道斜向光（用 background-image，不覆盖 backgroundColor 的透感） */
+.ch-input-box,
+.ch-card,
+.ch-msg.assistant .ch-bubble,
+.ch-trace,
+.modal {
+  background-image: linear-gradient(158deg,
+    rgba(255,255,255,.62) 0%,
+    rgba(255,255,255,.16) 38%,
+    rgba(255,255,255,.04) 62%,
+    rgba(255,255,255,.34) 100%);
+}
+/* 小件（胶囊/按钮）用弱一档的光，避免花 */
+.ch-sug, .ch-btn, .ch-skill-pill, .ch-tr-pill, .atx-link, .sb-new, .ch-w-badge, .ch-card .ch-card-ic {
+  background-image: linear-gradient(158deg, rgba(255,255,255,.42) 0%, rgba(255,255,255,.06) 55%, rgba(255,255,255,.22) 100%);
+}
+/* 顶部亮边（内阴影）＝"玻璃上沿接光"，玻璃感的关键一笔 */
+.ch-input-box,
+.ch-card,
+.ch-msg.assistant .ch-bubble,
+.ch-trace,
+.modal,
+.atx-link,
+.ch-w-badge,
+.sb-new {
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.9), var(--ds-glass-shadow-sm);
+}
+.ch-card:hover,
+.atx-link:hover {
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.95), var(--ds-glass-shadow);
+}
+/* 输入框是签名件，给最重的落地影 */
+.ch-input-box {
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.95), var(--ds-glass-shadow);
+}
+.ch-input-box:focus-within {
+  box-shadow: inset 0 1px 0 rgba(255,255,255,1), var(--ds-glass-shadow), 0 0 0 3px rgba(77,107,254,.12);
+}
+
+/* ============================================================
+   毛玻璃层 · 第三轮强化（观感"打到点上"）
+   ------------------------------------------------------------
+   上轮评估：方向对但力度弱。三处加力：
+     ① 背景色阶加深——玻璃要有"色"可透，底太淡则透出来还是白；
+     ② 噪点加强——颗粒越实，被 blur 抹平后的"雾面"越明显；
+     ③ 镜面光更定向 + 底部内阴影——真实玻璃有厚度，不是一张纸。
+   ============================================================ */
+
+/* ① 背景：加深底色 + 提高色块饱和度 */
+.ds-bg {
+  background: linear-gradient(180deg, #e6edfa 0%, #f2f4fa 34%, #f7f6f6 58%, #eeeaf8 100%);
+}
+.ds-bg > i:nth-child(2) {
+  background: radial-gradient(circle at 50% 50%, rgba(129,158,236,.70) 0%, rgba(129,158,236,.34) 46%, rgba(129,158,236,0) 72%);
+}
+.ds-bg > i:nth-child(3) {
+  background: radial-gradient(circle at 50% 50%, rgba(168,155,240,.58) 0%, rgba(168,155,240,.26) 48%, rgba(168,155,240,0) 74%);
+}
+/* ② 噪点：加强颗粒（更密更显） */
+.ds-bg::after {
+  opacity: .45;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='1.05' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* ③ 镜面光更定向（左上强 → 右下弱，再回一点），并补底部内阴影做"厚度" */
+.ch-input-box,
+.ch-card,
+.ch-msg.assistant .ch-bubble,
+.ch-trace,
+.modal {
+  background-image: linear-gradient(150deg,
+    rgba(255,255,255,.78) 0%,
+    rgba(255,255,255,.26) 30%,
+    rgba(255,255,255,.06) 58%,
+    rgba(255,255,255,.30) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.98),
+    inset 0 -1px 1px rgba(9,45,78,.07),
+    inset 0 -10px 18px -14px rgba(9,45,78,.14),
+    var(--ds-glass-shadow-sm);
+}
+.ch-input-box {
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,1),
+    inset 0 -1px 1px rgba(9,45,78,.07),
+    inset 0 -12px 20px -14px rgba(9,45,78,.14),
+    var(--ds-glass-shadow);
+}
+.ch-input-box:focus-within {
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,1),
+    inset 0 -1px 1px rgba(9,45,78,.07),
+    inset 0 -12px 20px -14px rgba(9,45,78,.14),
+    var(--ds-glass-shadow), 0 0 0 3px rgba(77,107,254,.12);
+}
+.ch-card:hover {
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,1),
+    inset 0 -1px 1px rgba(9,45,78,.07),
+    inset 0 -10px 18px -14px rgba(9,45,78,.12),
+    var(--ds-glass-shadow);
+}
+/* 小件也给一点定向光 + 亮边 */
+.ch-sug, .ch-btn, .ch-skill-pill, .ch-tr-pill, .atx-link, .sb-new, .ch-w-badge, .ch-card .ch-card-ic {
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.85), var(--ds-glass-shadow-sm);
+}
+
+/* ============================================================
+   Bug P：聊天页整页滚动 → 输入框被挤出视口
+   ------------------------------------------------------------
+   实测：innerH=577，但 .layout 只有 min-height:100vh 没有 height，
+   flex 子项按内容撑高（.ch-scroll 内容 622 + 输入栏 176 = 798），
+   导致 docScrollH=857 > 视口，composerVisibleWithoutScroll=false。
+   后果：① 矮屏（1366×768）上必须滚动才能打字；② 输入框脱离
+   .ds-bg 色域，玻璃背后无颜色可透 —— 签名件反而不像玻璃。
+   修法：只给聊天页（.ch-lock）锁视口高度，让 .ch-scroll 内部滚动、
+   输入栏钉在视口底。admin 页仍走整页滚动，不受影响。
+   ============================================================ */
+.layout.ch-lock {
+  height: 100vh; min-height: 100vh; overflow: hidden;
+}
+@supports (height: 100dvh) {
+  /* dvh 跟随移动端地址栏伸缩，避免键盘弹出时底部被切 */
+  .layout.ch-lock { height: 100dvh; min-height: 100dvh; }
+}
+
+/* ============================================================
+   Bug Q：backdrop-filter 嵌套 → 内层玻璃看不见页面背景
+   ------------------------------------------------------------
+   规范：带 backdrop-filter 的元素会成为其子元素的 backdrop root，
+   内层 backdrop-filter 只能对"root 内的内容"生效，取不到页面渐变。
+   实测影响：.ch-input-box 嵌在 .ch-input-bar 内 → 它 blur 的其实是
+   输入栏自己的半透白（一张平滑图），blur 等于白做；两层白叠加还把
+   渐变色压掉一半，签名件反而不如卡片像玻璃。
+   去嵌套：外层改纯透明（锁定视口后滚动内容不再穿过输入栏/侧边栏，
+   外层 blur 本无意义），玻璃只留内层一层 → 直接对页面渐变生效。
+   这是 DeepSeek 官网的真实结构：输入区没有"外壳层"，玻璃就是输入框本身。
+   ============================================================ */
+.ch-input-bar {
+  background: transparent;
+  -webkit-backdrop-filter: none; backdrop-filter: none;
+  border: none;
+}
+/* 侧边栏同理：内容不会穿到它后面（.ch-main 有 margin-left 让位），
+   去掉外层 blur 才能让 .sb-new 等内层玻璃透出页面渐变 */
+.sb { -webkit-backdrop-filter: none; backdrop-filter: none; }
+
+/* ============================================================
+   毛玻璃层 · 第四轮定稿
+   ------------------------------------------------------------
+   像素实测（同一 y 带左右对照）：
+     裸背景 高频颗粒 4.54 ｜ 玻璃输入框内 0.13 → 抹平 97%（blur 真生效）
+     玻璃内 blueness 16.8 vs 裸背景 15.9 → 渐变色确实透了过来
+   结论：机制已对，只差"力度"。颗粒从 .45 提到 .55（约 2.2% 振幅，
+   够看出"外糙内滑"又不至于显脏）；亮边与落地影再加一档。
+   ============================================================ */
+.ds-bg::after { opacity: .55; }
+
+/* 亮边加强：真玻璃的边不是均匀 1px，而是上沿一道实光 + 下沿一道弱反光 */
+.ch-card, .atx-link, .ch-w-badge, .sb-new, .ch-msg.assistant .ch-bubble {
+  border-color: rgba(255,255,255,.92) !important;
+}
+.ch-input-box { border-color: rgba(255,255,255,.98) !important; }
+
+/* 落地影加强：让玻璃"浮"起来，而不是贴平在背景上 */
+.ch-card { box-shadow: inset 0 1px 0 rgba(255,255,255,1), inset 0 -1px 1px rgba(9,45,78,.08), inset 0 -10px 18px -14px rgba(9,45,78,.16), 0 1px 2px rgba(9,45,78,.05), 0 10px 24px -6px rgba(9,45,78,.16) !important; }
+.ch-card:hover { box-shadow: inset 0 1px 0 rgba(255,255,255,1), inset 0 -1px 1px rgba(9,45,78,.08), inset 0 -10px 18px -14px rgba(9,45,78,.14), 0 2px 4px rgba(9,45,78,.06), 0 18px 38px -8px rgba(9,45,78,.24) !important; }
+.ch-input-box { box-shadow: inset 0 1px 0 rgba(255,255,255,1), inset 0 -1px 1px rgba(9,45,78,.08), inset 0 -12px 20px -14px rgba(9,45,78,.16), 0 2px 4px rgba(9,45,78,.05), 0 16px 40px -10px rgba(9,45,78,.22) !important; }
+.ch-input-box:focus-within { box-shadow: inset 0 1px 0 rgba(255,255,255,1), inset 0 -1px 1px rgba(9,45,78,.08), inset 0 -12px 20px -14px rgba(9,45,78,.16), 0 2px 4px rgba(9,45,78,.05), 0 16px 40px -10px rgba(9,45,78,.22), 0 0 0 3px rgba(77,107,254,.14) !important; }
+
+/* ============================================================
+   毛玻璃层 · 第五轮（修三处实测缺陷）
+   ------------------------------------------------------------
+   缺陷 1｜颗粒是"彩色噪声"，看着像 JPEG 色度压缩伪影。
+     实测背景高频残差：R=6.86 G=6.58 B=7.21，但 R-G 相关仅 +0.147、
+     R-B -0.070 —— 说明三通道噪声互相独立，即**彩色噪声**（灰度噪声应接近 +1.0）。
+     feTurbulence 默认在 RGB 各通道独立生成噪声，必须补一道 saturate=0 去色。
+     彩色噪声像压缩伪影，灰度噪声才像胶片颗粒。
+   缺陷 2｜输入框"框里套框"。全局 `input:focus,textarea:focus` 给 textarea 画了
+     一道 3px 光环，外层 .ch-input-box:focus-within 又画一道 → 两个嵌套圆角矩形。
+     聚焦光环应由外框统一表达，内部控件不再重复画。
+   缺陷 3｜侧栏与渐变交界是一条硬缝。补一道亮白棱边 + 极淡侧影，把"色阶突变"
+     变成"玻璃边缘"。限定桌面宽度，避免覆盖移动端抽屉的投影。
+   ============================================================ */
+.ds-bg::after {
+  /* 去色：type='saturate' values='0' 把彩色噪声压成灰度颗粒 */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='1.05' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  opacity: .45;
+}
+
+/* 缺陷 2：输入框内部控件不再重复画聚焦光环 */
+.ch-input-box textarea:focus,
+.ch-input-box input:focus,
+.ch-input-box select:focus {
+  box-shadow: none; border-color: transparent;
+}
+
+/* 缺陷 3：只在桌面给侧栏玻璃棱边（移动端抽屉的投影另有一套，别覆盖） */
+@media (min-width: 901px) {
+  .sb {
+    border-right: 1px solid rgba(255,255,255,.78);
+    box-shadow: 1px 0 0 rgba(9,45,78,.04), 16px 0 40px -28px rgba(9,45,78,.20);
+  }
 }

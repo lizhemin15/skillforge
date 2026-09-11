@@ -68,6 +68,12 @@ jobs:
           node --check web/js/admin.js
           node web/tests/readonly_file_editor.test.mjs
 
+      # 毛玻璃层回归：复刻 deepseek.com 的那套玻璃，坏起来是"静默的"——
+      # 背景层被删、颗粒层被删、外层又加回 backdrop-filter、聊天页不再锁视口，
+      # 页面都不会报错，只是玻璃变回纯色块。肉眼很难发现，必须机器守。
+      - name: 前端回归（毛玻璃层契约）
+        run: node web/tests/glassmorphism.test.mjs
+
       - name: Build
         run: |
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o skillforge ./cmd/server
