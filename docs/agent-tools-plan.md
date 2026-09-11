@@ -2,6 +2,44 @@
 
 > 目标（用户原话）：「整个 ai 系统我期望你做的像 hermes 一样，内置很多常用工具，且能写一些代码，然后这些工具一组合，威力无穷」
 
+## 进度
+
+- ✅ **P1 已完成（2026-09-11）**：工具注册表 + Agent 循环 + `http_request` + `run_python`（systemd 沙箱）
+- ✅ 分类器新增 `needs_tools` 判定：需要外部实时数据/真实计算的任务优先走工具循环
+- ⏳ P2：把 `fill_template` / `gen_document` 包装成循环可用工具（这样「取实时数据 → 填进指定模板」也能一站完成）
+- ⏳ P3：`search_skills` / `read_skill`（让模型自己翻技能库）、`query_db`
+
+### P1 验收证据（实测）
+
+服务以 root 运行、公网可达，故沙箱是唯一防线，逐项实测：
+
+| 项 | 结果 |
+|---|---|
+| 降权 | 沙箱内 `uid=65534`（nobody），绝不以 root 执行 |
+| 断网 | `socket` 连接失败（PrivateNetwork 命名空间） |
+| 只读根 | 写 `/opt/skillforge`、`/etc`、`/root` 全部拒绝；仅工作区可写 |
+| 密钥防护 | 读不到 `skillforge.env` / DB / 会话记录（并已把 data 目录从 755 收到 700、DB 与会话文件收到 600） |
+| 资源限额 | MemoryMax 256M 拦住 800MB 分配；TasksMax 32 拦住 fork 炸弹；CPUQuota 50% |
+| 超时 | 死循环 3s 被杀，且**不留孤儿进程**（Go 只杀 systemd-run 不够，必须 `systemctl kill` 掉 unit） |
+| SSRF | 环回/私网/云元数据地址默认拦截；302 跳转到内网同样拦；内网接口可由 `SKILLFORGE_TOOL_HTTP_ALLOW` 开白 |
+
+端到端（真实模型，两轮）：
+1. 「查 golang/go 的 star/fork 并算比值，出 CSV」→ `http_request`(GitHub API) → `run_python` → 交付 CSV，
+   文件内容 `138403,19353,7.1515` 与 GitHub 官方 API **逐位一致**（工具取数，不是编的）。
+2. 「取 golang/go 与 rust-lang/rust 的 star，算倍差，出 CSV」→ 2×http_request + run_python → CSV，
+   `138403` / `118379` 与官方一致。
+
+对比改造前：同一个问题会命中「办公文档管家」技能、由模型**凭空编造** star 数并生成一份看着很合理的 xlsx。
+这是本次改造要解决的核心弊病。
+
+### 环境坑（本机实测）
+
+- `DynamicUser=yes` 起不来（本机未配子 uid 范围，exit 200），改用 `User=nobody`
+- `PrivateTmp=yes` 起不来（容器环境，exit 200），已剔除
+- `unshare -n` 在降权**之后**执行会失败（非 root 无权限）；顺序必须是先建命名空间再降权
+- 每次沙箱执行开销 ~30ms，可接受
+- 本机 PATH 里的 `go` 是 1.18 古董，必须用 `/usr/local/go/bin/go`（1.25.10）
+
 ## 0. 结论先行：威力来自「循环」，不是「工具多」
 
 当前架构是**一次性管线**：

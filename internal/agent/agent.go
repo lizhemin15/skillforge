@@ -57,6 +57,10 @@ type Eval struct {
 	//   "write"         → free-form writing via a write skill → Generate
 	//   "answer"        → plain chat / QA, no file → Generate (general)
 	Action string `json:"action"`
+	// NeedsTools 表示这个任务必须先拿到外部实时数据或做真实计算才能完成。
+	// 为 true 时走 Agent 工具循环（http_request / run_python），而不是让模型
+	// 凭记忆编内容——编造 star 数、销量、汇率这类「看起来合理」的数字是最坏的结果。
+	NeedsTools bool `json:"needs_tools"`
 }
 
 // TraceStep is one visible stage of the agent's decision pipeline.
@@ -161,6 +165,18 @@ func loadSessionFromDisk(path string) []Message {
 
 // SetLLM swaps the underlying client (provider hot-swap).
 func (e *Engine) SetLLM(l *llm.Client) { e.mu.Lock(); e.llm = l; e.mu.Unlock() }
+
+// ChatTools 是工具循环所需的模型调用入口（引擎持有 LLM 客户端，
+// 让 api 层不必自己再持有一份，也避免两处配置漂移）。
+func (e *Engine) ChatTools(ctx context.Context, msgs []llm.Msg, defs []llm.ToolDef) (llm.Msg, error) {
+	if err := e.ensureLLM(); err != nil {
+		return llm.Msg{}, err
+	}
+	e.mu.Lock()
+	cli := e.llm
+	e.mu.Unlock()
+	return cli.ChatTools(ctx, msgs, defs)
+}
 
 // ensureLLM lazily builds a client from the store's active config if the
 // engine holds a nil one (typical at startup when only env config exists).
@@ -286,8 +302,17 @@ func (e *Engine) EvalTurn(ctx context.Context, id, user string, history []Messag
    detail 用一句话，面向用户，别用内部术语。
 
 只输出一个 JSON 对象，不要任何其他文字：
-{"intent":"write|docgen|query|chat","action":"fill|template_only|gen|write|answer","skill_slug":"<slug 或空>","reason":"<一句话说明这次要不要技能、用什么动作>","params":{...},"needs":[],"steps":[...]}
-action 必须根据上面「意图→动作」映射严格输出，不要省略。params/needs/steps 可以为空，但 intent、action、steps 必须输出。
+{"intent":"write|docgen|query|chat","action":"fill|template_only|gen|write|answer","skill_slug":"<slug 或空>","needs_tools":true|false,"reason":"<一句话说明这次要不要技能、用什么动作>","params":{...},"needs":[],"steps":[...]}
+
+needs_tools 判断（很重要，判错会导致答案里的数字是编的）：
+- true：任务必须先拿到**外部实时数据**（查接口/API、抓网页、查实时行情、查仓库/订单/库存等外部系统数据），或需要对数据做**真实计算/统计**（求和、占比、同比、排序汇总）才能给出正确答案。
+  典型：「查一下某仓库的 star 数」「把某接口的数据拉下来统计」「各区域销量算占比」「今天的汇率是多少」。
+- false：用户要生成/填写**办公文档**、写文章、按模板出文件，或闲聊问答——这类不需要外部数据。
+  典型：「写一份述职报告」「用验收单模板填数据」「介绍下你们的产品」。
+- 判断分界线：**这个任务里有没有「事实类数字/数据」是模型不知道、必须去外部拿的**。有 → true。
+- needs_tools=true 时，skill_slug 可以为空、action 照常输出（后续阶段会改用工具完成，而不是让模型凭记忆编内容）。
+
+action 必须根据上面「意图→动作」映射严格输出，不要省略。params/needs/steps 可以为空，但 intent、action、steps、needs_tools 必须输出。
 
 技能清单：
 ` + rosterStr

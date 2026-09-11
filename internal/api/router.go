@@ -2,9 +2,12 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"net/http"
+	"os"
 	"runtime"
+	"strings"
 
 	"github.com/lizhemin15/skillforge/internal/agent"
 	"github.com/lizhemin15/skillforge/internal/llm"
@@ -33,11 +36,26 @@ func NewHandler(s *store.SkillStore, l *llm.Client, secret string) (*Handler, er
 	// Keep generator + engine in sync with the live LLM.
 	admin.SetEngine(eng)
 	genCache := newGenCache()
+	// 工具能力：按环境变量装配（默认开，SKILLFORGE_TOOLS=off 可回退纯对话）
+	toolReg := buildToolRegistry()
 	return &Handler{
 		Skills: skills, Admin: admin, Auth: auth,
-		Chat: &chatHandler{eng: eng, gen: genCache}, Eng: eng,
+		Chat: &chatHandler{eng: eng, gen: genCache, tools: toolReg, maxRound: toolMaxRounds()}, Eng: eng,
 		gen: genCache,
 	}, nil
+}
+
+// toolMaxRounds 是工具循环轮数上限，可用环境变量调（默认 6）。
+// 上限的意义：公网开放场景下必须有硬性终止条件，否则一次请求能无限烧 token。
+func toolMaxRounds() int {
+	if v := strings.TrimSpace(os.Getenv("SKILLFORGE_TOOL_ROUNDS")); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 && n <= 20 {
+			return n
+		}
+		fmt.Fprintf(os.Stderr, "[tools] SKILLFORGE_TOOL_ROUNDS=%q 不合法（1-20），回退默认 6\n", v)
+	}
+	return 6
 }
 
 func dataDirFor(s *store.SkillStore) string {

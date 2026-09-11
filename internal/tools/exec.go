@@ -1,0 +1,413 @@
+package tools
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// ExecConfig 是代码执行沙箱的配置。默认值即「安全默认」。
+type ExecConfig struct {
+	// WorkRoot 是每次执行的隔离工作区根目录。必须以 root 身份可写、且对降权用户可进入。
+	WorkRoot string
+	// Python 是解释器绝对路径。
+	Python string
+	// Timeout 是墙钟超时。同时下发给 systemd（RuntimeMaxSec），双保险：
+	// 只靠 Go 侧 kill 只杀 systemd-run 本身，systemd 起的实际进程会变孤儿。
+	Timeout time.Duration
+	// MemoryMax / CPUQuota / TasksMax 是 systemd 限额。TasksMax 同时是 fork 炸弹的闸门。
+	MemoryMax string
+	CPUQuota  string
+	TasksMax  int
+	// SandboxUser 是降权目标用户。
+	SandboxUser string
+	// SkillRoots 是额外暴露给沙箱的「只读数据」目录（如技能库素材）。
+	MaxOutput int // 回给模型的输出上限（字节）
+}
+
+// DefaultExecConfig 返回经过实测验证的默认配置。
+func DefaultExecConfig() ExecConfig {
+	return ExecConfig{
+		WorkRoot:    "/var/lib/skillforge/work",
+		Python:      "/usr/bin/python3",
+		Timeout:     30 * time.Second,
+		MemoryMax:   "256M",
+		CPUQuota:    "50%",
+		TasksMax:    32,
+		SandboxUser: "nobody",
+		MaxOutput:   65536,
+	}
+}
+
+// RunPythonTool 让模型现场写 Python 处理数据。这是「工具组合」的粘合剂。
+//
+// 安全前提（本项目服务以 root 运行且公网可达，因此这里是唯一防线）：
+//   - 降权：systemd User=nobody，绝不以 root 执行
+//   - 断网：PrivateNetwork=yes（要联网必须走 http_request，那条路径可审计、有 SSRF 拦截）
+//   - 只读根：ProtectSystem=strict，仅工作区可写；ProtectHome=yes 挡掉 /root
+//   - 限额：MemoryMax/CPUQuota/TasksMax/RuntimeMaxSec
+//   - 提权封堵：NoNewPrivileges + SystemCallFilter=@system-service
+//
+// 若沙箱不可用（systemd-run 缺失等）**拒绝执行**，绝不静默降级到裸跑。
+type RunPythonTool struct {
+	cfg ExecConfig
+}
+
+// NewRunPythonTool 构造 run_python 工具。
+func NewRunPythonTool(cfg ExecConfig) *RunPythonTool {
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = DefaultExecConfig().Timeout
+	}
+	if cfg.MaxOutput <= 0 {
+		cfg.MaxOutput = DefaultExecConfig().MaxOutput
+	}
+	if cfg.WorkRoot == "" {
+		cfg.WorkRoot = DefaultExecConfig().WorkRoot
+	}
+	if cfg.Python == "" {
+		cfg.Python = DefaultExecConfig().Python
+	}
+	if cfg.SandboxUser == "" {
+		cfg.SandboxUser = DefaultExecConfig().SandboxUser
+	}
+	if cfg.MemoryMax == "" {
+		cfg.MemoryMax = DefaultExecConfig().MemoryMax
+	}
+	if cfg.CPUQuota == "" {
+		cfg.CPUQuota = DefaultExecConfig().CPUQuota
+	}
+	if cfg.TasksMax <= 0 {
+		cfg.TasksMax = DefaultExecConfig().TasksMax
+	}
+	return &RunPythonTool{cfg: cfg}
+}
+
+func (t *RunPythonTool) Name() string { return "run_python" }
+
+func (t *RunPythonTool) Description() string {
+	return "在沙箱里执行一段 Python 代码来处理数据、做计算、生成文件。沙箱限制：无网络、文件系统只读（当前工作目录可写）、30 秒超时、256MB 内存、最多 32 进程。" +
+		"用 print() 输出结果（会被截断到 64KB）；需要交文件给用户就用 open('结果.xlsx','wb') 写到当前目录，运行结束后会自动作为附件交付。" +
+		"因为是离线沙箱，不要写需要联网的代码（如 requests）；需要联网请改用 http_request 工具。可用标准库：csv/json/math/statistics/datetime/re 等；第三方库不保证存在。"
+}
+
+func (t *RunPythonTool) Schema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"code": map[string]any{
+				"type":        "string",
+				"description": "要执行的 Python 源码。建议先算再打印，输出尽量精简（只 print 关键结果）。",
+			},
+		},
+		"required": []string{"code"},
+	}
+}
+
+// Run 执行代码。
+func (t *RunPythonTool) Run(ctx context.Context, args map[string]any) (Result, error) {
+	code := Str(args, "code")
+	if strings.TrimSpace(code) == "" {
+		return Result{}, errors.New("code 参数为空")
+	}
+	if _, err := exec.LookPath("systemd-run"); err != nil {
+		// fail closed：沙箱不可用就不执行
+		return Result{}, errors.New("沙箱不可用（缺少 systemd-run），已拒绝执行代码")
+	}
+
+	dir, err := t.makeWorkspace()
+	if err != nil {
+		return Result{}, fmt.Errorf("准备工作区失败: %w", err)
+	}
+	defer os.RemoveAll(dir)
+
+	script := filepath.Join(dir, "main.py")
+	if err := os.WriteFile(script, []byte(code), 0o644); err != nil {
+		return Result{}, fmt.Errorf("写入代码失败: %w", err)
+	}
+	// 交给降权用户
+	_ = os.Chown(script, sandboxUID(t.cfg.SandboxUser), sandboxUID(t.cfg.SandboxUser))
+
+	// 给本次执行起一个自己可控的 unit 名：超时要靠它把 systemd 里的实际进程杀掉。
+	// 只管 Go 侧的 cmd 是不够的——杀掉 systemd-run 不会带走它启动的进程，会留孤儿。
+	unit := "sfexec-" + randomHex(6)
+	runCtx, cancel := context.WithTimeout(ctx, t.cfg.Timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(runCtx, "systemd-run", t.systemdArgs(dir, unit)...)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	runErr := cmd.Run()
+
+	out := buf.String()
+	timedOut := errors.Is(runCtx.Err(), context.DeadlineExceeded) ||
+		strings.Contains(out, "Timeout") || strings.Contains(out, "timeout")
+	if timedOut {
+		// 兜底清理：SIGKILL 整个 unit 的 cgroup（子进程一起带走），再清掉 failed 状态
+		_ = exec.Command("systemctl", "kill", "--signal=SIGKILL", unit).Run()
+		_ = exec.Command("systemctl", "reset-failed", unit).Run()
+	}
+	// 收尾：unit 失败/残留时清理，避免 systemd 里堆一堆 failed 单元
+	_ = exec.Command("systemctl", "reset-failed", unit).Run()
+
+	// 收集产出文件
+	files := t.collectArtifacts(dir)
+
+	exitCode := 0
+	if runErr != nil {
+		var ee *exec.ExitError
+		if errors.As(runErr, &ee) {
+			exitCode = ee.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+	body := Truncate(strings.TrimSpace(out), t.cfg.MaxOutput)
+	if body == "" {
+		body = "(无输出)"
+	}
+	status := fmt.Sprintf("退出码 %d", exitCode)
+	if timedOut {
+		status = fmt.Sprintf("超时被杀（上限 %s）", t.cfg.Timeout)
+	}
+
+	content := fmt.Sprintf("沙箱执行结果（%s）：\n%s", status, body)
+	if len(files) > 0 {
+		names := make([]string, 0, len(files))
+		for _, f := range files {
+			names = append(names, f.Name)
+		}
+		content += fmt.Sprintf("\n产出文件已交付给用户: %s", strings.Join(names, ", "))
+	}
+	if runErr != nil && exitCode != 0 && !timedOut {
+		content += "\n（代码有报错，请根据上面的 stderr 修正后重试）"
+	}
+
+	return Result{
+		Content: content,
+		Files:   files,
+		Display: status,
+	}, nil
+}
+
+// systemdArgs 组装沙箱命令行。属性组合已在本机实测验证（见 docs/agent-tools-plan.md）。
+func (t *RunPythonTool) systemdArgs(dir, unit string) []string {
+	uid := fmt.Sprint(sandboxUID(t.cfg.SandboxUser))
+	args := []string{
+		"--pipe", "--wait", "--collect", "--quiet",
+		"--unit=" + unit,
+		"--property=User=" + t.cfg.SandboxUser,
+		"--property=Group=" + sandboxGroup(t.cfg.SandboxUser),
+		"--property=PrivateNetwork=yes",   // 断网
+		"--property=ProtectSystem=strict", // 全盘只读
+		"--property=ProtectHome=yes",      // 挡 /root /home
+		"--property=NoNewPrivileges=yes",
+		"--property=MemoryMax=" + t.cfg.MemoryMax,
+		"--property=CPUQuota=" + t.cfg.CPUQuota,
+		"--property=TasksMax=" + fmt.Sprint(t.cfg.TasksMax),
+		"--property=SystemCallFilter=@system-service",
+		// +2s 缓冲：正常路径由 Go 侧 ctx 先超时并显式 kill unit，这里只是最后一道保险
+		"--property=RuntimeMaxSec=" + fmt.Sprint(int(t.cfg.Timeout.Seconds())+2),
+		"--property=ReadWritePaths=" + dir,
+		"--working-directory=" + dir,
+		"--setenv=PYTHONIOENCODING=utf-8",
+		"--setenv=PYTHONDONTWRITEBYTECODE=1",
+		"--setenv=LANG=C.UTF-8",
+		"--setenv=HOME=" + dir,
+		"--setenv=TMPDIR=" + dir,
+		"--setenv=SANDBOX_UID=" + uid,
+	}
+	// 注意：不要加 PrivateTmp=yes（本机容器环境不支持，会 exit 200，已实测）
+	return append(args, t.cfg.Python, "main.py")
+}
+
+// makeWorkspace 建本次执行的隔离工作区：随机名 + 仅沙箱用户可访问。
+func (t *RunPythonTool) makeWorkspace() (string, error) {
+	root := t.cfg.WorkRoot
+	// 根目录 0711：可进入但不可列目录 → 别人猜不到、也列举不出会话目录
+	if err := os.MkdirAll(root, 0o711); err != nil {
+		return "", err
+	}
+	_ = os.Chmod(root, 0o711)
+
+	var dir string
+	for i := 0; i < 3; i++ {
+		dir = filepath.Join(root, "exec-"+randomHex(8))
+		if err := os.MkdirAll(dir, 0o700); err == nil {
+			break
+		}
+	}
+	if _, err := os.Stat(dir); err != nil {
+		return "", err
+	}
+	uid, gid := sandboxUID(t.cfg.SandboxUser), sandboxGID(t.cfg.SandboxUser)
+	if err := os.Chown(dir, uid, gid); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// collectArtifacts 收集沙箱里产出的文件（排除脚本自身）。
+func (t *RunPythonTool) collectArtifacts(dir string) []File {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	const maxFile = 20 << 20
+	var out []File
+	for _, e := range entries {
+		if e.IsDir() || e.Name() == "main.py" || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		if len(out) >= 5 {
+			break
+		}
+		p := filepath.Join(dir, e.Name())
+		fi, err := e.Info()
+		if err != nil || fi.Size() == 0 || fi.Size() > maxFile {
+			continue
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		out = append(out, File{Name: e.Name(), ContentType: contentTypeOf(e.Name()), Bytes: b})
+	}
+	return out
+}
+
+func contentTypeOf(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".xlsx":
+		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	case ".docx":
+		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	case ".pptx":
+		return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+	case ".pdf":
+		return "application/pdf"
+	case ".csv":
+		return "text/csv; charset=utf-8"
+	case ".json":
+		return "application/json; charset=utf-8"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".svg":
+		return "image/svg+xml"
+	case ".txt", ".md", ".log":
+		return "text/plain; charset=utf-8"
+	}
+	return "application/octet-stream"
+}
+
+// randomHex 生成 n 字节的随机十六进制串（工作区名与 unit 名都用它，避免可预测/撞名）。
+func randomHex(n int) string {
+	raw := make([]byte, n)
+	if _, err := rand.Read(raw); err != nil {
+		// 随机源不可用时退回时间戳，绝不能返回固定值（固定名 = 可预测路径 = 可被抢占）
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(raw)
+}
+
+// sandboxGroup 给出降权用户对应的组名。Ubuntu 上 nobody 的组叫 nogroup，
+// 别处可能就叫 nobody——探测一下，拿不到再用 nogroup 兜底。
+func sandboxGroup(name string) string {
+	if name != "" && name != "nobody" {
+		return name
+	}
+	for _, g := range []string{"nogroup", "nobody"} {
+		if err := exec.Command("getent", "group", g).Run(); err == nil {
+			return g
+		}
+	}
+	return "nogroup"
+}
+
+// sandboxUID 把用户名解析成 uid（解析失败兜底 65534=nobody）。
+func sandboxUID(name string) int {
+	if name == "nobody" || name == "" {
+		return 65534
+	}
+	return lookupID(name, true)
+}
+
+func sandboxGID(name string) int {
+	if name == "nobody" || name == "" {
+		return 65534
+	}
+	return lookupID(name, false)
+}
+
+// lookupID 从 getent 里解析 uid/gid（第 3 列，格式 name:passwd:id:...）。
+func lookupID(name string, isUID bool) int {
+	what := "passwd"
+	if !isUID {
+		what = "group"
+	}
+	out, err := exec.Command("getent", what, name).Output()
+	if err != nil {
+		return 65534
+	}
+	parts := strings.Split(strings.TrimSpace(string(out)), ":")
+	if len(parts) > 2 {
+		var id int
+		if _, err := fmt.Sscanf(parts[2], "%d", &id); err == nil {
+			return id
+		}
+	}
+	return 65534
+}
+
+// SandboxDiagnostics 跑一次探针，返回人类可读的沙箱自检报告（用于验收测试与 /api 自检）。
+func SandboxDiagnostics(ctx context.Context) map[string]string {
+	probe := `
+import os, socket
+r = {}
+r["uid"] = str(os.getuid())
+try:
+    socket.create_connection(("1.1.1.1", 80), timeout=2); r["network"] = "通(危险)"
+except Exception:
+    r["network"] = "断(OK)"
+for p in ("/opt/skillforge/skillforge.env", "/root/.ssh/id_rsa"):
+    try:
+        open(p, "rb").read(1); r["read:" + p] = "可读(危险)"
+    except Exception:
+        r["read:" + p] = "拒绝(OK)"
+try:
+    open("/etc/evil", "w"); r["write:/etc"] = "可写(危险)"
+except Exception:
+    r["write:/etc"] = "拒绝(OK)"
+try:
+    open("probe.txt", "w").write("ok"); r["write:work"] = "可以(OK)"
+except Exception as e:
+    r["write:work"] = "失败(异常): " + type(e).__name__
+print("|".join("%s=%s" % (k, v) for k, v in r.items()))
+`
+	t := NewRunPythonTool(DefaultExecConfig())
+	res, err := t.Run(ctx, map[string]any{"code": probe})
+	out := map[string]string{}
+	if err != nil {
+		out["error"] = err.Error()
+		return out
+	}
+	for _, line := range strings.Split(res.Content, "\n") {
+		for _, kv := range strings.Split(line, "|") {
+			if i := strings.Index(kv, "="); i > 0 {
+				out[strings.TrimSpace(kv[:i])] = strings.TrimSpace(kv[i+1:])
+			}
+		}
+	}
+	out["display"] = res.Display
+	return out
+}

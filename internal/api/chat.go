@@ -14,13 +14,16 @@ import (
 
 	"github.com/lizhemin15/skillforge/internal/agent"
 	"github.com/lizhemin15/skillforge/internal/model"
+	"github.com/lizhemin15/skillforge/internal/tools"
 )
 
 // chatHandler serves the conversation endpoint (POST /api/chat, SSE response).
 // Intentionally public (no auth) — the site-facing assistant is open to users.
 type chatHandler struct {
-	eng *agent.Engine
-	gen *genCache // generates one-time download URLs for docgen skills
+	eng      *agent.Engine
+	gen      *genCache       // generates one-time download URLs for docgen skills
+	tools    *tools.Registry // 工具注册表；nil = 工具能力关闭
+	maxRound int             // 工具循环轮数上限
 }
 
 type chatReq struct {
@@ -95,9 +98,17 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// surface the orchestrator's reasoning pipeline for writing tasks
 	// (skill hit OR general write/open-query intent), so users see the
 	// multi-agent scheduling even when no skill matches; chatter (chat) stays quiet.
-	showTrace := eval.SkillSlug != "" || eval.Intent == "write" || eval.Intent == "docgen" || eval.Intent == "query"
+	showTrace := eval.SkillSlug != "" || eval.Intent == "write" || eval.Intent == "docgen" || eval.Intent == "query" || eval.NeedsTools
 	if showTrace && len(eval.Steps) > 0 {
 		write(evTrace, jsonSafe(eval.Steps))
+	}
+
+	// 2a. 工具循环优先：任务需要外部实时数据或真实计算时，交给 Agent 自己组合工具
+	//     （优先于技能快路径——否则模型会「凭记忆编数字」生成一份看着很像的文档）
+	if eval.NeedsTools {
+		if h.runAgentLoop(ctx, write, req, *eval, history) {
+			return
+		}
 	}
 
 	// 2. generation
