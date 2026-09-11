@@ -1,10 +1,10 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-site-page="admin">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SkillForge · 管理端</title>
-  <link rel="stylesheet" href="/assets/css/style.css?v=20260911K">
+  <link rel="stylesheet" href="/assets/css/style.css?v=20260911M">
   <link rel="stylesheet" href="/assets/vendor/codemirror/lib/codemirror.min.css?v=20260908A">
   <link rel="stylesheet" href="/assets/vendor/codemirror/addon/fold/foldgutter.min.css?v=20260908A">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23111418'/><rect x='9' y='9' width='6' height='14' rx='2' fill='%23c8ccd2'/><rect x='17' y='9' width='6' height='14' rx='2' fill='%23757c86'/></svg>">
@@ -15,7 +15,7 @@
 <div class="layout">
   <header class="topbar">
     <div class="container topbar-inner">
-      <a href="/" class="brand"><span class="dot"></span>SkillForge<small>管理端</small></a>
+      <a href="/" class="brand"><span class="dot"></span><span data-site-name>SkillForge</span><small>管理端</small></a>
       <nav class="nav"><a href="/" class="ghost">← 返回</a></nav>
     </div>
   </header>
@@ -46,6 +46,7 @@
       <div class="admin-tabs">
         <button class="active" data-tab="llm">LLM 服务</button>
         <button data-tab="skills">技能管理</button>
+        <button data-tab="site">站点设置</button>
       </div>
 
       <!-- Tab: LLM -->
@@ -78,6 +79,40 @@
               <button type="button" class="btn ghost" id="llm-cancel" style="display:none">取消</button>
               <div class="msg" id="llm-msg"></div>
             </form>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab: Site -->
+      <div class="tab-pane hidden" id="tab-site" style="display:none">
+        <div class="admin-grid">
+          <div class="card">
+            <h3>站点信息</h3>
+            <p class="card-sub">改的是整个网页的名字：左上角品牌区、浏览器标签页、页脚</p>
+            <form id="site-form">
+              <div class="field">
+                <label>网站名称</label>
+                <input type="text" id="site-name" maxlength="30" autocomplete="off" placeholder="SkillForge">
+                <p class="dim" style="margin:6px 0 0;font-size:12px">最长 30 个字；清空保存 = 恢复默认</p>
+              </div>
+              <div class="field">
+                <label>副标题</label>
+                <input type="text" id="site-tagline" maxlength="40" autocomplete="off" placeholder="智能写作工坊">
+                <p class="dim" style="margin:6px 0 0;font-size:12px">显示在名称右侧的浅色小字；留空则不显示</p>
+              </div>
+              <button type="submit" class="btn primary" id="site-save">保存</button>
+              <button type="button" class="btn ghost" id="site-reset">恢复默认</button>
+              <div class="msg" id="site-msg"></div>
+            </form>
+          </div>
+          <div class="card">
+            <h3>预览</h3>
+            <p class="card-sub">保存后全站立即生效</p>
+            <div class="brand" style="font-size:15px;margin-bottom:14px">
+              <span class="dot"></span><span id="site-preview-name">SkillForge</span><small id="site-preview-tagline">智能写作工坊</small>
+            </div>
+            <div class="site-preview-row"><span class="dim">浏览器标签页</span><span id="site-preview-title"></span></div>
+            <div class="site-preview-row"><span class="dim">页脚</span><span id="site-preview-footer"></span></div>
           </div>
         </div>
       </div>
@@ -163,7 +198,7 @@
     </div>
   </main>
 
-  <footer><div class="container"><span>SkillForge · 管理端</span></div></footer>
+  <footer><div class="container"><span data-site-title="管理端">SkillForge · 管理端</span></div></footer>
 </div>
 <div class="toast" id="toast"></div>
 <script src="/assets/vendor/codemirror/lib/codemirror.min.js?v=20260908A"></script>
@@ -176,6 +211,7 @@
 <script src="/assets/vendor/codemirror/addon/display/placeholder.min.js?v=20260908A"></script>
 <script src="/assets/vendor/codemirror/addon/fold/foldcode.min.js?v=20260908A"></script>
 <script src="/assets/vendor/codemirror/addon/fold/foldgutter.min.js?v=20260908A"></script>
-<script src="/assets/js/admin.js?v=20260911C"></script>
+<script src="/assets/js/site.js?v=20260911M"></script>
+<script src="/assets/js/admin.js?v=20260911N"></script>
 </body>
 </html>

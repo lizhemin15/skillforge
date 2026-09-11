@@ -71,6 +71,13 @@ func migrate(db *sql.DB) error {
 			pass_hash  TEXT NOT NULL,
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
+		// 站点级设置：key/value 通用表（当前只有 site_name / site_tagline）。
+		// 用通用 KV 而不是给每项设置加一列 —— 以后加设置项不用再写迁移。
+		`CREATE TABLE IF NOT EXISTS settings (
+			key        TEXT PRIMARY KEY,
+			val        TEXT NOT NULL DEFAULT '',
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {

@@ -22,6 +22,7 @@ type Handler struct {
 	Skills *Skills
 	Admin  *Admin
 	Auth   *Auth
+	Site   *Site
 	Chat   *chatHandler
 	Eng    *agent.Engine // exposed so admin can hot-swap the engine LLM
 	gen    *genCache     // one-time generated-file store for docgen delivery
@@ -39,7 +40,7 @@ func NewHandler(s *store.SkillStore, l *llm.Client, secret string) (*Handler, er
 	// 工具能力：按环境变量装配（默认开，SKILLFORGE_TOOLS=off 可回退纯对话）
 	toolReg := buildToolRegistry(s)
 	return &Handler{
-		Skills: skills, Admin: admin, Auth: auth,
+		Skills: skills, Admin: admin, Auth: auth, Site: NewSite(s),
 		Chat: &chatHandler{eng: eng, gen: genCache, tools: toolReg, maxRound: toolMaxRounds()}, Eng: eng,
 		gen: genCache,
 	}, nil
@@ -95,6 +96,10 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("/admin", serveStatic("admin.html"))
 
 	// ---- public API ----
+	// 站点设置：GET 必须公开（未登录也要看到正确站名），写走鉴权。
+	mux.HandleFunc("GET /api/site", h.Site.Get)
+	mux.HandleFunc("GET /api/admin/site", h.Auth.Middleware(h.Site.GetAdmin))
+	mux.HandleFunc("PUT /api/admin/site", h.Auth.Middleware(h.Site.Update))
 	mux.HandleFunc("GET /api/skills", h.Skills.List)
 	mux.HandleFunc("GET /api/skills/{slug}", h.Skills.Get)
 	mux.HandleFunc("POST /api/generate", h.Skills.Generate)

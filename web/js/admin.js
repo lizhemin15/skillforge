@@ -46,6 +46,7 @@
     $('shell').classList.remove('hidden');
     loadProviders();
     loadManageSkills();
+    loadSite();
   }
 
   // ---------- tabs ----------
@@ -879,6 +880,106 @@
     if (r.ok) { msg.className = 'msg ok'; msg.textContent = `已回滚 → v${j.version}`; loadVersions(); }
     else { msg.className = 'msg err'; msg.textContent = j.error || '回滚失败'; }
   };
+
+  // ---------- 站点设置 ----------
+  // 契约：写接口只认 {name, tagline}；空串 = 恢复默认。前端一律 textContent，绝不 innerHTML。
+  const siteEls = () => ({
+    name: $('site-name'), tagline: $('site-tagline'),
+    pName: $('site-preview-name'), pTag: $('site-preview-tagline'),
+    pTitle: $('site-preview-title'), pFoot: $('site-preview-footer')
+  });
+
+  // 默认值由后端 GET /api/admin/site 的 defaults 下发，前端**不硬编码**。
+  // 硬编码一份就是同一事实写两遍：后端改了 store.DefaultSiteName 而前端没跟，
+  // 这里显示的名字就开始骗人。
+  let siteDefaults = { name: '', tagline: '' };
+
+  function paintSitePreview(cfg) {
+    const e = siteEls();
+    if (!e.pName) return;
+    const nm = cfg.name || siteDefaults.name || '';
+    e.pName.textContent = nm;
+    e.pTag.textContent = cfg.tagline || '';
+    e.pTag.style.display = cfg.tagline ? '' : 'none';
+    const page = document.documentElement.dataset.sitePage || 'admin';
+    e.pTitle.textContent = document.title;
+    e.pFoot.textContent = page === 'admin' ? nm + ' · 管理端' : nm;
+  }
+
+  // 纯函数（不碰 DOM、不发请求），入参就是 GET /api/admin/site 的响应体。
+  // 单独抽出来是为了让前端防线能直接从出货文件里抽这个函数来跑。
+  //
+  // 踩过的坑：is_custom 是 {name:bool, tagline:bool} **对象**，第一版这里直接
+  // `j.is_custom ? 自定义 : 默认`，对象恒为真 —— 明明两项都是默认值，界面却一直
+  // 显示「当前为自定义名称」。Go 侧测试守不到这条，它只看接口字段对不对。
+  function siteStatusText(j) {
+    const c = (j && j.is_custom) || {};
+    const d = (j && j.defaults) || {};
+    const hint = (d.name || d.tagline)
+      ? `（默认：${d.name || ''}${d.tagline ? ' / ' + d.tagline : ''}）`
+      : '';
+    if (!c.name && !c.tagline) return '当前为默认名称';
+    if (c.name && c.tagline) return `名称和副标题都自定义了${hint}`;
+    return `${c.name ? '名称' : '副标题'}已自定义${hint}`;
+  }
+
+  function showSiteMsg(text, cls) {
+    const m = $('site-msg');
+    m.className = 'msg ' + (cls || '');
+    m.textContent = text;
+  }
+
+  async function loadSite() {
+    if (!$('site-name')) return;
+    try {
+      const r = await fetch('/api/admin/site', { headers: authHdr() });
+      const j = await r.json();
+      if (!r.ok) { showSiteMsg(j.error || '读取失败', 'err'); return; }
+      siteDefaults = j.defaults || siteDefaults;
+      siteEls().name.value = j.name || '';
+      siteEls().tagline.value = j.tagline || '';
+      paintSitePreview(j);
+      showSiteMsg(siteStatusText(j));
+    } catch (err) { showSiteMsg('网络错误', 'err'); }
+  }
+
+  ['site-name', 'site-tagline'].forEach(id => {
+    const el = $(id);
+    if (el) el.addEventListener('input', () => paintSitePreview({
+      name: $('site-name').value.trim(), tagline: $('site-tagline').value.trim()
+    }));
+  });
+
+  async function saveSite(payload, okText) {
+    showSiteMsg('保存中…');
+    try {
+      const r = await fetch('/api/admin/site', { method: 'PUT', headers: authHdr(), body: JSON.stringify(payload) });
+      const j = await r.json();
+      if (!r.ok) { showSiteMsg(j.error || '保存失败', 'err'); return; }
+      siteEls().name.value = j.name || '';
+      siteEls().tagline.value = j.tagline || '';
+      // 立刻用服务端返回值刷新当前页（含 <title>），不等下一次 GET
+      if (window.sfSiteApply) window.sfSiteApply({ name: j.name, tagline: j.tagline });
+      paintSitePreview(j);
+      showSiteMsg(okText || '已保存');
+      toast(okText || '已保存', 'ok');
+    } catch (err) { showSiteMsg('网络错误', 'err'); }
+  }
+
+  const siteForm = $('site-form');
+  if (siteForm) {
+    siteForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      saveSite({ name: $('site-name').value.trim(), tagline: $('site-tagline').value.trim() });
+    });
+  }
+  const siteResetBtn = $('site-reset');
+  if (siteResetBtn) {
+    siteResetBtn.addEventListener('click', () => {
+      $('site-name').value = ''; $('site-tagline').value = '';
+      saveSite({ name: '', tagline: '' }, '已恢复默认');
+    });
+  }
 
   function logout() {
     localStorage.removeItem(TOKEN_KEY);

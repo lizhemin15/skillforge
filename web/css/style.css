@@ -1451,3 +1451,11 @@ header.topbar {
     box-shadow: 1px 0 0 rgba(9,45,78,.04), 16px 0 40px -28px rgba(9,45,78,.20);
   }
 }
+
+/* 管理端「站点设置」预览：两行键值，细分隔线，无装饰 */
+.site-preview-row {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 8px 0; border-top: 1px solid var(--line-soft); font-size: 13px;
+}
+.site-preview-row:first-of-type { border-top: 0; }
+.site-preview-row > span:last-child { color: var(--text); font-weight: 500; }

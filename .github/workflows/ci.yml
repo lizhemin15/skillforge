@@ -74,6 +74,13 @@ jobs:
       - name: 前端回归（毛玻璃层契约）
         run: node web/tests/glassmorphism.test.mjs
 
+      # 站点名自定义回归：站名是运行时数据，改错了不报错——只是全站名字不对/
+      # 保存后页面不刷新/站名被当 HTML 注入。前端这半边 Go 测试抓不住。
+      - name: 前端回归（站点名自定义）
+        run: |
+          node --check web/js/site.js
+          node web/tests/site_config.test.mjs
+
       - name: Build
         run: |
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o skillforge ./cmd/server
@@ -89,6 +96,10 @@ jobs:
             if curl -fsS http://127.0.0.1:8092/api/skills >/dev/null 2>&1; then
               echo "服务已就绪（第 ${i} 次探测）"
               curl -fsS http://127.0.0.1:8092/api/skills
+              # 站名接口必须**免鉴权**可读：未登录访客打开首页也要看到正确站名。
+              # 一旦有人把它挪到鉴权后面，页面会静默回落到硬编码的默认名。
+              echo "--- /api/site（必须匿名 200）"
+              curl -fsS http://127.0.0.1:8092/api/site
               exit 0
             fi
             sleep 1
