@@ -59,6 +59,15 @@ jobs:
       - name: Unit tests
         run: go test -race -count=1 ./...
 
+      # 管理端前端防线：只读文件（style_profile.md 这类不可变锚点）不能渲染出
+      # 编辑框和「保存」按钮——后端 store.WriteFile 会 400 拒绝，界面在承诺一个
+      # 做不到的操作。Go 测试抓不住这半边，只能在前端守。
+      - name: 前端回归（只读文件不得渲染保存入口）
+        run: |
+          node --version
+          node --check web/js/admin.js
+          node web/tests/readonly_file_editor.test.mjs
+
       - name: Build
         run: |
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o skillforge ./cmd/server

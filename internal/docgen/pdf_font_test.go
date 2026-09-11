@@ -217,6 +217,12 @@ func TestResolvePDFFontEnvOverride(t *testing.T) {
 // （pdfFontCandidates）优先级本来就高于扫描，那是刻意设计。顺序被改回去时，没有配
 // SKILLFORGE_PDF_FONT_FILE 的场景（手工跑二进制、容器里直接执行）就会先吃到系统字体，
 // 于是「自检说用包内字体，运行时却用了别的」。
+//
+// 断言的是**类别顺序**，不是「本实例目录排在索引 0」——后者是过强断言：
+// bundledFontScanRoots 用 glob 找同机所有 skillforge-* 目录再按字母序排，
+// 装了第二个实例的机器上（开发机/生产机就是）别的实例名按字母序可能在前面，
+// 那依然是「包内字体」，不是回归。写死 roots[0] 的结果是：CI 干净机器上假绿、
+// 真实机器上假红——一条只在不装东西的机器上成立的防线等于没有。
 func TestBundledFontScanRootsComeFirst(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("需要在 /usr/local/share/fonts 下建测试目录，非 root 跳过")
@@ -232,19 +238,48 @@ func TestBundledFontScanRootsComeFirst(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	roots := bundledFontScanRoots()
-	if len(roots) == 0 || roots[0] != dir {
-		t.Fatalf("包内字体目录应排在扫描根首位：期望 roots[0]=%s，实际 %v", dir, roots)
-	}
-	// 通用系统目录不能被挤掉（否则客户机没装包内字体时反而找不到字体）。
-	found := false
-	for _, r := range roots[1:] {
-		if r == "/usr/share/fonts" {
-			found = true
+
+	// ① 本实例的字体目录必须真的被扫到，否则装了字体也白装。
+	contained := false
+	for _, r := range roots {
+		if r == dir {
+			contained = true
 		}
 	}
-	if !found {
-		t.Fatalf("通用系统字体目录被挤掉了：%v", roots)
+	if !contained {
+		t.Fatalf("包内字体目录未出现在扫描根里：期望包含 %s，实际 %v", dir, roots)
 	}
+
+	// ② 所有包内字体目录必须**整体**排在通用系统目录之前。
+	//
+	// 别写成「遍历第一个系统目录之前的那一段，检查它们都是包内目录」——
+	// 顺序被整个倒回系统优先时，第一个系统目录正好在索引 0，那一段是空集，
+	// 断言恒真、永远假绿（这个写法我实测踩到了：注入回归后依然全绿）。
+	// 这里改成比较「最后一个包内目录」与「第一个系统目录」的下标。
+	lastBundled, firstGeneric := -1, -1
+	for i, r := range roots {
+		if strings.HasPrefix(r, base+"/skillforge") {
+			lastBundled = i
+		} else if firstGeneric < 0 {
+			firstGeneric = i
+		}
+	}
+	if lastBundled < 0 {
+		t.Fatalf("扫描根里没有任何包内字体目录：%v", roots)
+	}
+	if firstGeneric < 0 {
+		t.Fatalf("扫描根里没有任何通用系统目录（客户机没装包内字体时会彻底找不到字体）：%v", roots)
+	}
+	if lastBundled > firstGeneric {
+		t.Fatalf("包内字体目录必须全部排在通用系统目录之前，实际最后一个包内目录在索引 %d、"+
+			"通用系统目录从索引 %d 就开始。完整顺序 %v", lastBundled, firstGeneric, roots)
+	}
+	for _, r := range roots[firstGeneric:] {
+		if r == "/usr/share/fonts" {
+			return // 通用系统目录还在，没被挤掉
+		}
+	}
+	t.Fatalf("通用系统字体目录 /usr/share/fonts 被挤掉了：%v", roots)
 }
 
 // TestBuildPDFKeepsDigits 直接生成 PDF 并确认生成的字节流里包含数字字形。

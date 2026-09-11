@@ -12,6 +12,7 @@
   let cmEditor = null;
   let cmSaveCb = null;      // function(slug,path,...) bound to current editor
   let cmEditorSlug = null;
+  let cmReadOnly = false;   // 当前编辑器是不是只读视图（style_profile.md 这类不可变锚点）
 
   // ---------- toast ----------
   function toast(msg, cls) {
@@ -380,8 +381,10 @@
         for (const f of items) {
           const canEdit = f.editable;
           const canDel = f.kind === 'example' || f.kind === 'source';
+          // 只读文本在树上就要看得出来，别等点进去才发现改不了
+          const roTag = fileViewMode(f) === 'readonly' ? ` <span class="chip">只读</span>` : '';
           tree += `<div class="kb-tree-row" data-path="${esc(f.path)}" onclick="window.openEditorFile('${encodeURIComponent(curSkillSlug)}','${escapeJs(f.path)}')" title="${esc(f.path)}">
-            <span class="kb-tree-name">${esc(f.name)} <span class="dim">${f.size}B</span></span>
+            <span class="kb-tree-name">${esc(f.name)} <span class="dim">${f.size}B</span>${roTag}</span>
             <span class="kb-tree-ops">
               ${canEdit ? `<button class="link-btn" onclick="event.stopPropagation()">编辑</button>` : ''}
               <a class="link-btn" title="下载" href="/api/admin/skills/${encodeURIComponent(curSkillSlug)}/file?path=${encodeURIComponent(f.path)}&download=1" onclick="event.stopPropagation()">⬇</a>
@@ -407,7 +410,8 @@
 
   // ---- CodeMirror-backed file editor ----
     // module: mount a CM editor into a given holder div
-    function mountCm(holder) {
+    function mountCm(holder, opts) {
+      opts = opts || {};
       const ta = document.createElement('textarea');
       ta.id = 'kb-content';
       if (holder.dataset.placeholder) ta.placeholder = holder.dataset.placeholder;
@@ -419,11 +423,12 @@
         styleActiveLine: true,
         matchBrackets: true,
         autoCloseBrackets: true,
+        readOnly: !!opts.readOnly,
         foldGutter: true,
         gutters: ['CodeMirror-foldgutter', 'CodeMirror-linenumbers'],
         extraKeys: {
-          'Ctrl-S': function () { if (cmSaveCb) cmSaveCb(); },
-          'Cmd-S': function () { if (cmSaveCb) cmSaveCb(); },
+          'Ctrl-S': function () { if (!opts.readOnly && cmSaveCb) cmSaveCb(); },
+          'Cmd-S': function () { if (!opts.readOnly && cmSaveCb) cmSaveCb(); },
           Tab: function (cm) {
             if (cm.somethingSelected()) cm.indentSelection('add');
             else cm.replaceSelection('\t');
@@ -434,6 +439,7 @@
       });
       editor.setSize('100%', 360);
       cmEditor = editor;
+      cmReadOnly = !!opts.readOnly;
       return editor;
     }
 
@@ -447,13 +453,38 @@
 
     function destroyCm() {
       if (cmEditor) { cmEditor.toTextArea(); cmEditor = null; }
-      cmSaveCb = null; cmEditorSlug = null;
+      cmSaveCb = null; cmEditorSlug = null; cmReadOnly = false;
     }
 
     function cmContent() {
       if (cmEditor) return cmEditor.getValue();
       const el = $('kb-content'); return el ? el.value : '';
     }
+
+    // 单个文件的展示模式：'preview'（二进制，走预览）| 'readonly'（只读文本）| 'edit'。
+    //
+    // 为什么必须区分：后端 store.WriteFile 对「不可变锚点」是硬拒的 ——
+    // style_profile.md 在 fileKind() 里被标成 editable=false，PUT 直接 400
+    // 「该文件只读，不可编辑」（见 internal/store/skill_files.go）。
+    // 前端若仍然渲染一个可编辑框 + 「保存」按钮，就是在承诺一个它做不到的操作：
+    // 用户认真改完点保存，等来的只有一条报错，且改动全丢。
+    // 之前的实现就是这么干的 —— 列表接口明明带着 editable:false，编辑器完全无视它。
+    function fileViewMode(f) {
+      if (!f) return 'edit';
+      if (f.binary) return 'preview';
+      if (f.editable === false) return 'readonly';
+      return 'edit';
+    }
+    window.fileViewMode = fileViewMode;
+
+    // 只读原因：不能只甩一个灰标签，得说清为什么不让改。
+    function readOnlyNotice(f) {
+      if (f && f.kind === 'style') {
+        return '风格锚点由训练流程固化：改了会让后续生成的文风漂移，故不可编辑';
+      }
+      return '该文件为只读内容，不可编辑';
+    }
+    window.readOnlyNotice = readOnlyNotice;
 
     // open a file from the tree -> highlight + edit
     window.openEditorFile = async (slug, path) => {
@@ -479,8 +510,9 @@
         const r = await fetch('/api/admin/skills/' + encodeURIComponent(slug) + '/file?path=' + encodeURIComponent(path), { headers: authHdr() });
         const j = await r.json();
         if (!r.ok) { ed.innerHTML = '<p class="msg err">' + esc(j.error || '加载失败') + '</p>'; return; }
+        const mode = fileViewMode(j);
         // Binary (PDF/image/Office): read via /raw as a blob, render read-only preview.
-        if (j.binary) {
+        if (mode === 'preview') {
           ed.innerHTML =
             '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">' +
               '<b>预览 ' + esc(j.path) + '</b>' +
@@ -522,7 +554,31 @@
           } catch (e) { holder.innerHTML = '<p class="msg err">网络错误</p>'; }
           return;
         }
-        
+
+        // 只读文本（style_profile.md 等不可变锚点）：渲染成查看器，不给保存入口。
+        if (mode === 'readonly') {
+          ed.innerHTML =
+            '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">' +
+              '<b>' + esc(j.path) + '</b>' +
+              '<div style="display:flex;gap:8px;align-items:center">' +
+                '<span class="chip">只读</span>' +
+                '<span class="dim" style="font-size:11.5px">' + esc(readOnlyNotice(j)) + '</span>' +
+                '<span id="cm-stats" class="dim" style="font-size:11.5px"></span>' +
+                '<button class="btn ghost" onclick="toggleCmFullscreen()">全屏</button>' +
+                '<a class="btn ghost" href="/api/admin/skills/' + encodeURIComponent(slug) + '/file?path=' + encodeURIComponent(path) + '&download=1">下载</a>' +
+                '<button class="btn ghost" onclick="closeDetailEditor()">关闭</button>' +
+              '</div>' +
+            '</div>' +
+            '<div id="cm-holder"></div>';
+          cmSaveCb = null; // Ctrl-S 不接任何保存回调
+          cmEditorSlug = slug;
+          const roEditor = mountCm(ed.querySelector('#cm-holder'), { readOnly: true });
+          roEditor.setValue(j.content || '');
+          roEditor.on('change', updateCmStats);
+          updateCmStats();
+          return;
+        }
+
         ed.innerHTML =
           '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">' +
             '<b>编辑 ' + esc(j.path) + '</b>' +
@@ -552,6 +608,9 @@
 
     window.saveSkillFile = async (slug, path) => {
       slug = decodeURIComponent(slug);
+      // 双保险：只读视图本来就不渲染保存入口，这里再拦一道，
+      // 免得将来某处误接线又把请求发到后端（后端会 400，用户白等一条报错）。
+      if (cmReadOnly) { toast('该文件为只读内容，不可编辑', 'err'); return; }
       let content;
       if (cmEditor && cmEditorSlug === slug) content = cmEditor.getValue();
       else content = $('kb-content') ? $('kb-content').value : '';
