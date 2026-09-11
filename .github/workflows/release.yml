@@ -8,6 +8,7 @@ permissions:
   contents: write
 
 jobs:
+  # 裸二进制：给「我自己会部署」的用户（有 Go 或有自己的一套流程）。
   goreleaser-simple:
     name: 交叉编译并发布
     runs-on: ubuntu-latest
@@ -72,9 +73,145 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # 离线一键安装包：给「拷到内网机器上一条命令装完」的用户。
+  # 只做 linux（离线包的目标就是 Linux 服务器），带中文字体、许可证和安装脚本。
+  offline-bundle:
+    name: 离线安装包（linux/${{ matrix.goarch }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 打包脚本会从系统字体目录里挑字体并随附其许可证，所以 runner 上必须先有字体。
+      # 这里装的是构建期依赖，跟「客户机器装包时不联网」不冲突——字体是被打进包里的。
+      - name: 安装中文字体（离线包要自带，缺了就挑不到字体）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-arphic-gbsn00lp fonts-arphic-gkai00mp
+          ls -l /usr/share/fonts/truetype/arphic-gbsn00lp/
+
+      - name: 注入版本信息
+        id: vars
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: 编译 linux/${{ matrix.goarch }} 二进制
+        env:
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          MOD=github.com/lizhemin15/skillforge/internal/version
+          CGO_ENABLED=0 GOOS=linux GOARCH=${GOARCH} \
+          go build -trimpath \
+            -ldflags "-s -w \
+              -X ${MOD}.Version=${{ steps.vars.outputs.version }} \
+              -X ${MOD}.Commit=$(git rev-parse --short HEAD) \
+              -X ${MOD}.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o /tmp/skillforge-linux-${GOARCH} ./cmd/server
+          file /tmp/skillforge-linux-${GOARCH}
+
+      - name: 打离线包（自动挑字体 + 带许可证 + 确定性 tar）
+        run: |
+          chmod +x scripts/build-offline-bundle.sh
+          scripts/build-offline-bundle.sh \
+            --version "${{ steps.vars.outputs.version }}" \
+            --arch "${{ matrix.goarch }}" \
+            --binary "/tmp/skillforge-linux-${{ matrix.goarch }}"
+
+      # 出厂前验货：包里的东西必须能一步步装起来，缺一样就挡在这里，别让用户发现。
+      - name: 验货（内容 / 脚本语法 / 校验和 / 许可证）
+        run: |
+          set -euo pipefail
+          TGZ="$(ls dist/skillforge-offline-*-linux-${{ matrix.goarch }}.tar.gz)"
+          ROOT="$(basename "$TGZ" .tar.gz)"
+          echo "检查：$TGZ"
+
+          # 1) 校验和文件必须与实际字节一致（Release 里给用户的 sha256 不能是错的）
+          ( cd dist && sha256sum -c "$(basename "$TGZ").sha256" )
+
+          # 2) 必需内容一个都不能少
+          # 注意：别写成 `tar tzf ... | grep -q`。grep -q 命中第一个就退出，tar 会收到
+          # SIGPIPE 而非零退出，配合 set -o pipefail 会让整条管道判失败 → 明明有文件也
+          # 报「缺少」。这里先把清单读进变量，再用 bash 自身做字符串匹配。
+          LIST="$(tar tzf "$TGZ")"
+          for f in "bin/skillforge" "fonts/" "licenses/" "install.sh" "uninstall.sh" \
+                   "skillforge.service.template" "skillforge.env.example" "README.md" "INSTALL.txt" "VERSION"; do
+            case "$LIST" in
+              *"/$f"*) ;;
+              *) echo "::error::离线包缺少 $f"; exit 1 ;;
+            esac
+          done
+
+          # 3) 脚本语法要在解包前就验证：客户机器上 bash -n 报错等于「一键安装」当场失效
+          TMP="$(mktemp -d)"
+          tar xzf "$TGZ" -C "$TMP"
+          bash -n "$TMP/$ROOT/install.sh"
+          bash -n "$TMP/$ROOT/uninstall.sh"
+
+          # 4) install.sh 引用的路径必须真的在包里（路径写错是这类脚本最常见的死法）
+          test -x "$TMP/$ROOT/bin/skillforge"
+          test -s "$TMP/$ROOT/fonts/$(ls "$TMP/$ROOT/fonts" | head -1)"
+          test -s "$TMP/$ROOT/licenses/ARPHICPL.txt"
+
+          # 5) 字体覆盖率复验：包里那份字体必须含 0-9（Bug G 的防线，从脚本到产物都要过一遍）
+          python3 - "$TMP/$ROOT/fonts" <<'PY'
+          import glob, struct, sys
+          path = glob.glob(sys.argv[1] + "/*.ttf")[0]
+          need = [ord(c) for c in "0123456789ABCZabc"]
+          data = open(path, "rb").read()
+          n = struct.unpack(">H", data[4:6])[0]
+          off = next(12 + i * 16 for i in range(n) if data[12 + i * 16:16 + i * 16] == b"cmap")
+          cmap = struct.unpack(">I", data[off + 8:off + 12])[0]
+          best = None
+          cnt = struct.unpack(">H", data[cmap + 2:cmap + 4])[0]
+          for i in range(cnt):
+              r = cmap + 4 + i * 8
+              pid, eid, so = struct.unpack(">HHI", data[r:r + 8])
+              if (pid, eid) in ((3, 10), (0, 4), (0, 6)):
+                  best = cmap + so
+                  break
+              if (pid, eid) in ((3, 1), (0, 3)) and best is None:
+                  best = cmap + so
+          fmt = struct.unpack(">H", data[best:best + 2])[0]
+          cover = set()
+          if fmt == 4:
+              x2 = struct.unpack(">H", data[best + 6:best + 8])[0]
+              seg = x2 // 2
+              ends = struct.unpack(">" + "H" * seg, data[best + 14:best + 14 + x2])
+              starts = struct.unpack(">" + "H" * seg, data[best + 16 + x2:best + 16 + 2 * x2])
+              for s, e in zip(starts, ends):
+                  if s != 0xFFFF:
+                      cover.update(range(s, e + 1))
+          miss = [hex(c) for c in need if c not in cover]
+          if miss:
+              print("::error::包内字体缺字符 %s" % " ".join(miss))
+              sys.exit(1)
+          print("包内字体覆盖 0-9 / 拉丁 通过")
+          PY
+
+          echo "验货通过"
+
+      - name: 上传离线包
+        uses: actions/upload-artifact@v4
+        with:
+          name: skillforge-offline-linux-${{ matrix.goarch }}
+          path: |
+            dist/skillforge-offline-*.tar.gz
+            dist/skillforge-offline-*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
   release:
     name: 创建 GitHub Release
-    needs: goreleaser-simple
+    needs: [goreleaser-simple, offline-bundle]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -88,6 +225,15 @@ jobs:
 
       - name: 列出产物
         run: ls -lh dist
+
+      # Release 是给人下载的，发布前再确认一次「离线包在里面」，免得链接发出去了才发现没附上。
+      - name: 确认离线包已附
+        run: |
+          set -euo pipefail
+          for a in amd64 arm64; do
+            ls dist/skillforge-offline-*-linux-$a.tar.gz >/dev/null \
+              || { echo "::error::Release 缺少 linux/$a 的离线包"; exit 1; }
+          done
 
       - name: 生成 Release
         uses: softprops/action-gh-release@v2

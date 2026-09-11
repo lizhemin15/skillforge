@@ -1,0 +1,31 @@
+[Unit]
+Description=SkillForge — 技能驱动的 AI 办公文档工作台（离线包安装版）
+Documentation=https://github.com/lizhemin15/skillforge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__PREFIX__
+EnvironmentFile=__ENV_FILE__
+ExecStart=__PREFIX__/skillforge
+Restart=always
+RestartSec=3
+
+# ---- 权限说明 ----
+# 服务**以 root 运行是设计决定，不是疏忽**：
+#   「沙箱内执行代码」这个能力需要调用 systemd-run 创建瞬时单元并把子进程降权到 nobody，
+#   而创建瞬时单元需要 root 或 polkit 授权。服务自身对外暴露的接口有独立鉴权，
+#   真正跑用户代码的是 systemd 托管的降权子进程（nobody、网络隔离、只读文件系统、内存/CPU 限额）。
+#
+# 下面的加固项都是「加了不破坏沙箱、但能减少服务本体被利用后的破坏面」的安全项。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

@@ -20,11 +20,16 @@ func main() {
 	dataDir := flag.String("data", os.Getenv("SKILLFORGE_DATA_DIR"), "data directory (env SKILLFORGE_DATA_DIR)")
 	addr := flag.String("addr", os.Getenv("SKILLFORGE_ADDR"), "listen address (env SKILLFORGE_ADDR)")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	selfTest := flag.Bool("selftest", false, "run offline self-test (version / PDF font / sandbox) and exit")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println("skillforge " + version.String())
 		return
+	}
+
+	if *selfTest {
+		os.Exit(runSelfTest())
 	}
 
 	log.Printf("skillforge %s starting", version.String())

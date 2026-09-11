@@ -121,6 +121,12 @@ func dedupRunes(in []rune) []rune {
 //
 // 跳过 .ttc（字体集合）与 .otf（CFF 轮廓）：gopdf 加载这两种会报
 // "Unrecognized file (font) format"，收进来只会白跑一趟探测。
+// 按「根」逐个扫、逐个排：**roots 的顺序就是优先级**。
+//
+// ⚠️ 历史教训：这里曾经把所有候选收进一个切片后做一次全局 sort.Strings，再截断到
+// maxScannedFonts。后果是「自带字体目录」的优先级被文件名字典序抹平——系统字体目录
+// 里只要字体够多（/usr/share/fonts 很容易上百个），排序后自带字体就被挤到截断线之外，
+// 于是明明包里带了字体，运行期却挑到系统里那份（或挑不到）。性能封顶不能靠丢优先级实现。
 func scanTTFFonts(roots []string) []string {
 	var out []string
 	for _, root := range roots {
@@ -130,17 +136,22 @@ func scanTTFFonts(roots []string) []string {
 		if _, err := os.Stat(root); err != nil {
 			continue
 		}
+		var inRoot []string
 		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil || d.IsDir() {
 				return nil
 			}
 			if strings.EqualFold(filepath.Ext(path), ".ttf") {
-				out = append(out, path)
+				inRoot = append(inRoot, path)
 			}
 			return nil
 		})
+		sort.Strings(inRoot) // 根内排序：同一台机器上选出的字体可复现
+		out = append(out, inRoot...)
+		if len(out) >= maxScannedFonts {
+			break // 已经够了就不再扫后面的根，优先级高的先拿到配额
+		}
 	}
-	sort.Strings(out) // 排序保证同一台机器上选出的字体可复现
 	if len(out) > maxScannedFonts {
 		out = out[:maxScannedFonts]
 	}
@@ -149,6 +160,19 @@ func scanTTFFonts(roots []string) []string {
 
 // maxScannedFonts 给目录扫描的探测次数封顶，避免字体极多的机器上首次调用过慢。
 const maxScannedFonts = 120
+
+// bundledFontScanRoots 返回目录扫描的搜索根，顺序即优先级：
+// 离线包自带的字体目录（安装脚本按实例写成 /usr/local/share/fonts/skillforge-<服务名>）
+// 排在最前，然后是通用系统目录。
+//
+// 为什么把「包内」排最前：客户机上可能已经有别的中文字体，那些字体能通过覆盖率门槛，
+// 但观感/口径与装包自检时用的那份不同——排前面能保证「自检说用哪个，运行时就用哪个」。
+// 注：SKILLFORGE_PDF_FONT_FILE 优先级更高，安装脚本会显式指定，这里只兜底没配 env 的场景。
+func bundledFontScanRoots() []string {
+	bundled, _ := filepath.Glob("/usr/local/share/fonts/skillforge*")
+	sort.Strings(bundled)
+	return append(append([]string{}, bundled...), pdfFontScanDirs...)
+}
 
 // resolvePDFFont 挑选第一个「门槛字符集全覆盖」的字体；若无，则取缺字最少的那个
 // 并 WARN 记录缺了哪些字符。结果被缓存，只在进程内探测一次。
@@ -209,8 +233,12 @@ func resolvePDFFont() (string, []rune) {
 			}
 		}
 
-		// 3) 扫描系统字体目录，找一个全覆盖的（固定候选全都只能部分覆盖时才走到这里）
-		for _, cand := range scanTTFFonts(pdfFontScanDirs) {
+		// 2.5) 离线包自带的字体目录优先（见 bundledFontScanRoots）：
+		// 固定候选里没有、只能靠扫描时，「包里带的」必须排在「系统里碰巧有的」前面。
+		scanRoots := bundledFontScanRoots()
+
+		// 3) 扫描字体目录，找一个全覆盖的（固定候选全都只能部分覆盖时才走到这里）
+		for _, cand := range scanTTFFonts(scanRoots) {
 			if tryOne(cand) {
 				return
 			}

@@ -26,3 +26,6 @@ deploy.env
 # ---- 其它 ----
 .DS_Store
 *.log
+
+# ---- 本地打包产物（离线包体积大，由 CI 产出并附到 Release，不入库）----
+/dist/

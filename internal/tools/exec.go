@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -369,21 +370,44 @@ func lookupID(name string, isUID bool) int {
 	return 65534
 }
 
-// SandboxDiagnostics 跑一次探针，返回人类可读的沙箱自检报告（用于验收测试与 /api 自检）。
-func SandboxDiagnostics(ctx context.Context) map[string]string {
-	probe := `
-import os, socket
+// probeTemplate 是沙箱自检探针：在沙箱里跑一遍，回答「我是谁 / 能不能联网 /
+// 能不能读机密 / 能不能乱写」，每条都带结论词（OK / 危险 / 证据无效）。
+//
+// __SECRET_PATHS__ 会被替换成一个 JSON 数组字面量（同时是合法的 Python 字面量）。
+//
+// ⚠️ 探针必须先 os.path.exists 再 open：路径不存在时 open 抛 FileNotFoundError，
+// 会被同一个 except 捕获成「拒绝(OK)」——那是假证据，会把「根本没检查」伪装成「检查通过」。
+const probeTemplate = `
+import os, socket, json
+paths = json.loads('__SECRET_PATHS__')
 r = {}
 r["uid"] = str(os.getuid())
 try:
     socket.create_connection(("1.1.1.1", 80), timeout=2); r["network"] = "通(危险)"
 except Exception:
     r["network"] = "断(OK)"
-for p in ("/opt/skillforge/skillforge.env", "/root/.ssh/id_rsa"):
+for p in paths:
+    # ⚠️ 这里**不能**用 os.path.exists()：它会吞掉 EACCES 一律返回 False。
+    # 离线包装完后 data/ 是 0700 root（install.sh 故意的），沙箱是 nobody，
+    # 于是「存在但父目录不让进」被写成「文件不存在」——自检在真机上假红（Bug H）。
+    # 必须问内核要 errno，把「真不存在」和「存在但不可达」分开。
+    # 探针只报原始事实，怎么解读交给 Go 侧 classifyReadEvidence（可被单测覆盖）。
     try:
-        open(p, "rb").read(1); r["read:" + p] = "可读(危险)"
-    except Exception:
-        r["read:" + p] = "拒绝(OK)"
+        os.stat(p); state = "stat_ok"
+    except FileNotFoundError:
+        state = "enoent"
+    except NotADirectoryError:
+        state = "enoent"
+    except PermissionError:
+        state = "parent_denied"
+    except Exception as e:
+        state = "err:" + type(e).__name__
+    if state == "stat_ok":
+        try:
+            open(p, "rb").read(1); state = "readable"
+        except Exception:
+            state = "denied"
+    r["read:" + p] = state
 try:
     open("/etc/evil", "w"); r["write:/etc"] = "可写(危险)"
 except Exception:
@@ -394,6 +418,30 @@ except Exception as e:
     r["write:work"] = "失败(异常): " + type(e).__name__
 print("|".join("%s=%s" % (k, v) for k, v in r.items()))
 `
+
+// SandboxDiagnostics 跑一次探针，返回人类可读的沙箱自检报告（用于验收测试与 /api 自检）。
+// 默认探测 /opt/skillforge 下的机密文件；自定义安装前缀请用 SandboxDiagnosticsFor。
+func SandboxDiagnostics(ctx context.Context) map[string]string {
+	return SandboxDiagnosticsFor(ctx, []string{
+		"/opt/skillforge/skillforge.env",
+		"/opt/skillforge/data/skillforge.db",
+		"/root/.ssh/id_rsa",
+	})
+}
+
+// SandboxDiagnosticsFor 与 SandboxDiagnostics 相同，但由调用方指定「必须读不到」的机密路径。
+//
+// ⚠️ 为什么必须让调用方传真实路径：探针里写死一个**不存在的路径**时，Python 抛的是
+// FileNotFoundError，也会被同一段 except 捕获成「拒绝(OK)」——装在不同前缀下的实例
+// 会拿一个假证据宣称「读不到机密」。证据必须落在真实文件上。
+func SandboxDiagnosticsFor(ctx context.Context, secretPaths []string) map[string]string {
+	if len(secretPaths) == 0 {
+		secretPaths = []string{"/root/.ssh/id_rsa"}
+	}
+	// JSON 字符串字面量同时是合法的 Python 字面量（双引号 + JSON 转义），
+	// 用它把路径安全嵌进代码；用占位符替换而不是 Sprintf——探针里有 `%s` 会打架。
+	encoded, _ := json.Marshal(secretPaths)
+	probe := strings.Replace(probeTemplate, "__SECRET_PATHS__", string(encoded), 1)
 	t := NewRunPythonTool(DefaultExecConfig())
 	res, err := t.Run(ctx, map[string]any{"code": probe})
 	out := map[string]string{}
@@ -401,13 +449,49 @@ print("|".join("%s=%s" % (k, v) for k, v in r.items()))
 		out["error"] = err.Error()
 		return out
 	}
-	for _, line := range strings.Split(res.Content, "\n") {
+	for k, v := range parseProbeOutput(res.Content) {
+		if strings.HasPrefix(k, "read:") {
+			v = classifyReadEvidence(v)
+		}
+		out[k] = v
+	}
+	out["display"] = res.Display
+	return out
+}
+
+// parseProbeOutput 解析探针输出的 `k=v|k=v` 行。
+//
+// 单独拆出来是为了让「原始证据 → 结论」这条链在 CI 里可测：探针侧只能给原始事实
+// （读成功了 / errno 是啥），解读放在 Go 里才锁得住。
+func parseProbeOutput(content string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(content, "\n") {
 		for _, kv := range strings.Split(line, "|") {
 			if i := strings.Index(kv, "="); i > 0 {
 				out[strings.TrimSpace(kv[:i])] = strings.TrimSpace(kv[i+1:])
 			}
 		}
 	}
-	out["display"] = res.Display
 	return out
+}
+
+// classifyReadEvidence 把探针给的原始判定翻译成结论词。纯函数，单测直接打它。
+//
+// 历史坑（Bug H）：原先探针用 os.path.exists() 判存在性，它吞掉 EACCES 返回 False，
+// 于是「文件在、但父目录 0700 让沙箱连 stat 都进不去」被写成「文件不存在(证据无效)」，
+// 自检在真机上直接判失败、客户以为系统坏了。EACCES 恰恰是**更强的**安全证据：
+// 内核只在对象存在时才会因权限拒绝访问。所以 parent_denied 必须判通过。
+func classifyReadEvidence(raw string) string {
+	switch raw {
+	case "readable":
+		return "可读(危险)"
+	case "denied":
+		return "拒绝(OK)"
+	case "parent_denied":
+		return "拒绝(OK)（父目录不可达，沙箱连 stat 都进不去）"
+	case "enoent":
+		return "文件不存在(证据无效)"
+	default:
+		return "探针未给出有效判定(证据无效): " + raw
+	}
 }

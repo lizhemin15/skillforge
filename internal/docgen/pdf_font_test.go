@@ -1,6 +1,7 @@
 package docgen
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,6 +120,62 @@ func TestScanTTFFontsFiltersAndSorts(t *testing.T) {
 	}
 }
 
+// TestScanTTFFontsKeepsBundledFontWhenOtherRootsHaveManyFonts 锁定「roots 顺序即优先级」。
+//
+// 早期实现把所有搜索根的结果合并后做**全局路径排序**再按上限截断。
+// 实测真实路径的字典序（/usr/local/share/fonts/skillforge 排在
+// /usr/share/fonts 之前），所以「系统字体多 → 自带字体被挤掉」并不是普遍故障；
+// 但**同根下字典序更靠前的目录**（如 /usr/local/share/fonts/aaa-fonts/）
+// 一旦攒够 maxScannedFonts 个 .ttf，自带字体就会被截断掉，运行时静默退回系统字体。
+// 在没有 CJK 字体的离线机器上，那等于 PDF 里中文数字全空白。
+//
+// 本用例用命名刻意制造这个次序（低优先级根 aaa-system 排前、高优先级根 zzz-bundled 排后），
+// 断言 roots 的先后就是优先级：先扫到的先保留，截断只砍后面的根。
+func TestScanTTFFontsKeepsBundledFontWhenOtherRootsHaveManyFonts(t *testing.T) {
+	base := t.TempDir()
+	system := filepath.Join(base, "aaa-system")   // 低优先级根，故意让字典序排前面
+	bundled := filepath.Join(base, "zzz-bundled") // 高优先级根，字典序在后
+	for _, d := range []string{system, bundled} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeFont := func(root, name string) string {
+		p := filepath.Join(root, name)
+		if err := os.WriteFile(p, make([]byte, 4), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	want := writeFont(bundled, "gbsn00lp.ttf")
+	// 低优先级根塞满超过上限的字体，制造「全局排序 + 截断」会砍掉自带字体的情况
+	for i := 0; i < maxScannedFonts+20; i++ {
+		writeFont(system, fmt.Sprintf("sys-%03d.ttf", i))
+	}
+
+	got := scanTTFFonts([]string{bundled, system})
+	if len(got) == 0 {
+		t.Fatal("一个字体都没扫到")
+	}
+	if got[0] != want {
+		t.Fatalf("高优先级根里的字体必须排第一，实际第一个是 %s（roots 顺序即优先级）", got[0])
+	}
+	if len(got) > maxScannedFonts {
+		t.Fatalf("扫描结果 %d 个，超过上限 %d", len(got), maxScannedFonts)
+	}
+	found := false
+	for _, p := range got {
+		if p == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("自带字体 %s 被截断挤掉了（共扫到 %d 个）：%v…", want, len(got), got[:3])
+	}
+}
+
 // TestResolvePDFFontEnvOverride 校验 SKILLFORGE_PDF_FONT_FILE 生效：
 // 指到真实字体时必须用它；指到不存在的路径时必须优雅回落到正常探测，而不是崩或者静默变空。
 func TestResolvePDFFontEnvOverride(t *testing.T) {
@@ -151,6 +208,43 @@ func TestResolvePDFFontEnvOverride(t *testing.T) {
 			t.Fatalf("路径无效时应回落到正常探测（期望 %s），实际 %s", good, got)
 		}
 	})
+}
+
+// TestBundledFontScanRootsComeFirst 守护 Bug K 相关的顺序约定：
+// 离线包自带字体目录（/usr/local/share/fonts/skillforge-<服务名>）必须排在通用系统字体目录之前。
+//
+// 注意这里断言的是**扫描根的顺序**，不是 resolvePDFFont 的最终选择——固定候选表
+// （pdfFontCandidates）优先级本来就高于扫描，那是刻意设计。顺序被改回去时，没有配
+// SKILLFORGE_PDF_FONT_FILE 的场景（手工跑二进制、容器里直接执行）就会先吃到系统字体，
+// 于是「自检说用包内字体，运行时却用了别的」。
+func TestBundledFontScanRootsComeFirst(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("需要在 /usr/local/share/fonts 下建测试目录，非 root 跳过")
+	}
+	base := "/usr/local/share/fonts"
+	if err := os.MkdirAll(base, 0755); err != nil {
+		t.Skipf("无法创建 %s: %v", base, err)
+	}
+	dir := filepath.Join(base, "skillforge-unittest")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Skipf("无法创建 %s: %v", dir, err)
+	}
+	defer os.RemoveAll(dir)
+
+	roots := bundledFontScanRoots()
+	if len(roots) == 0 || roots[0] != dir {
+		t.Fatalf("包内字体目录应排在扫描根首位：期望 roots[0]=%s，实际 %v", dir, roots)
+	}
+	// 通用系统目录不能被挤掉（否则客户机没装包内字体时反而找不到字体）。
+	found := false
+	for _, r := range roots[1:] {
+		if r == "/usr/share/fonts" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("通用系统字体目录被挤掉了：%v", roots)
+	}
 }
 
 // TestBuildPDFKeepsDigits 直接生成 PDF 并确认生成的字节流里包含数字字形。
