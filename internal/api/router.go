@@ -37,7 +37,7 @@ func NewHandler(s *store.SkillStore, l *llm.Client, secret string) (*Handler, er
 	admin.SetEngine(eng)
 	genCache := newGenCache()
 	// 工具能力：按环境变量装配（默认开，SKILLFORGE_TOOLS=off 可回退纯对话）
-	toolReg := buildToolRegistry()
+	toolReg := buildToolRegistry(s)
 	return &Handler{
 		Skills: skills, Admin: admin, Auth: auth,
 		Chat: &chatHandler{eng: eng, gen: genCache, tools: toolReg, maxRound: toolMaxRounds()}, Eng: eng,

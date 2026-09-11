@@ -9,6 +9,7 @@ import (
 
 	"github.com/lizhemin15/skillforge/internal/agent"
 	"github.com/lizhemin15/skillforge/internal/llm"
+	"github.com/lizhemin15/skillforge/internal/store"
 	"github.com/lizhemin15/skillforge/internal/tools"
 )
 
@@ -16,11 +17,12 @@ import (
 //
 //	SKILLFORGE_TOOLS=off            关掉整个工具循环（回退到纯文本对话）
 //	SKILLFORGE_EXEC=off             只关掉代码执行（沙箱），保留 http_request
+//	SKILLFORGE_DOCS=off             只关掉文档工具（模板填充 / 生成文档）
 //	SKILLFORGE_TOOL_HTTP_ALLOW=...  内网白名单（逗号分隔主机名或 CIDR）
 //	SKILLFORGE_TOOL_TIMEOUT=20s     单次工具超时
 //
 // 默认：工具开、代码执行开（沙箱兜底，用户明确要求公开可用）。
-func buildToolRegistry() *tools.Registry {
+func buildToolRegistry(s *store.SkillStore) *tools.Registry {
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("SKILLFORGE_TOOLS")), "off") {
 		return nil
 	}
@@ -32,6 +34,16 @@ func buildToolRegistry() *tools.Registry {
 
 	if !strings.EqualFold(strings.TrimSpace(os.Getenv("SKILLFORGE_EXEC")), "off") {
 		reg.Register(tools.NewRunPythonTool(tools.DefaultExecConfig()))
+	}
+
+	// 文档工具：模板发现/填充 + 从零生成。语义映射（哪个值填哪个字段）由
+	// 循环里的模型负责，工具只做机械落盘——工具里再调一次 LLM 就成了双重
+	// 调用，既慢又贵，而且模型看不到中间态没法纠错。
+	if !strings.EqualFold(strings.TrimSpace(os.Getenv("SKILLFORGE_DOCS")), "off") {
+		src := newStoreTemplates(s)
+		reg.Register(tools.NewListTemplatesTool(src))
+		reg.Register(tools.NewFillTemplateTool(src))
+		reg.Register(tools.NewGenDocumentTool())
 	}
 	return reg
 }
@@ -61,11 +73,20 @@ func agentSystemPrompt() string {
 
 工具使用原则：
 - 需要外部数据、调用接口/API → 用 http_request 取数；一次可以同时请求多个地址。
-- 需要计算、统计、清洗数据、生成文件（CSV/Excel/文本）→ 用 run_python。
+- 需要计算、统计、清洗数据、生成 CSV/文本 → 用 run_python。
   该沙箱**没有网络**，不要在里面写 requests/urllib 联网代码，取数一律交给 http_request。
   先把 http_request 返回的数据整理成代码里的字面量，再算。
+- 要填用户的模板（合同 / 验收单 / 报价单这类现成表格）→ 必须先用 list_templates
+  查出模板和字段名，再用 fill_template 填。**绝不要凭想象编字段名**：字段名错了
+  填出来就是一片空白，而且不会报错。
+- 用户要一份新文档、且没有现成模板 → 用 gen_document 生成 Word / Excel / PPT / PDF。
 - 能在本地算出来的结论，不要靠猜；工具拿到的数据优先于你的记忆。
 - 用户只是闲聊或问常识时，直接回答，不要调用工具。
+
+办公文档要点：
+- 数字要写成纯数字（"12000"），不要带千分位、货币符号或单位，否则 Excel 里
+  算不出合计；单位放在相邻的「备注」或列标题里。
+- 日期统一写成 2026年8月26日 或 2026-08-26。
 
 输出要求：
 - 全部用中文回答，简洁、结论先行。

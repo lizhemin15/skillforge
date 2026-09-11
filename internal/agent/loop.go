@@ -141,7 +141,12 @@ func (l *Loop) execOne(ctx context.Context, call llm.ToolCall) (string, []tools.
 	args := map[string]any{}
 	raw := strings.TrimSpace(call.Args)
 	if raw != "" && raw != "null" {
-		if err := json.Unmarshal([]byte(raw), &args); err != nil {
+		// UseNumber：数字保留 JSON 原文，不要落成 float64。
+		// 落成 float64 后 fmt 出来是 "1e+06" 这种科学计数法，
+		// 填进财务模板就是实打实的错值（"1000000" → "1e+06"）。
+		dec := json.NewDecoder(strings.NewReader(raw))
+		dec.UseNumber()
+		if err := dec.Decode(&args); err != nil {
 			// 参数不是合法 JSON：把原因回给模型让它自我修正，不中断循环
 			return fmt.Sprintf("参数解析失败（必须返回合法 JSON 对象）：%v。请修正后重新调用。", err), nil, "参数非法", nil
 		}

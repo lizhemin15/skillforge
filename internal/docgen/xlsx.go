@@ -2,6 +2,8 @@ package docgen
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/xuri/excelize/v2"
 )
@@ -37,7 +39,11 @@ func buildXLSX(d Doc) ([]byte, error) {
 			if err != nil {
 				return err
 			}
-			if err := f.SetCellValue(sheetName, cellName, val); err != nil {
+			if v, ok := numericCell(val); ok {
+				if err := f.SetCellValue(sheetName, cellName, v); err != nil {
+					return err
+				}
+			} else if err := f.SetCellValue(sheetName, cellName, val); err != nil {
 				return err
 			}
 			if header {
@@ -83,6 +89,57 @@ func buildXLSX(d Doc) ([]byte, error) {
 		return nil, fmt.Errorf("docgen xlsx: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+// numericCell 判断一个字符串是否该写成 Excel 数值单元格，返回解析后的值。
+//
+// 为什么必须区分：excelize 的 SetCellValue 收到 string 会写成共享字符串
+// （t="s"），也就是**文本**单元格。文本单元格在 Excel 里不能参与 SUM 和公式——
+// 用户拿到一份"每列都对、求和恒为 0"的报价单，而生成日志写的是"成功"。
+// 这种缺陷在命令行里完全看不出来，只有断言 XML 才能发现。
+//
+// 反过来也不能一律强转：以下都必须是文本，转了就是数据损坏——
+//   - 前导零编号："007"、"0138" 转身就变 7 / 138
+//   - 超过 15 位有效数字（身份证号、长订单号）会丢精度（Excel 自身也只有 15 位）
+//   - 带单位/货币/百分号："5台"、"¥12000"、"12%"
+func numericCell(s string) (float64, bool) {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return 0, false
+	}
+	body := t
+	if body[0] == '+' || body[0] == '-' {
+		body = body[1:]
+	}
+	if body == "" {
+		return 0, false
+	}
+	digits, dots := 0, 0
+	for i := 0; i < len(body); i++ {
+		switch ch := body[i]; {
+		case ch >= '0' && ch <= '9':
+			digits++
+		case ch == '.':
+			dots++
+		default:
+			return 0, false
+		}
+	}
+	if digits == 0 || dots > 1 || digits > 15 {
+		return 0, false
+	}
+	intPart := body
+	if i := strings.IndexByte(body, '.'); i >= 0 {
+		intPart = body[:i]
+	}
+	if len(intPart) > 1 && intPart[0] == '0' {
+		return 0, false // 前导零 = 编号，不是数字
+	}
+	v, err := strconv.ParseFloat(t, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }
 
 // replaceAll is a small rune-replacement helper used to sanitise sheet names.
