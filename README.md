@@ -253,10 +253,20 @@ skills/<slug>/
 ```bash
 go test ./...                       # 单元测试
 go vet ./...                        # 静态检查
+bash deploy/offline/test-fontref.sh  # 卸载器路径引用判定（无需 root、无副作用）
 python3 e2e/docgen_regression.py    # 端到端：文档生成 / 续改 / 合计重算（需服务在 8092）
 ```
 
 端到端脚本走真实 HTTP API，下载真实产物字节并解包校验，不做 mock。
+
+**离线包要在真·断网下验。** 网络命名空间里跑安装 / 卸载，才能证明「不联网也能装」不是嘴上说的：
+
+```bash
+unshare -n bash your-e2e.sh   # 台架自己会先探外网，探到即拒绝出结论（绝不降级放行）
+```
+
+装机 / 卸载这类脚本的断言必须在**真被脚本扫描的路径**里造现场（先 `grep -n "for _f in"` 抄下扫描范围），
+否则断言会骑在别的 bug 上假绿；写完还要做**双向验证**：注入真故障 → 变红，恢复正常 → 变绿。
 
 ---
 
@@ -265,7 +275,8 @@ python3 e2e/docgen_regression.py    # 端到端：文档生成 / 续改 / 合计
 CI 由 GitHub Actions 负责，无需本地交叉编译：
 
 - **`.github/workflows/ci.yml`** — 每次 push / PR：`go vet` + `go test` + 构建
-- **`.github/workflows/release.yml`** — 打 tag（`v*`）时：交叉编译 linux / darwin / windows × amd64 / arm64，自动创建 Release 并附上产物
+- **`.github/workflows/release.yml`** — 打 tag（`v*`）时：交叉编译 linux / darwin / windows × amd64 / arm64，自动创建 Release 并附上产物；
+  同时打 linux amd64 / arm64 的**离线一键安装包**（打包前先跑 `deploy/offline/test-fontref.sh`——卸载器逻辑坏了就直接不出包）
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0   # 触发 Release
