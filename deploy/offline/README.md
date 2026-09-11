@@ -103,6 +103,42 @@ sudo ./uninstall.sh --purge        # 连数据一起删（会二次确认）
 
 ---
 
+## 五点五、同一台机器装第二份实例
+
+服务名（`--service`）同时决定 systemd 单元名，所以**多实例必须换 `--service` 名字**：
+
+```bash
+sudo ./install.sh --service skillforge-test --prefix /srv/sf-test --port 19000
+```
+
+不换名字、只换前缀的话，脚本会**拒绝安装**。原因值得说清楚，因为这是最容易踩的一脚：
+
+```
+sudo ./install.sh --prefix /srv/sf-x      # 假设机器上已经有 /opt/skillforge 在跑
+```
+
+它会去写 `/etc/systemd/system/skillforge.service`——把里面指向 `/opt/skillforge` 的
+`WorkingDirectory` / `ExecStart` / `EnvironmentFile` 全改成 `/srv/sf-x` 的。此时：
+
+- **不会报任何错**。文件写得进去，`systemctl daemon-reload` 也成功，甚至旧进程还在跑、网站还正常；
+- **真正的爆炸在下一次重启**（或被 `Restart=always` 拉起、被运维 `systemctl restart` 时）：
+  已经在跑的服务会静默切到 `/srv/sf-x` 的二进制、`/srv/sf-x/data/` 的数据库、`/srv/sf-x/skillforge.env` 的配置。
+  表现是「技能没了、数据回到从前、配置变了」，但日志里一句报错都没有。
+
+卸载侧更危险，因为它会**真的把单元停掉并删除**：在已经跑着正式服务的机器上执行一次默认参数的
+`uninstall.sh --prefix /srv/sf-x`，会把 `/opt/skillforge` 那份的服务停掉、开机自启取消、单元文件删掉，
+而它自己的程序文件和数据都还留在原地——等于把它打成既不自启也起不来的残废状态，而输出还是
+「服务已停止并取消开机自启」，看起来像卸载成功。
+
+所以两边都做了闸门：**同名单元已存在、且它指向的前缀与本次不同 → 拒绝执行**，并打印出单元实际
+指向哪个前缀、该用哪个 `--prefix`。确实要顶掉旧实例（旧实例可以下线）时，显式加 `--force`。
+
+> 注意 `uninstall.sh --force` 的语义是「强拆这个单元」，它不会去分辨单元归谁。所以**别拿 `--force`
+> 去清一个和正式实例同名的废弃测试实例**——那会把正式的单元一起删掉。这种情况直接把前缀目录挪走/删掉即可，
+> 单元本来就不归它。
+
+---
+
 ## 六、常见问题
 
 **装完打不开页面？**

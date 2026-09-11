@@ -117,7 +117,42 @@ SKILLFORGE_DATA_DIR=/opt/skillforge/data ./skillforge
 
 ---
 
-## 部署（systemd）
+## 部署
+
+### 方式一：离线一键安装包（推荐，目标机不需要联网、不需要装 Go）
+
+从 [Releases](https://github.com/lizhemin15/skillforge/releases) 下载 `skillforge-offline-<版本>-linux-<架构>.tar.gz`，
+拷到目标机任意位置（U 盘、内网跳板都行），然后：
+
+```bash
+tar -xzf skillforge-offline-*.tar.gz
+cd skillforge-offline-*/
+sudo ./install.sh                      # 默认装到 /opt/skillforge，端口 8092
+```
+
+装完直接开浏览器访问 `http://<机器IP>:8092`。卸载用同目录的 `uninstall.sh`。
+
+包内自带静态二进制（含全部依赖）、中文字体及字体许可证，安装过程**不执行任何 curl / wget / apt / pip**，
+所以完全断网的机器也能装。前置要求只有一条：目标机有 systemd
+（代码执行沙箱建立在 `systemd-run` 降权机制上，它是本服务对外公开时唯一的防线，缺了它脚本拒绝安装）。
+
+常用参数：
+
+```bash
+sudo ./install.sh --port 9000                  # 换端口
+sudo ./install.sh --prefix /srv/sf             # 换安装前缀
+sudo ./install.sh --service skillforge-test    # 换服务名（同机装第二份实例）
+sudo ./uninstall.sh --purge                    # 卸载并连数据一起删
+```
+
+> **同机多实例必须换 `--service` 名字。** 服务名同时决定 systemd 单元名；如果单元已存在但指向
+> 另一个安装前缀，`install.sh` / `uninstall.sh` 会**拒绝执行**而不是默默覆盖——因为覆盖单元文件时
+> 已经在跑的进程不会报错，但那个服务下次重启就会静默切到本次的目录、数据和配置上，是最难排查的
+> 一类线上事故。确认要顶掉旧实例时显式加 `--force`。
+
+详细说明见 [`deploy/offline/README.md`](deploy/offline/README.md)。
+
+### 方式二：手动 systemd 部署
 
 ```bash
 sudo mkdir -p /opt/skillforge && cd /opt/skillforge
