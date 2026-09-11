@@ -144,6 +144,16 @@ for f in "$BIN" "$BIN.new" "$ENV_FILE"; do
 done
 [ "$removed" -eq 0 ] && c_info "前缀目录里本来就没有程序文件"
 
+# 把目录转成「整段路径」匹配用的正则：
+# 路径必须按整段比对，不能用子串——/usr/local/share/fonts/skillforge 是
+# /usr/local/share/fonts/skillforge-<实例名> 的前缀，子串比对会把别的实例的字体
+# 目录误判成本目录仍被引用 → 旧的共享目录永远清不掉（Bug O）。
+# 边界规则：目录串后面只允许出现 /（目录内文件）、引号、空白或行尾；
+# 紧跟字母/数字/点/连字符都说明那是另一个更长的名字，不算引用。
+font_ref_regex() {
+	printf '%s([^A-Za-z0-9._-]|$)' "$(printf '%s' "$1" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
+}
+
 # 同机其它实例是否还在引用某个字体目录？
 # 只报事实（有没有、谁引用），不猜、不擅自删。
 font_dir_in_use() {
@@ -155,7 +165,7 @@ font_dir_in_use() {
 		[ -f "$_f" ] || continue
 		[ "$_f" = "$ENV_FILE" ] && continue
 		[ "$_f" = "$UNIT" ] && continue
-		_hits="$_hits$(grep -F -- "$_ref_dir" "$_f" 2>/dev/null || true)"
+		_hits="$_hits$(grep -E -- "$(font_ref_regex "$_ref_dir")" "$_f" 2>/dev/null || true)"
 	done
 	[ -n "$_hits" ]
 }

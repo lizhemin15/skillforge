@@ -118,6 +118,11 @@ jobs:
             -o /tmp/skillforge-linux-${GOARCH} ./cmd/server
           file /tmp/skillforge-linux-${GOARCH}
 
+      # 出厂前先自查：字体「引用判定」的路径边界回归防线（Bug O）。
+      # 放在打包之前——逻辑坏了就别打这个包。
+      - name: 回归防线（卸载器路径引用判定 · Bug O）
+        run: bash deploy/offline/test-fontref.sh
+
       - name: 打离线包（自动挑字体 + 带许可证 + 确定性 tar）
         run: |
           chmod +x scripts/build-offline-bundle.sh
