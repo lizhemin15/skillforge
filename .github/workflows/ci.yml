@@ -81,6 +81,13 @@ jobs:
           node --check web/js/site.js
           node web/tests/site_config.test.mjs
 
+      # 技能模板文件可见性：模板 .docx/.xlsx 躺在技能目录顶层、fill_template 真在读它，
+      # 但管理端文件树曾经一个都不列（用户原话「skill 里怎么没有模板源文件」）。
+      # 后端那半由 internal/store 的单测守；「后端列了、前端不画」是同一种用户可见结果，
+      # 所以前端这半（分组渲染 + 上传时 target=template 接线）必须也守上。
+      - name: 前端回归（技能模板文件）
+        run: node web/tests/skill_template_files.test.mjs
+
       - name: Build
         run: |
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o skillforge ./cmd/server

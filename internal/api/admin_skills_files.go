@@ -8,11 +8,13 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 	"time"
 
 	"github.com/lizhemin15/skillforge/internal/model"
+	"github.com/lizhemin15/skillforge/internal/store"
 )
 
 // ===== Knowledge-base style skill file management =====
@@ -42,12 +44,14 @@ func (a *Admin) ReadSkillFile(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusNotFound, err.Error())
 			return
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		// 下载的是真文件（模板 .docx/.xlsx、素材 .pdf…），Content-Type 必须按扩展名给：
+		// 一律 text/plain 会让浏览器/解压工具认错格式（.xlsx 被当成文本打开）。
+		w.Header().Set("Content-Type", mimeTypeFor(rel))
 		name := rel
 		if idx := lastSlash(rel); idx >= 0 {
 			name = rel[idx+1:]
 		}
-		w.Header().Set("Content-Disposition", "attachment; filename="+name)
+		w.Header().Set("Content-Disposition", contentDisposition(name))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(content))
 		return
@@ -83,6 +87,21 @@ func (a *Admin) ReadSkillFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, f)
+}
+
+// contentDisposition 生成下载头。
+//
+// 只写 `filename=` 时，HTTP 头按 latin-1 传，中文名到浏览器就是乱码或直接丢失
+// （用户下载到「____.docx」）。所以 ASCII 兜底名 + RFC 5987 的 filename* 一起给：
+// 老浏览器读前者，现代浏览器读后者拿到正确中文名。
+func contentDisposition(name string) string {
+	ascii := strings.Map(func(r rune) rune {
+		if r < 128 && r != '"' && r != '\\' {
+			return r
+		}
+		return '_'
+	}, name)
+	return fmt.Sprintf("attachment; filename=%q; filename*=UTF-8''%s", ascii, url.PathEscape(name))
 }
 
 func lastSlash(s string) int {
@@ -164,13 +183,23 @@ func (a *Admin) UpdateSkillMeta(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// UploadSkillFile adds new raw source/reference material to the skill (~ multipart).
+// UploadSkillFile adds raw material to a skill (~ multipart).
+//
+// 落点由表单字段 target 决定：
+//   - 缺省 / "source" → source/<文件名>，原始素材（可抽取文字的会顺带抽一份 txt）
+//   - "template"      → <文件名>（技能目录顶层），可填模板，同名即替换
+//
+// 模板必须能**原地替换**：用户换模板的真实动作就是「同名重传」，
+// 所以这里不能另起文件名（那会变成同一个技能挂两个模板，模型随机挑一个，行为不可复现）。
 func (a *Admin) UploadSkillFile(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 	if err := r.ParseMultipartForm(20 << 20); err != nil {
 		writeErr(w, http.StatusBadRequest, "multipart 解析失败: "+err.Error())
 		return
 	}
+	// 必须在 ParseMultipartForm 之后读：先读字段会把 multipart 提前按默认上限解析掉，
+	// 后面这次 ParseMultipartForm(20<<20) 就形同虚设（体积上限被悄悄换成默认值）。
+	target := strings.TrimSpace(r.FormValue("target"))
 	file, hdr, err := r.FormFile("file")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "需要 file 字段")
@@ -182,7 +211,19 @@ func (a *Admin) UploadSkillFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "读取文件失败")
 		return
 	}
-	rel := "source/" + sanitizeFilename(hdr.Filename)
+	name := sanitizeFilename(hdr.Filename)
+	isTemplate := target == "template"
+	rel := "source/" + name
+	if isTemplate {
+		// 顶层模板：扩展名必须与 fill_template 认的格式一致，
+		// 判据用 store 那一份真值（FillableTemplateFormat），不在这里另抄扩展名。
+		if store.FillableTemplateFormat(name) == "" {
+			writeErr(w, http.StatusBadRequest,
+				"模板只支持 .docx/.xlsx（fill_template 能填的格式）: "+name)
+			return
+		}
+		rel = name
+	}
 	if err := a.store.WriteFileRaw(slug, rel, data); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -190,7 +231,9 @@ func (a *Admin) UploadSkillFile(w http.ResponseWriter, r *http.Request) {
 	// If it's a document format we can extract text from, parse it asynchronously
 	// and land the text as source/<base>.txt next to the raw file. Non-blocking:
 	// extraction failure never fails the upload — the raw file stays for download.
-	if extractableExt(hdr.Filename) {
+	// 模板（target=template）跳过抽取：模板是给 fill_template 填的骨架，
+	// 把它的样例文字抽成 source/<base>.txt 只会污染技能知识库（模型会当成范文）。
+	if !isTemplate && extractableExt(hdr.Filename) {
 		go a.extractAndLand(slug, hdr.Filename, data)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": rel})
@@ -313,26 +356,10 @@ func (a *Admin) RawSkillFile(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(content)
 }
 
-func mimeTypeFor(rel string) string {
-	ext := strings.ToLower(path.Ext(rel))
-	switch ext {
-	case ".pdf":
-		return "application/pdf"
-	case ".png":
-		return "image/png"
-	case ".jpg", ".jpeg":
-		return "image/jpeg"
-	case ".gif":
-		return "image/gif"
-	case ".webp":
-		return "image/webp"
-	case ".svg":
-		return "image/svg+xml"
-	case ".bmp":
-		return "image/bmp"
-	}
-	return "application/octet-stream"
-}
+// 统一委托给 store：下载、预览两处的 Content-Type 必须是同一份真值，
+// 各写一张扩展名表迟早不对称（本轮就踩过：下载被硬编码成 text/plain，
+// 模板 .docx/.xlsx 全被当文本）。
+func mimeTypeFor(rel string) string { return store.MimeFor(rel) }
 
 // CreateSkill manually creates a brand-new skill (non-LLM).
 func (a *Admin) CreateSkill(w http.ResponseWriter, r *http.Request) {

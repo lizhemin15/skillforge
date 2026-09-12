@@ -104,6 +104,19 @@ func templateFormatOf(name string) string {
 	}
 }
 
+// FillableTemplateFormat 把 templateFormatOf 暴露给 API 层。
+//
+// 目的是「同一个真值只写一份」：上传接口要判断 target=template 的落点是否合法、
+// 管理端文件清单要判断一个顶层文件是不是模板，两处都必须和 fill_template
+// 能填的格式完全一致。各自抄一份扩展名列表 → 迟早出现
+// 「界面说是模板、模型填不了」这种两套视图打架的 bug。
+func FillableTemplateFormat(name string) string { return templateFormatOf(name) }
+
+// MimeFor 把 mimeFor 暴露给 API 层。
+// 下载/预览的 Content-Type 只能有一份真值：API 层早先自己抄了一张表，
+// 结果是「预览认得 .docx、下载却回 text/plain」这种不对称 —— 用户下到的 xlsx 被当文本打开。
+func MimeFor(rel string) string { return mimeFor(rel) }
+
 // maxTemplateBytes 单个模板的读取上限。
 // 服务以 root 运行，工具又是模型驱动的，所以这里不能只靠 safeRel ——
 // 万一有人把 500MB 的文件丢进技能目录，一次 fill_template 就能把内存吃光。

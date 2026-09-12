@@ -43,7 +43,25 @@ func fileKind(rel string) (kind string, editable bool) {
 		// raw reference material — binary files are previewable but not text-editable.
 		return "source", !isBinaryExt(rel)
 	}
+	if isTopTemplateFile(rel) {
+		// 可填模板（顶层 .docx/.xlsx）：二进制，不可文本编辑，但**必须可下载/替换/删除**。
+		// 它们既不在上面的白名单 md 里，也不在 source/ 里，早先落进 "other" ——
+		// 结果 fill_template 能填、管理端文件树上却一个模板都看不到，换模板只能 SSH。
+		return "templatefile", false
+	}
 	return "other", false
+}
+
+// isTopTemplateFile 判断一个相对路径是不是「技能目录顶层」的可填模板。
+//
+// 扩展名真值直接复用 templateFormatOf（= fill_template 真正能填的格式），
+// 不另写一份扩展名列表：两份列表迟早漂移，漂移的表现就是
+// 「管理端列出来是模板、模型却填不了」或者反过来「悄悄能填、界面看不见」。
+func isTopTemplateFile(rel string) bool {
+	if strings.Contains(rel, "/") {
+		return false // 只认顶层；source/ 下的模板文件走 source 分组，避免同一文件出现两次
+	}
+	return templateFormatOf(rel) != ""
 }
 
 // isBinaryExt reports whether a filename looks like a non-textual format.
@@ -172,6 +190,18 @@ func (s *SkillStore) ListFiles(slug string) ([]model.SkillFile, error) {
 			add(filepath.Join(dir, "source", en.Name()), "source/"+en.Name(), "source")
 		}
 	}
+	// 顶层可填模板（.docx/.xlsx）：单独扫一遍。
+	// 白名单只列 4 个 md，不扫这一层的话模板文件永远进不了清单 ——
+	// 而模板是用户最想换的东西（换字体/表头/页边距），必须能看见、能下载、能替换。
+	// 只收 isTopTemplateFile 认的格式，meta.json / versions/ / 其它杂项天然被挡在外面。
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, en := range entries {
+			if en.IsDir() || !isTopTemplateFile(en.Name()) {
+				continue
+			}
+			add(filepath.Join(dir, en.Name()), en.Name(), "templatefile")
+		}
+	}
 	sort.Slice(out, func(i, j int) bool {
 		oi, oj := orderOf(out[i].Kind), orderOf(out[j].Kind)
 		if oi != oj {
@@ -192,14 +222,18 @@ func orderOf(kind string) int {
 		return 1
 	case "template":
 		return 2
-	case "requirement":
+	case "templatefile":
+		// 紧跟在写作模板（template.md）后面：一个是「怎么写的骨架」，
+		// 一个是「真正被填充的源文件」，用户找模板时两处要挨着。
 		return 3
-	case "style":
+	case "requirement":
 		return 4
-	case "example":
+	case "style":
 		return 5
-	case "source":
+	case "example":
 		return 6
+	case "source":
+		return 7
 	}
 	return 9
 }
@@ -262,8 +296,11 @@ func (s *SkillStore) WriteFile(slug, rel, content string) error {
 // text-editability check. Only intended for source/ uploads (binary files such
 // as .docx/.pdf/images are stored via this path). Kind is always "source".
 func (s *SkillStore) WriteFileRaw(slug, rel string, data []byte) error {
-	if !strings.HasPrefix(rel, "source/") {
-		return fmt.Errorf("只能写入 source/ 目录: %s", rel)
+	// 两个合法落点：source/ 下的原始素材，和技能目录顶层的可填模板。
+	// 顶层只放行 templateFormatOf 认的格式 —— 否则这条批量写入口就成了
+	// 「往技能目录里写任意文件」的通道（system_prompt.md / meta.json 都能被覆盖）。
+	if !strings.HasPrefix(rel, "source/") && !isTopTemplateFile(rel) {
+		return fmt.Errorf("只能写入 source/ 目录或顶层模板文件(.docx/.xlsx): %s", rel)
 	}
 	abs, err := s.absFile(slug, rel)
 	if err != nil {
@@ -329,6 +366,18 @@ func (s *SkillStore) DeleteFile(slug, rel string) error {
 		return err
 	}
 	kind, editable := fileKind(rel)
+	// 模板文件是二进制、editable=false，但它是用户自己传上来的资产，
+	// 必须可删（删掉 = 该技能回到「无模板」状态）。核心 md 仍然只读。
+	if kind == "templatefile" {
+		abs, err := s.absFile(slug, rel)
+		if err != nil {
+			return err
+		}
+		if err := os.Remove(abs); err != nil {
+			return fmt.Errorf("删除失败: %w", err)
+		}
+		return nil
+	}
 	if !editable {
 		return fmt.Errorf("该文件不可删除: %s", rel)
 	}

@@ -93,7 +93,7 @@ type Message struct {
 // "template.md", "requirement.md", "examples/example01.md", "source/original.docx").
 type SkillFile struct {
 	Path     string `json:"path"`              // relative path inside skill dir
-	Kind     string `json:"kind"`              // prompt | template | requirement | example | source
+	Kind     string `json:"kind"`              // prompt | template | templatefile | requirement | style | example | source
 	Name     string `json:"name"`              // base filename
 	Size     int    `json:"size"`              // bytes
 	Content  string `json:"content,omitempty"` // populated on read only (text files)

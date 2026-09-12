@@ -320,8 +320,27 @@
   };
 
   // ---------- knowledge-base skill detail ----------
-  const KIND_LABEL = { prompt: '核心提示词', template: '写作模板', requirement: '训练需求', style: '风格画像', example: '参考范文', source: '原始素材', other: '其他' };
-  const KIND_ICON = { prompt: '🧠', template: '📋', requirement: '📐', style: '🎯', example: '📄', source: '📁', other: '📎' };
+  // slug 在 onclick 属性里是 encodeURIComponent 过的（不然中文/引号塞不进属性），
+  // 而拼 API URL 时还要再编码一次交给 HTTP —— 不加区分地拼，就会**编码两次**：
+  // 服务端解出来是字面量 "%E9%87%87%E8%B4%AD%E5%90%88%E5%90%8C"，一律 404。
+  // 本轮实测：技能文件管理里的「删除」「上传素材」「新增范文」以及新加的模板上传/下载
+  // 全都栽在这上面（界面上有按钮，点了报「技能不存在 / no such file」）。
+  // 统一走这两个助手：decSlug 拿原始名，urlSlug 得到「恰好一次」编码的 URL 片段。
+  function decSlug(slug) {
+    try { return decodeURIComponent(slug); } catch (e) { return slug; } // 名字里真有 % 时不炸
+  }
+  function urlSlug(slug) { return encodeURIComponent(decSlug(slug)); }
+
+  // templatefile = 技能目录里真被 fill_template 填充的 .docx/.xlsx 模板；
+  // 和 template（写作模板 template.md，教模型「怎么写」）是两回事，必须分开列，
+  // 否则用户会去改那份 md，以为改了模板样式。
+  const KIND_LABEL = { prompt: '核心提示词', template: '写作模板', templatefile: '模板文件（可填）', requirement: '训练需求', style: '风格画像', example: '参考范文', source: '原始素材', other: '其他' };
+  const KIND_ICON = { prompt: '🧠', template: '📋', templatefile: '📃', requirement: '📐', style: '🎯', example: '📄', source: '📁', other: '📎' };
+  // 空分组也要显示的 kind（用户来这里就是为了找模板/加范文，隐藏空组等于把入口藏了）
+  const KIND_EMPTY_HINT = {
+    templatefile: '暂无模板文件，点上方「上传模板」加一个（.docx/.xlsx，同名重传即替换）',
+    example: '暂无，下方添加',
+  };
   let curSkillSlug = null;
   let curEditPath = null; // last file open in the IDE editor (persists across reloads)
 
@@ -359,12 +378,13 @@
   }
 
   function renderSkillFiles(body, files) {
-    const groups = ['prompt', 'template', 'requirement', 'style', 'example', 'source'];
+    const groups = ['prompt', 'template', 'templatefile', 'requirement', 'style', 'example', 'source'];
     // LEFT: file tree; RIGHT: editor
     let tree = '', right = '';
     // top action row (new example / upload source) pinned above tree
     tree += `<div class="kb-tree-actions">
         <button class="btn ghost" onclick="window.addExampleView()">+ 新增范文</button>
+        <button class="btn ghost" onclick="window.uploadTemplateView()">+ 上传模板</button>
         <button class="btn ghost" onclick="window.uploadSourceView()">+ 上传素材</button>
         <button class="btn ghost" onclick="window.editMetaView()">元数据</button>
         <button class="btn ghost" onclick="window.showReviewPanel()">✨ AI 优化</button>
@@ -372,24 +392,24 @@
       </div>`;
     for (const k of groups) {
       const items = files.filter(f => f.kind === k);
-      if (!items.length && k !== 'example') continue;
+      if (!items.length && !KIND_EMPTY_HINT[k]) continue;
       tree += `<div class="kb-group">
         <div class="kb-group-title">${KIND_ICON[k]} ${KIND_LABEL[k]} <span class="dim" style="font-weight:400">(${items.length})</span></div>
         <div class="kb-list">`;
       if (!items.length) {
-        tree += `<div class="kb-empty">暂无，下方添加</div>`;
+        tree += `<div class="kb-empty">${KIND_EMPTY_HINT[k] || '暂无'}</div>`;
       } else {
         for (const f of items) {
           const canEdit = f.editable;
-          const canDel = f.kind === 'example' || f.kind === 'source';
+          const canDel = f.kind === 'example' || f.kind === 'source' || f.kind === 'templatefile';
           // 只读文本在树上就要看得出来，别等点进去才发现改不了
           const roTag = fileViewMode(f) === 'readonly' ? ` <span class="chip">只读</span>` : '';
           tree += `<div class="kb-tree-row" data-path="${esc(f.path)}" onclick="window.openEditorFile('${encodeURIComponent(curSkillSlug)}','${escapeJs(f.path)}')" title="${esc(f.path)}">
             <span class="kb-tree-name">${esc(f.name)} <span class="dim">${f.size}B</span>${roTag}</span>
             <span class="kb-tree-ops">
               ${canEdit ? `<button class="link-btn" onclick="event.stopPropagation()">编辑</button>` : ''}
-              <a class="link-btn" title="下载" href="/api/admin/skills/${encodeURIComponent(curSkillSlug)}/file?path=${encodeURIComponent(f.path)}&download=1" onclick="event.stopPropagation()">⬇</a>
-              ${canDel ? `<button class="icon-btn danger" title="删除" onclick="event.stopPropagation();window.delSkillFile('${encodeURIComponent(curSkillSlug)}','${escapeJs(f.path)}')">✕</button>` : ''}
+              <button class="link-btn" title="下载" onclick="event.stopPropagation();window.downloadSkillFile('${encodeURIComponent(curSkillSlug)}','${escapeJs(f.path)}')">⬇</button>
+              ${canDel ? `<button class="icon-btn danger" title="删除" onclick="event.stopPropagation();window.delSkillFile('${encodeURIComponent(curSkillSlug)}','${escapeJs(f.path)}','${escapeJs(f.kind)}')">✕</button>` : ''}
             </span>
           </div>`;
         }
@@ -489,7 +509,7 @@
 
     // open a file from the tree -> highlight + edit
     window.openEditorFile = async (slug, path) => {
-      slug = decodeURIComponent(slug);
+      slug = decSlug(slug);
       // highlight active row
       const rows = document.querySelectorAll('#kb-tree .kb-tree-row');
       rows.forEach(r => r.classList.toggle('active', r.dataset.path === decodeURIComponent(path)));
@@ -498,7 +518,7 @@
 
     // edit a file (CodeMirror)
     window.editSkillFile = async (slug, path) => {
-      slug = decodeURIComponent(slug);
+      slug = decSlug(slug);
       curEditPath = decodeURIComponent(path); // remember for reload persistence
       destroyCm();
       const ed = $('kb-editor');
@@ -518,7 +538,7 @@
             '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">' +
               '<b>预览 ' + esc(j.path) + '</b>' +
               '<div style="display:flex;gap:8px;align-items:center">' +
-                '<a class="btn ghost" href="/api/admin/skills/' + encodeURIComponent(slug) + '/file?path=' + encodeURIComponent(path) + '&download=1">下载</a>' +
+                '<button class="btn ghost" onclick="window.downloadSkillFile(\'' + encodeURIComponent(slug) + '\',\'' + path + '\')">下载</button>' +
                 '<button class="btn ghost" onclick="closeDetailEditor()">关闭</button>' +
               '</div>' +
             '</div>' +
@@ -566,7 +586,7 @@
                 '<span class="dim" style="font-size:11.5px">' + esc(readOnlyNotice(j)) + '</span>' +
                 '<span id="cm-stats" class="dim" style="font-size:11.5px"></span>' +
                 '<button class="btn ghost" onclick="toggleCmFullscreen()">全屏</button>' +
-                '<a class="btn ghost" href="/api/admin/skills/' + encodeURIComponent(slug) + '/file?path=' + encodeURIComponent(path) + '&download=1">下载</a>' +
+                '<button class="btn ghost" onclick="window.downloadSkillFile(\'' + encodeURIComponent(slug) + '\',\'' + path + '\')">下载</button>' +
                 '<button class="btn ghost" onclick="closeDetailEditor()">关闭</button>' +
               '</div>' +
             '</div>' +
@@ -608,7 +628,7 @@
 
 
     window.saveSkillFile = async (slug, path) => {
-      slug = decodeURIComponent(slug);
+      slug = decSlug(slug);
       // 双保险：只读视图本来就不渲染保存入口，这里再拦一道，
       // 免得将来某处误接线又把请求发到后端（后端会 400，用户白等一条报错）。
       if (cmReadOnly) { toast('该文件为只读内容，不可编辑', 'err'); return; }
@@ -660,7 +680,7 @@
   window.doAddExample = async (slug) => {
     const content = cmContent();
     if (!content.trim()) { toast('内容不能为空', 'err'); return; }
-    const r = await fetch(`/api/admin/skills/${encodeURIComponent(slug)}/example`, {
+    const r = await fetch(`/api/admin/skills/${urlSlug(slug)}/example`, {
       method: 'POST', headers: authHdr(), body: JSON.stringify({ content })
     });
     const j = await r.json();
@@ -690,7 +710,7 @@
     if (!input.files.length) { toast('请选择文件', 'err'); return; }
     const fd = new FormData();
     fd.append('file', input.files[0]);
-    const r = await fetch(`/api/admin/skills/${encodeURIComponent(slug)}/file`, {
+    const r = await fetch(`/api/admin/skills/${urlSlug(slug)}/file`, {
       method: 'POST', headers: { 'Authorization': 'Bearer ' + token() }, body: fd
     });
     const j = await r.json();
@@ -698,10 +718,83 @@
     else toast(j.error || '上传失败', 'err');
   };
 
-  // delete example file
-  window.delSkillFile = async (slug, path) => {
-    if (!confirm('删除这篇示例范文？')) return;
-    const r = await fetch(`/api/admin/skills/${encodeURIComponent(slug)}/file?path=${encodeURIComponent(path)}`, {
+  // 上传可填模板（.docx/.xlsx）——落到技能目录顶层，也就是 fill_template 真正读的位置。
+  // 换模板 = 同名重传：后端同名覆盖，前端这里不用另设「替换」入口。
+  window.uploadTemplateView = () => {
+    const ed = $('kb-editor');
+    ed.style.display = 'block'; ed.classList.remove('hidden');
+    ed.classList.remove('ide-mode'); ed.classList.add('form-mode');
+    ed.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <b>上传模板文件</b>
+        <div><button class="btn ghost" onclick="closeDetailEditor()">取消</button>
+        <button class="btn primary" onclick="window.doUploadTemplate('${encodeURIComponent(curSkillSlug)}')">上传</button></div>
+      </div>
+      <div class="drop" id="tpl-drop" style="margin-bottom:8px">点击选择模板文件（.docx / .xlsx）</div>
+      <p class="dim" style="margin:0">同名重传即替换原模板；模板不参与版本回滚，替换前可先下载留存。</p>
+      <input type="file" id="tpl-input" accept=".docx,.xlsx" style="display:none">`;
+    const drop = $('tpl-drop'), input = $('tpl-input');
+    drop.addEventListener('click', () => input.click());
+    input.addEventListener('change', () => { if (input.files.length) drop.textContent = '已选择：' + input.files[0].name; });
+  };
+  window.doUploadTemplate = async (slug) => {
+    const input = $('tpl-input');
+    if (!input.files.length) { toast('请选择模板文件', 'err'); return; }
+    const fd = new FormData();
+    fd.append('file', input.files[0]);
+    fd.append('target', 'template'); // 后端据此落到技能目录顶层（而非 source/），并跳过文字抽取
+    const r = await fetch(`/api/admin/skills/${urlSlug(slug)}/file`, {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + token() }, body: fd
+    });
+    const j = await r.json();
+    if (r.ok) { toast('模板已上传', 'ok'); closeDetailEditor(); loadSkillFiles(curSkillSlug); }
+    else toast(j.error || '上传失败', 'err');
+  };
+
+  // 下载技能文件。
+  //
+  // 不能用 `<a href="…&download=1">`：那个接口走 Bearer 头鉴权，`<a>` 带不上头，
+  // 浏览器点下去只会拿到 401 —— 界面上有「⬇」但永远下不来（本轮真浏览器的实测结果，
+  // 之前一直被「验证代理替请求补了 Authorization」掩盖着，看不出问题）。
+  // 所以改成前端自己 fetch（带 authHdr()）→ 转 blob → 触发保存。
+  window.downloadSkillFile = async (slug, path) => {
+    const url = `/api/admin/skills/${urlSlug(slug)}/file?path=${encodeURIComponent(path)}&download=1`;
+    let r;
+    try {
+      r = await fetch(url, { headers: authHdr() });
+    } catch (e) { toast('网络错误', 'err'); return; }
+    if (!r.ok) {
+      let msg = '下载失败（' + r.status + '）';
+      try { msg = (await r.json()).error || msg; } catch (e) { /* 非 JSON 响应 */ }
+      toast(msg, 'err');
+      return;
+    }
+    const blob = await r.blob();
+    // 文件名优先取服务端 Content-Disposition（RFC 5987 的 filename* 带中文名），
+    // 取不到再退回路径末段 —— 中文名走路径会被 URL 编码，直接当文件名会是一串 %E9…
+    const cd = r.headers.get('Content-Disposition') || '';
+    const star = /filename\*=UTF-8''([^;]+)/i.exec(cd);
+    const plain = /filename="?([^";]+)"?/i.exec(cd);
+    let name = path.split('/').pop();
+    if (star) { try { name = decodeURIComponent(star[1]); } catch (e) { /* 保持原样 */ } }
+    else if (plain) { name = plain[1]; }
+    const a = document.createElement('a');
+    const objUrl = URL.createObjectURL(blob);
+    a.href = objUrl;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(objUrl), 10000);
+  };
+
+  // delete example / source / template file
+  window.delSkillFile = async (slug, path, kind) => {
+    const what = kind === 'templatefile' ? '这个模板文件？删掉后该技能就没有可填模板了'
+      : kind === 'source' ? '这个原始素材？'
+      : '这篇示例范文？';
+    if (!confirm('删除' + what)) return;
+    const r = await fetch(`/api/admin/skills/${urlSlug(slug)}/file?path=${encodeURIComponent(path)}`, {
       method: 'DELETE', headers: authHdr()
     });
     const j = await r.json();
