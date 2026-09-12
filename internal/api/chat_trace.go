@@ -35,10 +35,9 @@ type traceClock struct {
 	write func(ev, data string)
 	beat  time.Duration
 
-	mu      sync.Mutex
-	steps   []agent.TraceStep
-	start   time.Time
-	stopped bool
+	mu    sync.Mutex
+	steps []agent.TraceStep
+	start time.Time
 
 	stopOnce sync.Once
 	done     chan struct{}
@@ -47,9 +46,17 @@ type traceClock struct {
 
 // newTraceClock 立刻下发首帧并起心跳。
 func newTraceClock(write func(ev, data string), steps []agent.TraceStep) *traceClock {
+	return newTraceClockBeat(write, steps, traceBeat)
+}
+
+// newTraceClockBeat 是带节拍参数的构造器。存在的唯一理由是**可测性**：
+// beat 必须在起 goroutine 之前定下来。曾经测试是在 newTraceClock 之后直接改
+// c.beat，于是 loop() 读 c.beat 与测试写 c.beat 构成数据竞争——本地不带 -race
+// 全绿，CI 上 `go test -race` 当场红（真踩过）。参数注入比给 beat 加锁干净。
+func newTraceClockBeat(write func(ev, data string), steps []agent.TraceStep, beat time.Duration) *traceClock {
 	c := &traceClock{
 		write: write,
-		beat:  traceBeat,
+		beat:  beat,
 		start: time.Now(),
 		done:  make(chan struct{}),
 	}
@@ -127,9 +134,6 @@ func (c *traceClock) loop() {
 
 func (c *traceClock) stop() {
 	c.stopOnce.Do(func() {
-		c.mu.Lock()
-		c.stopped = true
-		c.mu.Unlock()
 		close(c.done)
 		c.wg.Wait() // 等心跳 goroutine 退净，避免终帧之后又冒出一帧
 	})

@@ -74,8 +74,7 @@ func TestTraceClockEmitsFirstFrameAtOnce(t *testing.T) {
 // 心跳：阻塞期间必须持续有帧，且带上「已用 Ns」，否则用户无法判断是卡死还是慢。
 func TestTraceClockHeartbeatsWithElapsed(t *testing.T) {
 	rec := &frameRec{}
-	c := newTraceClock(rec.write, bootSteps())
-	c.beat = 15 * time.Millisecond
+	c := newTraceClockBeat(rec.write, bootSteps(), 15*time.Millisecond)
 	defer c.Freeze()
 
 	time.Sleep(90 * time.Millisecond)
@@ -95,8 +94,7 @@ func TestTraceClockHeartbeatsWithElapsed(t *testing.T) {
 // 秒数只装饰发送副本，绝不能写回内部状态（否则文案会叠成「已用 3s（已用 6s）」）。
 func TestTraceClockElapsedDoesNotPolluteState(t *testing.T) {
 	rec := &frameRec{}
-	c := newTraceClock(rec.write, bootSteps())
-	c.beat = 10 * time.Millisecond
+	c := newTraceClockBeat(rec.write, bootSteps(), 10*time.Millisecond)
 	defer c.Freeze()
 	time.Sleep(50 * time.Millisecond)
 
@@ -115,8 +113,7 @@ func TestTraceClockElapsedDoesNotPolluteState(t *testing.T) {
 // 等待用户补充时要停跳：等待态继续跳秒会让人以为后台还在跑。
 func TestTraceClockQuietWhileAwaiting(t *testing.T) {
 	rec := &frameRec{}
-	c := newTraceClock(rec.write, bootSteps())
-	c.beat = 15 * time.Millisecond
+	c := newTraceClockBeat(rec.write, bootSteps(), 15*time.Millisecond)
 	defer c.Freeze()
 
 	c.Awaiting("等待补充：金额")
@@ -138,8 +135,7 @@ func TestTraceClockQuietWhileAwaiting(t *testing.T) {
 // Finish 必须：全部 done + 停跳（终帧之后不能再冒帧，否则前端会闪回「进行中」）。
 func TestTraceClockFinishMarksDoneAndStops(t *testing.T) {
 	rec := &frameRec{}
-	c := newTraceClock(rec.write, bootSteps())
-	c.beat = 15 * time.Millisecond
+	c := newTraceClockBeat(rec.write, bootSteps(), 15*time.Millisecond)
 	defer c.Freeze()
 
 	c.Finish()
@@ -220,5 +216,29 @@ func TestTraceOnlyEmittedThroughClock(t *testing.T) {
 	}
 	if !strings.Contains(string(src), "newTraceClock(write, []agent.TraceStep{{") {
 		t.Fatal("chat.go 未在请求入口下发步骤骨架 —— 首帧缺失即回到「空白加载」")
+	}
+}
+
+// 回归守卫：心跳节拍必须在起 goroutine 之前定死。
+// 曾经的写法是构造完再给节拍字段赋值，于是 loop() 读、测试写，构成数据竞争：
+// 本地不带 -race 全绿、CI 上 `go test -race` 红。（正解是 newTraceClockBeat 参数注入。）
+func TestTraceBeatIsNotMutatedAfterConstruction(t *testing.T) {
+	// 病毒串拆开拼：否则本文件里的注释/字面量自己就命中自己（这坑踩了两遍）。
+	needle := "." + "beat" + " " + "="
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("读目录失败: %v", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
+			continue
+		}
+		b, err := os.ReadFile(e.Name())
+		if err != nil {
+			t.Fatalf("读 %s 失败: %v", e.Name(), err)
+		}
+		if strings.Contains(string(b), needle) {
+			t.Fatalf("%s 里出现构造后改写心跳节拍 —— 与心跳 goroutine 构成数据竞争，请用 newTraceClockBeat 注入", e.Name())
+		}
 	}
 }
