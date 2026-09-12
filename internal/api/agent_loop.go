@@ -104,6 +104,7 @@ func agentSystemPrompt() string {
 func (h *chatHandler) runAgentLoop(
 	ctx context.Context,
 	write func(ev, data string),
+	clock *traceClock,
 	req chatReq,
 	eval agent.Eval,
 	history []agent.Message,
@@ -124,7 +125,7 @@ func (h *chatHandler) runAgentLoop(
 		Detail: "模型将自行决定调用哪些工具",
 		Status: "active",
 	})
-	write(evTrace, jsonSafe(steps))
+	clock.Set(steps)
 
 	// toolNo 是稳定的工具序号：不能用 len(steps) 推算——running 事件刚追加过步骤，
 	// 用长度算会从 2 开始跳号（实测踩过）。
@@ -143,7 +144,7 @@ func (h *chatHandler) runAgentLoop(
 				Detail: d,
 				Status: "active",
 			})
-			write(evTrace, jsonSafe(steps))
+			clock.Set(steps)
 		case "done", "error":
 			detail := ev.Note
 			if detail == "" {
@@ -156,7 +157,7 @@ func (h *chatHandler) runAgentLoop(
 				steps[len(steps)-1].Detail = detail
 				steps[len(steps)-1].Status = "done"
 			}
-			write(evTrace, jsonSafe(steps))
+			clock.Set(steps)
 		}
 	}
 
@@ -166,7 +167,7 @@ func (h *chatHandler) runAgentLoop(
 		// 循环失败：把错误交给前端，但不要静默变成空回答
 		steps[len(steps)-1].Status = "done"
 		steps[len(steps)-1].Detail = "失败：" + err.Error()
-		write(evTrace, jsonSafe(steps))
+		clock.Set(steps)
 		write(evError, jsonSafe(map[string]string{"error": "工具执行失败: " + err.Error()}))
 		return true
 	}
@@ -179,7 +180,7 @@ func (h *chatHandler) runAgentLoop(
 			steps[len(steps)-1].Detail = fmt.Sprintf("共调用 %d 次工具", n)
 		}
 	}
-	write(evTrace, jsonSafe(steps))
+	clock.Set(steps)
 
 	text := strings.TrimSpace(out.Text)
 	if text == "" {

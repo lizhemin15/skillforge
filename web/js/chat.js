@@ -808,12 +808,14 @@
       head.addEventListener('click', () => {
         const body = trace.querySelector('.ch-tr-body');
         const isOpen = trace.classList.toggle('open');
+        // 记下用户的手动选择：之后自动开合一律让位，别跟用户抢控制权
+        trace.dataset.manual = isOpen ? 'open' : 'close';
         if (body) body.style.display = isOpen ? 'block' : 'none';
         head.querySelector('.ch-tr-chev').textContent = isOpen ? '▾' : '▸';
       });
       const body = el('div', 'ch-tr-body');
-      body.style.display = 'none'; // 收敛成轻量状态条：默认折叠，点展开看细节
-      trace.classList.remove('open'); // 不自动展开调度细节
+      body.style.display = 'none';
+      trace.classList.remove('open');
       trace.appendChild(head); trace.appendChild(body);
     }
     // status badge: live pulse while running, ✓ count when done
@@ -830,6 +832,18 @@
     } else {
       statusEl.className = 'ch-tr-status';
       statusEl.textContent = doneCount + '/' + steps.length;
+    }
+
+    // 运行中自动展开时间线、结束后自动收起。用户反馈过「问完以后看不到中间步骤，
+    // 一直转圈然后直接出答案」，所以过程默认必须可见；跑完收起保持界面清爽。
+    // 手动点过表头的（dataset.manual）以用户为准，不再自动干预。
+    if (trace.dataset.manual !== 'open' && trace.dataset.manual !== 'close') {
+      const shell = trace.querySelector('.ch-tr-body');
+      const wantOpen = !!live;
+      trace.classList.toggle('open', wantOpen);
+      if (shell) shell.style.display = wantOpen ? 'block' : 'none';
+      const chev = head.querySelector('.ch-tr-chev');
+      if (chev) chev.textContent = wantOpen ? '▾' : '▸';
     }
 
     // ---- step timeline ----

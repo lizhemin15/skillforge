@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lizhemin15/skillforge/internal/agent"
@@ -70,12 +71,27 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
+	// SSE 帧必须串行写：心跳 goroutine 与主流程都会下发 trace 帧，不加锁会把
+	// 「event:/data:」切碎，前端解析直接失败。
+	var wmu sync.Mutex
 	write := func(ev, data string) {
+		wmu.Lock()
+		defer wmu.Unlock()
 		if _, err := w.Write([]byte("event: " + ev + "\ndata: " + data + "\n\n")); err != nil {
 			return
 		}
 		fl.Flush()
 	}
+
+	// 0. 先画步骤骨架：第一件事就是让「思考中」出现在用户屏幕上。
+	//    意图分类是一次几十秒的阻塞调用，这之前什么都不发 = 用户干瞪眼。
+	clock := newTraceClock(write, []agent.TraceStep{{
+		Phase:  "analyze",
+		Label:  "① 意图分析",
+		Detail: "正在理解你的问题…",
+		Status: "active",
+	}})
+	defer clock.Freeze() // 兜底：任何分支（含 error 早退）都必须让心跳停下
 
 	ctx := r.Context()
 
@@ -95,18 +111,18 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	write(evMeta, jsonSafe(map[string]string{"reason": eval.Reason, "skill": eval.SkillSlug, "intent": eval.Intent}))
 
-	// surface the orchestrator's reasoning pipeline for writing tasks
-	// (skill hit OR general write/open-query intent), so users see the
-	// multi-agent scheduling even when no skill matches; chatter (chat) stays quiet.
-	showTrace := eval.SkillSlug != "" || eval.Intent == "write" || eval.Intent == "docgen" || eval.Intent == "query" || eval.NeedsTools
-	if showTrace && len(eval.Steps) > 0 {
-		write(evTrace, jsonSafe(eval.Steps))
+	// 把调度过程画给用户看。这里**不再**按意图过滤（闲聊也发）：过滤掉就等于
+	// 回到「几十秒空白 + 最后啪一下出答案」，那正是用户抱怨的现象。
+	steps := eval.Steps
+	if len(steps) == 0 {
+		steps = fallbackSteps(*eval)
 	}
+	clock.Set(normalizeSteps(steps))
 
 	// 2a. 工具循环优先：任务需要外部实时数据或真实计算时，交给 Agent 自己组合工具
 	//     （优先于技能快路径——否则模型会「凭记忆编数字」生成一份看着很像的文档）
 	if eval.NeedsTools {
-		if h.runAgentLoop(ctx, write, req, *eval, history) {
+		if h.runAgentLoop(ctx, write, clock, req, *eval, history) {
 			return
 		}
 	}
@@ -145,20 +161,8 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// surface missing required params as a needs event, then skip gen
 			msg := needsMessage(eval.Needs)
 			write(evNeeds, jsonSafe(eval.Needs))
-			// refresh trace so the generate step reads as "awaiting params" not active
-			if len(eval.Steps) > 0 {
-				waitSteps := make([]agent.TraceStep, len(eval.Steps))
-				copy(waitSteps, eval.Steps)
-				for i := range waitSteps {
-					if waitSteps[i].Status == "active" {
-						waitSteps[i].Status = "waiting"
-						waitSteps[i].Detail = "等待补充：" + needsShort(eval.Needs)
-					} else {
-						waitSteps[i].Status = "done"
-					}
-				}
-				write(evTrace, jsonSafe(waitSteps))
-			}
+			// 让 generate 那一步读作「等补充」而不是「还在跑」
+			clock.Awaiting("等待补充：" + needsShort(eval.Needs))
 			write(evDelta, jsonSafe(map[string]string{"t": msg}))
 			// record assistant prompt asking for the fields
 			h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: msg, SkillSlug: eval.SkillSlug, At: time.Now()})
@@ -182,15 +186,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"url":  "/api/chat/gen/" + tok,
 				"kind": "gen",
 			}))
-			// mark the generate step done so the trace panel shows completion
-			if len(eval.Steps) > 0 {
-				doneSteps := make([]agent.TraceStep, len(eval.Steps))
-				copy(doneSteps, eval.Steps)
-				for i := range doneSteps {
-					doneSteps[i].Status = "done"
-				}
-				write(evTrace, jsonSafe(doneSteps))
-			}
+			clock.Finish()
 			// Persist this turn's spec into session history (as a marker in the
 			// assistant message) so a follow-up "再加一行 / 把单价改成 8000"
 			// continues from THIS document instead of inventing a new one.
@@ -229,14 +225,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					"slug": eval.SkillSlug, "name": sc.Attachment,
 					"url": "/api/chat/attachment/" + eval.SkillSlug,
 				}))
-				if len(eval.Steps) > 0 {
-					doneSteps := make([]agent.TraceStep, len(eval.Steps))
-					copy(doneSteps, eval.Steps)
-					for i := range doneSteps {
-						doneSteps[i].Status = "done"
-					}
-					write(evTrace, jsonSafe(doneSteps))
-				}
+				clock.Finish()
 				h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: "已下发「" + sc.Name + "」空白模板。", SkillSlug: eval.SkillSlug, At: time.Now()})
 				write(evDone, jsonSafe(map[string]string{"skill": eval.SkillSlug}))
 				return
@@ -252,19 +241,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// The fill model decided the request lacks key facts (user gave
 				// a concrete edit intent but no specifics). Ask back instead of
 				// inventing data — like any decent AI would.
-				if len(eval.Steps) > 0 {
-					waitSteps := make([]agent.TraceStep, len(eval.Steps))
-					copy(waitSteps, eval.Steps)
-					for i := range waitSteps {
-						if waitSteps[i].Status == "active" {
-							waitSteps[i].Status = "waiting"
-							waitSteps[i].Detail = "信息不足，等待用户补充：" + joinQuestions(fres.Clarify.Questions)
-						} else {
-							waitSteps[i].Status = "done"
-						}
-					}
-					write(evTrace, jsonSafe(waitSteps))
-				}
+				clock.Awaiting("信息不足，等待用户补充：" + joinQuestions(fres.Clarify.Questions))
 				msg := "在填充前还需要确认几个信息：\n" + numberedQuestions(fres.Clarify.Questions)
 				write(evDelta, jsonSafe(map[string]string{"t": msg}))
 				h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: msg, SkillSlug: eval.SkillSlug, At: time.Now()})
@@ -280,15 +257,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					"url":  "/api/chat/gen/" + tok,
 					"kind": "gen",
 				}))
-				// mark generate step done for the trace panel
-				if len(eval.Steps) > 0 {
-					doneSteps := make([]agent.TraceStep, len(eval.Steps))
-					copy(doneSteps, eval.Steps)
-					for i := range doneSteps {
-						doneSteps[i].Status = "done"
-					}
-					write(evTrace, jsonSafe(doneSteps))
-				}
+				clock.Finish()
 				// Persist this turn's filled values INTO session history (as an
 				// assistant fill summary) so a follow-up edit turn can recover them
 				// and continue incrementally instead of wiping untouched fields.
@@ -311,15 +280,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: full, SkillSlug: eval.SkillSlug, At: time.Now()})
-		// mark the generate step done so the trace panel shows completion
-		if len(eval.Steps) > 0 {
-			doneSteps := make([]agent.TraceStep, len(eval.Steps))
-			copy(doneSteps, eval.Steps)
-			for i := range doneSteps {
-				doneSteps[i].Status = "done"
-			}
-			write(evTrace, jsonSafe(doneSteps))
-		}
+		clock.Finish()
 		// typed flow skill with a declared template file → dispatch it for download
 		if sc.Attachment != "" {
 			write(evFile, jsonSafe(map[string]string{
@@ -340,15 +301,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: full, At: time.Now()})
-	// for general write intent (no skill matched), close the trace panel as done
-	if showTrace && len(eval.Steps) > 0 {
-		doneSteps := make([]agent.TraceStep, len(eval.Steps))
-		copy(doneSteps, eval.Steps)
-		for i := range doneSteps {
-			doneSteps[i].Status = "done"
-		}
-		write(evTrace, jsonSafe(doneSteps))
-	}
+	clock.Finish()
 	write(evDone, jsonSafe(map[string]string{"skill": ""}))
 }
 

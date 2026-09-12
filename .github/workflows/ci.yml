@@ -88,6 +88,15 @@ jobs:
       - name: 前端回归（技能模板文件）
         run: node web/tests/skill_template_files.test.mjs
 
+      # 调度过程可见性：用户原话「问完以后中间步骤都没有显示，一直加载状态，
+      # 最后显示一个最终答案」。后端那半（心跳帧、闲聊也发步骤）由 internal/api
+      # 的单测守；这半边是前端——时间线必须运行中自动展开、跑完自动收起、手动开合
+      # 优先于自动。函数写对了但没人调用、或展开逻辑被删，界面都会退回「白等」。
+      - name: 前端回归（AI 调度台过程可见性）
+        run: |
+          node --check web/js/chat.js
+          node web/tests/chat_trace.test.mjs
+
       - name: Build
         run: |
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o skillforge ./cmd/server
