@@ -208,5 +208,31 @@ console.log('聊天界面 · 结构与样式');
   check('本页资源带缓存版本号', /\?v=20\d{6}[A-Z]/.test(INDEX_HTML));
 }
 
+console.log('聊天方式 · 技能失效降级说明');
+{
+  const noteLine = bind(CHAT_JS, 'function metaNoteLine(');
+  const degraded = { mode: 'auto', note: '指定的技能「公司新闻通稿」不可用，已改用自动调度' };
+  check('有 note → 渲染成引用行', noteLine(degraded) === '> ' + degraded.note + '\n\n');
+  check('没 note → 什么都不加', noteLine({ mode: 'auto' }) === '');
+  check('空对象/undefined 不炸', noteLine(undefined) === '' && noteLine({}) === '');
+  // 这句话必须落在"该轮回复"的渲染路径上，且不能被轨迹面板的存在与否连带。
+  // 曾经它挂在 if (trace) 里面：轨迹面板一旦没渲染出来，降级说明就被静默吞掉，
+  // 用户只看到"结果不对"，永远不知道是技能被删了。
+  // ⚠️ 锚点要整段锚：早先写 indexOf('metaNoteLine(obj)') 会先命中函数定义
+  // 「function metaNoteLine(obj) {」，定义在 case meta 之前 → 断言恒假红。
+  // 定 call site 的整段形状才是"真的在这一段里被调用"。
+  const iNote = CHAT_JS.indexOf('appendText(bubble, metaNoteLine(obj))');
+  const iMeta = CHAT_JS.indexOf("case 'meta'");
+  const iTraceGuard = CHAT_JS.indexOf('if (trace) {', iMeta);
+  check('case meta 里调用了 metaNoteLine', iNote > 0);
+  check('降级说明在 case meta 的渲染路径上', iMeta > 0 && iNote > iMeta);
+  // 光比"在同一段里"不够：把它塞进下面那个 if (trace) 里也满足顺序关系，
+  // 但那样就退回成"轨迹面板不在=这句话被吞"。所以必须证明它排在守卫之前。
+  check('降级说明排在 if (trace) 守卫之前（面板缺失也不会被吞）',
+    iTraceGuard > 0 && iNote < iTraceGuard);
+  check('不再直接用 obj.note 拼引用行（免得又挪回 trace 里面）',
+    !CHAT_JS.includes('if (obj.note) appendText(bubble'));
+}
+
 if (failures) { console.log(`\n${failures} 项失败`); process.exit(1); }
 console.log('\n全部通过');

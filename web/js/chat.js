@@ -738,6 +738,13 @@
     skPanel.classList.add('hidden');
     skBtn.setAttribute('aria-expanded', 'false');
   }
+  // 后端降级说明 → 渲染成回复开头的引用行。
+  // 单独抽出来是为了能被回归测试直接调用：这句话只有一条，丢了用户就抓瞎。
+  function metaNoteLine(obj) {
+    if (!obj || !obj.note) return '';
+    return '> ' + obj.note + '\n\n';
+  }
+
   function toggleSkPanel() {
     if (skPanel.classList.contains('hidden')) openSkPanel(false); else closeSkPanel();
   }
@@ -894,12 +901,13 @@
         break;
       case 'meta':
         if (obj.text) appendText(bubble, obj.text + '\n');
+        // 降级说明要走在 trace 判断外面。挂在里面的话，只要轨迹面板没渲染出来
+        // （换布局/元素缺失），"你锁的技能没了、已改用自动调度"这句话就被静默吞掉，
+        // 用户只会看到结果不对，永远不知道该怪谁。
+        if (metaNoteLine(obj)) appendText(bubble, metaNoteLine(obj));
         if (trace) {
           // 手动/自动要贯穿整轮：轨迹面板的角色徽章按它切换措辞。
           if (obj.mode) trace.dataset.mode = obj.mode;
-          // 指定的技能用不了（刚被删/停用）时后端会降级成自动，必须告诉用户，
-          // 否则他会以为"我明明锁了技能，怎么结果不一样"。
-          if (obj.note) appendText(bubble, '> ' + obj.note + '\n\n');
           if (obj.skill) {
             trace.dataset.skill = obj.skill;
           } else if (obj.intent === 'query') {

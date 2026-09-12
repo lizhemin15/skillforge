@@ -72,18 +72,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 手动模式：用户点名的技能必须真实存在，否则派生的动作/步骤全是错的。
 	// 技能不存在（刚被删/被停用）或不给 slug 都退回自动调度 —— 悄悄换技能很糟，
 	// 所以原因会挂到 meta 事件上让前端提示一句。
-	var manualSkill *agent.SkillContent
-	manualNote := ""
-	if mode == "manual" && req.Skill != "" {
-		if sc, lerr := h.eng.LoadSkill(req.Skill); lerr == nil {
-			manualSkill = sc
-		} else {
-			manualNote = "指定的技能「" + req.Skill + "」不可用，已改用自动调度"
-			mode = "auto"
-		}
-	} else {
-		mode = "auto"
-	}
+	manualSkill, mode, manualNote := resolveMode(mode, req.Skill, h.eng.LoadSkill)
 
 	// SSE plumbing
 	fl, ok := w.(http.Flusher)
@@ -351,6 +340,23 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: full, At: time.Now()})
 	clock.Finish()
 	write(evDone, jsonSafe(map[string]string{"skill": ""}))
+}
+
+// resolveMode 把手动模式解析成"真正要用的技能 + 生效模式 + 给用户的一句说明"。
+// 抽成纯函数是为了能单独测：这里错一步，用户要么会看到"锁定了 A 技能却按 B 出结果"，
+// 要么会看到"技能已经没了，界面一声不吭地换了技能"。
+// load 传 nil 或返回错误都当成"技能不可用"，退回自动调度并给出原因。
+func resolveMode(mode, slug string, load func(string) (*agent.SkillContent, error)) (*agent.SkillContent, string, string) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	slug = strings.TrimSpace(slug)
+	if mode != "manual" || slug == "" || load == nil {
+		return nil, "auto", ""
+	}
+	sc, err := load(slug)
+	if err != nil || sc == nil {
+		return nil, "auto", "指定的技能「" + slug + "」不可用，已改用自动调度"
+	}
+	return sc, "manual", ""
 }
 
 // fillSummarySuffix renders the just-filled field values as a compact tracer
