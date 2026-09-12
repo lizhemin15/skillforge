@@ -214,8 +214,27 @@ func TestTraceOnlyEmittedThroughClock(t *testing.T) {
 	if !strings.Contains(string(src), "defer clock.Freeze()") {
 		t.Fatal("chat.go 缺少 defer clock.Freeze()，error 早退时心跳会漏停")
 	}
-	if !strings.Contains(string(src), "newTraceClock(write, []agent.TraceStep{{") {
-		t.Fatal("chat.go 未在请求入口下发步骤骨架 —— 首帧缺失即回到「空白加载」")
+	// 骨架必须在**请求入口**就绪，而且必须早于意图分类 —— 顺序反了就等于
+	// 「分类跑完才画步骤」，中间那几十秒屏幕依旧空白（正是用户投诉的原现象）。
+	//
+	// 这里只认"先后关系 + 骨架里有 active"，不认具体调用写法：
+	// 上一版断言写死了 `newTraceClock(write, []agent.TraceStep{{`，本轮把骨架
+	// 抽成 seed 变量以便手动模式换一套步骤，功能没退化、守卫却假红了一次。
+	// 断言骑在实现形状上就会这样 —— 守行为，别守写法。
+	iClock := strings.Index(string(src), "newTraceClock(")
+	if iClock < 0 {
+		t.Fatal("chat.go 未构造 traceClock —— 步骤无从下发")
+	}
+	iClassify := strings.Index(string(src), "EvalTurn(")
+	if iClassify >= 0 && iClock > iClassify {
+		t.Fatal("traceClock 构造晚于意图分类 —— 分类阻塞期间屏幕依旧空白")
+	}
+	skeleton := string(src)
+	if iClassify > 0 {
+		skeleton = string(src)[:iClassify] // 分类之前的代码 = 骨架构造区
+	}
+	if !strings.Contains(skeleton, "Status: \"active\"") {
+		t.Fatal("请求入口的骨架里没有 active 步骤 —— 首帧会是没有进度的空壳")
 	}
 }
 

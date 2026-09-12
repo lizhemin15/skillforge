@@ -17,6 +17,14 @@ func (s *SkillStore) seedCoreSkills() {
 		"",
 		coreDocGenSystemPrompt,
 	)
+	s.ensureCoreSkill(
+		"技能工厂",
+		"技能工厂",
+		`按用户需求设计并产出一个可直接落地的技能定义（名称、slug、类型、输入参数、系统提示词、模板结构），产出物可直接导入「技能管理 → 新建技能」。触发场景：帮我做一个技能、根据需求生成 skill、把一套流程/规范沉淀成技能、我想要一个能自动写 XX 的技能、这个技能怎么设计。`,
+		"write",
+		"",
+		coreSkillStudioSystemPrompt,
+	)
 }
 
 // ensureCoreSkill creates (if missing) a single built-in skill: its metadata

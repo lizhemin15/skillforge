@@ -22,6 +22,9 @@ type SkillStore struct {
 func NewSkillStore(db *sql.DB, dataDir string) *SkillStore {
 	s := &SkillStore{db: db, skillsDir: filepath.Join(dataDir, "skills")}
 	s.seedCoreSkills()
+	// 历史库里有技能被错误地标成核心（业务技能占了核心位）。
+	// 归一化只跑一次，之后管理端「设为核心 / 取消核心」的选择不会再被启动流程覆盖。
+	_, _ = s.NormalizeCoreSkills(DefaultCoreSkillSlugs)
 	return s
 }
 

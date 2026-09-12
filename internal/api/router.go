@@ -116,6 +116,7 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("DELETE /api/admin/llms/{id}", h.Auth.Middleware(h.Admin.DeleteLLM))
 	mux.HandleFunc("POST /api/admin/train", h.Auth.Middleware(h.Admin.Train))
 	mux.HandleFunc("POST /api/admin/skills/toggle", h.Auth.Middleware(h.Admin.ToggleSkill))
+	mux.HandleFunc("POST /api/admin/skills/core", h.Auth.Middleware(h.Admin.SetSkillCore))
 	mux.HandleFunc("DELETE /api/admin/skills/{slug}", h.Auth.Middleware(h.Admin.DeleteSkill))
 
 	// ---- knowledge-base style skill file management ----

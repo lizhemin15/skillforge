@@ -5,6 +5,29 @@
   const input = $('#chat-input'), send = $('#chat-send');
   const welcome = $('#welcome'), suggs = $('#suggestions');
   const pill = $('#active-skill-pill');
+  const modeAuto = $('#mode-auto'), modeManual = $('#mode-manual');
+  const skBtn = $('#skill-pick-btn'), skLabel = $('#skill-pick-label');
+  const skPanel = $('#skill-panel'), skSearch = $('#skill-search'), skList = $('#skill-list');
+  const footnote = $('#ch-footnote');
+
+  // —— 两种对话方式 ——
+  // auto   : 让引擎自己理解意图，从技能库里挑（默认，适合"我也不知道该用哪个"）
+  // manual : 用户点名技能，后端整跳过一次意图分类 —— 不只是更准，也快得多
+  const MODE_KEY = 'skillforge.chatmode';
+  const SKILL_KEY = 'skillforge.chatskill';
+  let chatMode = 'auto';
+  let pickedSkill = null;   // { slug, name } —— manual 模式下锁定发送的技能
+  let allSkills = [];       // /api/skills 缓存（面板与欢迎卡片共用）
+  let skFetched = false;
+
+  const FOOTNOTE = {
+    auto: '引擎会自己理解你的需求，从技能库里挑最合适的技能',
+    manual: '已锁定技能，全程只按这一个技能的规矩来 —— 跳过意图识别，出结果更快',
+  };
+  const PLACEHOLDER = {
+    auto: '说说你想写什么…（Enter 发送，Shift+Enter 换行）',
+    manual: '把材料和要求直接写在这里…（Enter 发送，Shift+Enter 换行）',
+  };
 
   // sessionId tracks the ACTIVE local session; restored on boot so a refresh
   // keeps the same id (and thus the server-side in-memory history).
@@ -297,6 +320,8 @@
     });
 
     renderSuggestions();
+    wireModes();
+    initModes();
     autoGrow();
     input.focus();
     input.addEventListener('keydown', (e) => {
@@ -363,28 +388,42 @@
     suggs.appendChild(b);
   }
 
-  // —— 场景卡片网格（方案 A：一卡 = 一件事，点开即填）——
+  // —— 场景卡片网格（一卡 = 一件事，点开即填）——
+  // 核心技能排最前：它们是"通用能力"，用户第一次来最该看见的就是这两张卡。
   function renderSkillCards(list) {
     suggs.className = 'ch-card-grid';
-    list.forEach((sk) => {
+    suggs.innerHTML = '';
+    const sorted = list.slice().sort((a, b) => (b.is_core ? 1 : 0) - (a.is_core ? 1 : 0));
+    sorted.forEach((sk) => {
       const t = TYPE_META[sk.skill_type] || TYPE_META.write;
-      const card = el('button', 'ch-card');
+      const card = el('button', 'ch-card' + (sk.is_core ? ' is-core' : ''));
       card.type = 'button';
+      card.dataset.slug = sk.slug;
       const hasForm = Array.isArray(sk.input_params) && sk.input_params.length > 0;
       card.innerHTML =
-        '<span class="ch-card-ic">' + t.icon + '</span>' +
+        '<span class="ch-card-ic">' + (sk.is_core ? CORE_STAR : t.icon) + '</span>' +
         '<span class="ch-card-txt">' +
-          '<span class="ch-card-name">' + esc(sk.name || sk.slug || '') + '</span>' +
+          '<span class="ch-card-name">' + esc(sk.name || sk.slug || '') +
+            (sk.is_core ? '<span class="ch-card-core">核心</span>' : '') + '</span>' +
           '<span class="ch-card-desc">' + esc(cardDesc(sk, t.tag)) + '</span>' +
         '</span>' +
         '<span class="ch-card-tag">' + esc(t.tag) + '</span>';
       card.addEventListener('click', () => {
+        if (chatMode === 'manual') {
+          // 手动模式：点卡片 = 指定这个技能，并顺手把示例填进去
+          pickSkill(sk);
+          const q = quickExample(sk);
+          if (q) { setInput(q); input.focus(); }
+          return;
+        }
         if (hasForm && Array.isArray(sk.input_params)) openSkillForm(sk, card);
         else { const q = quickExample(sk); if (q) { setInput(q); input.focus(); } }
       });
       suggs.appendChild(card);
     });
   }
+
+  const CORE_STAR = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 14.4 9l6 .5-4.6 4 1.4 5.9L12 16.4 6.8 19.4 8.2 13.5 3.6 9.5l6-.5z"/></svg>';
 
   function cardDesc(sk, tag) {
     const d = sk.description ? sk.description.trim() : '';
@@ -547,10 +586,187 @@
     }
   }
 
+  /* ---------- 对话方式切换 + 技能选择面板 ---------- */
+  function setMode(m, silent) {
+    chatMode = m === 'manual' ? 'manual' : 'auto';
+    try { localStorage.setItem(MODE_KEY, chatMode); } catch (e) {}
+    modeAuto.classList.toggle('on', chatMode === 'auto');
+    modeManual.classList.toggle('on', chatMode === 'manual');
+    modeAuto.setAttribute('aria-selected', String(chatMode === 'auto'));
+    modeManual.setAttribute('aria-selected', String(chatMode === 'manual'));
+    skBtn.classList.toggle('hidden', chatMode !== 'manual');
+    footnote.textContent = FOOTNOTE[chatMode];
+    input.placeholder = PLACEHOLDER[chatMode];
+    // 切到手动却还没选技能 → 直接把面板打开，别让用户猜下一步干什么
+    if (chatMode === 'manual' && !pickedSkill && !silent) openSkPanel(true);
+    else if (chatMode === 'auto') closeSkPanel();
+  }
+
+  function initModes() {
+    let m = 'auto', slug = '';
+    try {
+      m = localStorage.getItem(MODE_KEY) || 'auto';
+      slug = localStorage.getItem(SKILL_KEY) || '';
+    } catch (e) {}
+    // 技能是后加载的：先记下 slug，等索引回来再对齐（技能可能已被删/停用）
+    setMode(m, true);
+    if (slug) pendingSlug = slug;
+    loadSkillIndex().then(() => {
+      if (pendingSlug && allSkills.some((s) => s.slug === pendingSlug)) {
+        pickSkill(allSkills.find((s) => s.slug === pendingSlug), true);
+      } else if (pendingSlug) {
+        try { localStorage.removeItem(SKILL_KEY); } catch (e) {}
+      }
+    });
+  }
+  let pendingSlug = '';
+
+  function loadSkillIndex() {
+    if (skFetched) return Promise.resolve(allSkills);
+    return fetch('/api/skills')
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((data) => {
+        allSkills = ((data && data.skills) || []).slice()
+          .sort((a, b) => (b.is_core ? 1 : 0) - (a.is_core ? 1 : 0));
+        skFetched = true;
+        renderSkList('');
+        return allSkills;
+      })
+      .catch(() => allSkills);
+  }
+
+  // 技能面板的 HTML 由这个纯函数产出（skills/picked 全部走参数）。
+  // 抽成纯函数不是为了好看：分组与「核心标」是这一轮的核心交付物，
+  // 必须能被 web/tests 直接喂数据跑，而不是靠人肉点界面确认。
+  function skPanelHTML(q, picked, skills) {
+    const kw = (q || '').trim().toLowerCase();
+    const all = Array.isArray(skills) ? skills : [];
+    const hit = all.filter((sk) => {
+      if (!kw) return true;
+      return (String(sk.name || '') + ' ' + String(sk.slug || '') + ' ' + String(sk.description || ''))
+        .toLowerCase().includes(kw);
+    });
+    // 核心技能（通用能力）永远独占一组且排在业务技能前面 —— 顺序不靠后端排序兜底。
+    const core = hit.filter((s) => s.is_core), biz = hit.filter((s) => !s.is_core);
+    const block = (title, items) => items.length
+      ? '<div class="ch-skgroup"><div class="ch-skgroup-h">' + title + '<i>' + items.length + '</i></div>' +
+        items.map((sk) => skItemHtml(sk, picked)).join('') + '</div>'
+      : '';
+    // 已锁定技能时给一条"退路"：一键回到自动调度，免得用户找不到取消入口
+    const reset = picked
+      ? '<button type="button" class="ch-skitem ch-skreset" data-reset="1">' +
+        '<span class="ch-skitem-ic">↺</span>' +
+        '<span class="ch-skitem-txt"><span class="ch-skitem-name">不指定技能</span>' +
+        '<span class="ch-skitem-desc">改由引擎自己理解需求、按需挑技能</span></span>' +
+        '<span class="ch-skitem-tag">自动调度</span></button>'
+      : '';
+    return reset + block('核心技能 · 通用能力', core) + block('业务技能', biz);
+  }
+
+  function renderSkList(q) {
+    skList.innerHTML = skPanelHTML(q, pickedSkill, allSkills) || '<div class="ch-skempty">没有匹配的技能</div>';
+    skList.querySelectorAll('.ch-skitem').forEach((n) => {
+      n.addEventListener('click', () => {
+        if (n.dataset.reset) { clearSkill(); setMode('auto'); closeSkPanel(); input.focus(); return; }
+        const sk = allSkills.find((s) => s.slug === n.dataset.slug);
+        if (sk) { pickSkill(sk); input.focus(); }
+      });
+    });
+  }
+
+  function skItemHtml(sk, picked) {
+    const t = TYPE_META[sk.skill_type] || TYPE_META.write;
+    const on = picked && picked.slug === sk.slug ? ' on' : '';
+    return '<button type="button" class="ch-skitem' + on + '" data-slug="' + esc(sk.slug) + '">' +
+      '<span class="ch-skitem-ic">' + (sk.is_core ? '★' : '✦') + '</span>' +
+      '<span class="ch-skitem-txt">' +
+        '<span class="ch-skitem-name">' + esc(sk.name || sk.slug) +
+          (sk.is_core ? '<span class="ch-core">核心</span>' : '') + '</span>' +
+        '<span class="ch-skitem-desc">' + esc(cardDesc(sk, t.tag)) + '</span>' +
+      '</span>' +
+      '<span class="ch-skitem-tag">' + esc(t.tag) + '</span>' +
+    '</button>';
+  }
+
+  function pickSkill(sk, silent) {
+    if (!sk) return;
+    pickedSkill = { slug: sk.slug, name: sk.name || sk.slug };
+    try { localStorage.setItem(SKILL_KEY, pickedSkill.slug); } catch (e) {}
+    skLabel.textContent = pickedSkill.name;
+    skBtn.classList.add('picked');
+    if (!silent) {
+      closeSkPanel();
+      footnote.textContent = '已指定「' + pickedSkill.name + '」· 跳过意图识别，出结果更快';
+      document.querySelectorAll('.ch-card').forEach((c) => c.classList.toggle('on', c.dataset.slug === pickedSkill.slug));
+    }
+    renderSkList(skSearch.value);
+  }
+
+  function clearSkill() {
+    pickedSkill = null;
+    try { localStorage.removeItem(SKILL_KEY); } catch (e) {}
+    skLabel.textContent = '选择技能';
+    skBtn.classList.remove('picked');
+    document.querySelectorAll('.ch-card.on').forEach((c) => c.classList.remove('on'));
+    renderSkList(skSearch.value);
+  }
+
+  function openSkPanel(nudge) {
+    skPanel.classList.remove('hidden');
+    skBtn.setAttribute('aria-expanded', 'true');
+    loadSkillIndex();
+    if (nudge) {
+      skPanel.classList.add('nudge');
+      setTimeout(() => skPanel.classList.remove('nudge'), 600);
+      try { skSearch.focus(); } catch (e) {}
+    }
+  }
+  function closeSkPanel() {
+    skPanel.classList.add('hidden');
+    skBtn.setAttribute('aria-expanded', 'false');
+  }
+  function toggleSkPanel() {
+    if (skPanel.classList.contains('hidden')) openSkPanel(false); else closeSkPanel();
+  }
+
+  function wireModes() {
+    modeAuto.addEventListener('click', () => setMode('auto'));
+    modeManual.addEventListener('click', () => setMode('manual'));
+    skBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleSkPanel(); });
+    skSearch.addEventListener('input', () => renderSkList(skSearch.value));
+    // 点面板外面 / 按 Esc 收起
+    document.addEventListener('click', (e) => {
+      if (skPanel.classList.contains('hidden')) return;
+      if (skPanel.contains(e.target) || skBtn.contains(e.target)) return;
+      closeSkPanel();
+    });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSkPanel(); });
+  }
+
   /* ---------- core send ---------- */
+  // 组装 /api/chat 的请求体。抽成独立纯函数是为了能被 web/tests 直接跑真代码：
+  // 手动模式下 mode/skill 一旦漏发，后端会静默退回自动调度，
+  // 用户"明明锁了技能"却拿到别的东西 —— 这种失败在界面上一点提示都没有。
+  function chatPayload(text) {
+    return JSON.stringify({
+      session_id: sessionId,
+      message: text,
+      mode: chatMode,
+      skill: (chatMode === 'manual' && pickedSkill) ? pickedSkill.slug : '',
+    });
+  }
+
+  // 手动模式没选技能时不许发送：与其让后端猜，不如让用户先选一个。
+  function sendBlocked(mode, picked) {
+    return mode === 'manual' && !picked;
+  }
+
   async function submit() {
     const text = input.value.trim();
     if (!text || busy) return;
+    // 手动模式却没选技能 —— 不能偷偷退回自动（用户以为是"指定"的），
+    // 直接打开面板并把搜索框聚焦，把这一步补上。
+    if (sendBlocked(chatMode, pickedSkill)) { openSkPanel(true); return; }
     input.value = ''; input.focus(); autoGrow();
     if (welcome && !welcome.classList.contains('hidden')) welcome.classList.add('hidden');
 
@@ -604,7 +820,7 @@
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId, message: text }),
+      body: chatPayload(text),
     });
     if (!res.ok || !res.body) {
       const t = await res.text().catch(() => '');
@@ -649,6 +865,11 @@
       case 'meta':
         if (obj.text) appendText(bubble, obj.text + '\n');
         if (trace) {
+          // 手动/自动要贯穿整轮：轨迹面板的角色徽章按它切换措辞。
+          if (obj.mode) trace.dataset.mode = obj.mode;
+          // 指定的技能用不了（刚被删/停用）时后端会降级成自动，必须告诉用户，
+          // 否则他会以为"我明明锁了技能，怎么结果不一样"。
+          if (obj.note) appendText(bubble, '> ' + obj.note + '\n\n');
           if (obj.skill) {
             trace.dataset.skill = obj.skill;
           } else if (obj.intent === 'query') {
@@ -776,6 +997,14 @@
     params:   { n: '3', role: '要素提炼', act: '提取办理信息' },
     generate: { n: '4', role: '流程执笔', act: '给出办事步骤' },
   };
+  // 手动模式（用户点名下技能）——第一步不该再自称"意图分析"，
+  // 面板要如实说明"这一跳被跳过了"，否则和右边写着"跳过意图分析"的文案自相矛盾。
+  const AGENTS_MANUAL = {
+    analyze:  { n: '1', role: '指定技能', act: '沿用手动选择' },
+    match:    { n: '2', role: '载入能力', act: '注入提示词与模板' },
+    params:   { n: '3', role: '参数校对', act: '核对要素是否齐备' },
+    generate: { n: '4', role: '直接执行', act: '按该技能的约定处理' },
+  };
   const MARK = {
     done: '<span class="ctk-dot ok">✓</span>',
     active: '<span class="ctk-dot live"></span>',
@@ -852,8 +1081,9 @@
     steps.forEach((s, i) => {
       const st = s.status || 'pending';
       const row = el('div', 'ctk-step ' + st + (i === steps.length - 1 ? ' last' : ''));
-      const agents = (trace.dataset.stype === 'query' || trace.dataset.stype === 'template')
-        ? AGENTS_QUERY : AGENTS;
+      const agents = trace.dataset.mode === 'manual'
+        ? AGENTS_MANUAL
+        : ((trace.dataset.stype === 'query' || trace.dataset.stype === 'template') ? AGENTS_QUERY : AGENTS);
       const agent = agents[s.phase] || { role: '', act: '' };
       const mark = MARK[st] || MARK.pending;
       row.innerHTML =

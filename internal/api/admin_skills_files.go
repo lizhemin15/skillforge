@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -394,6 +395,36 @@ func (a *Admin) CreateSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "slug": body.Slug})
+}
+
+// SetSkillCore marks/unmarks a skill as a "core" (generic) skill.
+//
+// 核心 = 通用能力（办公文档管家、技能工厂），与具体业务无关；业务技能不该占核心位。
+// 前台与技能列表靠 is_core DESC 把通用能力排在前面，核心技能同时受删除保护。
+func (a *Admin) SetSkillCore(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Slug   string `json:"slug"`
+		IsCore *bool  `json:"is_core"`
+	}
+	if err := readBody(r, &body); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体无效")
+		return
+	}
+	if body.Slug == "" || body.IsCore == nil {
+		writeErr(w, http.StatusBadRequest, "需要 slug 与 is_core")
+		return
+	}
+	if err := a.store.SetCore(body.Slug, *body.IsCore); err != nil {
+		// 技能不存在必须是 404：返回 200 会让管理端显示成"已设为核心"，
+		// 而库里什么都没有 —— 用户以为改成功了，其实点了个已删除的技能。
+		if errors.Is(err, store.ErrSkillNotFound) {
+			writeErr(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "slug": body.Slug, "is_core": *body.IsCore})
 }
 
 func firstNonEmptyS(vals ...string) string {

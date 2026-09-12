@@ -291,19 +291,40 @@
       const list = (j.skills || []);
       const box = $('skill-manage-list');
       if (!list.length) { box.innerHTML = '<div class="empty"><h3>暂无技能</h3></div>'; return; }
-      box.innerHTML = list.map(sk => `
-        <div class="prov-row">
-          <div class="pk">✦</div>
+      const core = list.filter((s) => s.is_core);
+      const biz = list.filter((s) => !s.is_core);
+      // 核心 = 通用能力（办公文档管家、技能工厂），换谁用都得有；业务技能只对
+      // 某个场景成立。两者混在一列里，用户根本看不出哪些是「平台自带的本事」。
+      const rowHtml = (sk, isCoreGroup) => `
+        <div class="prov-row${sk.is_core ? ' is-core' : ''}">
+          <div class="pk">${isCoreGroup ? '★' : '✦'}</div>
           <div class="inf">
-            <div class="nm">${esc(sk.name)} ${sk.is_core ? '<span class="pill-active">CORE</span>' : ''}</div>
+            <div class="nm">${esc(sk.name)} ${sk.is_core ? '<span class="pill-active">核心</span>' : ''}${sk.enabled ? '' : '<span class="pill-off">已停用</span>'}</div>
             <div class="dt">${esc(sk.slug)} · v${sk.version} · ${(sk.input_params || []).length} 参数</div>
           </div>
           <div class="row-actions">
-            <button class="btn ghost" style="padding:4px 8px;font-size:12px" onclick="window.openSkillDetail('${esc(sk.slug)}','${esc(sk.name.replace(/'/g,"\\'"))}')">编辑</button>
+            <button class="btn ghost" style="padding:4px 8px;font-size:12px" onclick="window.openSkillDetail('${esc(sk.slug)}','${esc(sk.name.replace(/'/g, "\\'"))}')">编辑</button>
             <button class="btn ghost" style="padding:4px 8px;font-size:12px" onclick="window.toggleSkill('${esc(sk.slug)}',${!sk.enabled})">${sk.enabled ? '停用' : '启用'}</button>
+            <button class="btn ghost" style="padding:4px 8px;font-size:12px" title="${sk.is_core ? '取消后变成业务技能，可以被删除' : '标记为通用能力，排在聊天技能列表最前面且不可删除'}" onclick="window.setSkillCore('${esc(sk.slug)}',${!sk.is_core})">${sk.is_core ? '取消核心' : '设为核心'}</button>
             ${sk.is_core ? '' : `<button class="icon-btn danger" title="删除" onclick="window.delSkill('${esc(sk.slug)}')">✕</button>`}
           </div>
-        </div>`).join('');
+        </div>`;
+      const groupBlock = (title, sub, items, isCoreGroup) => `
+        <div class="mg-group">
+          <div class="mg-head">
+            <span class="mg-dot${isCoreGroup ? ' core' : ''}"></span>
+            <div class="mg-htxt"><div class="mg-title">${title}</div><div class="mg-sub">${sub}</div></div>
+            <span class="mg-count">${items.length}</span>
+          </div>
+          <div class="mg-rows">${
+            items.length
+              ? items.map((sk) => rowHtml(sk, isCoreGroup)).join('')
+              : `<div class="mg-empty">${isCoreGroup ? '还没有核心技能。在业务技能右侧点「设为核心」，把通用能力提上来。' : '暂无业务技能，点右上角「+ 新建技能」加一个。'}</div>`
+          }</div>
+        </div>`;
+      box.innerHTML =
+        groupBlock('核心技能 · 通用能力', '与具体业务无关、换谁用都得有的本事，例如按需求造技能、生成办公文档。核心技能不可删除。', core, true) +
+        groupBlock('业务技能 · 具体场景', '只在某类业务里成立的本事，例如某公司的通稿、某种办事流程。它们不占核心位。', biz, false);
     } catch (e) {}
   }
   window.toggleSkill = async (slug, enabled) => {
@@ -317,6 +338,16 @@
     const r = await fetch('/api/admin/skills/' + slug, { method: 'DELETE', headers: authHdr() });
     const j = await r.json();
     if (r.ok) { toast('已删除', 'ok'); loadManageSkills(); } else toast(j.error || '删除失败', 'err');
+  };
+
+  // 核心/业务是**语义**上的分类，不是权限位：核心技能排在聊天技能列表最前面，
+  // 并且受删除保护（api 层同样挡，不是只靠前端藏按钮）。
+  window.setSkillCore = async (slug, isCore) => {
+    if (!isCore && !confirm('取消核心后，该技能会变成业务技能，并且可以被删除。继续？')) return;
+    const r = await fetch('/api/admin/skills/core', { method: 'POST', headers: authHdr(), body: JSON.stringify({ slug, is_core: isCore }) });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) { toast(isCore ? '已设为核心技能' : '已取消核心', 'ok'); loadManageSkills(); loadSkillsPublic && loadSkillsPublic(); }
+    else toast(j.error || '操作失败', 'err');
   };
 
   // ---------- knowledge-base skill detail ----------

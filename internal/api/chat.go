@@ -30,6 +30,12 @@ type chatHandler struct {
 type chatReq struct {
 	SessionID string `json:"session_id"`
 	Message   string `json:"message"`
+	// Mode selects how the skill is chosen:
+	//   ""/"auto" → 自动调度：由分类器理解意图后从技能库里挑
+	//   "manual"  → 手动指定：Skills 里点名的技能直接用，跳过意图分类
+	Mode string `json:"mode"`
+	// Skill 是 mode=manual 时锁定的技能 slug。
+	Skill string `json:"skill"`
 }
 
 // needsAnswer is a mid-generation event the engine emits when a skill has
@@ -61,6 +67,23 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if req.SessionID == "" {
 		req.SessionID = "anon"
 	}
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	req.Skill = strings.TrimSpace(req.Skill)
+	// 手动模式：用户点名的技能必须真实存在，否则派生的动作/步骤全是错的。
+	// 技能不存在（刚被删/被停用）或不给 slug 都退回自动调度 —— 悄悄换技能很糟，
+	// 所以原因会挂到 meta 事件上让前端提示一句。
+	var manualSkill *agent.SkillContent
+	manualNote := ""
+	if mode == "manual" && req.Skill != "" {
+		if sc, lerr := h.eng.LoadSkill(req.Skill); lerr == nil {
+			manualSkill = sc
+		} else {
+			manualNote = "指定的技能「" + req.Skill + "」不可用，已改用自动调度"
+			mode = "auto"
+		}
+	} else {
+		mode = "auto"
+	}
 
 	// SSE plumbing
 	fl, ok := w.(http.Flusher)
@@ -85,12 +108,17 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 0. 先画步骤骨架：第一件事就是让「思考中」出现在用户屏幕上。
 	//    意图分类是一次几十秒的阻塞调用，这之前什么都不发 = 用户干瞪眼。
-	clock := newTraceClock(write, []agent.TraceStep{{
+	//    手动模式没有这一步，骨架直接读作"已选定技能"。
+	seed := []agent.TraceStep{{
 		Phase:  "analyze",
 		Label:  "① 意图分析",
 		Detail: "正在理解你的问题…",
 		Status: "active",
-	}})
+	}}
+	if manualSkill != nil {
+		seed = agent.ManualSteps(manualSkill)
+	}
+	clock := newTraceClock(write, seed)
 	defer clock.Freeze() // 兜底：任何分支（含 error 早退）都必须让心跳停下
 
 	ctx := r.Context()
@@ -104,20 +132,39 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fullHist := h.eng.FullSession(req.SessionID)
 
 	// 1. orchestrator: decide skill
-	eval, err := h.eng.EvalTurn(ctx, req.SessionID, req.Message, history)
+	//    手动模式下技能已经定了，直接合成 Eval —— 这一步是「指定技能」按钮的全部价值：
+	//    省掉一次几十秒的阻塞分类调用，也不再让分类器推翻用户的选择。
+	var (
+		eval *agent.Eval
+		err  error
+	)
+	if manualSkill != nil {
+		eval = agent.ManualEval(manualSkill)
+		if a := agent.ManualActionFor(manualSkill, req.Message); a != "" {
+			eval.Action = a
+		}
+	} else {
+		eval, err = h.eng.EvalTurn(ctx, req.SessionID, req.Message, history)
+	}
 	if err != nil {
 		write(evError, jsonSafe(map[string]string{"error": "调度失败: " + err.Error()}))
 		return
 	}
-	write(evMeta, jsonSafe(map[string]string{"reason": eval.Reason, "skill": eval.SkillSlug, "intent": eval.Intent}))
+	write(evMeta, jsonSafe(map[string]string{
+		"reason": eval.Reason, "skill": eval.SkillSlug, "intent": eval.Intent,
+		"mode": mode, "note": manualNote,
+	}))
 
 	// 把调度过程画给用户看。这里**不再**按意图过滤（闲聊也发）：过滤掉就等于
 	// 回到「几十秒空白 + 最后啪一下出答案」，那正是用户抱怨的现象。
-	steps := eval.Steps
-	if len(steps) == 0 {
-		steps = fallbackSteps(*eval)
+	// 手动模式的骨架在点选时就画好了，重复 Set 只会把已完成的步骤闪回 active。
+	if manualSkill == nil {
+		steps := eval.Steps
+		if len(steps) == 0 {
+			steps = fallbackSteps(*eval)
+		}
+		clock.Set(normalizeSteps(steps))
 	}
-	clock.Set(normalizeSteps(steps))
 
 	// 2a. 工具循环优先：任务需要外部实时数据或真实计算时，交给 Agent 自己组合工具
 	//     （优先于技能快路径——否则模型会「凭记忆编数字」生成一份看着很像的文档）
@@ -139,7 +186,8 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// template fill (e.g. "把手机号改成139…"), route back to THAT template
 		// skill and redo a smart-fill instead of whatever the classifier picked
 		// (which can drift to a generic docgen skill and wipe prior values).
-		if tslug := agent.TemplateFillSkillInHistory(fullHist, req.Message); tslug != "" && tslug != eval.SkillSlug {
+		// 手动模式下用户已经点名了技能，接力逻辑必须让位（否则会被悄悄换掉）。
+		if tslug := agent.TemplateFillSkillInHistory(fullHist, req.Message); manualSkill == nil && tslug != "" && tslug != eval.SkillSlug {
 			tsc, terr := h.eng.LoadSkill(tslug)
 			if terr == nil && tsc.SkillType == model.SkillTypeTemplate && tsc.Attachment != "" {
 				sc = tsc

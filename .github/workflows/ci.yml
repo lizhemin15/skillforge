@@ -97,6 +97,18 @@ jobs:
           node --check web/js/chat.js
           node web/tests/chat_trace.test.mjs
 
+      # 聊天两种方式（自动调度 / 指定技能）：坏了界面上没有任何报错——
+      # 手动选了技能却退化成自动调度（mode/skill 漏发），用户只会觉得"它没听我的"。
+      # 后端那半（ManualEval/ManualSteps）由 internal/agent 的单测守；这半边守
+      # 请求体组装、发送守卫、技能面板分组与样式。
+      - name: 前端回归（聊天两种方式）
+        run: node web/tests/chat_modes.test.mjs
+
+      # 核心技能 = 通用能力（办公文档管家 / 技能工厂），其余归业务技能：
+      # 分组画错、核心技能被删掉、切换标记没打鉴权头，界面都不会报错。
+      - name: 前端回归（核心技能归类）
+        run: node web/tests/core_skills.test.mjs
+
       - name: Build
         run: |
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o skillforge ./cmd/server
