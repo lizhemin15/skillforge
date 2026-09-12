@@ -166,6 +166,16 @@ func loadSessionFromDisk(path string) []Message {
 // SetLLM swaps the underlying client (provider hot-swap).
 func (e *Engine) SetLLM(l *llm.Client) { e.mu.Lock(); e.llm = l; e.mu.Unlock() }
 
+// HasLLM 报告引擎手里有没有模型客户端。
+// 存在理由：线上事故是"启动时传了 nil"，而 nil 只有在第一个请求打到模型时才炸成
+// 空指针（前端显示得像网络错误）。有个可查询的状态，启动装配才有可断言的抓手，
+// 不用真的发一个请求去试探。
+func (e *Engine) HasLLM() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.llm != nil
+}
+
 // ChatTools 是工具循环所需的模型调用入口（引擎持有 LLM 客户端，
 // 让 api 层不必自己再持有一份，也避免两处配置漂移）。
 func (e *Engine) ChatTools(ctx context.Context, msgs []llm.Msg, defs []llm.ToolDef) (llm.Msg, error) {

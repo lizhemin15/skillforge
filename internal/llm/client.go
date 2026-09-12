@@ -33,8 +33,26 @@ func New(cfg *model.LLMConfig) *Client {
 	return &Client{cfg: cfg, cli: openai.NewClientWithConfig(conf)}
 }
 
+// ErrNoLLM 是"引擎手里根本没装模型"时的统一错误。
+// 背景（线上事故）：启动时 NewHandler 收到的是 nil client，第一条走到模型调用的
+// 请求在 (*Client).Chat 上空指针 panic —— net/http 直接掐断连接，前端只显示
+// "连接失败：network error"，排查时会误以为是网络/跨域问题。
+// 有了这个守卫，同样的配置错误会变成一句人话，而且请求能正常收尾。
+var ErrNoLLM = errors.New("未配置 LLM：请在管理端「模型」里选择并启用一个模型")
+
+// usable 挡住 nil 接收者。放在每个公开方法的最前面，比在每个调用点加 if 更不容易漏。
+func (c *Client) usable() error {
+	if c == nil || c.cfg == nil {
+		return ErrNoLLM
+	}
+	return nil
+}
+
 // Complete streams a chat completion, writing text deltas to onDelta.
 func (c *Client) Complete(ctx context.Context, system, user string, onDelta func(string)) (string, error) {
+	if err := c.usable(); err != nil {
+		return "", err
+	}
 	if strings.TrimSpace(c.cfg.APIKey) == "" {
 		return "", errors.New("未配置 LLM API Key（请在管理端配置）")
 	}
@@ -79,6 +97,9 @@ func (c *Client) Complete(ctx context.Context, system, user string, onDelta func
 // a strict JSON object (response_format), which is required for the intent
 // classifier and docgen parser that unmarshal the reply.
 func (c *Client) Chat(ctx context.Context, sys, user string, jsonMode ...bool) (string, error) {
+	if err := c.usable(); err != nil {
+		return "", err
+	}
 	if strings.TrimSpace(c.cfg.APIKey) == "" {
 		return "", errors.New("未配置 LLM API Key")
 	}
@@ -104,5 +125,11 @@ func (c *Client) Chat(ctx context.Context, sys, user string, jsonMode ...bool) (
 	return resp.Choices[0].Message.Content, nil
 }
 
-// Config returns the underlying LLM config (for display).
-func (c *Client) Config() *model.LLMConfig { return c.cfg }
+// Config returns the underlying LLM config (for display). nil 接收者返回 nil，
+// 免得展示路径（管理端读当前模型）也跟着 panic。
+func (c *Client) Config() *model.LLMConfig {
+	if c == nil {
+		return nil
+	}
+	return c.cfg
+}
