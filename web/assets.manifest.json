@@ -1,0 +1,126 @@
+{
+  "_comment": "由 web/tests/gen-asset-manifest.mjs 生成；勿手改，改了会被 asset_version 测试抓住",
+  "assets": {
+    "/assets/css/style.css": {
+      "v": "20260913A",
+      "sha256": "d3f6f99a67229168e77783cde5d5f682dae7769efb882c00cb73447c25b5cb94",
+      "in": [
+        "index.html",
+        "admin.html"
+      ]
+    },
+    "/assets/js/admin.js": {
+      "v": "20260912C",
+      "sha256": "affb52796cae3de36d698db90f031bcf76fe35b8f4af38ba9c43931bf6c1d25c",
+      "in": [
+        "admin.html"
+      ]
+    },
+    "/assets/js/chat.js": {
+      "v": "20260913B",
+      "sha256": "a04350dcdbdedc470469036fae3a59fc324d6cee2b329ad1256a025da20271ec",
+      "in": [
+        "index.html"
+      ]
+    },
+    "/assets/js/site.js": {
+      "v": "20260911M",
+      "sha256": "d28b306ef4cfc5a37291a6dddac68cb79167b0ea70482c0bbfd665780aebd704",
+      "in": [
+        "index.html",
+        "admin.html"
+      ]
+    },
+    "/assets/vendor/codemirror/addon/display/autorefresh.min.js": {
+      "v": "20260908A",
+      "sha256": "06fe82f4587a6fb44f3d6bc9da647f44095879e70dd6fb68a011c607c50f0afc",
+      "in": [
+        "admin.html"
+      ]
+    },
+    "/assets/vendor/codemirror/addon/display/placeholder.min.js": {
+      "v": "20260908A",
+      "sha256": "e294bb43c778ac6b4327adaa2a32721d9723832ad84163afab6602102e704def",
+      "in": [
+        "admin.html"
+      ]
+    },
+    "/assets/vendor/codemirror/addon/edit/closebrackets.min.js": {
+      "v": "20260908A",
+      "sha256": "0124f8642fdc2622cd7295a5746cf0d9e6ef5eb5cb627261afb76dcf3a5fca87",
+      "in": [
+        "admin.html"
+      ]
+    },
+    "/assets/vendor/codemirror/addon/edit/matchbrackets.min.js": {
+      "v": "20260908A",
+      "sha256": "18cef450826bf5ac9a1733a9ab1122285a95df53298a7a213f0223c9f41fe5a6",
+      "in": [
+        "admin.html"
+      ]
+    },
+    "/assets/vendor/codemirror/addon/fold/foldcode.min.js": {
+      "v": "20260908A",
+      "sha256": "19c67822039dddab81b4bd5aff416857dc924158a553d0b7de4d0e60ca8e89a7",
+      "in": [
+        "admin.html"
+      ]
+    },
+    "/assets/vendor/codemirror/addon/fold/foldgutter.min.css": {
+      "v": "20260908A",
+      "sha256": "ae39b68cf9cbb4f253690ca2f1ba05e2c8e829356ff36a55acd68f7dac4129ac",
+      "in": [
+        "admin.html"
+      ]
+    },
+    "/assets/vendor/codemirror/addon/fold/foldgutter.min.js": {
+      "v": "20260908A",
+      "sha256": "46e91cd5fbb5a3460931d5bb1e00bedfed92a6df003108a744e1fa8c7463314c",
+      "in": [
+        "admin.html"
+      ]
+    },
+    "/assets/vendor/codemirror/addon/selection/active-line.min.js": {
+      "v": "20260908A",
+      "sha256": "d7e16513d4b1394e592b4b7b045f456ef5a3f2a05308292b902354368753963f",
+      "in": [
+        "admin.html"
+      ]
+    },
+    "/assets/vendor/codemirror/lib/codemirror.min.css": {
+      "v": "20260908A",
+      "sha256": "c176f3906cb706151ddbfe37b7856f17b4e612c6c6583a56a290561c9f5996a7",
+      "in": [
+        "admin.html"
+      ]
+    },
+    "/assets/vendor/codemirror/lib/codemirror.min.js": {
+      "v": "20260908A",
+      "sha256": "d230e4614ed889647dc357e34f343bde5669ca37a0a14d05121e04d0d5ae435a",
+      "in": [
+        "admin.html"
+      ]
+    },
+    "/assets/vendor/codemirror/mode/markdown/markdown.min.js": {
+      "v": "20260908A",
+      "sha256": "432666afda166008f9328b81a78215e2cb5c8b3f36df41dec1f90540f1c99041",
+      "in": [
+        "admin.html"
+      ]
+    },
+    "/assets/vendor/codemirror/mode/xml/xml.min.js": {
+      "v": "20260908A",
+      "sha256": "4b95c039e814f16c4196a3514d040feb2a53795465d9f700cbaa5b394b270a32",
+      "in": [
+        "admin.html"
+      ]
+    },
+    "/assets/vendor/marked/marked.min.js": {
+      "v": "20260909I",
+      "sha256": "c68075672d976e4777390560baa112194855bd4404b13647da4855aae1f9360c",
+      "in": [
+        "index.html"
+      ]
+    }
+  }
+}

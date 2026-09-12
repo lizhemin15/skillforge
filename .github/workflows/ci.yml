@@ -109,6 +109,13 @@ jobs:
       - name: 前端回归（核心技能归类）
         run: node web/tests/core_skills.test.mjs
 
+      # 缓存版本号：改了 JS/CSS 却忘了 bump ?v= 时，代码本身没毛病、测试全绿、
+      # 后端也真修好了 —— 只有老浏览器还在跑旧文件，用户看到的现象是"你没修"。
+      # 这个坑本项目栽过两次（chat.js 在 v0.3.12 改过、?v= 却停在 v0.3.11 的值），
+      # 靠人眼 review 抓不住，所以用 manifest 把"某段内容的哈希曾经挂在哪个 ?v= 下"记死。
+      - name: 前端回归（缓存版本号一致性）
+        run: node web/tests/asset_version.test.mjs
+
       - name: Build
         run: |
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o skillforge ./cmd/server
