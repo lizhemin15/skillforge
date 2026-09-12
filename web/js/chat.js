@@ -9,6 +9,7 @@
   const skBtn = $('#skill-pick-btn'), skLabel = $('#skill-pick-label');
   const skPanel = $('#skill-panel'), skSearch = $('#skill-search'), skList = $('#skill-list');
   const footnote = $('#ch-footnote');
+  const heroSub = $('#ch-w-sub'), heroEg = $('#ch-w-eg');
 
   // —— 两种对话方式 ——
   // auto   : 让引擎自己理解意图，从技能库里挑（默认，适合"我也不知道该用哪个"）
@@ -27,6 +28,16 @@
   const PLACEHOLDER = {
     auto: '说说你想写什么…（Enter 发送，Shift+Enter 换行）',
     manual: '把材料和要求直接写在这里…（Enter 发送，Shift+Enter 换行）',
+  };
+  // 欢迎语也得跟着模式变。自动模式下说"我帮你挑最合适的技能"是对的；
+  // 手动模式下还这么说就是骗人 —— 技能是你自己锁的，界面得说清楚。
+  const HERO_SUB = {
+    auto: '直接说你想要的文章，我来调度最合适的技能为你起草。',
+    manual: '先在下方指定一个技能，再说要写什么 —— 全程只按这个技能来，跳过意图识别。',
+  };
+  const HERO_EG = {
+    auto: '例如：「写一段写给客户的产品介绍，200 字左右」',
+    manual: '例如：选「采购合同」→「甲方 XX 公司，采购 30 台服务器，含税」',
   };
 
   // sessionId tracks the ACTIVE local session; restored on boot so a refresh
@@ -597,6 +608,8 @@
     skBtn.classList.toggle('hidden', chatMode !== 'manual');
     footnote.textContent = FOOTNOTE[chatMode];
     input.placeholder = PLACEHOLDER[chatMode];
+    if (heroSub) heroSub.textContent = HERO_SUB[chatMode];
+    if (heroEg) heroEg.textContent = HERO_EG[chatMode];
     // 切到手动却还没选技能 → 直接把面板打开，别让用户猜下一步干什么
     if (chatMode === 'manual' && !pickedSkill && !silent) openSkPanel(true);
     else if (chatMode === 'auto') closeSkPanel();
@@ -729,16 +742,33 @@
     if (skPanel.classList.contains('hidden')) openSkPanel(false); else closeSkPanel();
   }
 
+  // 面板开着时，这次点击该不该把它收起来？
+  // 返回 true = 收起。纯函数：入参是"点在哪"，不碰 DOM，方便回归测试。
+  function panelClosesOnClick(o) {
+    if (o.panelHidden) return false;                       // 本来就没开，无所谓
+    if (o.inPanel || o.inPickBtn) return false;            // 点在面板/技能钮上：那不是"点外面"
+    if (o.inSend || o.inInput) return false;               // 点在发送键/输入框上：见调用处注释
+    return true;
+  }
+
   function wireModes() {
     modeAuto.addEventListener('click', () => setMode('auto'));
     modeManual.addEventListener('click', () => setMode('manual'));
     skBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleSkPanel(); });
     skSearch.addEventListener('input', () => renderSkList(skSearch.value));
-    // 点面板外面 / 按 Esc 收起
+    // 点面板外面 / 按 Esc 收起。
+    // ⚠️ 这条判断必须放过"发送键"和输入框：手动模式没选技能时，submit() 正是靠
+    // openSkPanel 来提示用户补选技能，而这次点击会继续冒泡到这里 —— 若把它当成
+    // "点在外面"，面板刚开就被同一击关掉，用户看到的是「点了发送毫无反应」。
+    // 抽成纯函数是为了能被 web/tests 跑真代码、并且突变注入能精确变红。
     document.addEventListener('click', (e) => {
-      if (skPanel.classList.contains('hidden')) return;
-      if (skPanel.contains(e.target) || skBtn.contains(e.target)) return;
-      closeSkPanel();
+      if (panelClosesOnClick({
+        panelHidden: skPanel.classList.contains('hidden'),
+        inPanel: skPanel.contains(e.target),
+        inPickBtn: skBtn.contains(e.target),
+        inSend: send.contains(e.target),
+        inInput: input.contains(e.target),
+      })) closeSkPanel();
     });
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSkPanel(); });
   }

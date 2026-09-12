@@ -63,6 +63,21 @@ const skPanelHTML = bind(CHAT_JS, 'function skPanelHTML(', ['TYPE_META', 'esc', 
 const chatPayload = (sid, mode, picked) =>
   bind(CHAT_JS, 'function chatPayload(', ['sessionId', 'chatMode', 'pickedSkill'], [sid, mode, picked]);
 const sendBlocked = bind(CHAT_JS, 'function sendBlocked(');
+const panelClosesOnClick = bind(CHAT_JS, 'function panelClosesOnClick(');
+
+// 从出货文件里抠出配置表（FOOTNOTE / PLACEHOLDER / HERO_SUB / HERO_EG），
+// 而不是在测试里另抄一份文案 —— 抄一份的话，改了真文件测试照样绿。
+function extractObj(src, name) {
+  const m = src.match(new RegExp('const\\s+' + name + '\\s*=\\s*\\{[\\s\\S]*?\\n\\s*\\};'));
+  if (!m) throw new Error('抽不到配置表：' + name);
+  // 注意：不能写成 'return ' + 定义 —— return 后面接不了 const/var 声明。
+  // 要让声明留在函数体里，再单独 return 出来。
+  return new Function(m[0] + '\nreturn ' + name + ';')();
+}
+const FOOTNOTE = extractObj(CHAT_JS, 'FOOTNOTE');
+const PLACEHOLDER = extractObj(CHAT_JS, 'PLACEHOLDER');
+const HERO_SUB = extractObj(CHAT_JS, 'HERO_SUB');
+const HERO_EG = extractObj(CHAT_JS, 'HERO_EG');
 
 const SKILLS = [
   { slug: '办公文档管家', name: '办公文档管家', description: '生成或填写 Word/Excel/PDF/PPT', skill_type: 'docgen', is_core: 1 },
@@ -96,6 +111,42 @@ console.log('聊天方式 · 发送守卫（Bug W）');
   check('手动+未选技能 → 拦住', sendBlocked('manual', null) === true);
   check('手动+已选技能 → 放行', sendBlocked('manual', { slug: 'x' }) === false);
   check('自动+未选技能 → 放行', sendBlocked('auto', null) === false);
+}
+
+console.log('聊天方式 · 面板与提示跟随模式（Bug X）');
+{
+  // Bug X —— 手动没选技能点发送：submit() 会 openSkPanel 提示补选，
+  // 但这次点击继续冒泡到 document 的"点外面就收起"监听上，面板刚开就被关掉。
+  // 界面上表现为「点了发送毫无反应」，不报错、控制台干净，只能靠真浏览器复现。
+  const opts = (o) => Object.assign(
+    { panelHidden: false, inPanel: false, inPickBtn: false, inSend: false, inInput: false }, o);
+  check('点发送键不收起面板', panelClosesOnClick(opts({ inSend: true })) === false);
+  check('点输入框不收起面板', panelClosesOnClick(opts({ inInput: true })) === false);
+  check('点面板内不收起面板', panelClosesOnClick(opts({ inPanel: true })) === false);
+  check('点技能钮不收起面板', panelClosesOnClick(opts({ inPickBtn: true })) === false);
+  check('点真正的空白处才收起', panelClosesOnClick(opts()) === true);
+  check('面板本就没开时不动', panelClosesOnClick(opts({ panelHidden: true })) === false);
+
+  // 三处提示文案都得跟模式走：只改其中一处，用户会看到自相矛盾的界面
+  //（tab 写着"指定技能"，欢迎语却说"我帮你挑技能"）。
+  for (const t of [FOOTNOTE, PLACEHOLDER, HERO_SUB, HERO_EG]) {
+    check('文案两档都有', !!t.auto && !!t.manual);
+    check('文案两档不同', t.auto !== t.manual);
+  }
+  // 自动档说"我来调度"，手动档不能再说"我帮你挑" —— 技能是用户自己锁的
+  check('自动档欢迎语提调度', /调度|挑/.test(HERO_SUB.auto));
+  check('手动档欢迎语不提"我来挑"', !/调度|我来挑/.test(HERO_SUB.manual));
+  check('手动档欢迎语要求先指定技能', /指定|先选|锁定/.test(HERO_SUB.manual));
+  check('手动档占位符要求写材料', /材料/.test(PLACEHOLDER.manual));
+
+  // 欢迎语元素必须真的存在于出货 HTML 里，否则 setMode 里改了也没人看
+  check('index.html 有 #ch-w-sub', INDEX_HTML.includes('id="ch-w-sub"'));
+  check('index.html 有 #ch-w-eg', INDEX_HTML.includes('id="ch-w-eg"'));
+  // 光有文案表和元素还不够 —— setMode 必须真的把它们接上。
+  // 漏接的表现是：切到手动档，脚注变了、占位符变了，欢迎语还写着"我来挑技能"。
+  check('setMode 接了 heroSub', /heroSub\.textContent\s*=\s*HERO_SUB\[chatMode\]/.test(CHAT_JS));
+  check('setMode 接了 heroEg', /heroEg\.textContent\s*=\s*HERO_EG\[chatMode\]/.test(CHAT_JS));
+  check('取到了欢迎语元素', /heroSub\s*=\s*\$\('#ch-w-sub'\)/.test(CHAT_JS));
 }
 
 console.log('技能面板 · 分组（Bug V）');
