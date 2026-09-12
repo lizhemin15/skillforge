@@ -77,3 +77,28 @@ func TestResolveModeNilLoaderDoesNotPanic(t *testing.T) {
 		t.Fatalf("nil loader 处理错了: sc=%v mode=%q note=%q", sc, mode, note)
 	}
 }
+
+// 降级原因要出现在 t≈0 那一帧（步骤骨架），不能拖到几十秒后的 meta 事件。
+// 用户在锁定的技能失效时，第一秒就该知道"现在跑的是自动调度"。
+func TestAnalyzeDetailCarriesDegradeReason(t *testing.T) {
+	note := "指定的技能「公司新闻通稿」不可用，已改用自动调度"
+	got := analyzeDetail(note)
+	if !strings.Contains(got, note) {
+		t.Fatalf("骨架帧里的说明没带上降级原因: %q", got)
+	}
+	if !strings.Contains(got, "公司新闻通稿") {
+		t.Fatalf("骨架帧里的说明没点名技能: %q", got)
+	}
+	// 没有降级时不能多嘴：正常自动档不该凭空冒出"技能不可用"
+	if got := analyzeDetail(""); got != "正在理解你的问题…" {
+		t.Fatalf("无降级时骨架说明被改了: %q", got)
+	}
+	if got := analyzeDetail("   "); got != "正在理解你的问题…" {
+		t.Fatalf("空白说明没被当成空: %q", got)
+	}
+	// 心跳会在 detail 尾部补「已用 Ns」。原因必须排在前面，
+	// 否则会读成「正在理解…（原因）（已用 3s）」两个括号叠在一起。
+	if i := strings.Index(analyzeDetail(note), note); i != 0 {
+		t.Fatalf("降级原因没排在最前面（会被心跳后缀挤成连续括号）: %q", analyzeDetail(note))
+	}
+}

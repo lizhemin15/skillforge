@@ -101,7 +101,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	seed := []agent.TraceStep{{
 		Phase:  "analyze",
 		Label:  "① 意图分析",
-		Detail: "正在理解你的问题…",
+		Detail: analyzeDetail(manualNote),
 		Status: "active",
 	}}
 	if manualSkill != nil {
@@ -357,6 +357,19 @@ func resolveMode(mode, slug string, load func(string) (*agent.SkillContent, erro
 		return nil, "auto", "指定的技能「" + slug + "」不可用，已改用自动调度"
 	}
 	return sc, "manual", ""
+}
+
+// analyzeDetail 是 t≈0 那一帧的步骤说明。
+// 降级原因必须挂在这里，不能只等几十秒后那个 meta 事件：用户锁的技能被删了，
+// 第一秒就该知道"你现在看到的是自动调度的结果"，而不是等结果出来后才发现不对。
+// 顺序上把原因放前面、那句"正在理解…"放后面顶住心跳的「已用 Ns」后缀，
+// 免得读成「…（原因）（已用 3s）」两个括号连着堆。
+func analyzeDetail(note string) string {
+	note = strings.TrimSpace(note)
+	if note == "" {
+		return "正在理解你的问题…"
+	}
+	return note + " · 正在理解你的问题…"
 }
 
 // fillSummarySuffix renders the just-filled field values as a compact tracer
