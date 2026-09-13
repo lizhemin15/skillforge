@@ -157,7 +157,17 @@ func (h *Handler) Routes() *http.ServeMux {
 	// 无鉴权（和 /api/chat 同级，面向首页访客），代价靠超时 + 并发闸门控制。
 	// GET 也放行：SSR/预取/无 body 的探测都走它，语义同 POST（只读、无副作用）。
 	// 只建**一个** handler：并发闸门在 handlers 内部，两个实例等于把闸门放宽一倍。
-	suggest := newSuggestHandler(h.Eng, 5*time.Second)
+	//
+	// 超时 9s 是算出来的，不是拍的。FastJSON 内部最多打 3 次请求：
+	//   ① 带两族开关  →（400 就摘 enable_thinking）→ ② 换 knob 重试
+	//   ③ 空 content 就 ×4 预算重试（封顶 4096）
+	// 现线上（astron/astron-code-latest + reasoning_effort=none）单次实测 ~1s，
+	// 最坏链路 ≈ 6s，9s 留了余量。**别再往回收** —— 卡在 5s 时放大预算那一次
+	// 会被 ctx 掐断，等于白加兜底，症状又是「推荐行老是那几句」这种无声降级。
+	//
+	// 前端 web/js/chat.js 的 abort 必须比这里长（现 10.5s）：客户端先掐的话，
+	// 服务端就算成功也没人接，退化成和网络错误一样的表现。
+	suggest := newSuggestHandler(h.Eng, 9*time.Second)
 	mux.Handle("POST /api/chat/suggest", suggest)
 	mux.Handle("GET /api/chat/suggest", suggest)
 

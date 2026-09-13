@@ -572,7 +572,11 @@
       });
     } catch (e) { return; }
     const ctl = (typeof AbortController === 'function') ? new AbortController() : null;
-    const timer = setTimeout(() => { if (ctl) ctl.abort(); }, 6000);
+    // 10.5s：必须比服务端那个 9s ctx 长一点点（见 internal/api/router.go 的注释）。
+    // 客户端先掐断的话，服务端就算答出来了也没人接，表现和网络错误一样 ——
+    // 而这层失败是完全静默的（退回规则版胶囊），没人会想到是「谁先超时」的问题。
+    // 服务端最多 3 次尝试（换开关 / 放大预算重试），别按「一次请求」估这个数。
+    const timer = setTimeout(() => { if (ctl) ctl.abort(); }, 10500);
     fetch('/api/chat/suggest', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

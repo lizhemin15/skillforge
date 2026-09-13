@@ -427,8 +427,14 @@ console.log('推荐行 · LLM 精修是"可失败的旁路"');
 {
   // 规则版必须先渲染出来（用户零等待），精修只是替换。
   // 一批最容易踩的坑：接口不存在/超时/解析失败时把推荐行清空 —— 那还不如不做。
-  check('精修打到 POST /api/chat/suggest', /fetch\('\/api\/chat\/suggest'/.test(CHAT_JS));
-  check('带 6s 超时（不让推荐行等一个慢模型）', /setTimeout\([\s\S]{0,80}6000\)/.test(CHAT_JS));
+  check('打到 POST /api/chat/suggest', /fetch\('\/api\/chat\/suggest'/.test(CHAT_JS));
+  // 只断言「有超时」+「是个像样的数」。**具体值不在这里钉死**：
+  // 这个数必须和后端 ctx 一起看（前端 abort 要比后端长，否则服务端白算），
+  // 钉两个文件里的两个常量正是它上次烂掉的原因 —— 一端改了另一端没人提醒。
+  // 值的正确性归 web/tests/suggest_timeout_budget.test.mjs（跨文件比对那一对）。
+  check('带超时（不让推荐行等一个慢模型）', /setTimeout\([\s\S]{0,80}?ctl\.abort\(\)[\s\S]{0,20}?\b(\d{4,5})\)/.test(CHAT_JS));
+  check('超时值不是一个随便的小数（≥8s，要容得下后端 3 次尝试）',
+    Number((CHAT_JS.match(/ctl\.abort\(\)[\s\S]{0,20}?(\d{4,5})\)/) || [])[1] || 0) >= 8000);
   const refine = extractFn(CHAT_JS, 'function refineChips(');
   check('抽到了 refineChips', !!refine);
   check('精修只在自动档、且没指定技能时跑', /chatMode !== 'auto' \|\| pickedSkill/.test(refine || ''));
