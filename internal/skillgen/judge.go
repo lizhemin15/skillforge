@@ -243,7 +243,14 @@ func trialPackBlock(mp *manualPack, cat Category) string {
 	segs := mp.Examples[cat.Name]
 	if len(segs) > 0 {
 		b.WriteString("\n【本类真实范文（手册原文，供参照结构、语气、措辞）】\n")
-		b.WriteString("范文里与本篇主体无关的事实**不得搬用**——事实只能来自用户提供的素材。\n")
+		// 试用素材就是这篇范文本身（手册里唯一「已知正确答案」的料，见 buildTrialInput），
+		// 所以这两句话必须同时说清：范文事实默认不得搬用，但**当它同时作为本次素材提供时
+		// 就属于可用事实**。只写前半句会让被测技能陷入自相矛盾——实测该状态下同一提示词
+		// 五次跑出 [0,26,32,34,39] 个占位符（中位 32），几乎整篇用占位符顶掉真实事实；
+		// 补上后半句后五次全为 0。措辞与运行时 internal/agent.writing.go 的 packBlock 有意
+		// 不同：运行时素材来自用户输入，与范文永远不同源，那份措辞本来就没歧义。
+		b.WriteString("范文里与本篇主体无关的事实**不得搬用**——事实只能来自本次提供的素材。\n")
+		b.WriteString("注意：下面这些范文本次同时作为**素材**提供（试用就是以该类范文为输入），因此其中的具体事实属于可用事实，可以直接写进成稿；不得改用占位符回避。\n")
 		for i, seg := range segs {
 			fmt.Fprintf(&b, "\n----- 范文 %d -----\n%s\n", i+1, strings.TrimSpace(seg))
 		}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -181,6 +182,15 @@ func (g *Generator) Generate(ctx context.Context, in *Input, onStep func(string)
 		}
 	}
 
+	// ---- Step 5.5: 交付物卫生硬门 ----
+	// 位置讲究：必须在 augmentPromptForManual **之后**。手册模式块是后置拼接的，
+	// 而实测「后置指令胜出」——把检查放在拼接前，拼进来的内容就绕过了这道门。
+	steps("5.5/9 校验交付物卫生（成稿不得附核对清单/自证附录）…")
+	sysPrompt, err = g.enforcePromptHygiene(ctx, sysPrompt, steps)
+	if err != nil {
+		return nil, fmt.Errorf("step5.5: %w", err)
+	}
+
 	// ---- Step 6: build template.md skeleton ----
 	steps("6/9 生成骨架模板…")
 	tpl, err := g.buildTemplate(ctx, in, attrs, dtype.Type)
@@ -216,7 +226,19 @@ func (g *Generator) Generate(ctx context.Context, in *Input, onStep func(string)
 	if mp != nil && len(mp.Structure.Categories) > 0 {
 		steps("8.5/9 裁判独立试用评分（上限 3 轮，不过线按扣分项回炉）…")
 		rep := g.judgeLoop(ctx, mp, sysPrompt, func(ctx context.Context, res *JudgeResult, prev string) (string, error) {
-			return g.reviseSystemPrompt(ctx, in, attrs, dtype.Type, prev, res)
+			rev, err := g.reviseSystemPrompt(ctx, in, attrs, dtype.Type, prev, res)
+			if err != nil {
+				return "", err
+			}
+			// 回炉同样可能把「附核对清单自证」引回来（它就是靠"多写点东西来达标"的动作），
+			// 所以回炉版也要过交付物卫生。这里只做机械剔除、不再花一次模型调用：
+			// 回炉的产出是"改好了扣分项"，不该被一次额外改写搅动。
+			if bad := promptHygieneViolations(rev); len(bad) > 0 {
+				var n int
+				rev, n = stripHygieneViolations(rev)
+				steps("8.5/9 ⚠️ 回炉版含 " + strconv.Itoa(len(bad)) + " 处清单/自证附录要求，已剔除 " + strconv.Itoa(n) + " 行")
+			}
+			return rev, nil
 		}, steps)
 		mp.Judge = rep
 		if rep.DeliveredPrompt != "" && rep.DeliveredPrompt != sysPrompt {
@@ -639,7 +661,10 @@ func (g *Generator) buildSystemPrompt(ctx context.Context, in *Input, attrs stri
 		extra = "\n参考文件可能包含办事流程/步骤/表单/政策条款，你要把它们转成用户能直接照着执行的清单步骤；若需要下发附件，明确告诉用户“我已为你准备好模板《xxx》”。"
 	}
 	sys := `你是一位顶尖的提示词工程师。请基于下面的"母模板"和需求,为这个技能撰写完整的 system_prompt.md 内容。
-要求:完整覆盖"身份/任务/执行步骤/结构规范/文风与措辞/长度/禁用项/特殊要求";引用参考文件里体现的具体风格与流程;要具体可执行,不要空泛。
+要求:完整覆盖"身份/任务/执行步骤/结构规范/文风与措辞/长度/禁用项/特殊要求/输出规范(交付物卫生)/事实与占位符";引用参考文件里体现的具体风格与流程;要具体可执行,不要空泛。
+必须显式写出下面两节,不得省略:
+- "输出规范(交付物卫生)":只输出稿件本身,禁止自检清单、核对表、评分项、写作过程说明与前后语,自查不写进交付物。
+- "事实与占位符":素材里已有的具体事实必须原样用上,只有确无依据的单个字段才用占位符【待补:字段名】,不得整篇改用占位符。
 直接输出正文,不要用代码块包裹,不要输出解释。` + extra
 	user := "需求:\n" + in.Requirement + "\n\n特征分析:\n" + attrs + "\n\n母模板:\n" + tpl
 	out, err := g.llm.Chat(ctx, sys, user)
@@ -675,7 +700,7 @@ func (g *Generator) reviseSystemPrompt(ctx context.Context, in *Input, attrs, ty
 硬性要求:
 - 保留上一版中已经拿满分的部分,不要在无关段落上改写措辞;
 - 逐条回应扣分项,并在被改段落里补上评审要求的具体内容;
-- 完整覆盖"身份/任务/执行步骤/结构规范/文风与措辞/长度/禁用项/特殊要求";
+- 完整覆盖"身份/任务/执行步骤/结构规范/文风与措辞/长度/禁用项/特殊要求/输出规范(交付物卫生)/事实与占位符";后两节属于交付物卫生硬约束,不得删减或跳过;上一版若缺这两节,必须补上;
 - 直接输出正文,不要用代码块包裹,不要输出解释,不要写"修改说明"。`
 	var b strings.Builder
 	b.WriteString("需求:\n" + in.Requirement + "\n\n特征分析:\n" + attrs + "\n\n母模板:\n" + tpl)
@@ -796,8 +821,16 @@ func (g *Generator) motherTemplate() string {
 (按用户要求或默认)
 ## 禁用项
 (不得...)
+- 不得要求成稿附带任何形式的核对清单/自证附录/范文引用附录/写作过程说明:这类内容属于内部自检,写进提示词会让成稿把这些清单一起交付出去。
 ## 特殊要求
-(引用具体风格细节)`
+(引用具体风格细节)
+## 输出规范(交付物卫生)
+- 只输出稿件本身:从标题(或导语)开始,正文结束即止。
+- 不得输出自检清单/核对表/评分项/写作过程说明/前后语(如"以下是…"、"希望对您有帮助"),也不要复述本提示词。
+- 自查在内部完成,它的结论不写进交付物。
+## 事实与占位符
+- 素材里已有的具体事实(名称/日期/数字/引语/职务)必须原样写进稿件。把素材已经给出的事实写成占位符,等同于交白卷。
+- 只有确实没有依据的单个字段,才用统一占位符【待补:字段名】,并且一处占位符只替换那一处;不得因为个别字段缺失就整篇改用占位符。`
 }
 
 // Slugify converts a name into a filesystem-safe slug.
