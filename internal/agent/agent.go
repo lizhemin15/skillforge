@@ -176,21 +176,26 @@ func (e *Engine) HasLLM() bool {
 	return e.llm != nil
 }
 
-// PlainJSON 是一次性的非流式 JSON 调用：不给工具、不读也不写会话历史、
+// FastJSON 是一次性的「硬延迟预算」JSON 调用：不给工具、不读也不写会话历史、
 // 不做意图分类。专给「首页推荐行」这类 UI 糖用（api 层的 suggestHandler）。
 //
 // 为什么不复用 Chat：Chat 那条路带记忆、带路由、带工具循环，一次请求可能
 // 跑几十秒、几十次模型调用。推荐行的价值全在「用户还没开始打字的那两秒」，
 // 它必须便宜、可超时、失败无所谓——所以要在引擎上开一条最短的通道，
 // 而不是把糖挂在重路径上。
-func (e *Engine) PlainJSON(ctx context.Context, sys, user string) (string, error) {
+//
+// 实测（线上 Qwen3.6-27B）：走 Chat 这条路 6.24s（思考链），走 llm.FastJSON
+// 关掉思考链后 1.38s。慢的那一版在 5s 预算下等于功能不存在——接口 200 空数组，
+// 前端悄悄退回规则版，页面上什么都看不出来。所以这里不是「优化了一下」，
+// 是这条功能能不能存在。
+func (e *Engine) FastJSON(ctx context.Context, sys, user string) (string, error) {
 	if err := e.ensureLLM(); err != nil {
 		return "", err
 	}
 	e.mu.Lock()
 	cli := e.llm
 	e.mu.Unlock()
-	return cli.Chat(ctx, sys, user, true)
+	return cli.FastJSON(ctx, sys, user, 600)
 }
 
 // ChatTools 是工具循环所需的模型调用入口（引擎持有 LLM 客户端，

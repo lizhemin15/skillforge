@@ -262,6 +262,15 @@ func TestSuggestRoute_RegisteredAndServesChips(t *testing.T) {
 	if last := f.lastReq(t); !last.JSONMode {
 		t.Fatal("这次调用没开 jsonMode（response_format=json_object）")
 	}
+	// 思考链必须关掉。线上实测（Qwen3.6-27B）：开着 6.24s、关掉 1.38s，
+	// 而这条路的预算是 5s —— 开着等于每次超时、接口 200 空数组、
+	// 前端静默退回规则版推荐行，界面上完全看不出这个功能已经不存在了。
+	if last := f.lastReq(t); !last.ThinkingOff {
+		t.Fatal("这次调用没关思考链（enable_thinking=false）—— 线上会必然超时")
+	}
+	if last := f.lastReq(t); last.MaxTokens <= 0 {
+		t.Fatal("这次调用没有 max_tokens 上限（思考链可能吃满 completion 预算）")
+	}
 	// 上下文真的到了模型那边（不是只到 handler 就丢了）。
 	if last := f.lastReq(t); !strings.Contains(last.User, "防汛") {
 		t.Fatalf("发出去的请求里没有用户那句话：\n%s", last.User)

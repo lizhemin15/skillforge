@@ -18,21 +18,35 @@ export PATH=/usr/local/go/bin:$PATH
 SUGGEST=internal/api/suggest.go
 AGENT=internal/agent/agent.go
 ROUTER=internal/api/router.go
+# 推荐行的「延迟预算」那半边守在内层：思考链关不掉时，接口照样 200 空数组、
+# 前端照样静默降级 —— 所以 llm.FastJSON 也被这份自证覆盖。
+FASTJSON=internal/llm/fastjson.go
 BAK_DIR="$(mktemp -d)"
-for f in "$SUGGEST" "$AGENT" "$ROUTER"; do
+for f in "$SUGGEST" "$AGENT" "$ROUTER" "$FASTJSON"; do
   cp "$f" "$BAK_DIR/$(basename "$f")"
 done
 # 注意：restore 只负责还原，**不能**在这里删备份 —— 每条注入后都要还原一次，
 # 备份删了第二次还原就成了空操作，注入状态会一路带到下一条（自证结果全乱）。
 restore() {
-  for f in "$SUGGEST" "$AGENT" "$ROUTER"; do
+  for f in "$SUGGEST" "$AGENT" "$ROUTER" "$FASTJSON"; do
     cp "$BAK_DIR/$(basename "$f")" "$f"
   done
 }
 trap 'restore; rm -rf "$BAK_DIR"' EXIT
 
 fails=0
-run_test() { go test ./internal/api/ -run 'Suggest' -count=1 2>&1; }
+# 两个包一起跑：api 守「handler/路由/解析」，llm 守「这次调用真的够快」。
+# ⚠️ 必须自己聚合 rc：直接顺序写两条 `go test` 的话，函数返回的是**最后一条**的
+# 退出码 —— api 包真红了、llm 包绿着，整个 run_test 就是 0，注入自证会把
+# 「抓住了」判成「没抓住」。第一版就这么写的：14 条注入全被报成假绿，
+# 看上去是断言不行，其实是自证工具自己在骗人。
+run_test() {
+  local o1 o2 rc=0
+  o1="$(go test ./internal/api/ -run 'Suggest' -count=1 2>&1)" || rc=1
+  o2="$(go test ./internal/llm/ -run 'FastJSON|NormalizeBaseURL' -count=1 2>&1)" || rc=1
+  printf '%s\n%s\n' "$o1" "$o2"
+  return $rc
+}
 
 # ---------- 基线：不注入时必须全绿 ----------
 if ! out="$(run_test)"; then
@@ -115,7 +129,8 @@ inject_case '长回复不再截断（一次推荐行调用被整篇交付说明�
   'FAIL: TestSuggestPrompt_ClipsLongReply'
 
 inject_case 'JSON 模式关掉（模型开始套 ```json 围栏，解析全靠捡漏）' \
-  "$AGENT" 'return cli.Chat(ctx, sys, user, true)' 'return cli.Chat(ctx, sys, user, false)' \
+  "$FASTJSON" '"response_format": map[string]string{"type": "json_object"},' \
+  '"response_format": map[string]string{"type": "text"},' \
   'FAIL: TestSuggestRoute_RegisteredAndServesChips'
 
 inject_case '路由没注册（前端静默降级成规则版，谁也不会发现）' \
@@ -133,6 +148,22 @@ inject_case '空输入不再短路（首页刚打开就白白烧一次模型）'
 inject_case '没配模型时不再短路（走了 nil 引擎的 ensureLLM）' \
   "$SUGGEST" 'if h.eng == nil || !h.eng.HasLLM() {' 'if false {' \
   'FAIL: TestSuggestRoute_NoLLMIsEmpty200'
+
+inject_case '思考链开关被删（线上必然超时，功能静默消失）' \
+  "$FASTJSON" 'body["enable_thinking"] = false' 'body["_unused_thinking"] = false' \
+  'FAIL: TestFastJSON_SendsKnobsThatKeepItFast'
+
+inject_case 'max_tokens 上限被删（思考链可能吃满 completion，回空 content）' \
+  "$FASTJSON" '"max_tokens":      maxTokens,' '"max_tokens":      0,' \
+  'FAIL: TestFastJSON_SendsKnobsThatKeepItFast'
+
+inject_case '严格网关的 400 重试被删（换 provider 等于功能消失）' \
+  "$FASTJSON" 'if status == http.StatusBadRequest {' 'if status == http.StatusInternalServerError {' \
+  'FAIL: TestFastJSON_RetriesWithoutKnobOn400'
+
+inject_case '空 content 的报错不再指向思考链（排查方向会全错）' \
+  "$FASTJSON" '多半是思考链吃掉了 max_tokens' '未返回内容' \
+  'FAIL: TestFastJSON_EmptyContentExplainsReasoningBudget'
 
 echo
 if ! out="$(run_test)"; then

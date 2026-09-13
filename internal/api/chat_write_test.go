@@ -87,6 +87,12 @@ type fakeLLMReq struct {
 	System   string
 	User     string
 	JSONMode bool
+	// 推荐行（llm.FastJSON）走的是裸 HTTP，不经过 go-openai，所以这两项由
+	// 假模型自己从原始 body 里读。它们必须被断言守住：一旦有人把这条路改回
+	// Chat，思考链就关不掉了（实测 6.24s vs 1.38s），而超时后前端会静默退回
+	// 规则版推荐行——页面上完全看不出功能已经死了。
+	ThinkingOff bool
+	MaxTokens   int
 }
 
 func newFakeLLM(t *testing.T, reply func(system, user string) string) *fakeLLM {
@@ -103,6 +109,8 @@ func newFakeLLM(t *testing.T, reply func(system, user string) string) *fakeLLM {
 			ResponseFormat *struct {
 				Type string `json:"type"`
 			} `json:"response_format"`
+			EnableThinking *bool `json:"enable_thinking"`
+			MaxTokens      int   `json:"max_tokens"`
 		}
 		_ = json.Unmarshal(body, &req)
 
@@ -117,9 +125,11 @@ func newFakeLLM(t *testing.T, reply func(system, user string) string) *fakeLLM {
 		}
 		f.mu.Lock()
 		f.reqs = append(f.reqs, fakeLLMReq{
-			System:   sys,
-			User:     usr,
-			JSONMode: req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object",
+			System:      sys,
+			User:        usr,
+			JSONMode:    req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object",
+			ThinkingOff: req.EnableThinking != nil && !*req.EnableThinking,
+			MaxTokens:   req.MaxTokens,
 		})
 		replyFn := f.reply
 		f.mu.Unlock()

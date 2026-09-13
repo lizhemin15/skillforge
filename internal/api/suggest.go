@@ -154,7 +154,7 @@ func (h *suggestHandler) serve(w http.ResponseWriter, ctx context.Context, req s
 	defer cancel()
 
 	sys, user := suggestPrompt(req)
-	raw, err := h.eng.PlainJSON(ctx, sys, user)
+	raw, err := h.eng.FastJSON(ctx, sys, user)
 	if err != nil {
 		// 超时/未配模型/上游抖动都走这里。**不写 error 字段**：前端只看 chips，
 		// 多一个字都是噪音（而且会把「模型没配好」的运维信息暴露给公网用户）。

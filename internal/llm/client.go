@@ -23,13 +23,9 @@ type Client struct {
 // a base like https://api.deepseek.com/v1).
 func New(cfg *model.LLMConfig) *Client {
 	conf := openai.DefaultConfig(cfg.APIKey)
-	if cfg.BaseURL != "" {
-		base := strings.TrimRight(cfg.BaseURL, "/")
-		if !strings.HasSuffix(base, "/v1") && !strings.Contains(base, "/v1/") {
-			base += "/v1"
-		}
-		conf.BaseURL = base
-	}
+	// 归一化逻辑与 FastJSON 共用一处（fastjson.go 的 normalizeBaseURL）：
+	// 两条路各写一份的话，某天只改一条，同一个 provider 在两条路上会打到不同地址。
+	conf.BaseURL = normalizeBaseURL(cfg.BaseURL)
 	return &Client{cfg: cfg, cli: openai.NewClientWithConfig(conf)}
 }
 
