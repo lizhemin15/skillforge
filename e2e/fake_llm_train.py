@@ -34,15 +34,42 @@
 
 每一笔请求（含回复全文）都落 FAKE_LLM_LOG（jsonl），E2E 事后核对「注入了什么」。
 就绪行：FAKE_LLM_READY <port>
+
+【抖动注入】环境变量 FAKE_LLM_JUDGE_503_TIMES=N：前 N 次**裁判**调用回 HTTP 503
+  （body 逐字复刻线上那次「System is too busy now」）。用来验证「带退避重试、且重试
+  不消耗裁判轮次」——被顶替的那笔请求只落 kind=judge_503，不进 kind=judge 的计数，
+  所以 E2E 才说得清「评审结论仍只有 2 轮」。
+  N 大于等于「一轮裁判的总尝试数」时等价于「抖动一直不停」，用来验证有限次放弃 + 告知。
 """
 
 import json
 import os
 import re
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG = os.environ.get("FAKE_LLM_LOG", "/tmp/fake-llm-train.jsonl")
+
+# 抖动注入：前 N 次**裁判**调用回线上那个 503。0 = 不注入（老行为不变）。
+# 为什么只打裁判：线上那次 503 就打在这里；打在全部调用上会把「重试不吃裁判轮次」
+# 这条判定掩盖掉——评审被 503 顶替了就不叫裁判打过分。
+JUDGE_503_TIMES = int(os.environ.get("FAKE_LLM_JUDGE_503_TIMES", "0"))
+_LOCK = threading.Lock()
+_judge_seen = 0
+
+# 线上原文（HTTP 503 + 这个 body），逐字复刻，别改：分类逻辑就是照它写的。
+LIVE_503_BODY = {"code": 50508, "message": "System is too busy now. Please try again later.",
+                 "data": None}
+
+
+def judge_should_503():
+    global _judge_seen
+    if JUDGE_503_TIMES <= 0:
+        return False
+    with _LOCK:
+        _judge_seen += 1
+        return _judge_seen <= JUDGE_503_TIMES
 
 V1_MARK = "SYS-V1-MARK"
 V2_MARK = "SYS-V2-MARK"
@@ -250,8 +277,12 @@ def dispatch(system, user, stream):
         kind, text = "trial", trial_draft(system)
     else:
         kind, text = "fallback", fallback()
+    if kind == "judge" and judge_should_503():
+        # 这一笔请求不算「裁判打过分」：只落 kind=judge_503，正文留空。
+        log("judge_503", system, user, "", stream)
+        return kind, text, True
     log(kind, system, user, text, stream)
-    return text
+    return kind, text, False
 
 
 # ---------- HTTP ----------
@@ -261,6 +292,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):  # noqa: A002 —— 逐字对齐 BaseHTTPRequestHandler 的签名（覆盖时改名会与基类关键字调用不兼容）
         pass
+
+    def send_503(self):
+        """回线上那个 503：HTTP 503 + 供应商原文 body（键名 code/message/data）。"""
+        data = json.dumps(LIVE_503_BODY, ensure_ascii=False).encode()
+        self.send_response(503)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
@@ -274,7 +314,10 @@ class Handler(BaseHTTPRequestHandler):
         system = "\n".join(m.get("content", "") for m in msgs if m.get("role") == "system")
         user = "\n".join(m.get("content", "") for m in msgs if m.get("role") == "user")
         stream = bool(body.get("stream"))
-        text = dispatch(system, user, stream)
+        _kind, text, unavailable = dispatch(system, user, stream)
+        if unavailable:
+            self.send_503()
+            return
 
         if stream:
             self.send_response(200)

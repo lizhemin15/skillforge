@@ -68,7 +68,7 @@ func (c *Client) Complete(ctx context.Context, system, user string, onDelta func
 	}
 	stream, err := c.cli.CreateChatCompletionStream(ctx, req)
 	if err != nil {
-		return "", err
+		return "", NormalizeErr(err)
 	}
 	defer stream.Close()
 
@@ -79,7 +79,7 @@ func (c *Client) Complete(ctx context.Context, system, user string, onDelta func
 			break
 		}
 		if err != nil {
-			return sb.String(), err
+			return sb.String(), NormalizeErr(err)
 		}
 		if len(resp.Choices) == 0 {
 			continue
@@ -122,10 +122,13 @@ func (c *Client) Chat(ctx context.Context, sys, user string, jsonMode ...bool) (
 	}
 	resp, err := c.cli.CreateChatCompletion(ctx, req)
 	if err != nil {
-		return "", err
+		// 归一化：瞬时故障（429/5xx/网关抖动/超时）打上标记，让调用方能决定重试；
+		// 文案不变，只是多带一个可判定的身份。
+		return "", NormalizeErr(err)
 	}
 	if len(resp.Choices) == 0 {
-		return "", fmt.Errorf("LLM returned no choices")
+		// 空 choices 在实践中同样出现在上游过载时，按瞬时处理。
+		return "", &TransientError{Err: fmt.Errorf("LLM returned no choices")}
 	}
 	return resp.Choices[0].Message.Content, nil
 }

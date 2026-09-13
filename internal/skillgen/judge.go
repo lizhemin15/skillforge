@@ -589,13 +589,20 @@ func (g *Generator) judgeLoop(ctx context.Context, mp *manualPack, sysPrompt str
 			break
 		}
 		material := trialMaterial(mp, cat)
-		draft, err := g.trialDraft(ctx, cur, mp, cat, material)
+		// 三处调用都过 retryTransient：试用写稿、裁判打分、回炉重写提示词。
+		// 它们打的是同一个上游，瞬时抖动对三者一视同仁；只在裁判那处加重试，
+		// 会让抖动换个位置同样把整条训练线打断。
+		draft, err := retryTransient(ctx, judgeRetryNote("试用写稿", round, steps), func() (string, error) {
+			return g.trialDraft(ctx, cur, mp, cat, material)
+		})
 		if err != nil {
 			rep.Err = err.Error()
 			steps(fmt.Sprintf("8.5/9 第 %d 轮试用失败：%s", round, err.Error()))
 			break
 		}
-		res, err := g.judgeDraft(ctx, mp, cat, material, draft)
+		res, err := retryTransient(ctx, judgeRetryNote("裁判调用", round, steps), func() (*JudgeResult, error) {
+			return g.judgeDraft(ctx, mp, cat, material, draft)
+		})
 		if err != nil {
 			rep.Err = err.Error()
 			steps(fmt.Sprintf("8.5/9 第 %d 轮裁判失败：%s", round, err.Error()))
@@ -624,7 +631,9 @@ func (g *Generator) judgeLoop(ctx context.Context, mp *manualPack, sysPrompt str
 			break
 		}
 		steps(fmt.Sprintf("8.5/9 第 %d 轮未过线，按扣分项回炉重写提示词…", round))
-		next, rErr := revise(ctx, res, cur)
+		next, rErr := retryTransient(ctx, judgeRetryNote("回炉", round, steps), func() (string, error) {
+			return revise(ctx, res, cur)
+		})
 		if rErr != nil {
 			rep.Err = "回炉失败: " + rErr.Error()
 			steps("8.5/9 回炉失败（保留当前版本）：" + rErr.Error())
