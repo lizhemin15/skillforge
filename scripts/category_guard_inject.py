@@ -105,12 +105,13 @@ BAD400 = "TestCategoryAPI_BadInputIs400Not500"
 API_INJECTIONS = [
     (
         "状态码不分家：用户输入错误也回 500（用户会以为是系统坏了）",
+        # 锚点必须跟实现：categoryErrStatus 里 ErrNotManualSkill 已被**故意删除**
+        # （方案 C 放开后 store 不再抛它）。锚点失配时本脚本会直接报「锚点失效 ✗」，
+        # 而不是静默变成永远绿的摆设 —— 那是这里唯一可接受的失败方式。
         "\tcase errors.Is(err, store.ErrCategoryBadInput),\n"
-        "\t\terrors.Is(err, store.ErrCategoryInUse),\n"
-        "\t\terrors.Is(err, store.ErrNotManualSkill):",
+        "\t\terrors.Is(err, store.ErrCategoryInUse):",
         "\tcase false && errors.Is(err, store.ErrCategoryBadInput),\n"
-        "\t\tfalse && errors.Is(err, store.ErrCategoryInUse),\n"
-        "\t\tfalse && errors.Is(err, store.ErrNotManualSkill):",
+        "\t\tfalse && errors.Is(err, store.ErrCategoryInUse):",
         BAD400,
     ),
     (

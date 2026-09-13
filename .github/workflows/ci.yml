@@ -129,6 +129,17 @@ jobs:
           go test ./internal/api/ -run Suggest -count=1
           bash internal/api/suggest_mutation_check.sh
 
+      # 这两条 .py 自证脚本此前**没有任何地方调用**：CI 里没有 step、本地也没跑。
+      # 后果是可预测的 —— category_guard_inject.py 的一条锚点早就跟实现脱钩
+      # （categoryErrStatus 里 ErrNotManualSkill 被有意删掉），脚本自己在那行
+      # 打了「锚点失效 ✗」，但因为没有 step，谁也不会看见。
+      # 防线不跑就等于没有防线，而「永远绿的自证脚本」比没有更糟：
+      # 它会让人以为这块有人看着。
+      - name: 后端断言自证（分类结构管理 / 思考开关矩阵）
+        run: |
+          python3 scripts/category_guard_inject.py
+          python3 scripts/fastjson_knob_inject.py
+
       - name: Build
         run: |
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o skillforge ./cmd/server

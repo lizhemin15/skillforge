@@ -19,6 +19,17 @@ const read = (p) => readFileSync(new URL(p, REPO), 'utf8');
 const CI = read('.github/workflows/ci.yml');
 const PF = read('scripts/preflight.sh');
 
+// 枚举仓库里所有「注入自证」脚本。它们的共同点是：往出货文件里注入真实故障、
+// 要求对应断言变红、再显式还原。这类脚本有个致命性质 —— **不跑就没价值**，
+// 而且不跑的时候它是静的（不会报错、不会腐烂到崩，只是永远绿）。
+// 实测代价：scripts/category_guard_inject.py 的一条锚点跟实现脱钩很久，
+// 脚本每次都在打印「锚点失效 ✗」，但它既不在 CI 也没人手动跑，谁都没看见。
+const selfCheckScripts = () => [
+  ...readdirSync(new URL('internal/api/', REPO)).filter((f) => f.endsWith('_mutation_check.sh')).map((f) => `internal/api/${f}`),
+  ...readdirSync(new URL('web/tests/', REPO)).filter((f) => f.endsWith('_mutation_check.sh')).map((f) => `web/tests/${f}`),
+  ...readdirSync(new URL('scripts/', REPO)).filter((f) => /inject.*\.py$/.test(f)).map((f) => `scripts/${f}`),
+];
+
 test('preflight 与 CI 的 Go 单测命令必须逐字一致（含 -race -count=1）', () => {
   const WANT = 'go test -race -count=1 ./...';
 
@@ -109,5 +120,30 @@ test('tidy / gofmt 两道闸门本地与 CI 都要有', () => {
           `（2026-09-13 就因为本地没跑 gofmt -l 白红一次），本地必须能提前跑到。`,
       );
     }
+  }
+});
+
+test('每条注入自证脚本都必须在 CI 与 preflight 里被真正调用', () => {
+  const scripts = selfCheckScripts();
+
+  // 先守枚举本身：数目对不上说明上面的 readdir 逻辑失效了，
+  // 那样下面的循环会「空转通过」—— 这是所有守卫最常见的自杀方式。
+  assert.ok(
+    scripts.length >= 5,
+    `只枚举到 ${scripts.length} 条自证脚本（期望 ≥5：internal/api 1 条、web/tests 2 条、scripts 2 条）。` +
+      `枚举逻辑失效时这个测试会空转通过，所以必须把下限也钉死。实得：${scripts.join(', ')}`,
+  );
+
+  for (const s of scripts) {
+    assert.ok(
+      CI.includes(s),
+      `ci.yml 里没有调用 ${s} —— 这条防线在 CI 里从不跑，等于没有防线。` +
+        `它会静静地一直绿（或一直悄悄报失效）直到有人哪天手动跑一次。`,
+    );
+    assert.ok(
+      PF.includes(s),
+      `scripts/preflight.sh 里没有调用 ${s} —— 本地闸门比 CI 少一道，` +
+        `于是这类问题只能等推送之后由 CI 告诉你。`,
+    );
   }
 });

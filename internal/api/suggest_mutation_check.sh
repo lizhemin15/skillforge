@@ -158,7 +158,7 @@ inject_case 'max_tokens 上限被删（思考链可能吃满 completion，回空
   'FAIL: TestFastJSON_SendsKnobsThatKeepItFast'
 
 inject_case '严格网关的 400 重试被删（换 provider 等于功能消失）' \
-  "$FASTJSON" 'if status == http.StatusBadRequest {' 'if status == http.StatusInternalServerError {' \
+  "$FASTJSON" 'case status == http.StatusBadRequest && knob == knobBoth:' 'case status == http.StatusTeapot && knob == knobBoth:' \
   'FAIL: TestFastJSON_RetriesWithoutKnobOn400'
 
 inject_case '空 content 的报错不再指向思考链（排查方向会全错）' \

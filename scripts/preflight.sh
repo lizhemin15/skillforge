@@ -54,7 +54,7 @@ need go
 need node
 
 # ---- 1) go.mod / go.sum 是 tidy 状态（CI: Verify go.mod is tidy）----
-step '1/6 go.mod tidy'
+step '1/7 go.mod tidy'
 if [ -z "$(command -v go)" ]; then bad 'go 不可用'; else
   cp go.mod /tmp/.pf-go.mod.bak; cp go.sum /tmp/.pf-go.sum.bak
   go mod tidy >/tmp/.pf-tidy.log 2>&1
@@ -68,7 +68,7 @@ if [ -z "$(command -v go)" ]; then bad 'go 不可用'; else
 fi
 
 # ---- 2) go vet（CI: go vet ./...）----
-step '2/6 go vet'
+step '2/7 go vet'
 if go vet ./... >/tmp/.pf-vet.log 2>&1; then
   ok 'go vet 无告警'
 else
@@ -77,7 +77,7 @@ else
 fi
 
 # ---- 3) gofmt（CI: gofmt check）★ 最容易被漏、最不该漏 ----
-step '3/6 gofmt'
+step '3/7 gofmt'
 fmt=$(gofmt -l . 2>/dev/null)
 if [ -z "$fmt" ]; then
   ok '全部文件已格式化'
@@ -86,7 +86,7 @@ else
 fi
 
 # ---- 4) 编译（CI: build 步骤）----
-step '4/6 go build'
+step '4/7 go build'
 if go build ./... >/tmp/.pf-build.log 2>&1; then
   ok '编译通过'
 else
@@ -100,7 +100,7 @@ fi
 
 # ---- 5) Go 单测（CI: Unit tests）----
 if [ "$QUICK" = 0 ]; then
-  step '5/6 go test -race -count=1 ./...'
+  step '5/7 go test -race -count=1 ./...'
   # **必须与 CI 逐字一致**：CI 跑的是 `go test -race -count=1 ./...`，
   # 本地跑裸 `go test ./...` 会漏掉两类真缺陷：
   #   - 数据竞争（只有 -race 能看见，2026-09-13 白红一次）
@@ -119,7 +119,7 @@ fi
 #    为什么不像 CI 那样一个个写死：新加测试文件时容易漏加 step，
 #    而「漏加 = 这个测试在 CI 里从来不跑」。枚举目录才不会漏。
 if [ "$QUICK" = 0 ]; then
-  step '6/6 前端回归（web/tests/*.test.mjs）'
+  step '6/7 前端回归（web/tests/*.test.mjs）'
   n=0
   for t in web/tests/*.test.mjs; do
     [ -f "$t" ] || continue
@@ -135,6 +135,32 @@ if [ "$QUICK" = 0 ]; then
 fi
 
 # ---- 汇总 ----
+if [ "$QUICK" = 0 ]; then
+  # ---- 7/7 断言自证脚本（CI 里分三个 step 跑，这里一次跑完）----
+  # 这些脚本往**出货文件**里注入真实故障、要求对应断言变红，再显式还原。
+  # 它们不进任何闸门就会静态腐烂：实测 scripts/category_guard_inject.py 的一条锚点
+  # 早就跟实现脱钩（categoryErrStatus 里 ErrNotManualSkill 被有意删掉），脚本每次
+  # 都在打印「锚点失效 ✗」，但因为它既不在 CI 也没人手动跑，谁也没看见。
+  # 「永远绿的自证脚本」比没有更糟：它让人以为这块有人看着。
+  step '7/7 断言自证（5 条）'
+  selfcheck() {   # $1=标签，其余=命令
+    local label="$1"; shift
+    local out rc
+    out=$("$@" 2>&1); rc=$?
+    if [ "$rc" -eq 0 ]; then
+      ok "$label"
+    else
+      bad "$label —— rc=$rc（末尾 12 行见下）"
+      printf '%s\n' "$out" | tail -12 | sed 's/^/      /'
+    fi
+  }
+  selfcheck '前端 / 分类结构管理自证'   bash web/tests/category_ui_mutation_check.sh
+  selfcheck '前端 / 缓存版本号自证'     bash web/tests/asset_version_mutation_check.sh
+  selfcheck '后端 / 推荐行自证'         bash internal/api/suggest_mutation_check.sh
+  selfcheck '后端 / 分类结构管理自证'   python3 scripts/category_guard_inject.py
+  selfcheck '后端 / 思考开关矩阵自证'   python3 scripts/fastjson_knob_inject.py
+fi
+
 printf '\n\033[1m========== preflight 汇总 ==========\033[0m\n'
 printf '通过 %d 项' "$PASSED"
 if [ ${#SKIPPED[@]} -gt 0 ]; then printf '，跳过 %d 项（--quick）' "${#SKIPPED[@]}"; fi
