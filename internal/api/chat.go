@@ -309,6 +309,26 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// 2b. 手册模式（写作类技能 + 训练期抽出了分类素材）：判类 → 按类执笔 → 审稿。
+		//     「双开关」：skill_type=write 决定要不要走写文章这条路，categories/
+		//     目录在不在决定这条路是分三段还是单段。后者是训练期的抽取结果——
+		//     手册抽不出结构就不会建这个目录，于是自动退回下面的单段生成，
+		//     管理人不需要在任何地方勾选或配置。
+		//     不在这里处理的话，system_prompt 里那句「打开 categories/ 下对应的
+		//     文件」就是空头支票：模型看不到文件，只能凭分类名瞎猜要求。
+		if sc.SkillType == model.SkillTypeWrite {
+			pack, perr := h.eng.LoadWritePack(eval.SkillSlug)
+			if perr != nil {
+				write(evError, jsonSafe(map[string]string{"error": "载入手册素材失败: " + perr.Error()}))
+				return
+			}
+			if pack != nil {
+				if h.runManualWrite(ctx, write, clock, sc, pack, args, req.Message, req.SessionID, history) {
+					return
+				}
+			}
+		}
+
 		full, err = h.eng.Generate(ctx, sc, args, func(delta string) {
 			write(evDelta, jsonSafe(map[string]string{"t": delta}))
 		})

@@ -87,7 +87,12 @@ func (c *Client) Complete(ctx context.Context, system, user string, onDelta func
 		delta := resp.Choices[0].Delta.Content
 		if delta != "" {
 			sb.WriteString(delta)
-			onDelta(delta)
+			// onDelta 允许为 nil：调用方只关心最终文本（例如批量生成、审稿走的是
+			// 非流式 Chat）时不必为了凑一个空回调写闭包。对 nil 直接调用会整进程崩，
+			// 而这是调用方完全合理的用法。
+			if onDelta != nil {
+				onDelta(delta)
+			}
 		}
 	}
 	return sb.String(), nil

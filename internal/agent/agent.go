@@ -446,32 +446,30 @@ func (e *Engine) buildRoster() (string, []model.Skill, error) {
 // is typed: write skills produce an article; query/template skills produce an
 // actionable flow (and reference the downloadable attachment if present).
 func (e *Engine) Generate(ctx context.Context, sc *SkillContent, args map[string]string, onDelta func(string)) (string, error) {
-	var argBlock strings.Builder
-	if sc.SkillType == model.SkillTypeWrite {
-		argBlock.WriteString("# 本次写作的具体要求/内容\n\n")
-		if len(args) == 0 {
-			argBlock.WriteString("（用户本次对话中提供的细节）\n")
-		} else {
-			for k, v := range args {
-				if strings.TrimSpace(v) == "" {
-					continue
-				}
-				fmt.Fprintf(&argBlock, "- %s: %s\n", k, v)
-			}
-		}
-	} else {
-		argBlock.WriteString("# 本次要办理/查询的具体事项及已知信息\n\n")
-		if len(args) == 0 {
-			argBlock.WriteString("（用户本次对话中提供的细节）\n")
-		} else {
-			for k, v := range args {
-				if strings.TrimSpace(v) == "" {
-					continue
-				}
-				fmt.Fprintf(&argBlock, "- %s: %s\n", k, v)
-			}
-		}
+	return e.generateWithExtra(ctx, sc, args, "", onDelta)
+}
+
+// generateWithExtra 是 Generate 的完整实现。extra 非空时被追加到 system prompt
+// **末尾**：手册模式用它注入「本类写作要求 + 本类范文」。放末尾而不是插在中间，
+// 是因为 system prompt 里越靠后的内容离用户这句话越近，越不容易被中间的大段
+// 技能说明冲淡——手册要求是硬约束，不能被当成背景介绍。
+// extra 留空即普通生成，与原实现逐字等价。
+func (e *Engine) generateWithExtra(ctx context.Context, sc *SkillContent, args map[string]string, extra string, onDelta func(string)) (string, error) {
+	sys := e.generateSys(sc)
+	if strings.TrimSpace(extra) != "" {
+		sys += "\n\n" + extra
 	}
+	var done string
+	if sc.SkillType == model.SkillTypeWrite {
+		done = "请据此直接写出完整文章。"
+	} else {
+		done = "请据此给出结构化、可直接照做的办事流程/答案。"
+	}
+	return e.llm.Complete(ctx, sys, argBlockOf(sc, args)+"\n"+done, onDelta)
+}
+
+// generateSys 拼出技能的 system prompt（身份 + 技能提示词 + 骨架模板 + 附件提示）。
+func (e *Engine) generateSys(sc *SkillContent) string {
 	sys := "你是" + sc.Name + "的执行者。严格遵循下面的技能提示词响应。\n\n==== 技能提示词 ====\n" + sc.SystemPrompt
 	if strings.TrimSpace(sc.Template) != "" {
 		sys += "\n\n==== 回答骨架模板 ====\n" + sc.Template
@@ -480,13 +478,29 @@ func (e *Engine) Generate(ctx context.Context, sc *SkillContent, args map[string
 	if sc.SkillType != model.SkillTypeWrite && strings.TrimSpace(sc.Attachment) != "" {
 		sys += "\n\n注意：有一个模板文件《" + sc.Attachment + "》会随本次回答下发，请在回答中明确指引用户下载使用。"
 	}
-	var done string
+	return sys
+}
+
+// argBlockOf 把本次的要素整理成 user 侧的一段。写作类读作「具体要求」，
+// 办事类读作「要办理的事项」——同一份数据，两种技能对它的心理定位不同。
+func argBlockOf(sc *SkillContent, args map[string]string) string {
+	var argBlock strings.Builder
 	if sc.SkillType == model.SkillTypeWrite {
-		done = "请据此直接写出完整文章。"
+		argBlock.WriteString("# 本次写作的具体要求/内容\n\n")
 	} else {
-		done = "请据此给出结构化、可直接照做的办事流程/答案。"
+		argBlock.WriteString("# 本次要办理/查询的具体事项及已知信息\n\n")
 	}
-	return e.llm.Complete(ctx, sys, argBlock.String()+"\n"+done, onDelta)
+	if len(args) == 0 {
+		argBlock.WriteString("（用户本次对话中提供的细节）\n")
+		return argBlock.String()
+	}
+	for k, v := range args {
+		if strings.TrimSpace(v) == "" {
+			continue
+		}
+		fmt.Fprintf(&argBlock, "- %s: %s\n", k, v)
+	}
+	return argBlock.String()
 }
 
 // FlattenParams converts raw extracted params (which may hold arrays / nested
