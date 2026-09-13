@@ -183,6 +183,16 @@ func TestSuggestPrompt_CarriesContext(t *testing.T) {
 	if !strings.Contains(sys, "label") || !strings.Contains(sys, "send") {
 		t.Fatalf("system prompt 没交代输出格式：\n%s", sys)
 	}
+	// 不许编造具体事实 —— 线上验收时抓到的真实输出：助手刚问「产品名/卖点/人群」，
+	// 模型给的 send 直接写成「产品名称：智能办公本，核心卖点：纸感屏幕防误触…」，
+	// 而对话里从来没有这个产品。用户点一下，就等于自己认领了这条假事实。
+	//
+	// ⚠️ 断言必须锚**整句**（这条规则的第一句），不能只查「不许编」「占位符」这种词：
+	// 第一版就是查两个词，而「占位符」在下面「宁可留占位符」里还有一份、压根没被删掉，
+	// 于是注入删掉整条规则后断言照样绿 —— 又是裸子串假阳性（这个坑本项目记过账）。
+	if !strings.Contains(sys, "send 里不许出现对话中没出现过的具体事实") {
+		t.Fatalf("system prompt 没交代「send 不许编造具体事实」（整句都没了）：\n%s", sys)
+	}
 }
 
 // 第一轮（助手还没答）要明确标注，否则模型会把空的 last_reply 当成

@@ -165,6 +165,11 @@ inject_case '空 content 的报错不再指向思考链（排查方向会全错�
   "$FASTJSON" '多半是思考链吃掉了 max_tokens' '未返回内容' \
   'FAIL: TestFastJSON_EmptyContentExplainsReasoningBudget'
 
+inject_case '禁编造的约束被删（模型开始编用户没说过的产品名/数字）' \
+  "$SUGGEST" '"6. **send 里不许出现对话中没出现过的具体事实**：产品名、单位名、人名、数字、金额、日期、型号都不许编。" +' \
+  '"" +' \
+  'FAIL: TestSuggestPrompt_CarriesContext'
+
 echo
 if ! out="$(run_test)"; then
   echo "✗ 还原后测试还是红的 —— 注入没被干净还原，出货文件可能已被改坏"
