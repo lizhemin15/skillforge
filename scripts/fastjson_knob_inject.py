@@ -3,6 +3,7 @@
 
 「红在崩溃上不算红」：rc!=0 但没有 `--- FAIL` 行 = 脚本/编译崩了，不能证明断言有效。
 """
+import os
 import re
 import shutil
 import subprocess
@@ -47,11 +48,40 @@ INJECTIONS = [
 ]
 
 
+def go_bin() -> str:
+    """定位 go 可执行文件。
+
+    这里原先写死 "/usr/local/go/bin/go"，并把子进程环境**整个替换**成
+    {"PATH": "/usr/local/go/bin:/usr/bin:/bin", "HOME": "/root"}。
+    在本机（Go 装在 /usr/local/go）一直正常，所以没人发现；
+    在 GitHub runner 上 Go 在 toolcache 里，直接
+      FileNotFoundError: [Errno 2] No such file or directory: '/usr/local/go/bin/go'
+    —— 本文件被接进 CI 的第一天就崩了。
+
+    教训有两条，都不只适用于这个脚本：
+      1) 别写死任何工具的绝对路径，用 which 解析；
+      2) 别把子进程环境整个换掉（覆盖 PATH/HOME 会连带打断
+         代理、证书、缓存等一切依赖环境的东西），要在继承的基础上改。
+    找不到 go 时给一句人话并返回退出码 2（工具缺失 ≠ 防线有洞），
+    否则「环境问题」会被误读成「代码有问题」，排查方向就偏了。
+    """
+    found = shutil.which("go")
+    if found:
+        return found
+    fallback = "/usr/local/go/bin/go"
+    if os.path.exists(fallback):
+        return fallback
+    print("✗ 环境缺少 go 可执行文件（which go 找不到）—— 这条自证没跑，"
+          "不等于防线没问题；请先装 Go 或把 Go 放进 PATH。")
+    sys.exit(2)
+
+
 def run_tests() -> tuple[int, str]:
+    env = dict(os.environ)
+    env["PATH"] = os.path.dirname(go_bin()) + os.pathsep + env.get("PATH", "")
     p = subprocess.run(
-        ["/usr/local/go/bin/go", "test", "./internal/llm/", "-run", "FastJSON", "-v"],
-        cwd=REPO, capture_output=True, text=True,
-        env={"PATH": "/usr/local/go/bin:/usr/bin:/bin", "HOME": "/root"},
+        [go_bin(), "test", "./internal/llm/", "-run", "FastJSON", "-v"],
+        cwd=REPO, capture_output=True, text=True, env=env,
     )
     return p.returncode, p.stdout + p.stderr
 
