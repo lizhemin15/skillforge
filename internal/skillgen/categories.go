@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/lizhemin15/skillforge/internal/llm"
 )
@@ -77,12 +79,243 @@ func anchorPreview(s string) string {
 // 返回的每个片段以 Start 开头、以 End 结尾（含锚点本身），片段之间不含原文中
 // 的额外空白——是 text 的连续子串，可直接与原文做子串比对。
 func SplitByAnchors(text string, anchors []CatAnchor) ([]string, error) {
+	segs, err := SplitByAnchorsDetailed(text, anchors)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(segs))
+	for _, s := range segs {
+		out = append(out, s.Text)
+	}
+	return out, nil
+}
+
+// Segment 是一段按锚点切出的范文：Text 是原文的连续子串（原样，未改写一个字），
+// Start/End 是它在原文中的字节区间（半开），Level 是定位它所用的匹配级别。
+//
+// 暴露 Level 是为了让调用方把「这段是靠放宽匹配才切到的」显性报给管理员——
+// 静默放宽会让管理员失去判断依据，也可能掩盖手册本身的问题。
+type Segment struct {
+	Text  string
+	Start int
+	End   int
+	Level normLevel
+}
+
+// normLevel 是锚点定位的归一化级别，定位时从严到宽依次尝试。
+//
+// 为什么需要放宽：手册 PDF 经解析服务抽出的文本保留了原文的物理换行
+// （实测一本 6 万字的 50 页手册里有 1600+ 个换行），而模型「摘录」一句
+// 跨行的话时会把换行吞掉、连成一行——两边内容逐字相同，只在换行/空格上
+// 有别。若只认逐字相等，就会把「模型摘对了、只是没保留换行」误判成失败，
+// 整类范文被丢弃（实测 12 类里 6 类全灭）。
+//
+// 放宽的边界很硬：只放宽「怎么找到位置」，绝不放宽「切片从哪来」——
+// 片段永远是原文的一段连续子串，一个字符都不是模型补的，保真度不受影响。
+type normLevel int
+
+const (
+	levelExact  normLevel = iota // 逐字相等（旧行为，优先）
+	levelNoSpace                 // 忽略所有空白（换行、空格、全角空格）
+	levelNoPunct                 // 再忽略中英文标点
+)
+
+var normLevels = []normLevel{levelExact, levelNoSpace, levelNoPunct}
+
+func (l normLevel) String() string {
+	switch l {
+	case levelExact:
+		return "逐字"
+	case levelNoSpace:
+		return "忽略空白"
+	case levelNoPunct:
+		return "忽略空白与标点"
+	}
+	return "未知"
+}
+
+// punctCutset 是归一化时丢弃的标点白名单。
+//
+// 刻意用白名单而不是 unicode.IsPunct：书名号《》、方括号【】这类符号在各
+// Unicode 类别里归属不一，白名单可读、可审计。也刻意不含 %、+、#、字母与
+// 数字——这些是稿件里要保真的内容，丢了会让"数字保真核对"失效。
+const punctCutset = "，。、；：？！“”‘’（）()《》〈〉【】[]{}—–…·「」『』,.!?;:\"'`　"
+
+// cutByLevel 判断某字符在该级别下是否应从归一化文本中丢弃。
+func cutByLevel(r rune, lv normLevel) bool {
+	if unicode.IsSpace(r) {
+		return lv >= levelNoSpace
+	}
+	return lv >= levelNoPunct && strings.ContainsRune(punctCutset, r)
+}
+
+// normIndex 是「归一化文本 + 反向位置映射」。
+//
+// s[i] 是保留下来的第 i 个字符；beg[i]/end[i] 是它在原文中的字节区间（半开）。
+// 被丢弃的字符不占位置，因此任意一段归一化区间都能映射回原文里一段连续的
+// 原始字节——把归一化坐标换回原文坐标再切片，拿到的仍是原文子串。
+type normIndex struct {
+	s   []rune
+	beg []int
+	end []int
+}
+
+func buildNormIndex(text string, lv normLevel) *normIndex {
+	ni := &normIndex{}
+	for i := 0; i < len(text); {
+		r, size := utf8.DecodeRuneInString(text[i:])
+		if cutByLevel(r, lv) {
+			i += size
+			continue
+		}
+		ni.s = append(ni.s, r)
+		ni.beg = append(ni.beg, i)
+		ni.end = append(ni.end, i+size)
+		i += size
+	}
+	return ni
+}
+
+// find 返回 needle 在归一化文本中出现的全部起始位置（下标为归一化下标）。
+// 返回全部而非首个，是因为「出现多次」必须被当成错误而不是随便取一个。
+func (ni *normIndex) find(needle []rune) []int {
+	if len(needle) == 0 || len(needle) > len(ni.s) {
+		return nil
+	}
+	var hits []int
+	for i := 0; i+len(needle) <= len(ni.s); i++ {
+		match := true
+		for j := range needle {
+			if ni.s[i+j] != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			hits = append(hits, i)
+		}
+	}
+	return hits
+}
+
+// leadingCut 返回 frag 开头连续「在该级别下会被丢弃」的字符数。
+func leadingCut(frag string, lv normLevel) int {
+	n := 0
+	for _, r := range frag {
+		if !cutByLevel(r, lv) {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+// trailingCut 返回 frag 末尾连续「在该级别下会被丢弃」的字符数。
+func trailingCut(frag string, lv normLevel) int {
+	rs := []rune(frag)
+	n := 0
+	for i := len(rs) - 1; i >= 0; i-- {
+		if !cutByLevel(rs[i], lv) {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+// absorbHead 从 off 向前最多吸收 want 个「该级别下本就要丢弃」的字符，返回新起点。
+//
+// 用途：定位骨架只包含锚点的**保留字符**，但锚点首尾被归一化丢掉的字符
+// （如开头的【、结尾的。）在原文里往往真实存在。不补回来，切片就会缺头少尾
+// ——实测「忽略空白与标点」级别下，末位句号必然被吃掉。
+//
+// 安全边界：只吃该级别本就要丢弃的字符，且数量严格等于 want（不多吃），
+// 所以绝不可能把正文内容吞进切片。
+func absorbHead(text string, off, want int, lv normLevel) int {
+	for n := 0; n < want && off > 0; n++ {
+		r, size := utf8.DecodeLastRuneInString(text[:off])
+		if !cutByLevel(r, lv) {
+			break
+		}
+		off -= size
+	}
+	return off
+}
+
+// absorbTail 从 off 向后最多吸收 want 个「该级别下本就要丢弃」的字符，返回新终点。
+// 与 absorbHead 对称，边界约束相同。
+func absorbTail(text string, off, want int, lv normLevel) int {
+	for n := 0; n < want && off < len(text); n++ {
+		r, size := utf8.DecodeRuneInString(text[off:])
+		if !cutByLevel(r, lv) {
+			break
+		}
+		off += size
+	}
+	return off
+}
+
+// locateAnchor 定位片段在原文中的字节区间（半开），返回终点下标与命中级别。
+//
+// 三级依次尝试：逐字 → 忽略空白 → 忽略空白与标点。任一级出现「不唯一」立即
+// 报错（放宽只会让匹配更不唯一，继续放宽不会变好）；三级都找不到才报找不到，
+// 并在错误里写明三级都试过了，避免排查时误以为只试了逐字。
+func locateAnchor(text, frag string) (int, int, normLevel, error) {
+	var tried normLevel
+	for _, lv := range normLevels {
+		tried = lv
+		ni := buildNormIndex(text, lv)
+		needle := make([]rune, 0, len(frag))
+		for _, r := range frag {
+			if cutByLevel(r, lv) {
+				continue
+			}
+			needle = append(needle, r)
+		}
+		if len(needle) == 0 {
+			return 0, 0, lv, fmt.Errorf("锚点 %q 在该级别下归一化后为空（整段都是空白/标点）", anchorPreview(frag))
+		}
+		hits := ni.find(needle)
+		switch len(hits) {
+		case 1:
+			k := hits[0]
+			// 骨架区间 = 锚点首个保留字符的起点 → 末个保留字符的终点。
+			// 再按锚点首尾被归一化丢掉的字符数，向原文两侧「对齐吸收」补回来：
+			// 走「忽略空白与标点」级别时，锚点的【 和 。 都不参与定位，
+			// 不补回切片就会缺头少尾（末位句号必被吃掉）。
+			beg := absorbHead(text, ni.beg[k], leadingCut(frag, lv), lv)
+			end := absorbTail(text, ni.end[k+len(needle)-1], trailingCut(frag, lv), lv)
+			return beg, end, lv, nil
+		case 0:
+			continue
+		default:
+			return 0, 0, lv, fmt.Errorf("锚点 %q 在原文中出现 %d 次（%s 匹配下不唯一，拿它当锚点会切错位置）",
+				anchorPreview(frag), len(hits), lv)
+		}
+	}
+	return 0, 0, tried, fmt.Errorf("锚点 %q 在原文中找不到（已依次尝试逐字 / 忽略空白 / 忽略空白与标点三种匹配）", anchorPreview(frag))
+}
+
+// SplitByAnchorsDetailed 是 SplitByAnchors 的完整版：除切片外还返回每段的
+// 定位区间与所用匹配级别，供调用方记日志、做保真核对。
+//
+// 严格语义（与旧版一致）：任何"切不准"的情况都必须报错，绝不静默降级——
+// 静默降级切错位置，产出的是「看起来像范文、其实是别段」的脏数据，比直接
+// 失败危险得多（错的数据会被当成手册原文喂给模型）。报错情形：
+//
+//	① 某锚点片段在原文中找不到（三级匹配都试过）；
+//	② 某锚点片段在原文中出现多次（不唯一）——拿重复片段当锚点必然切错；
+//	③ 锚点顺序颠倒（后一个 Start 出现在前一段 Start 之前）；
+//	④ 相邻两段重叠（后一个 Start 落在前一段区间内）；
+//	⑤ anchors 为空；
+//	⑥ Start 或 End 为空串。
+func SplitByAnchorsDetailed(text string, anchors []CatAnchor) ([]Segment, error) {
 	if len(anchors) == 0 {
 		return nil, errors.New("SplitByAnchors: 锚点列表为空，无法切分")
 	}
 
-	segs := make([]string, 0, len(anchors))
-	// prevStart / prevEnd 是上一段的真实下标。注意必须先量出下标再比大小：
+	segs := make([]Segment, 0, len(anchors))
+	// prevStart / prevEnd 是上一段在原文中的真实下标。必须先量出下标再比大小：
 	// 裸子串比较（如 strings.Contains）判断不出"谁在前"和"是否重叠"，
 	// 这正是最容易埋 bug 的地方。
 	prevStart, prevEnd := -1, -1
@@ -92,28 +325,20 @@ func SplitByAnchors(text string, anchors []CatAnchor) ([]string, error) {
 			return nil, fmt.Errorf("SplitByAnchors: 第 %d 个锚点的 Start/End 为空串", i+1)
 		}
 
-		// 唯一性：用 strings.Count 而非 Contains。出现 0 次 = 找不到；
-		// 出现 ≥2 次 = 有歧义，Index 只会给第一个，切出来可能是错的段落。
-		if n := strings.Count(text, a.Start); n != 1 {
-			if n == 0 {
-				return nil, fmt.Errorf("SplitByAnchors: 第 %d 个锚点的 Start %q 在原文中找不到", i+1, anchorPreview(a.Start))
-			}
-			return nil, fmt.Errorf("SplitByAnchors: 第 %d 个锚点的 Start %q 在原文中出现 %d 次（必须唯一，否则会切错位置）", i+1, anchorPreview(a.Start), n)
+		si, _, lvS, err := locateAnchor(text, a.Start)
+		if err != nil {
+			return nil, fmt.Errorf("SplitByAnchors: 第 %d 个锚点的 Start 定位失败：%w", i+1, err)
 		}
-		if n := strings.Count(text, a.End); n != 1 {
-			if n == 0 {
-				return nil, fmt.Errorf("SplitByAnchors: 第 %d 个锚点的 End %q 在原文中找不到", i+1, anchorPreview(a.End))
-			}
-			return nil, fmt.Errorf("SplitByAnchors: 第 %d 个锚点的 End %q 在原文中出现 %d 次（必须唯一，否则会切错位置）", i+1, anchorPreview(a.End), n)
+		_, ei, lvE, err := locateAnchor(text, a.End)
+		if err != nil {
+			return nil, fmt.Errorf("SplitByAnchors: 第 %d 个锚点的 End 定位失败：%w", i+1, err)
 		}
 
-		si := strings.Index(text, a.Start)
-		ei := strings.Index(text, a.End)
-		// End 在自己这段的 Start 之前 → 锚点本身写反了。
-		if ei < si {
+		// End 在自己这段的 Start 之前（或紧贴其前）→ 锚点本身写反了。
+		// ei 是半开区间的终点，故用 <= 而非 <：ei <= si 意味着这一段为空或反向。
+		if ei <= si {
 			return nil, fmt.Errorf("SplitByAnchors: 第 %d 个锚点的 End %q 出现在其 Start %q 之前", i+1, anchorPreview(a.End), anchorPreview(a.Start))
 		}
-		end := ei + len(a.End) // 结束位置（不含）——下标比较统一用半开区间
 
 		if prevEnd >= 0 {
 			// 先判"顺序颠倒"再判"重叠"：si < prevStart 时两者都成立，
@@ -129,8 +354,14 @@ func SplitByAnchors(text string, anchors []CatAnchor) ([]string, error) {
 		}
 
 		// 切片即「原样」：不 TrimSpace、不折叠空白，逐字节等于原文子串。
-		segs = append(segs, text[si:end])
-		prevStart, prevEnd = si, end
+		// 注意 si/ei 已由归一化坐标映射回原文坐标，所以即使定位走了「忽略
+		// 空白」级别，切出的片段里依然保留着原文的换行与标点。
+		lv := lvS
+		if lvE > lv {
+			lv = lvE
+		}
+		segs = append(segs, Segment{Text: text[si:ei], Start: si, End: ei, Level: lv})
+		prevStart, prevEnd = si, ei
 	}
 	return segs, nil
 }
