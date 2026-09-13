@@ -157,7 +157,7 @@ func (c *Client) fastOnce(ctx context.Context, system, user string, maxTokens in
 			} `json:"message"`
 		} `json:"choices"`
 		Usage struct {
-			CompletionTokens int `json:"completion_tokens"`
+			CompletionTokens  int `json:"completion_tokens"`
 			CompletionDetails struct {
 				ReasoningTokens int `json:"reasoning_tokens"`
 			} `json:"completion_tokens_details"`
