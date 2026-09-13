@@ -124,8 +124,8 @@ func transientByText(msg string) bool {
 	}
 	l := strings.ToLower(msg)
 	for _, s := range []string{
-		"too busy",              // 硅基流动/部分国产网关的过载文案
-		"rate limit",            // 限流
+		"too busy",   // 硅基流动/部分国产网关的过载文案
+		"rate limit", // 限流
 		"temporarily unavailable",
 		"service unavailable",
 		"bad gateway",

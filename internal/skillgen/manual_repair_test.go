@@ -3,6 +3,7 @@ package skillgen
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -192,10 +193,13 @@ func TestExtractByChaptersSkipChapterLeavesWarning(t *testing.T) {
 // 抽一半失败 → 剩下的仍可用；这条保护了「补救路径不把已有成果全丢」。
 func TestExtractByChaptersHalfFailsStillUseful(t *testing.T) {
 	spans := pickChapterSpans(chaptersDoc)
-	var n int
+	// 计数器必须原子：extractStructureByChapters 并发逐章调模型（worker 池），
+	// 普通 n++ 在 -race 下是 READ/WRITE DATA RACE。
+	// 语义上也要留意：并发下 n==1 不保证是「第一章」，只保证**恰好一章**失败——
+	// 本用例的断言（剩 1 类 + 1 条解析失败告警）不依赖是哪一章，所以仍然成立。
+	var n int64
 	fc := &fakeChat{reply: func(call fakeCall) (string, error) {
-		n++
-		if n == 1 {
+		if atomic.AddInt64(&n, 1) == 1 {
 			return "这不是 JSON", nil // 解析失败
 		}
 		return `{"is_category":true,"trigger":"t","requirement":"产品发布类稿件要交代产品定位","anchors":[]}`, nil

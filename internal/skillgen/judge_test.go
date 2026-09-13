@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -37,7 +38,14 @@ type fakeCall struct {
 // fakeChat 是 chatClient 的替身：把每次调用记下来，按调用方给的 reply 出结果。
 // 记 Sys/User 是为了断言「裁判看到的输入里有什么、没有什么」——
 // 独立性（裁判看不到技能自述与审稿清单）不是靠注释声明的，是靠这里断出来的。
+//
+// calls 必须加锁：生产代码里 extractStructureByChapters 会**并发**逐章调用模型
+// （manual_repair.go 的 worker 池），同一个替身实例会被多个 goroutine 同时进 Chat。
+// 无锁 append 在 -race 下是实打实的 DATA RACE（CI 的 Unit tests 步骤跑的就是
+// `go test -race`，本地不带 -race 跑不出来——踩过：tidy/gofmt 先红把这一步挡住了）。
+// 测试替身不同步，等于给生产代码的并发路径发一张假通行证。
 type fakeChat struct {
+	mu    sync.Mutex
 	calls []fakeCall
 	reply func(call fakeCall) (string, error)
 }
@@ -47,11 +55,31 @@ func (f *fakeChat) Chat(_ context.Context, sys, user string, jsonMode ...bool) (
 	if len(jsonMode) > 0 {
 		c.JSON, c.JSONSet = jsonMode[0], true
 	}
+	f.mu.Lock()
 	f.calls = append(f.calls, c)
-	if f.reply == nil {
+	reply := f.reply
+	f.mu.Unlock()
+	if reply == nil {
 		return "", errors.New("fakeChat: 未设置 reply")
 	}
-	return f.reply(c)
+	// reply 在锁外调用：它可能自己再取锁（loopChat 的记录闭包），
+	// 也可能耗时较长，不该把 calls 的锁一并占住。
+	return reply(c)
+}
+
+// callCount / callAt 给并发路径的断言用：直接读 f.calls 在「被测函数还在并发调模型」
+// 的场合会与 append 撞上（读-写竞态）。测试里凡是在 WaitGroup 之后读的可以不用它
+// （WG 已建立 happens-before），但并发中途取数必须走这两个方法。
+func (f *fakeChat) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
+
+func (f *fakeChat) callAt(i int) fakeCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls[i]
 }
 
 // judgeJSON 拼一份合法的裁判输出：dims 五维全给。

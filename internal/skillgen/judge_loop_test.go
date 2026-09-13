@@ -156,7 +156,7 @@ func TestJudgeLoopRevisesUntilRoundCap(t *testing.T) {
 // 掩盖成「提示词不够好」，还把手册缺陷摊薄成几轮低分。
 func TestJudgeLoopEarlyStopsWhenAllFindingsAreHard(t *testing.T) {
 	mp := synthPack()
-	delete(mp.Examples, "会议纪要") // 有锚点却一篇没切出来 → 硬校验命中
+	delete(mp.Examples, "会议纪要")          // 有锚点却一篇没切出来 → 硬校验命中
 	fake := newLoopChat(loopFullMarks()) // 模型甚至给满分，硬校验照样否决
 	g := &Generator{}
 	g.SetChatClient(fake)
