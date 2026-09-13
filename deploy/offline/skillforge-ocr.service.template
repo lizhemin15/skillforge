@@ -1,0 +1,19 @@
+[Unit]
+Description=SkillForge 文档解析服务（RapidOCR PP-OCRv4，扫描件/Office 抽文本）
+Documentation=https://github.com/lizhemin15/skillforge
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=__OCR_BIN__ --port __OCR_PORT__
+Restart=on-failure
+RestartSec=3
+# 只监听 127.0.0.1（代码里写死），不对外暴露 —— 它不是公开接口，是主服务的内部依赖。
+#
+# 内存上限为什么是 2G：50 页扫描件实测峰值约 1.8G（引擎不回收时），给 1G 会被 cgroup
+# OOM 杀掉，表现是"抽一半失败"。ocrd 内部每 20 页重建一次引擎压低峰值，这里留 2G 余量；
+# 真超了宁可让 systemd 重启它，也不要它把整机内存吃光（主服务还在跑，重启只影响这一份解析）。
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

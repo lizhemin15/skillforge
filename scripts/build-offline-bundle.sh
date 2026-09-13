@@ -27,6 +27,8 @@ ARCH="$(go env GOARCH 2>/dev/null || uname -m)"
 BINARY=""
 OUTDIR="dist"
 FONT_FILE=""
+OCR_BIN=""
+NO_OCR=""
 SOURCE_DATE=""
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,6 +48,8 @@ while [ $# -gt 0 ]; do
 		--version) VERSION="${2:?--version 需要值，如 v0.3.0}"; shift 2 ;;
 		--arch)    ARCH="${2:?--arch 需要值，如 amd64/arm64}"; shift 2 ;;
 		--binary)  BINARY="${2:?--binary 需要值，指向已编译的 linux 二进制}"; shift 2 ;;
+		--ocr)     OCR_BIN="${2:?--ocr 需要值，指向已编译好的 linux ocrd}"; shift 2 ;;
+		--no-ocr)  NO_OCR=1; shift ;;
 		--outdir)  OUTDIR="${2:?}"; shift 2 ;;
 		--font)    FONT_FILE="${2:?}"; shift 2 ;;
 		--source-date) SOURCE_DATE="${2:?}"; shift 2 ;;
@@ -73,6 +77,29 @@ if [ -n "$BIN_ARCH" ] && [ "$BIN_ARCH" != "$ARCH" ]; then
 	die "二进制架构与 --arch 不符：--arch=$ARCH，但文件是 $BIN_ARCH（$BIN_DESC）"
 fi
 c_ok "二进制架构核对通过：$ARCH（$(du -h "$BINARY" | cut -f1)）"
+
+# ocrd（文档解析服务）架构核对：跟主二进制同一套规矩 —— 用文件内容判定，不靠文件名。
+# 装错架构的 ocrd 在目标机上表现为「Exec format error」→ 解析服务起不来 →
+# 用户看到的是"扫描件抽不出文本"，而不是"包打错了"，极难往回追。
+if [ -n "$OCR_BIN" ]; then
+	[ -f "$OCR_BIN" ] || die "找不到 ocrd：$OCR_BIN"
+	OCR_DESC="$(file -b "$OCR_BIN" 2>/dev/null || true)"
+	case "$OCR_DESC" in
+		*ARM\ aarch64*) OCR_ARCH=arm64 ;;
+		*x86-64*)       OCR_ARCH=amd64 ;;
+		*)              OCR_ARCH="" ;;
+	esac
+	if [ -n "$OCR_ARCH" ] && [ "$OCR_ARCH" != "$ARCH" ]; then
+		die "ocrd 架构与 --arch 不符：--arch=$ARCH，但文件是 $OCR_ARCH（$OCR_DESC）"
+	fi
+	c_ok "ocrd 架构核对通过：$ARCH（$(du -h "$OCR_BIN" | cut -f1)）"
+elif [ -n "$NO_OCR" ]; then
+	c_warn "按 --no-ocr 打一个不含文档解析服务的包（扫描件/Office 抽文本会不可用）"
+else
+	# 默认**必须**带：用户拿到的包如果只缺它，装完才发现 = 一次无效交付。
+	# 真要打不带 ocr 的包，显式加 --no-ocr。
+	die "没有 --ocr 指定 ocrd 二进制。离线包默认必须带文档解析服务；确实不要请显式加 --no-ocr"
+fi
 
 # 版本核对：install.sh 的装后自检会核对版本号是「构建期注入」还是 "dev"，用来证明
 # 客户跑的是 CI 产物。把 dev 二进制打进离线包 = 客户按一键安装装完，自检必然红，
@@ -212,10 +239,14 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" "$STAGE/fonts" "$STAGE/licenses"
 
 install -m 0755 "$BINARY" "$STAGE/bin/skillforge"
+# 用 if 而不是 `[ -n ] && install`：后者在 OCR_BIN 为空时整条列表状态非零，
+# 跟 set -e 的交互容易被误读（有的 shell 布局下会中断打包）。
+if [ -n "$OCR_BIN" ]; then install -m 0755 "$OCR_BIN" "$STAGE/bin/ocrd"; fi
 install -m 0644 "$font_pick" "$STAGE/fonts/$(basename "$font_pick")"
 install -m 0755 "$REPO_ROOT/deploy/offline/install.sh" "$STAGE/install.sh"
 install -m 0755 "$REPO_ROOT/deploy/offline/uninstall.sh" "$STAGE/uninstall.sh"
 install -m 0644 "$REPO_ROOT/deploy/offline/skillforge.service.template" "$STAGE/skillforge.service.template"
+install -m 0644 "$REPO_ROOT/deploy/offline/skillforge-ocr.service.template" "$STAGE/skillforge-ocr.service.template"
 install -m 0644 "$REPO_ROOT/deploy/offline/skillforge.env.example" "$STAGE/skillforge.env.example"
 install -m 0644 "$REPO_ROOT/deploy/offline/README.md" "$STAGE/README.md"
 
@@ -261,6 +292,7 @@ version=$VERSION
 arch=$ARCH
 built=$BUILD_STAMP
 font=$(basename "$font_pick")
+ocr=$([ -n "$OCR_BIN" ] && echo yes || echo no)
 EOF
 
 cat > "$STAGE/INSTALL.txt" <<'EOF'
@@ -274,6 +306,11 @@ SkillForge 离线安装包
   3. 装完会打印访问地址和管理员密码（密码只显示一次，记下来）
 
 安装脚本不联网：全程不 curl / wget / apt / pip，需要的东西都在这个包里。
+
+包里带了两个程序：
+  bin/skillforge  主服务（Web 界面 + 技能引擎）
+  bin/ocrd        文档解析服务（扫描件/Word/Excel 抽文本，含 OCR 模型，无需额外依赖）
+安装时会先扫描端口：默认主服务 8092、文档解析 8093。端口被占时会提示你指定新端口。
 
 装完会自动跑一次自检（skillforge -selftest），逐项验证：
   - 程序版本

@@ -12,6 +12,7 @@
 #   sudo ./uninstall.sh --purge --yes  # 连数据一起删，不再确认
 #   sudo ./uninstall.sh --prefix /srv/sf --purge
 #   sudo ./uninstall.sh --force        # 单元属于别的前缀时强拆（见下）
+#   sudo ./uninstall.sh --no-ocr       # 不动文档解析服务（装了多份实例混用时用）
 #
 # 与 install.sh 用同一套参数名，参数不写就按默认值（改过前缀的机器一定要带 --prefix）。
 # 如果 $SERVICE_NAME 的服务单元已存在、但指向的前缀跟本次不同，脚本会拒绝卸载——
@@ -50,6 +51,7 @@ while [ $# -gt 0 ]; do
 		--purge)      DO_PURGE=1; shift ;;
 		--yes|-y)     ASSUME_YES=1; shift ;;
 		--force)      FORCE=1; shift ;;
+		--no-ocr)     DO_OCR=0; shift ;;
 		-h|--help)    usage ;;
 		*)            die "无法识别的参数：$1（用 --help 看用法）" ;;
 	esac
@@ -60,6 +62,12 @@ done
 ENV_FILE="$PREFIX/skillforge.env"
 BIN="$PREFIX/skillforge"
 UNIT="/etc/systemd/system/$SERVICE_NAME.service"
+# 文档解析服务（ocrd）：install.sh 装在同一前缀的 bin/ 下，卸载必须一起清，
+# 否则删了主服务却留着一个吃 2G 内存上限的解析进程在监听端口（残留得很难看，
+# 而且下次装的时候 8093 被自己占着 → 又被端口冲突拦一次）。
+OCR_BIN="$PREFIX/bin/ocrd"
+OCR_UNIT="/etc/systemd/system/$SERVICE_NAME-ocr.service"
+DO_OCR=1
 
 printf '\033[1mSkillForge 卸载\033[0m\n'
 c_info "安装前缀 : $PREFIX"
@@ -131,17 +139,56 @@ else
 	c_info "没有服务单元文件需要删除"
 fi
 
+# ---------- 1.5 文档解析服务（ocrd）----------
+# 与主服务分开处理，理由：它可能本来就没装（--no-ocr 安装 / 旧版离线包不带），
+# 也可能属于另一份实例（多实例同机）。判据用 ExecStart 里的路径，不看文件名 ——
+# 同机两份实例的单元名不可能相同（名字里带 --service），但为了不误删别人家的，
+# 还是按"这个单元到底在启动哪个前缀下的二进制"来判断。
+if [ "$DO_OCR" -eq 1 ] && [ -f "$OCR_UNIT" ]; then
+	OCR_EXEC="$(sed -n 's|^[[:space:]]*ExecStart=||p' "$OCR_UNIT" | head -n 1 | awk '{print $1}')"
+	case "$OCR_EXEC" in
+		"$PREFIX"/*) ;;
+		"")
+			c_warn "单元 $OCR_UNIT 里读不到 ExecStart，跳过（请人工确认后手动删）"
+			;;
+		*)
+			if [ "$FORCE" -ne 1 ]; then
+				c_fail "文档解析单元「$OCR_UNIT」启动的是另一个前缀的程序：$OCR_EXEC"
+				c_fail "本次要卸的是 $PREFIX。继续会把别人的解析服务停掉。"
+				c_fail "确认要强拆：加 --force；只是想跳过它：加 --no-ocr"
+				exit 1
+			fi
+			c_warn "按 --force 强拆文档解析单元（它启动的是 $OCR_EXEC）"
+			;;
+	esac
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl stop "$SERVICE_NAME-ocr" >/dev/null 2>&1 || true
+		systemctl disable "$SERVICE_NAME-ocr" >/dev/null 2>&1 || true
+		systemctl reset-failed "$SERVICE_NAME-ocr" >/dev/null 2>&1 || true
+	fi
+	rm -f "$OCR_UNIT"
+	command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload
+	c_ok "文档解析服务已停止并删除单元：$OCR_UNIT"
+elif [ "$DO_OCR" -eq 1 ]; then
+	c_info "没有文档解析单元需要删除"
+fi
+
 # ---------- 2. 删程序与配置 ----------
 step "2/4" "删除程序与配置"
 
 removed=0
-for f in "$BIN" "$BIN.new" "$ENV_FILE"; do
+for f in "$BIN" "$BIN.new" "$ENV_FILE" "$OCR_BIN" "$OCR_BIN.new"; do
 	if [ -e "$f" ]; then
 		rm -f "$f"
 		c_ok "已删除 $f"
 		removed=1
 	fi
 done
+# bin/ 是给解析服务用的子目录：里面空了就顺手删掉（非空说明有用户自己放的东西，留着）
+if [ -d "$PREFIX/bin" ] && [ -z "$(ls -A "$PREFIX/bin" 2>/dev/null)" ]; then
+	rmdir "$PREFIX/bin"
+	c_ok "已删除空的 $PREFIX/bin"
+fi
 [ "$removed" -eq 0 ] && c_info "前缀目录里本来就没有程序文件"
 
 # 把目录转成「整段路径」匹配用的正则：
@@ -231,7 +278,7 @@ fi
 step "4/4" "收尾核对"
 
 leftover=0
-for f in "$BIN" "$ENV_FILE" "$UNIT" "$FONT_DIR"; do
+for f in "$BIN" "$ENV_FILE" "$UNIT" "$FONT_DIR" "$OCR_BIN" "$OCR_UNIT"; do
 	if [ -e "$f" ]; then
 		c_warn "仍然存在：$f"
 		leftover=1
@@ -239,12 +286,14 @@ for f in "$BIN" "$ENV_FILE" "$UNIT" "$FONT_DIR"; do
 done
 # 崩溃重启循环（activating）也算残留：只查 is-active 会放过它
 if command -v systemctl >/dev/null 2>&1; then
-	state="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
-	case "$state" in
-		active|activating|reloading)
-			c_warn "服务 $SERVICE_NAME 仍在运行（状态：$state）"
-			leftover=1 ;;
-	esac
+	for svc in "$SERVICE_NAME" "$SERVICE_NAME-ocr"; do
+		state="$(systemctl is-active "$svc" 2>/dev/null || true)"
+		case "$state" in
+			active|activating|reloading)
+				c_warn "服务 $svc 仍在运行（状态：$state）"
+				leftover=1 ;;
+		esac
+	done
 fi
 
 printf '\n'

@@ -7,6 +7,10 @@
   // 全页唯一的"多入口"：输入框上方那一条推荐行。内容由 renderChips() 按对话状态现算，
   // 不再有技能卡片网格 / 技能下拉面板 / 搜索框 / 脚注那四套并存的入口。
   const chipsBox = $('#chips');
+  const chipsWrap = $('#chips-wrap');
+  const inputBar = $('.ch-input-bar');
+  // 技能勾选层（「指定技能」档的下拉面板）
+  const skLayer = $('#sk-layer'), skQ = $('#sk-q'), skList = $('#sk-list'), skFoot = $('#sk-foot');
   const switchBox = $('#ch-switch');
   const modeAuto = $('#mode-auto'), modeManual = $('#mode-manual');
   const thumb = $('#ch-switch-thumb');
@@ -386,18 +390,23 @@
     const cap = 4;
 
     // —— 指定技能档 ——
-    // 这一档没选技能就发不出去（见 sendBlocked），所以推荐行必须给出候选；
-    // 否则用户被卡在"不能发 + 没有地方选"里 —— 面板删掉之后这是唯一的入口。
+    // 这一档没选技能就发不出去（见 sendBlocked），所以推荐行必须给出入口。
+    // 入口形态是一颗「打开勾选层」的胶囊，而不是技能候选本身：
+    //   技能库有几十上百个，推荐行只有 4 颗的位置，铺在这里 = 后面的技能永远点不到。
+    //   （上一版就是这么坏掉的：只列前 4 个，用户报"都没法选指定技能"。）
     if (mode === 'manual') {
       if (picked) {
-        items.push({ kind: 'unpick', label: '✓ ' + (picked.name || picked.slug), title: '点一下取消指定，回到自动调度' });
+        const nm = picked.name || picked.slug;
+        items.push({
+          kind: 'skillpick',
+          label: '技能：' + nm,
+          title: '点开技能列表，可换一个或取消指定',
+        });
         // 锁定了技能，此时最有用的是"用它写点什么"：给示范问句而不是技能列表
         askedFor(picked).forEach((a) => items.push(a));
         return { hint: '已指定', items: items.slice(0, cap) };
       }
-      core.concat(biz).slice(0, cap).forEach((k) => {
-        items.push({ kind: 'pick', slug: k.slug, label: k.name || k.slug, core: !!k.is_core, title: '指定这个技能' });
-      });
+      items.push({ kind: 'skillpick', label: '选择技能 ▾', title: '展开技能列表，勾一个来指定' });
       return { hint: CHIP_HINT.manual, items: items };
     }
 
@@ -467,6 +476,9 @@
       + (c.kind === 'pick' ? ' is-pick' : '')
       + (c.kind === 'pick' && c.core ? ' is-core' : '')
       + (c.kind === 'unpick' ? ' is-on' : '')
+      // 「选择技能 ▾」：虚线表示"还能选"，展开中点亮，跟已指定状态视觉上分开
+      + (c.kind === 'skillpick' ? ' is-pick' : '')
+      + (c.kind === 'skillpick' && skOpen ? ' is-on' : '')
       + (c.kind === 'again' ? ' is-pick' : ''));
     b.type = 'button';
     b.textContent = c.label;
@@ -487,6 +499,9 @@
       return;
     }
     if (c.kind === 'unpick') { clearSkill(); input.focus(); return; }
+    // 技能勾选层：这一颗不是"发一句话"，是"开一个面板"，绝不能落到下面的 ask 分支 ——
+    // 落到那里就会把「选择技能」四个字填进输入框然后发出去，变成一句对模型毫无意义的请求。
+    if (c.kind === 'skillpick') { toggleSkLayer(); return; }
     if (c.kind === 'again') {
       const sk = (allSkills || []).find((k) => k.slug === c.slug)
         || { slug: c.slug, name: c.slug };
@@ -495,14 +510,27 @@
       input.focus();
       return;
     }
-    // ask：点了就直接发，不让用户再按一次回车 —— 推荐操作的价值就在于省这一步。
-    // 但已经有草稿时不覆盖：草稿是用户自己敲的，优先级更高。
+    // ask：**只把这句话填进输入框，不直接发**。
+    // 上一版是点了就发 —— 看着省事，实际是逼用户"要么接受这个句子，要么等它写完再让它重写"，
+    // 想改个字数/语气都得白烧一次模型调用。现在光标落在末尾，接着打字就是改。
     // 没有文案的 chip 一律当无效：input.value = undefined 会把字面量 "undefined"
     // 写进输入框，submit() 再把它当用户说的话发出去 —— 一个空 chip 能发出一条假消息。
     const q = c.send || c.label;
     if (!q) return;
-    if (!(input.value || '').trim()) { setInput(q); }
-    submit();
+    setInput(q);
+    toEnd(input);
+    input.focus();
+  }
+
+  // 光标送到末尾：填完就是接着改，不是让人再按一下 End。
+  // 测试沙箱里的 input 是裸对象（没有 setSelectionRange），所以这里必须容错。
+  function toEnd(node) {
+    try {
+      if (node && typeof node.setSelectionRange === 'function') {
+        const n = String(node.value || '').length;
+        node.setSelectionRange(n, n);
+      }
+    } catch (e) {}
   }
 
   // 把当前状态渲染成推荐行。hint 用一个不起眼的小字标签，不抢视觉。
@@ -663,6 +691,8 @@
     paintMode(chatMode, modeAuto, modeManual);
     syncThumb();
     input.placeholder = PLACEHOLDER[chatMode];
+    // 切回自动档时层必须收掉：那一档不需要指定技能，层挂在屏幕上只会误导
+    if (chatMode === 'auto') closeSkLayer();
     renderChips();
     if (chatMode === 'manual' && !pickedSkill && !silent) nudgeChips();
   }
@@ -707,7 +737,9 @@
       }
       renderChips();
       syncThumb();   // 索引/字体就位后再校一次滑块
+      if (skOpen) renderSkLayer();
     });
+    wireSkLayer();
   }
   let pendingSlug = '';
 
@@ -722,6 +754,8 @@
           .sort((a, b) => (b.is_core ? 1 : 0) - (a.is_core ? 1 : 0));
         skFetched = true;
         renderChips();
+        // 层开着时技能库才到货（用户手快）：列表得补上，否则面板一直是"加载中"
+        if (skOpen) renderSkLayer();
         return allSkills;
       })
       .catch(() => allSkills);
@@ -738,6 +772,160 @@
     pickedSkill = null;
     try { localStorage.removeItem(SKILL_KEY); } catch (e) {}
     renderChips();
+  }
+
+  /* ---------- 技能勾选层（「指定技能」档的下拉面板） ----------
+     三层分工，全部可测：
+       · orderSkills / skillMatches / filterSkills / togglePick 是**纯函数** ——
+         状态进、清单出，不碰 DOM。回归测试直接喂一份技能清单就能断言
+         "技能库里的 13 个是不是都在面板里、搜索是不是真过滤了、再勾一次会不会取消"，
+         不需要人去点界面（人肉点界面 = 这条防线等于没有）。
+       · renderSkLayer 只把上面的结果铺成 DOM。
+       · open/close/toggle 管可见性。 */
+
+  // 核心技能（通用能力）排最前：用户找"办公文档管家"的频率远高于找某个业务技能。
+  // 不依赖后端排序 —— 后端哪天多塞一个技能就可能把通用能力挤出屏幕。
+  function orderSkills(list) {
+    return (list || []).slice().sort((a, b) => (b && b.is_core ? 1 : 0) - (a && a.is_core ? 1 : 0));
+  }
+
+  // 搜什么：名字、slug、用途说明。用户在输入框里想到的往往是"合同"这种词，
+  // 而它多半躺在 description 里 —— 只搜名字会搜不到（然后用户以为技能没了）。
+  function skillMatches(sk, q) {
+    const needle = String(q || '').trim().toLowerCase();
+    if (!needle) return true;
+    if (!sk) return false;
+    const hay = [sk.name, sk.slug, sk.description]
+      .map((v) => String(v == null ? '' : v)).join(' ').toLowerCase();
+    return hay.indexOf(needle) >= 0;
+  }
+
+  function filterSkills(list, q) {
+    return orderSkills(list).filter((sk) => skillMatches(sk, q));
+  }
+
+  // 勾选语义 = 单选 + 可取消：点已勾的那颗 → 取消（返回空串），点别的 → 换过去。
+  // 为什么是单选而不是多选：后端 /api/chat 只吃一个 skill 字段（锁定单个技能、跳过意图分类）。
+  // 面板做成多选就等于给出一个后端根本不兑现的承诺 —— 勾三个只会有一个生效，用户还查不出原因。
+  function togglePick(currentSlug, slug) {
+    if (!slug) return currentSlug || '';
+    return currentSlug === slug ? '' : slug;
+  }
+
+  let skOpen = false;                  // 勾选层当前是否开着
+  function renderSkLayer() {
+    if (!skList) return;
+    const q = skQ ? skQ.value : '';
+    const list = filterSkills(allSkills, q);
+    skList.innerHTML = '';
+    if (!list.length) {
+      const empty = el('div', 'ch-sklayer-empty');
+      // 两种"空"要分开说：技能库真为空 / 只是搜索没命中。
+      // 混成一句话的话，用户在搜索框里打错一个字就会以为技能被删了。
+      empty.textContent = (allSkills && allSkills.length)
+        ? '没有匹配「' + String(q).trim() + '」的技能' : '技能库还在加载，稍等一下';
+      skList.appendChild(empty);
+    } else {
+      list.forEach((sk) => {
+        const on = !!pickedSkill && pickedSkill.slug === sk.slug;
+        const row = el('button', 'ch-skrow' + (on ? ' is-on' : ''));
+        row.type = 'button';
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-selected', on ? 'true' : 'false');
+        if (sk.slug) row.dataset.slug = sk.slug;
+        const box = el('span', 'ch-skbox');
+        box.setAttribute('aria-hidden', 'true');
+        const main = el('span', 'ch-skmain');
+        const nm = el('span', 'ch-skname');
+        nm.textContent = sk.name || sk.slug || '';
+        main.appendChild(nm);
+        if (sk.is_core) {
+          const tag = el('span', 'ch-sktag');
+          tag.textContent = '通用';
+          main.appendChild(tag);
+        }
+        if (sk.description) {
+          const d = el('span', 'ch-skdesc');
+          d.textContent = sk.description;
+          main.appendChild(d);
+        }
+        row.appendChild(box);
+        row.appendChild(main);
+        row.addEventListener('click', () => chooseSkill(sk));
+        skList.appendChild(row);
+      });
+    }
+    if (skFoot) {
+      // 页脚只干一件事：告诉用户"勾了之后会怎样"。不写这句话，面板看起来像个多选过滤器。
+      skFoot.textContent = pickedSkill
+        ? '已指定「' + (pickedSkill.name || pickedSkill.slug) + '」，再点一次可取消'
+        : '勾一个技能，之后的提问都用它（再点一次可取消）';
+    }
+  }
+
+  // 勾选：换/取消 → 关层 → 焦点回到输入框（下一步一定是打字）。
+  function chooseSkill(sk) {
+    if (!sk) return;
+    const next = togglePick(pickedSkill ? pickedSkill.slug : '', sk.slug);
+    if (next) pickSkill(sk); else clearSkill();
+    closeSkLayer();
+    input.focus();
+  }
+
+  function openSkLayer() {
+    if (!skLayer) return;
+    // 每次打开都清空搜索词：上次搜的"合同"留着，会让用户以为技能库里只有合同。
+    if (skQ && skQ.value) skQ.value = '';
+    skOpen = true;
+    skLayer.hidden = false;
+    renderSkLayer();
+    if (skQ) skQ.focus();
+    renderChips();                     // 触发器要显示成"展开中"
+  }
+
+  function closeSkLayer() {
+    if (!skLayer || !skOpen) return;
+    skOpen = false;
+    skLayer.hidden = true;
+    renderChips();
+  }
+
+  function toggleSkLayer() { if (skOpen) closeSkLayer(); else openSkLayer(); }
+
+  function wireSkLayer() {
+    if (!skLayer) return;
+    if (skQ) {
+      skQ.addEventListener('input', renderSkLayer);
+      skQ.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          // 搜到就直接回车 —— 不逼用户"搜完再把鼠标挪到列表上点一下"
+          e.preventDefault();
+          const first = filterSkills(allSkills, skQ.value)[0];
+          if (first) chooseSkill(first);
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          closeSkLayer();
+          input.focus();
+        }
+      });
+    }
+    // 点层外关掉。**必须排除推荐行和输入栏**：手动档没选技能点发送时，submit() 会主动
+    // 打开这一层，而文档级 click 监听在冒泡末端才跑 —— 不排除的话它会把刚打开的层
+    // 当场关掉，用户看到的就是"点了发送毫无反应"（这个坑踩过一次，别再踩）。
+    document.addEventListener('click', (e) => {
+      if (!skOpen) return;
+      const t = e.target;
+      if (skLayer.contains(t)) return;
+      if (chipsWrap && chipsWrap.contains(t)) return;
+      if (inputBar && inputBar.contains(t)) return;
+      closeSkLayer();
+    });
+    // 焦点在输入框里时按 Esc 也要能关（不然只能去点外面）
+    document.addEventListener('keydown', (e) => {
+      if (skOpen && e.key === 'Escape' && !(skQ && document.activeElement === skQ)) {
+        closeSkLayer();
+      }
+    });
   }
 
   // 后端降级说明 → 渲染成回复开头的引用行。
@@ -786,8 +974,15 @@
     if (!text || busy) return;
     // 手动模式却没选技能 —— 不能偷偷退回自动（用户以为是"指定"的），
     // 直接打开面板并把搜索框聚焦，把这一步补上。
-    if (sendBlocked(chatMode, pickedSkill)) { nudgeChips(); return; }
+    if (sendBlocked(chatMode, pickedSkill)) {
+      nudgeChips();
+      // 光抖一下还不够：这一档的唯一出路在勾选层里，直接把层打开、搜索框聚焦，
+      // 用户下一步就只剩"勾一个"。抖是"看这里"，开层是"这里就能解决"。
+      openSkLayer();
+      return;
+    }
     input.value = ''; input.focus(); autoGrow();
+    closeSkLayer();                    // 发出去了就把层收掉，别让它压在对话上面
     if (welcome && !welcome.classList.contains('hidden')) welcome.classList.add('hidden');
 
     // persist user message + auto-title (first message, untitled session)

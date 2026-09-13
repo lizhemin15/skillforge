@@ -1667,6 +1667,99 @@ header.topbar {
 /* LLM 精修回来的那批：原地淡入，别让整行闪一下 */
 .ch-chips.refined { animation: ch-in .2s ease; }
 
+/* —— 推荐行 + 技能勾选层的定位容器 ——
+   为什么要多这一层：勾选层要"浮在推荐行上方"，而 renderChips() 每次会清空 #chips 的
+   innerHTML —— 层必须放在被清空的节点外面，靠这个 wrap 做 position:relative 的锚点。 */
+.ch-chips-wrap {
+  position: relative; flex: none;
+  max-width: 908px; width: 100%; margin: 0 auto;
+}
+
+/* —— 技能勾选层（「指定技能」档的下拉面板）——
+   它就是"指定技能"这四个字的兑现：技能库有几十上百个，推荐行只有 4 颗的位置。
+   视觉沿用毛玻璃面板 token，不新造颜色。 */
+.ch-sklayer {
+  position: absolute; z-index: 40;
+  bottom: calc(100% + 4px); left: 24px; right: 24px;   /* 与输入栏左缘对齐（同 .ch-chips 的 padding） */
+  display: flex; flex-direction: column;
+  max-height: min(46vh, 340px);
+  padding: 8px;
+  border-radius: 14px;
+  background: var(--ds-glass-bg-panel);
+  border: 1px solid var(--ds-glass-edge-cool);
+  -webkit-backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  box-shadow: var(--ds-shadow-card);
+  animation: ch-in .16s ease;
+}
+/* ⚠️ 必须有这一条：上面的 display:flex 会盖掉浏览器默认的 [hidden]{display:none}，
+   少了它，JS 里 skLayer.hidden = true 看着设了，层却还在屏幕上 ——
+   "点了没反应"的另一半（层关不掉）就是这么来的。 */
+.ch-sklayer[hidden] { display: none; }
+
+.ch-sklayer-q {
+  flex: none; box-sizing: border-box; width: 100%;
+  margin: 0 0 6px; padding: 7px 10px;
+  font: inherit; font-size: 12.5px; color: var(--ds-color-text-primary);
+  background: rgba(9,45,78,.04);
+  border: 1px solid var(--ds-color-border-soft); border-radius: 9px;
+  outline: none;
+  transition: border-color .15s ease, background .15s ease;
+}
+.ch-sklayer-q:focus { border-color: rgba(77,107,254,.45); background: #fff; }
+.ch-sklayer-q::placeholder { color: var(--ds-color-text-faint); }
+
+.ch-sklayer-list {
+  display: flex; flex-direction: column; gap: 2px;
+  overflow-y: auto; overscroll-behavior: contain;
+}
+.ch-sklayer-empty {
+  padding: 16px 10px; text-align: center;
+  font-size: 12px; color: var(--ds-color-text-faint);
+}
+
+/* 一行一个技能：勾选框 + 名字 +（可选）通用标记 + 说明 */
+.ch-skrow {
+  display: flex; align-items: flex-start; gap: 9px;
+  box-sizing: border-box; width: 100%; padding: 7px 9px;
+  font: inherit; font-size: 12.5px; color: var(--ds-color-text-primary);
+  text-align: left; cursor: pointer;
+  background: none; border: 0; border-radius: 9px;
+  transition: background .12s ease;
+}
+.ch-skrow:hover { background: rgba(9,45,78,.05); }
+.ch-skrow.is-on { background: rgba(77,107,254,.09); }
+
+.ch-skbox {
+  position: relative; flex: none; width: 14px; height: 14px; margin-top: 1px;
+  background: #fff; border: 1px solid var(--ds-color-border-strong); border-radius: 4px;
+}
+.ch-skrow.is-on .ch-skbox { background: var(--ds-color-brand); border-color: var(--ds-color-brand); }
+.ch-skrow.is-on .ch-skbox::after {
+  content: ''; position: absolute; left: 3.5px; top: .5px;
+  width: 4px; height: 8px;
+  border: solid #fff; border-width: 0 1.6px 1.6px 0;
+  transform: rotate(45deg);
+}
+.ch-skmain { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.ch-skname { color: var(--ds-color-text-bluish); }
+.ch-sktag {
+  flex: none; padding: 0 4px;
+  font-size: 10.5px; color: var(--ds-color-text-faint);
+  border: 1px solid var(--ds-color-border-soft); border-radius: 5px;
+}
+.ch-skdesc {
+  flex-basis: 100%; min-width: 0;
+  font-size: 11.5px; line-height: 1.4; color: var(--ds-color-text-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.ch-sklayer-foot {
+  flex: none; margin-top: 6px; padding: 7px 3px 1px;
+  font-size: 11px; color: var(--ds-color-text-faint);
+  border-top: 1px solid var(--ds-color-border-soft);
+}
+
 /* 指定技能档却没选技能 → 抖一下并高亮。
    "点了发送毫无反应"只能靠这一行来解释，所以反馈必须落在用户该点的地方。 */
 @keyframes ch-need {

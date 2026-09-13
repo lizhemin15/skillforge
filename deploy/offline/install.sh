@@ -11,10 +11,16 @@
 # 用法：
 #   sudo ./install.sh                       # 默认装到 /opt/skillforge，端口 8092
 #   sudo ./install.sh --port 9000           # 换端口
+#   sudo ./install.sh --ocr-port 9103       # 换文档解析服务（OCR）端口
+#   sudo ./install.sh --no-ocr              # 不装文档解析服务（只装主服务）
 #   sudo ./install.sh --prefix /srv/sf      # 换安装前缀
 #   sudo ./install.sh --service sf-test     # 换服务名（同一台机器装第二份实例用）
 #   sudo ./install.sh --force               # 顶掉同名的、别的前缀的既有实例（危险，见下）
 #   sudo ./install.sh --skip-selftest       # 跳过装后自检（仅开发调试用）
+#
+# 端口冲突：安装前会**先扫描**主服务端口和 OCR 端口。任一被别的进程占用时，
+# 交互式终端里会直接问你「换成哪个端口」（回车用建议值），非交互环境下会失败并
+# 打印确切的命令（--port / --ocr-port），不会带着冲突硬装下去。
 #
 # 同一台机器装第二份实例：**必须换 --service 名字**（单元名 = 服务名）。
 # 不换名字而前缀又不同，脚本会拒绝安装——因为覆盖单元不会立刻报错，但那个服务
@@ -29,6 +35,10 @@ set -euo pipefail
 
 PREFIX=/opt/skillforge
 PORT=8092
+# 文档解析服务（ocrd）默认 8093。它只监听 127.0.0.1，是主服务的内部依赖：
+# 没有它 PDF/Word/Excel 的正文抽不出来，但对「纯文字写作」类技能没有影响。
+OCR_PORT=8093
+DO_OCR=1
 DATA_DIR=""
 ADMIN_USER=admin
 ADMIN_PASS=""
@@ -44,6 +54,8 @@ DO_SELFTEST=1
 PUBLIC_URL=""
 # 顶掉「别人家的」服务单元需要显式 --force（见 0.5 冲突检查）。
 FORCE=0
+# --public-url 有没有显式给过：端口冲突时我们会改 PORT，默认的 PUBLIC_URL 必须跟着重算
+PUBLIC_URL_SET=0
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="${BASH_SOURCE[0]}"
@@ -70,11 +82,13 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 		--prefix)      PREFIX="${2:?--prefix 需要一个目录}"; shift 2 ;;
 		--port)        PORT="${2:?--port 需要端口号}"; shift 2 ;;
+		--ocr-port)    OCR_PORT="${2:?--ocr-port 需要端口号}"; shift 2 ;;
+		--no-ocr)      DO_OCR=0; shift ;;
 		--data-dir)    DATA_DIR="${2:?--data-dir 需要一个目录}"; shift 2 ;;
 		--admin-user)  ADMIN_USER="${2:?}"; shift 2 ;;
 		--admin-pass)  ADMIN_PASS="${2:?}"; shift 2 ;;
 		--font-dir)    FONT_DIR="${2:?}"; FONT_DIR_SET=1; shift 2 ;;
-		--public-url)  PUBLIC_URL="${2:?}"; shift 2 ;;
+		--public-url)  PUBLIC_URL="${2:?}"; PUBLIC_URL_SET=1; shift 2 ;;
 		# 服务名同时决定 systemd 单元名，所以同一台机器上装第二份实例（灰度/测试）
 		# 必须换名字，否则会覆盖第一份的单元文件。参数名与 uninstall.sh 对齐（--service）。
 		--service|--service-name) SERVICE_NAME="${2:?--service 需要一个服务名}"; shift 2 ;;
@@ -95,6 +109,9 @@ done
 ENV_FILE="$PREFIX/skillforge.env"
 BIN="$PREFIX/skillforge"
 UNIT="/etc/systemd/system/$SERVICE_NAME.service"
+# 文档解析服务：二进制与单元跟主服务同前缀/同服务名前缀命名，卸载才能一起清干净
+OCR_BIN="$PREFIX/bin/ocrd"
+OCR_UNIT="/etc/systemd/system/$SERVICE_NAME-ocr.service"
 BUNDLED_FONT=""
 
 printf '\033[1mSkillForge 离线安装\033[0m\n'
@@ -156,22 +173,156 @@ if [ -f "$UNIT" ]; then
 fi
 
 port_in_use() {
-	command -v ss >/dev/null 2>&1 || return 1
-	local out
-	out="$(ss -ltn 2>/dev/null || true)"
-	case "$out" in
-		*":$PORT "*) return 0 ;;
-		*)           return 1 ;;
+	# 判据：TCP LISTEN 里有没有这个端口。用 ss 优先，没有 ss 就退回 /proc/net/tcp
+	# （离线最小系统常常没装 iproute2）。
+	local p="${1:?port_in_use 需要端口号}"
+	if command -v ss >/dev/null 2>&1; then
+		local out
+		out="$(ss -ltn 2>/dev/null || true)"
+		case "$out" in
+			*":$p "*) return 0 ;;
+			*)       return 1 ;;
+		esac
+	fi
+	# /proc/net/tcp 的本地地址是 16 进制大端，端口是低 4 位十六进制
+	local hex
+	hex="$(printf '%04X' "$p")"
+	awk -v h="$hex" 'NR>1 && $4=="0A" { split($2,a,":"); if (toupper(a[2])==h) found=1 } END { exit found?0:1 }' /proc/net/tcp 2>/dev/null
+}
+
+port_owner() {
+	# 谁占着这个端口 —— 只为了在冲突报告里写清楚"被谁占了"。
+	# 拿不到就返回空（比如进程属于别的 namespace），不因此判失败。
+	local p="${1:?}" out=""
+	if command -v ss >/dev/null 2>&1; then
+		out="$(ss -ltnp 2>/dev/null | awk -v p=":$p" '$4 ~ p"$" || index($4, p" ") {print; exit}' || true)"
+	fi
+	if [ -z "$out" ]; then
+		local hex
+		hex="$(printf '%04X' "$p")"
+		out="$(awk -v h="$hex" 'NR>1 && $4=="0A" { split($2,a,":"); if (toupper(a[2])==h) print "inode="$10 }' /proc/net/tcp 2>/dev/null | head -n 1)"
+	fi
+	printf '%s' "$out"
+}
+
+valid_port() {
+	case "${1:-}" in
+		''|*[!0-9]*) return 1 ;;
 	esac
+	[ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# 读一个端口：交互式终端下反复问直到拿到合法且空闲的端口；非交互直接判失败。
+# 为什么必须"问到对为止"而不是问一次：
+#   用户输入的第二个端口同样可能撞车（尤其是抄了旁边那台机器的端口），
+#   只问一次就装下去，等于把这个冲突推到"服务起不来"才暴露。
+ask_port() {
+	local label="$1" def="$2" cur="$3" ans="" tries=0
+	while [ "$tries" -lt 20 ]; do
+		tries=$((tries + 1))
+		printf '  %s端口 [%s]: ' "$label" "$def" >&2
+		read -r ans || ans=""
+		[ -n "$ans" ] || ans="$def"
+		if ! valid_port "$ans"; then
+			c_warn "「$ans」不是合法端口（1-65535），重来" >&2
+			continue
+		fi
+		if [ "$ans" = "$cur" ]; then
+			c_warn "「$ans」就是刚才冲突的那个端口，重来" >&2
+			continue
+		fi
+		if port_in_use "$ans"; then
+			c_warn "「$ans」也被占用了（$(port_owner "$ans")），换一个" >&2
+			continue
+		fi
+		printf '%s' "$ans"
+		return 0
+	done
+	return 1
 }
 
 # 注意：这里**不能**写成 `ss | awk | grep -q`。grep -q 命中即退出会让上游进程收到 SIGPIPE，
 # 在 set -o pipefail 下整条管道被判失败 → 端口占用检测恒为「空闲」，冲突被静默放过。
-if port_in_use; then
-	if ! systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-		die "端口 $PORT 已被别的进程占用（且不是本服务）。换端口：sudo $SELF --port 9000"
+#
+# 主服务端口：如果是本服务自己占着（unit 已在跑），当"升级"处理，不算冲突。
+MAIN_BUSY=0
+if port_in_use "$PORT"; then
+	if [ -f "$UNIT" ] && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+		c_warn "端口 $PORT 已被本服务（$SERVICE_NAME）占用——按「升级」处理"
+	else
+		MAIN_BUSY=1
 	fi
-	c_warn "端口 $PORT 已被本服务占用——按「升级」处理"
+fi
+# OCR 端口：本实例的 ocr 单元在跑也算"自己的"，同样是升级。
+OCR_BUSY=0
+if [ "$DO_OCR" -eq 1 ] && port_in_use "$OCR_PORT"; then
+	if [ -f "$OCR_UNIT" ] && systemctl is-active --quiet "$SERVICE_NAME-ocr" 2>/dev/null; then
+		c_warn "端口 $OCR_PORT 已被本实例的文档解析服务占用——按「升级」处理"
+	else
+		OCR_BUSY=1
+	fi
+fi
+
+# ---------- 0.4 端口预扫描（冲突要当场解决，不要等"服务起不来"）----------
+# 为什么要"先扫描再装"：装到一半才发现端口被占，机器上已经留下了半个安装（目录、
+# 用户、字体、可能还有单元文件），用户还得先搞清楚怎么清干净再来一遍。
+# 扫描放在最前面，冲突就在这一步解决掉（或者在非交互环境里明确拒绝）。
+suggest_port() {
+	# 从 start 往上找第一个空闲端口；跳过 exclude（避免跟另一个服务撞成同一个）
+	local p="$1" ex="$2" i=0
+	while [ "$i" -lt 200 ]; do
+		if [ "$p" != "$ex" ] && ! port_in_use "$p"; then
+			printf '%s' "$p"; return 0
+		fi
+		p=$((p + 1)); i=$((i + 1))
+	done
+	return 1
+}
+
+TTY_MODE="none"
+if [ -t 0 ]; then
+	TTY_MODE="stdin"
+elif [ -r /dev/tty ]; then
+	TTY_MODE="tty"
+fi
+
+# 两个服务不能用一个端口：撞在一起时后起的那个必然起不来，而且报错很难懂（address in use）
+if [ "$DO_OCR" -eq 1 ] && [ "$PORT" = "$OCR_PORT" ]; then
+	die "主服务端口和 OCR 端口不能相同（都是 $PORT）。例：sudo $SELF --port 8092 --ocr-port 8093"
+fi
+
+if [ "$MAIN_BUSY" -eq 1 ] || [ "$OCR_BUSY" -eq 1 ]; then
+	printf '\n\033[1m端口检查\033[0m\n'
+	[ "$MAIN_BUSY" -eq 1 ] && { c_fail "主服务端口 $PORT 被别的进程占用：$(port_owner "$PORT")"; } || c_ok "主服务端口 $PORT 空闲"
+	if [ "$DO_OCR" -eq 1 ]; then
+		[ "$OCR_BUSY" -eq 1 ] && { c_fail "文档解析端口 $OCR_PORT 被别的进程占用：$(port_owner "$OCR_PORT")"; } || c_ok "文档解析端口 $OCR_PORT 空闲"
+	fi
+
+	if [ "$TTY_MODE" = "none" ]; then
+		c_fail "非交互环境（stdin 不是终端），无法询问端口。请显式指定后重跑："
+		c_fail "  sudo $SELF --port <主服务端口> --ocr-port <文档解析端口>"
+		[ "$DO_OCR" -eq 0 ] && c_fail "  （已用 --no-ocr，只需 --port）"
+		exit 1
+	fi
+
+	c_info "需要你指定没被占用的端口（直接回车 = 用建议值）："
+	if [ "$MAIN_BUSY" -eq 1 ]; then
+		SUG="$(suggest_port $((PORT + 1)) "$OCR_PORT" || printf '%s' "$((PORT + 100))")"
+		NEW="$(ask_port "主服务" "$SUG" "$PORT")" || die "端口没有确定下来，安装中止（没有改动系统）"
+		PORT="$NEW"
+		MAIN_BUSY=0
+	fi
+	if [ "$OCR_BUSY" -eq 1 ]; then
+		SUG="$(suggest_port $((OCR_PORT + 1)) "$PORT" || printf '%s' "$((OCR_PORT + 100))")"
+		NEW="$(ask_port "文档解析" "$SUG" "$OCR_PORT")" || die "端口没有确定下来，安装中止（没有改动系统）"
+		OCR_PORT="$NEW"
+		OCR_BUSY=0
+	fi
+	c_ok "端口确定：主服务 $PORT ／ 文档解析 $OCR_PORT"
+	# 端口变了，PUBLIC_URL 的默认值要跟着改（否则下载链接里还是旧端口）
+	[ -n "$PUBLIC_URL_SET" ] || PUBLIC_URL="http://localhost:$PORT"
+else
+	c_ok "端口检查通过（主服务 $PORT$([ "$DO_OCR" -eq 1 ] && printf ' ／ 文档解析 %s' "$OCR_PORT") 都空闲）"
 fi
 
 # ---------- 1. 生成/复用密钥 ----------
@@ -265,6 +416,23 @@ install -m 0755 "$HERE/bin/skillforge" "$BIN.new"
 mv -f "$BIN.new" "$BIN"
 c_ok "程序：$BIN"
 
+# 文档解析服务（ocrd）：同一个前缀下的 bin/，与主服务同生命周期（装上/卸载一起走）。
+# 它是「扫件/Word/Excel 正文抽取」的唯一实现——缺了它这类技能会报"解析服务不可用"，
+# 纯文字写作类技能不受影响。所以缺文件只告警、不阻断安装。
+if [ "$DO_OCR" -eq 1 ]; then
+	install -d -m 0755 "$PREFIX/bin"
+	if [ -f "$HERE/bin/ocrd" ]; then
+		install -m 0755 "$HERE/bin/ocrd" "$OCR_BIN.new"
+		mv -f "$OCR_BIN.new" "$OCR_BIN"
+		c_ok "文档解析服务：$OCR_BIN（含 PP-OCRv4 模型，无需额外依赖）"
+	else
+		DO_OCR=0
+		c_warn "包里没有 bin/ocrd → 跳过文档解析服务。"
+		c_warn "影响：扫描件 PDF / Word / Excel 的正文抽不出来（纯文字写作类技能不受影响）。"
+		c_warn "带上它需要重新下载完整离线包（含 ocrd 的那份）。"
+	fi
+fi
+
 # 技能不随包带：程序启动时会自己 seed 内置技能（见 internal/store/seed.go），
 # 包里再塞一份目录只会造成「有目录没数据库记录」的孤儿状态。
 
@@ -290,6 +458,12 @@ umask 077
 	printf '%s=%s\n\n' SKILLFORGE_JWT_SECRET "$SF_JWT"
 	printf '# ---- PDF 字体（离线包自带；显式指定可避免运行时猜字体）----\n'
 	printf 'SKILLFORGE_PDF_FONT_FILE=%s\n\n' "$BUNDLED_FONT"
+	if [ "$DO_OCR" -eq 1 ]; then
+		printf '# ---- 文档解析服务（ocrd，本机回环，不对外）----\n'
+		printf '# 只监听 127.0.0.1，主服务用它把 PDF/Word/Excel/扫描件抽成文本。\n'
+		printf '# 端口冲突时安装脚本会问你换端口，改完这里要同步重启两个服务。\n'
+		printf 'SKILLFORGE_OCR_URL=http://127.0.0.1:%s\n\n' "$OCR_PORT"
+	fi
 	printf '# ---- 离线自检用来证明「沙箱确实读不到机密」的证据文件 ----\n'
 	printf 'SKILLFORGE_ENV_FILE=%s\n\n' "$ENV_FILE"
 	printf '# ---- LLM（也可装好后登录管理端在网页上配，网页配置优先）----\n'
@@ -337,7 +511,43 @@ chmod 644 "$UNIT"
 systemctl daemon-reload
 c_ok "服务单元：$UNIT"
 
+# 文档解析服务的单元：独立单元（不是主服务的子进程）—— 它内存峰值高（50 页扫描件约 1.8G），
+# 单独一个单元才能单独设 MemoryMax，也才能单独重启而不打断正在写作的主服务。
+if [ "$DO_OCR" -eq 1 ]; then
+	if [ -f "$HERE/skillforge-ocr.service.template" ]; then
+		sed -e "s|__OCR_BIN__|$OCR_BIN|g" \
+		    -e "s|__OCR_PORT__|$OCR_PORT|g" \
+		    -e "s|__SERVICE_NAME__|$SERVICE_NAME|g" \
+		    "$HERE/skillforge-ocr.service.template" > "$OCR_UNIT"
+	else
+		cat > "$OCR_UNIT" <<EOF
+[Unit]
+Description=SkillForge document parser ($SERVICE_NAME-ocr, RapidOCR PP-OCRv4)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$OCR_BIN --port $OCR_PORT
+Restart=on-failure
+RestartSec=3
+# 扫描件 OCR 峰值内存高（50 页约 1.8G），给 2G 余量，超了宁重启也不拖垮整机
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target
+EOF
+	fi
+	chmod 644 "$OCR_UNIT"
+	systemctl daemon-reload
+	c_ok "文档解析单元：$OCR_UNIT（端口 $OCR_PORT，内存上限 2G）"
+fi
+
 if [ "$DO_START" -eq 1 ]; then
+	# 先起解析服务：主服务启动时会探测它，先起来能少一轮"解析服务不可用"
+	if [ "$DO_OCR" -eq 1 ]; then
+		systemctl enable "$SERVICE_NAME-ocr" >/dev/null 2>&1 || true
+		systemctl restart "$SERVICE_NAME-ocr"
+	fi
 	systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
 	systemctl restart "$SERVICE_NAME"
 	c_ok "服务已启动（已设为开机自启）"
@@ -351,6 +561,33 @@ step "6/7" "等待服务就绪"
 SELFTEST_RC=0
 if [ "$DO_START" -eq 1 ]; then
 	# 不依赖 curl/wget（离线机可能都没有），用 bash 自带的 /dev/tcp 探活
+	wait_port() {
+		local p="$1" label="$2" n="${3:-40}"
+		local i=0
+		while [ "$i" -lt "$n" ]; do
+			if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
+				exec 3<&- 2>/dev/null || true
+				return 0
+			fi
+			i=$((i + 1))
+			sleep 0.5
+		done
+		return 1
+	}
+
+	# 解析服务只等"端口在监听"，**不等模型加载完**：ocrd 的引擎是首次抽文本时才惰性加载的，
+	# 在这里等它等于让用户对着一个卡住的安装界面等半分钟，而它根本不影响主服务启动。
+	if [ "$DO_OCR" -eq 1 ]; then
+		if wait_port "$OCR_PORT" "文档解析" 60; then
+			c_ok "文档解析服务已监听 $OCR_PORT"
+		else
+			c_warn "文档解析服务 30 秒内没监听 $OCR_PORT（主服务仍可用，扫描件/Word/Excel 抽取会失败）"
+			if command -v journalctl >/dev/null 2>&1; then
+				journalctl -u "$SERVICE_NAME-ocr" -n 10 --no-pager 2>/dev/null | sed 's/^/      /' || true
+			fi
+		fi
+	fi
+
 	ready=0
 	for _ in $(seq 1 40); do
 		if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then

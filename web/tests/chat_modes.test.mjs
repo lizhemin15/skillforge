@@ -83,13 +83,21 @@ const buildChipPlan = (allSkills = []) => {
 // runChip 依赖 pickSkill/clearSkill/setMode/setInput/submit 这些动作，这里全部换成
 // 探针 —— 测的是"点了 chip 有没有接到该接的动作"，不是那几个动作自身的行为。
 function makeRunChip(log, opts = {}) {
+  // input 先造出来：setInput 要真的写进它的 value，否则 toEnd 探针读到的是空串，
+  // 测试就分不清"填了没填"（假绿）。
+  const input = { value: opts.inputValue || '', focus: () => log.push('focus') };
   const deps = {
     pickSkill: (sk) => log.push('pick:' + sk.slug),
     clearSkill: () => log.push('unpick'),
     setMode: (m) => log.push('mode:' + m),
-    setInput: (t) => log.push('input:' + t),
+    setInput: (t) => { input.value = t; log.push('input:' + t); },
     submit: () => log.push('submit'),
-    input: { value: opts.inputValue || '', focus: () => log.push('focus') },
+    // 勾选层的开关：runChip 只负责"点了要开/关层"，层自身的行为另有测试
+    toggleSkLayer: () => log.push('layer:toggle'),
+    // 光标归位：真实现会调 input.setSelectionRange（沙箱的裸对象没有），
+    // 这里换成探针，测的是"填完有没有把光标送走"。
+    toEnd: (node) => log.push('toEnd:' + String(node && node.value)),
+    input,
     allSkills: opts.skills || [],
   };
   const names = Object.keys(deps);
@@ -140,12 +148,15 @@ console.log('聊天方式 · 发送守卫（Bug W）');
   check('手动+已选技能 → 放行', sendBlocked('manual', { slug: 'x' }) === false);
   check('自动+未选技能 → 放行', sendBlocked('auto', null) === false);
 
-  // Bug X（升级版）：被拦住那一帧必须让用户看见"差一步"。
-  // 面板删掉之后，唯一能解释这件事的就是推荐行抖动 → 断言必须钉在
-  // 「拦住 → nudgeChips() → 立即 return（不发请求）」这个整段形状上。
-  // 只写 includes('nudgeChips') 会命中函数定义，恒真 —— 那是假绿。
-  const guarded = /if \(sendBlocked\(chatMode, pickedSkill\)\) \{ nudgeChips\(\); return; \}/.test(CHAT_JS);
-  check('★ 拦住后抖动推荐行并立即返回（不静默吞掉）', guarded);
+  // Bug X（升级版）：被拦住那一帧必须让用户看见"差一步"，而且要**给出出路**。
+  // 面板重做之后，"出路"就是勾选层 —— 抖只是"看这里"，开层才是"这里能解决"。
+  // 断言钉在整段形状上（nudge + openLayer + return），不写 includes('nudgeChips')
+  // 那种会命中函数定义的恒真假绿。
+  const blockedBranch = (CHAT_JS.match(/if \(sendBlocked\(chatMode, pickedSkill\)\) \{[\s\S]*?\n    \}/) || [''])[0];
+  check('★ 拦住后抖动推荐行 + 打开勾选层 + 立即返回',
+    /nudgeChips\(\)/.test(blockedBranch) && /openSkLayer\(\)/.test(blockedBranch) && /return;/.test(blockedBranch),
+    blockedBranch);
+  check('★ 拦住那一帧不发请求（分支里没有 fetch）', !/fetch\(/.test(blockedBranch), blockedBranch);
   // nudgeChips 必须真的把 .need 类挂上去（只弹个 toast 的话，用户视线在输入框上）
   const nudge = extractFn(CHAT_JS, 'function nudgeChips(');
   check('抽到了 nudgeChips', !!nudge);
@@ -155,48 +166,39 @@ console.log('聊天方式 · 发送守卫（Bug W）');
   check('抖完聚焦输入框（用户下一步是打字）', /input\.focus\(\)/.test(nudge || ''));
 }
 
-console.log('聊天方式 · 技能候选分组（Bug V）');
+console.log('指定技能 · 推荐行给的是"开面板"的入口（Bug V 的根治）');
 {
-  // 手动档没选技能 → 推荐行整行变成候选清单，核心技能必须排在业务技能前面。
+  // 旧契约：手动档把技能铺成 pick 候选，最多 4 颗。用户实测报"都没法选指定技能" ——
+  // 技能库十几个起，铺 4 颗 = 剩下的永远点不到。新契约：推荐行只给一颗入口，
+  // 全量清单搬进勾选层（下面的"技能勾选层"一节测它）。
   const plan = chipPlan({ skills: SKILLS, mode: 'manual', picked: null, turns: 0 });
   const labels = plan.items.map((c) => c.label).join('|');
-  const iCore1 = labels.indexOf('办公文档管家');
-  const iCore2 = labels.indexOf('技能工厂');
-  const iBiz = labels.indexOf('采购合同');
-  check('候选全是 pick 类', plan.items.every((c) => c.kind === 'pick'), labels);
-  check('两个核心技能都在候选里', iCore1 >= 0 && iCore2 >= 0, labels);
-  check('核心技能排在业务技能前面', iCore1 >= 0 && iBiz > iCore1, labels);
-  check('核心技能带 is_core 标记（界面据此加星）', plan.items.some((c) => c.slug === '办公文档管家' && c.core));
-  // 排序无关：即使后端把业务技能排在前面，前端也得分对先后
-  const rev = chipPlan({
-    skills: [SKILLS[2], SKILLS[1], SKILLS[3], SKILLS[0]], mode: 'manual', picked: null, turns: 0,
-  });
-  check('乱序输入也把核心排前面',
-    rev.items.findIndex((c) => c.slug === '技能工厂') < rev.items.findIndex((c) => c.slug === '采购合同'));
-  // 一行最多 4 颗：多了会折行，把输入框顶下去
-  check('候选不超过 4 颗', plan.items.length <= 4, 'len=' + plan.items.length);
-  check('候选抬头提醒"先选技能"', plan.hint === CHIP_HINT.manual, plan.hint);
+  check('没选技能时给一颗开面板的入口', plan.items.some((c) => c.kind === 'skillpick'), labels);
+  check('★ 不再把技能铺成 pick 候选（铺了就有技能永远点不到）',
+    !plan.items.some((c) => c.kind === 'pick'), labels);
+  check('入口带 slug 提示（肉眼知道点了会展开）', /▾/.test(labels), labels);
+  check('入口抬头提醒"先选技能"', plan.hint === CHIP_HINT.manual, plan.hint);
+  check('入口不超过 4 颗（不折行顶掉输入框）', plan.items.length <= 4, 'len=' + plan.items.length);
 
-  // 已指定技能 → 候选让位给"取消指定" + 一句该技能的示范问句（否则用户被锁死）
+  // 已指定技能 → 入口显示已选的那个，并把位置让给"用它写点什么"的示范问句
   const picked = chipPlan({
     skills: SKILLS, mode: 'manual', picked: { slug: '采购合同', name: '采购合同' }, turns: 1,
   });
-  check('已指定时给出取消入口', picked.items.some((c) => c.kind === 'unpick' && c.label.includes('采购合同')));
+  check('已指定时入口显示技能名', picked.items.some((c) => c.kind === 'skillpick' && c.label.includes('采购合同')));
   check('已指定时给出示范问句', picked.items.some((c) => c.kind === 'ask' && c.send));
-  check('已指定时不再堆技能候选',
-    !picked.items.some((c) => c.kind === 'pick' && c.slug === '办公文档管家'));
+  check('已指定时不再堆技能候选', !picked.items.some((c) => c.kind === 'pick'));
 
   // ★ 两颗同名 chip 是纯噪声：实测并排出现「✓ 办公文档管家」+「办公文档管家」，
-  // 用户看不出哪颗是取消指定、哪颗是发送问句 → 示范 chip 的标签必须是**要发出去的那句话**。
+  // 用户看不出哪颗是改指定、哪颗是发送问句 → 示范 chip 的标签必须是**要发出去的那句话**。
   const labelsOf = (r) => r.items.map((c) => c.label);
-  // ⚠️ 不能直接比字符串：取消那颗的真值是「✓ 采购合同」，跟「采购合同」不相等，
-  // 但用户眼里就是两颗同名的 —— 撞名的是去掉勾号标记之后的显示文本。
-  const bare = (l) => String(l).replace(/^[✓✔\s]+/, '');
-  check('两颗 chip 去掉勾号后不撞名（撞了就分不清取消/发送）',
+  // ⚠️ 不能直接比字符串：入口那颗的真值是「技能：采购合同」，跟「采购合同」不相等，
+  // 但用户眼里是两颗同名的 —— 撞名的是去掉前缀/勾号之后的显示文本。
+  const bare = (l) => String(l).replace(/^(技能：|[✓✔\s]+)/, '');
+  check('两颗 chip 去掉前缀后不撞名（撞了就分不清改指定/发送）',
     new Set(labelsOf(picked).map(bare)).size === picked.items.length,
     labelsOf(picked).map(bare).join(' | '));
   const dAsk = picked.items.find((c) => c.kind === 'ask');
-  check('示范 chip 标签不等于技能名（否则跟「✓」那颗撞在一起）',
+  check('示范 chip 标签不等于技能名（否则跟入口那颗撞在一起）',
     !!dAsk && dAsk.label !== '采购合同', dAsk && dAsk.label);
   check('标签不过长（一行胶囊不至于把输入框顶下去）',
     !!dAsk && dAsk.label.length <= 21, dAsk && dAsk.label);
@@ -220,10 +222,13 @@ console.log('聊天方式 · 技能候选分组（Bug V）');
   // 截断只动标签，不许动 send —— 发出去的必须还是完整那句
   check('截断不伤 send（send 里没有省略号）', !!bAsk && !bAsk.send.includes('…'), bAsk && bAsk.send);
 
-  // 空技能库不能炸（后端还没 seed 完 / 全停用时）
+  // 空技能库不能炸（后端还没 seed 完 / 全停用时）。
+  // 断言的是"不炸 + 仍给出入口"：技能库空的时候把手动档的入口也收掉，
+  // 用户就彻底没有出路了（面板里空着，推荐行也没得点）。
   const empty = chipPlan({ skills: [], mode: 'manual', picked: null, turns: 0 });
-  check('空技能库不炸', empty.items.length === 0);
-  check('skills 为 undefined 不炸', chipPlan({ mode: 'manual', picked: null }).items.length === 0);
+  check('空技能库不炸且仍给入口', empty.items.length >= 1 && empty.items.some((c) => c.kind === 'skillpick'));
+  const noSk = chipPlan({ mode: 'manual', picked: null });
+  check('skills 为 undefined 不炸且仍给入口', noSk.items.some((c) => c.kind === 'skillpick'));
 }
 
 console.log('推荐行 · 随对话状态变化');
@@ -253,17 +258,22 @@ console.log('推荐行 · 随对话状态变化');
 
 console.log('推荐行 · 点击真的接到动作');
 {
-  // ask：点一下就该发出去（推荐操作的价值就在于省掉"再按一次回车"）
+  // ask：点一下把话**填进输入框**，不直接发 —— 用户要先能改两个字（比如"200字"改"500字"）。
+  // 旧契约是点了就发；那等于逼用户"要么接受这句，要么等它写完再让它重写"。
   {
     const { runChip, log } = makeRunChip([]);
     runChip({ kind: 'ask', label: '再短一点', send: '把上面的内容再压缩一些' });
-    check('点 ask → 填入并提交', log.join(',') === 'input:把上面的内容再压缩一些,submit', log.join(','));
+    check('★ 点 ask → 只填入，不提交',
+      log.join(',') === 'input:把上面的内容再压缩一些,toEnd:把上面的内容再压缩一些,focus', log.join(','));
+    check('★ 点 ask 不会误发（日志里没有 submit）', !log.includes('submit'), log.join(','));
   }
-  // 有草稿时不覆盖：草稿是用户自己敲的，优先级更高
+  // 已有草稿也照样填：点胶囊是明确动作，用户点的就是"换成这句"。
+  // （旧行为是"草稿优先、点了没反应" —— 这正是用户抱怨的那种"点了跟没点一样"。）
   {
     const { runChip, log } = makeRunChip([], { inputValue: '我自己写的' });
     runChip({ kind: 'ask', label: '再短一点', send: '压缩' });
-    check('有草稿时不被推荐句覆盖', log.join(',') === 'submit', log.join(','));
+    check('★ 有草稿时也照填（点了必须有反应）',
+      log.join(',') === 'input:压缩,toEnd:压缩,focus', log.join(','));
   }
   // pick：只选不发送 —— 选完还要让用户自己说材料
   {
@@ -275,6 +285,14 @@ console.log('推荐行 · 点击真的接到动作');
     const { runChip, log } = makeRunChip([], { skills: SKILLS });
     runChip({ kind: 'unpick' });
     check('点 unpick → 取消指定且不提交', log.join(',') === 'unpick,focus', log.join(','));
+  }
+  // skillpick：入口那颗是"开面板"的开关。绝不能落到 ask 分支 ——
+  // 落下去就会把「选择技能 ▾」四个字填进输入框然后当成用户的话发出去。
+  {
+    const { runChip, log } = makeRunChip([], { skills: SKILLS });
+    runChip({ kind: 'skillpick', label: '选择技能 ▾' });
+    check('★ 点入口 → 开/关勾选层，不填输入框、不提交',
+      log.join(',') === 'layer:toggle', log.join(','));
   }
   // again：切回手动档并锁定那个技能（否则"继续用它"只改了界面文案）
   {
@@ -294,6 +312,98 @@ console.log('推荐行 · 点击真的接到动作');
     runChip(null); runChip({});
     check('空 chip 不炸（点了也不该有副作用）', log.length === 0, log.join(','));
   }
+}
+
+console.log('技能勾选层 · 纯函数（不点界面也能验证）');
+{
+  // 这一节是"指定技能"真正能用的地基：技能库有 N 个，面板必须不全漏、搜索必须真过滤。
+  // 全是纯函数（状态进、清单出、不碰 DOM）—— 所以断言可以直接喂清单，不用人肉点界面。
+  const orderSkills = bind(CHAT_JS, 'function orderSkills(');
+  const skillMatches = bind(CHAT_JS, 'function skillMatches(');
+  const filterSkills = bind(CHAT_JS, 'function filterSkills(', ['orderSkills', 'skillMatches'], [orderSkills, skillMatches]);
+  const togglePick = bind(CHAT_JS, 'function togglePick(');
+
+  // 核心技能（通用能力）必须排最前：用户找"办公文档管家"的频率远高于找某个业务技能
+  const shuffled = [SKILLS[2], SKILLS[1], SKILLS[3], SKILLS[0]];
+  const ordered = orderSkills(shuffled);
+  check('核心技能排在业务技能前面（乱序输入也分对先后）',
+    ordered[0].slug !== '采购合同' && ordered[1].slug !== '采购合同', ordered.map((s) => s.slug).join('|'));
+  check('排序不丢技能（只是换顺序）', ordered.length === shuffled.length);
+  check('orderSkills 不改原数组（纯函数）', shuffled[0].slug === '采购合同', shuffled.map((s) => s.slug).join('|'));
+
+  // ★ 这次 bug 的核心：面板必须能列出**全部**技能。旧版推荐行只铺 4 颗，
+  //   第 5 个开始的技能用户永远点不到。所以用 13 个的清单钉住"一个都不能少"。
+  const many = Array.from({ length: 13 }, (_, i) => ({ slug: 'sk-' + i, name: '技能' + i, is_core: i === 12 ? 1 : 0 }));
+  check('★ 面板列全（13 个技能一个不少，不是只有 4 个）', filterSkills(many, '').length === 13,
+    'len=' + filterSkills(many, '').length);
+  check('★ 第 13 个技能在面板里（旧版正好卡在第 4 个之后）',
+    filterSkills(many, '').some((s) => s.slug === 'sk-12'));
+
+  // 搜索：名字 / 说明 / slug 三个字段都要能搜到 —— 用户想的是"合同"，名字里不一定有
+  check('搜名字命中', skillMatches(SKILLS[2], '采购'));
+  check('搜说明命中（关键词常在 description 里）', skillMatches(SKILLS[0], 'Word'));
+  check('搜 slug 命中', skillMatches(SKILLS[1], '工厂'));
+  check('大小写不敏感', skillMatches(SKILLS[0], 'word'));
+  check('首尾空格不影响', skillMatches(SKILLS[2], '  采购  '));
+  check('过滤真的过滤（不是全返回）', filterSkills(SKILLS, '采购').length === 1,
+    'len=' + filterSkills(SKILLS, '采购').length);
+  check('没命中的关键词返回空（界面据此说"没找到"）', filterSkills(SKILLS, '不存在的词').length === 0);
+  check('空查询返回全部（不是空列表）', filterSkills(SKILLS, '').length === SKILLS.length);
+  check('undefined 技能库不炸', filterSkills(undefined, '').length === 0 && filterSkills(null, 'x').length === 0);
+  check('技能对象缺字段不炸', filterSkills([{ slug: 'a' }], 'a').length === 1);
+
+  // 勾选语义 = 单选 + 可取消。后端只吃一个 skill 字段，多选就是"给了不兑现的承诺"。
+  check('没选过 → 勾上', togglePick('', '采购合同') === '采购合同');
+  check('★ 再勾一次同一颗 → 取消（否则没法取消指定）', togglePick('采购合同', '采购合同') === '');
+  check('★ 勾另一颗 → 换过去（单选的本质：不可能同时选中两个）', togglePick('采购合同', '技能工厂') === '技能工厂');
+  check('空 slug 不改变现状（脏数据不清空已选）', togglePick('采购合同', '') === '采购合同');
+}
+
+console.log('技能勾选层 · 接线（层会不会被清掉 / 关掉）');
+{
+  // 结构断言。这些点踩过一次就会"点了没反应"，属于必须钉住的接线。
+  check('index.html 里有层容器 #sk-layer', INDEX_HTML.includes('id="sk-layer"'));
+  check('index.html 里有搜索框 #sk-q', INDEX_HTML.includes('id="sk-q"'));
+  check('index.html 里有列表 #sk-list', INDEX_HTML.includes('id="sk-list"'));
+  // ★ 层必须在 #chips 外面：renderChips() 每次清空 #chips 的 innerHTML，
+  //   层放进去会被连带清掉 → 用户看到面板一闪就没了。
+  const iLayer = INDEX_HTML.indexOf('id="sk-layer"');
+  const iChips = INDEX_HTML.indexOf('id="chips"');
+  check('★ 层在 #chips 之前且不在其中（不然被 renderChips 清掉）',
+    iLayer > 0 && iChips > 0 && iLayer < iChips, `layer@${iLayer} chips@${iChips}`);
+  check('层默认是 hidden（刷新页面不能自己弹出来）', /id="sk-layer"[^>]*hidden/.test(INDEX_HTML));
+
+  // ★ CSS 必须显式处理 [hidden]：.ch-sklayer 用了 display:flex，
+  //   会盖掉浏览器默认的 [hidden]{display:none} → JS 设了 hidden 也关不掉。
+  check('★ style.css 有 .ch-sklayer[hidden]{display:none}（否则关不掉）',
+    /\.ch-sklayer\[hidden\]\s*\{[^}]*display:\s*none/.test(STYLE_CSS));
+  for (const sel of ['.ch-sklayer', '.ch-sklayer-q', '.ch-skrow', '.ch-skbox', '.ch-skname', '.ch-skdesc']) {
+    check(`style.css 有 ${sel}`, STYLE_CSS.includes(sel));
+  }
+  check('层有最大高度（技能多了不把整页顶开）', /\.ch-sklayer\s*\{[\s\S]*?max-height/.test(STYLE_CSS));
+  check('列表可滚动', /\.ch-sklayer-list\s*\{[^}]*overflow-y:\s*auto/.test(STYLE_CSS));
+  check('层的选中态跟输入框胶囊一致（同一套会话状态，视觉不能各说各话）',
+    /\.ch-skrow\.is-on/.test(STYLE_CSS));
+
+  // chat.js 接线
+  check('每次打开清空搜索词（不然用户以为技能库里只剩上次搜的）',
+    /function openSkLayer[\s\S]{0,600}?skQ\.value = ''/.test(CHAT_JS) || /if \(skQ && skQ\.value\) skQ\.value = ''/.test(CHAT_JS));
+  check('打开后聚焦搜索框（打开即可打字）', /function openSkLayer[\s\S]{0,700}?skQ\.focus\(\)/.test(CHAT_JS));
+  // ★ 点外面关层时必须排除推荐行和输入栏：手动档点发送会主动开层，
+  //   文档级监听在冒泡末端跑，不排除就会把刚开的层当场关掉 → "点了发送毫无反应"。
+  check('★ 点外关闭排除了推荐行（chipsWrap）', /chipsWrap\.contains\(t\)/.test(CHAT_JS));
+  check('★ 点外关闭排除了输入栏（inputBar）', /inputBar\.contains\(t\)/.test(CHAT_JS));
+  check('点外关闭会真的关层', /document\.addEventListener\('click'[\s\S]{0,400}?closeSkLayer\(\)/.test(CHAT_JS));
+  check('Esc 能关层', /Escape[\s\S]{0,200}?closeSkLayer\(\)/.test(CHAT_JS));
+  check('搜索框回车直接勾第一个（搜到就回车是最快路径）',
+    /skQ\.addEventListener\('keydown'[\s\S]{0,400}?filterSkills\(allSkills, skQ\.value\)\[0\]/.test(CHAT_JS));
+  // ★ 手动档没选技能点发送 → 除了抖，还要把层打开（否则用户还是不知道去哪选）
+  check('★ 发送被拦时打开勾选层', /sendBlocked\(chatMode, pickedSkill\)[\s\S]{0,300}?openSkLayer\(\)/.test(CHAT_JS));
+  check('切回自动档时收掉层', /chatMode === 'auto'\)\s*closeSkLayer\(\)/.test(CHAT_JS));
+  check('发出去之后收掉层', /input\.value = ''[\s\S]{0,120}?closeSkLayer\(\)/.test(CHAT_JS));
+  check('技能库到货时补渲染层（用户手快先开了层）', /if \(skOpen\) renderSkLayer\(\)/.test(CHAT_JS));
+  check('层有页脚说明"勾了会怎样"（不写就像个多选过滤器）', /skFoot\.textContent/.test(CHAT_JS));
+  check('层里没找到技能时给独立文案（跟"没加载完"区分开）', /没有匹配/.test(CHAT_JS));
 }
 
 console.log('推荐行 · LLM 精修是"可失败的旁路"');

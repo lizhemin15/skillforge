@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SkillForge — 智能写作工坊</title>
   <meta name="description" content="以 Skill 为核心的文章写作 AI 系统。像聊天一样，告诉它你想写什么，引擎自动调度最合适的写作技能帮你成文。">
-  <link rel="stylesheet" href="/assets/css/style.css?v=20260913B">
+  <link rel="stylesheet" href="/assets/css/style.css?v=20260914A">
   <link rel="preload" as="font" type="font/woff2" href="/assets/fonts/dm-sans-latin.woff2" crossorigin>
   <link rel="preload" as="font" type="font/woff2" href="/assets/fonts/montserrat-latin.woff2" crossorigin>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%234d6bfe'/><rect x='9' y='9' width='6' height='14' rx='2' fill='%23ffffff'/><rect x='17' y='9' width='6' height='14' rx='2' fill='%23c3d0ff'/></svg>">
@@ -59,8 +59,22 @@
     </div>
 
     <!-- 推荐行：全页唯一的多入口。内容随对话动态生成（chat.js renderChips），
-         默认是"你可以这样说"的推荐动作；切到「指定技能」后变成技能候选。 -->
-    <div class="ch-chips" id="chips" aria-live="polite"></div>
+         默认是"你可以这样说"的推荐动作；切到「指定技能」后这一行变成打开技能勾选层的入口。
+         点击行为是**把话填进输入框**（不直接发），用户能先改两个字再发。 -->
+    <div class="ch-chips-wrap" id="chips-wrap">
+      <!-- 技能勾选层（下拉）：「指定技能」档专用，从推荐行往上弹出。
+           为什么要有个层：推荐行只有 4 颗的位置，技能库有几十上百个 ——
+           之前那一版只能显示前 4 个，剩下的用户永远点不到（"都没法选指定技能"）。
+           放在 #chips 外面：renderChips() 每次会清空 #chips 的 innerHTML，
+           层要是在里面就会被一起清掉。 -->
+      <div class="ch-sklayer" id="sk-layer" hidden>
+        <input type="text" class="ch-sklayer-q" id="sk-q" autocomplete="off"
+               placeholder="搜索技能名或用途…" aria-label="搜索技能">
+        <div class="ch-sklayer-list" id="sk-list" role="listbox" aria-label="选择技能"></div>
+        <div class="ch-sklayer-foot" id="sk-foot"></div>
+      </div>
+      <div class="ch-chips" id="chips" aria-live="polite"></div>
+    </div>
 
     <!-- 输入区：框内只有一个胶囊，滑动在「自动调度 / 指定技能」两档之间 -->
     <div class="ch-input-bar">
@@ -81,6 +95,6 @@
 
 <script src="/assets/vendor/marked/marked.min.js?v=20260909I"></script>
 <script src="/assets/js/site.js?v=20260911M"></script>
-<script src="/assets/js/chat.js?v=20260913D"></script>
+<script src="/assets/js/chat.js?v=20260914A"></script>
 </body>
 </html>
