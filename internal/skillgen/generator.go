@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -336,11 +337,25 @@ func (g *Generator) extractAttributes(ctx context.Context, in *Input) (string, e
 - term_note: 术语/措辞注意
 只输出JSON对象，不要多余文字。`
 	user := corpus
-	out, err := g.llm.Chat(ctx, sys, user)
+	// 显式开 JSON 模式（第 4 个参数 true）。本函数的输出经 jsonStringify 直接作为
+	// 「特征分析」注入后续所有 prompt，而模型只要在字符串值里写出未转义的英文双引号
+	// （例如 "生成一篇"标准"格式的公文"），产出的就是坏 JSON；坏 JSON 不报错，只以
+	// 原文形态静默流进下游。实测事故：线上训练挂在 step2 的
+	//   `invalid character 'ä' after object key:value pair`
+	// —— 'ä' 是 Go 把中文首字节 0xE4 按 latin1 打印出来的，真因是 JSON 语法在中文
+	// 字符处崩了，而报错本身看不出模型写坏了哪里。
+	out, err := g.llm.Chat(ctx, sys, user, true)
 	if err != nil {
 		return "", err
 	}
-	return jsonStringify(extractJSON(out)), nil
+	raw := extractJSON(out)
+	attrs := jsonStringify(raw)
+	if !json.Valid(raw) {
+		// 不静默降级：必须留痕。但 attrs 是给模型看的分析文本、不是结构化数据，
+		// 原文注入仍可用，所以返回它并记警告，而不是让整条流水线失败。
+		log.Printf("[skillgen] 警告：特征分析不是合法 JSON，已回退为原文注入（可能影响生成质量）：%s", snippet(string(raw), 160))
+	}
+	return attrs, nil
 }
 
 // typeOut is the output of the skill-type detector.
@@ -370,13 +385,13 @@ func (g *Generator) detectType(ctx context.Context, in *Input) (*typeOut, error)
 - type=query：参考文件是"办事流程、业务步骤、审批环节、操作指导、政策问答"，目标是用户问什么时候，助手直接给出流程/步骤/答案，不写长篇大论。
 - type=template：同 query，但参考文件里还包含"需要用户填写/签字的表单模板或 Word 文档"，用户命中时除了给流程，还要把该文件作为附件下发。
 注意：若参考文件里明确有 .docx/.xlsx/.xls/.doc/.pdf 这类文件，多半是 template 型要下发的附件。`
-	out, err := g.llm.Chat(ctx, sys, corpus)
+	out, err := g.llm.Chat(ctx, sys, corpus, true)
 	if err != nil {
 		return nil, err
 	}
 	var t typeOut
 	if err := json.Unmarshal([]byte(extractJSON(out)), &t); err != nil {
-		return nil, fmt.Errorf("type json: %w", err)
+		return nil, jsonErrDetail("类型判定", out, err)
 	}
 	if t.Type == "" {
 		t.Type = model.SkillTypeWrite
@@ -531,13 +546,13 @@ func (g *Generator) synthesizeMetadata(ctx context.Context, in *Input, attrs str
 }
 input_params 通常3-6项。只输出JSON。`
 	user := "需求:\n" + in.Requirement + "\n\n分析:\n" + attrs
-	out, err := g.llm.Chat(ctx, sys, user)
+	out, err := g.llm.Chat(ctx, sys, user, true)
 	if err != nil {
 		return nil, err
 	}
 	var m metaOut
 	if err := json.Unmarshal([]byte(extractJSON(out)), &m); err != nil {
-		return nil, fmt.Errorf("meta json: %w", err)
+		return nil, jsonErrDetail("step2 元数据", out, err)
 	}
 	if m.Name == "" {
 		m.Name = in.Name
@@ -723,6 +738,26 @@ func looksLikeArticle(s string) bool {
 	words := len(strings.Fields(s))
 	hasTitle := strings.Count(s, "#") >= 1 || len(s) > 800
 	return words > 150 && hasTitle
+}
+
+// jsonErrDetail 把「模型输出不是合法 JSON」做成查得动的错误。
+//
+// 为什么需要它：Go 的 json 解析错误对非 ASCII 字节是按 latin1 打印的，中文首字节
+// 0xE4 会显示成 'ä'。所以线上只看得到
+//     meta json: invalid character 'ä' after object key:value pair
+// 完全看不出模型把哪里写坏了。这里把原文（rune 安全截断）一起回带出来。
+func jsonErrDetail(step, raw string, err error) error {
+	return fmt.Errorf("%s：模型输出不是合法 JSON：%w；原文=<<%s>>", step, err, snippet(raw, 400))
+}
+
+// snippet 按 rune 截断，避免把半个中文字符切进日志或错误信息。
+func snippet(s string, n int) string {
+	s = strings.TrimSpace(s)
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…（原文共 " + fmt.Sprint(len(r)) + " 字符）"
 }
 
 // extractJSON pulls the first {...} JSON object from a string.
