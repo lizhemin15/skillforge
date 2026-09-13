@@ -36,6 +36,12 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 c_info() { printf '  %s\n' "$*"; }
 c_ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 c_fail() { printf '  \033[31m✗\033[0m %s\n' "$*"; }
+# c_warn 曾经漏定义：唯一调用点在 --no-ocr 分支里，而 amd64 永远走的是带 ocr 的分支，
+# 于是这个分支在 CI 里从没被执行过 —— 直到 arm64 用它，报 "c_warn: command not found"
+# （exit 127），把 arm64 离线包 job 打红 → needs 不满足 → 「创建 GitHub Release」被跳过
+# → v0.3.21/v0.3.22/v0.3.23 连续三个 tag 一个 Release 产物都没有。
+# 教训：没被执行过的分支就是坏的分支。现在 amd64 job 会额外跑一次 --no-ocr 冒烟。
+c_warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
 die()    { c_fail "$*" >&2; exit 1; }
 
 usage() {
@@ -306,6 +312,14 @@ SkillForge 离线安装包
   3. 装完会打印访问地址和管理员密码（密码只显示一次，记下来）
 
 安装脚本不联网：全程不 curl / wget / apt / pip，需要的东西都在这个包里。
+
+目标机要求（装之前请先确认）：
+  - systemd（含 systemd-run）—— 代码执行沙箱靠它隔离；没有就直接拒绝安装
+  - /usr/bin/python3 —— 代码执行沙箱的探针与「执行代码」工具的解释器
+      Debian / Ubuntu 默认自带；RHEL / AlmaLinux / CentOS 最小安装默认不带，
+      补：dnf install -y python3（离线机挂发行版 ISO 或配本地源）
+      缺了它安装仍会继续（写作功能不受影响），但自检里「代码执行沙箱」一项会失败，
+      AI 也就无法跑代码/脚本校验。
 
 包里带了两个程序：
   bin/skillforge  主服务（Web 界面 + 技能引擎）

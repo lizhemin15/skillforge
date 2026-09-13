@@ -148,6 +148,25 @@ jobs:
           fi
           scripts/build-offline-bundle.sh "${ARGS[@]}"
 
+      # 冒烟：把 --no-ocr 分支真的跑一遍（只为踩通那条路径，产物不发布）。
+      # 为什么单独加这一步：c_warn 曾经漏定义，而它唯一的调用点就在 --no-ocr 分支里。
+      # amd64 走的是带 ocr 的分支，那条分支在 CI 里从没被执行过；arm64 一用就报
+      # "c_warn: command not found"（exit 127）→ arm64 离线包 job 红 → needs 不满足
+      # → 整个 GitHub Release 被 skip（v0.3.21 / v0.3.22 / v0.3.23 全是这个死法）。
+      # 一句话：没被执行过的分支就是坏的分支。用 amd64 的二进制多打一个不带 ocr 的包，
+      # 成本几秒，换这条路径每次 push 都被踩一遍。
+      - name: 冒烟 · 无 OCR 分支必须能走通（--no-ocr）
+        if: matrix.goarch == 'amd64'
+        run: |
+          chmod +x scripts/build-offline-bundle.sh
+          scripts/build-offline-bundle.sh \
+            --version "${{ steps.vars.outputs.version }}" \
+            --arch amd64 \
+            --binary /tmp/skillforge-linux-amd64 \
+            --no-ocr \
+            --outdir /tmp/smoke-no-ocr
+          ls -l /tmp/smoke-no-ocr/
+
       # 出厂前验货：包里的东西必须能一步步装起来，缺一样就挡在这里，别让用户发现。
       - name: 验货（内容 / 脚本语法 / 校验和 / 许可证）
         run: |
