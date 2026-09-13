@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -189,10 +191,103 @@ func isDocFile(name string) bool {
 // SetOCR 注入 ocrd 微服务地址（http://127.0.0.1:8093）。为空则跳过二进制抽取。
 func (g *Generator) SetOCR(url string) { g.ocrURL = url }
 
+// SetOCRTimeout 覆盖单次文档解析的客户端超时（<=0 表示回到 DefaultOCRTimeout）。
+func (g *Generator) SetOCRTimeout(d time.Duration) { g.ocrTimeout = d }
+
+// OCRTimeout 返回当前生效的解析超时（默认值也在此fold入）。
+// 存在的意义：上层要能自检「环境变量到底吃进去没有」，而不是只能靠观察一次真实解析。
+func (g *Generator) OCRTimeout() time.Duration { return g.ocrTimeoutOrDefault() }
+
+// DefaultOCRTimeout 是单次文档解析的客户端超时默认值。
+//
+// 实测（4 核 / dpi=200）：13.6MB、50 页的扫描件 manual-scan-lite.pdf 需要 397.5s
+// 才能出文本。旧实现硬编码 300s，比真实耗时还短——扫描件必然超时，训练随即
+// 静默退回通用流程（8.5 裁判层根本没机会执行）。这里取实测值的 4 倍余量，
+// 给页数更多 / dpi 更高的手册留空间；再多就用 SKILLFORGE_OCR_TIMEOUT 调。
+const DefaultOCRTimeout = 30 * time.Minute
+
+// ocrProgressInterval 是长解析期间回报进度的间隔。
+// 变量而非常量：测试要把它压到毫秒级，避免真的等 30s。
+var ocrProgressInterval = 30 * time.Second
+
+// ocrClient 返回调用解析服务用的 HTTP 客户端。
+// 超时是**整体**上限（含逐页推理），不是连接超时——别改小。
+func (g *Generator) ocrClient() *http.Client {
+	d := g.ocrTimeout
+	if d <= 0 {
+		d = DefaultOCRTimeout
+	}
+	return &http.Client{Timeout: d}
+}
+
+// ocrProgress 在解析期间周期回报「还在跑、已等待多久」，避免前端看起来像卡死。
+//
+// 返回的 stop 必须在解析返回后**立刻**调用：它停掉心跳并等待心跳 goroutine 退出。
+// 少了这一步，goroutine 可能在 HTTP handler 返回之后还在往 ResponseWriter 写。
+// stop 幂等（内部 sync.Once）：调用点写成 defer 再显式调用一次也不会炸。
+func ocrProgress(steps func(string), fn string, start time.Time) func() {
+	if steps == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(ocrProgressInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				steps(fmt.Sprintf("%s 解析中，已等待 %s…", fn, humanDuration(time.Since(start))))
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(done)
+			wg.Wait()
+		})
+	}
+}
+
+// ocrTimeoutOrDefault 返回当前生效的解析超时上限（用于给人看的报错文案）。
+func (g *Generator) ocrTimeoutOrDefault() time.Duration {
+	if g.ocrTimeout > 0 {
+		return g.ocrTimeout
+	}
+	return DefaultOCRTimeout
+}
+
+// isTimeoutErr 区分「超时」和「其他失败」：只有超时才需要在流里解释降级后果。
+// 注意 context.Canceled（用户关页面）不算超时，不该弹那句提示。
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// humanDuration 把耗时说成人话（中文流水线里给用户看的）。
+func humanDuration(d time.Duration) string {
+	sec := int(d.Seconds() + 0.5)
+	if sec < 60 {
+		return fmt.Sprintf("%d 秒", sec)
+	}
+	return fmt.Sprintf("%d 分 %d 秒", sec/60, sec%60)
+}
+
 // ocrExtract 调用 ocrd 的 /extract 接口把文档解析成纯文本。
 // 字段名与 api 层 extractDoc 保持一致（form 字段 "file"），避免两个调用方
 // 对同一个微服务用两套协议。
-func ocrExtract(ctx context.Context, ocrURL, filename string, data []byte) (string, error) {
+func ocrExtract(ctx context.Context, ocrURL, filename string, data []byte, client *http.Client) (string, error) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	name := filepath.Base(filename)
@@ -214,8 +309,8 @@ func ocrExtract(ctx context.Context, ocrURL, filename string, data []byte) (stri
 		return "", err
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	// 50 页扫描件实测约 40-60s（RapidOCR 逐页推理），留足余量。
-	client := &http.Client{Timeout: 300 * time.Second}
+	// 超时由调用方注入（默认 30 分钟，见 DefaultOCRTimeout）。这里坚决不写死数值：
+	// 旧实现写死 300s，而真实扫描件要 397.5s，导致解析必然失败却只在流里留一行 ⚠️。
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -270,10 +365,21 @@ func (g *Generator) ingestFiles(ctx context.Context, in *Input, steps func(strin
 		}
 		start := time.Now()
 		raw := []byte(uf.Content)
-		text, err := ocrExtract(ctx, g.ocrURL, fn, raw)
+		// 扫描件解析要几分钟，中途必须回报进度——否则前端看起来就是卡死。
+		stopProgress := ocrProgress(steps, fn, start)
+		text, err := ocrExtract(ctx, g.ocrURL, fn, raw, g.ocrClient())
+		stopProgress()
 		if err != nil {
 			if steps != nil {
-				steps(fmt.Sprintf("⚠️ %s 解析失败：%v", fn, err))
+				msg := fmt.Sprintf("⚠️ %s 解析失败：%v", fn, err)
+				if isTimeoutErr(err) {
+					// 超时必须指名道姓地说清后果和出口，否则用户只看到一行 ⚠️，
+					// 完全不知道训练已经悄悄降级成通用流程了。
+					msg += fmt.Sprintf("（已等待 %s；解析超时会让本次训练退回通用流程，"+
+						"确实需要更久可调大 SKILLFORGE_OCR_TIMEOUT，当前上限 %s）",
+						humanDuration(time.Since(start)), humanDuration(g.ocrTimeoutOrDefault()))
+				}
+				steps(msg)
 			}
 			continue
 		}
@@ -348,6 +454,13 @@ type manualPack struct {
 	Paths    map[string][]string
 	Reviewer string
 	Warnings []string
+	// Fallbacks 记录「锚点不可用、改用原文章节整章兜底」的分类。
+	//
+	// 与 Warnings 分开记是刻意的：Warnings 是「这一类没范文」，Fallbacks 是
+	// 「这一类有范文，但不是模型精确锚出来的那一段」。前者是缺陷，后者是降级，
+	// 混在一起会让管理员分不清「要不要管」。两者都必须在 fidelity.md 里显性出现——
+	// 静默降级等于管理员失去判断依据（这正是本模块反复踩的坑）。
+	Fallbacks []string
 	// Source 是切出范文用的原文（OCR 后的手册全文）。只为 fidelity.md 的保真
 	// 核对服务——「这篇范文确实能在原文里逐字找到」这句结论需要原文在手。
 	Source string
@@ -396,33 +509,97 @@ func (g *Generator) buildManual(ctx context.Context, in *Input) (*manualPack, er
 	if g.llm == nil {
 		return nil, errors.New("未配置 LLM，无法抽取手册结构")
 	}
-	st, err := ExtractStructure(ctx, g.llm, src)
-	if err != nil {
-		return nil, fmt.Errorf("结构抽取失败: %w", err)
+	// 章节区间只探一次：它是兜底切片与按章抽取共用的地基，纯代码零成本。
+	// 探不到（手册没有「第X章」这种结构）时两条路各自放弃，不影响主流程。
+	spans := pickChapterSpans(src)
+
+	st, stErr := ExtractStructure(ctx, g.llm, src)
+	var packErr error
+	if stErr == nil && st != nil && len(st.Categories) >= manualMinCategories {
+		// 路径一：全文一次抽取。能用就用——一次调用最省时间，成功率也不低
+		// （实测 6 万字里能抽出 6-12 个分类），不能因为有小概率失败就先花
+		// 十几次调用按章抽。
+		mp, err := g.packFromStructure(src, st, spans, nil)
+		if err == nil {
+			return mp, nil
+		}
+		// 「分类抽出来了、但一篇范文都切不出来」同样是抽取不可靠的证据，
+		// 值得走按章重抽（锚点全带「…」的实测事故就是这个形态）。
+		packErr = err
 	}
-	if st == nil || len(st.Categories) < manualMinCategories {
+
+	// 路径二：按章小 prompt 抽取（治本，见 manual_repair.go 顶部注释）。
+	// 只有路径一不可靠时才走，所以「十几次调用」这个代价只在失败路径上付。
+	if len(spans) >= manualMinCategories {
+		st2, warns2, err2 := extractStructureByChapters(ctx, g.llm, spans)
+		if err2 == nil && st2 != nil && len(st2.Categories) >= manualMinCategories {
+			notes := append([]string{chapterStructureNote}, warns2...)
+			if mp, err := g.packFromStructure(src, st2, spans, notes); err == nil {
+				return mp, nil
+			}
+		}
+	}
+
+	// 两条路都没走通：保持原有降级语义（返回 error → 调用方退回通用流程），
+	// 但把最能说明问题的原因带回去——trace 里只剩一句「失败了」没法排查。
+	switch {
+	case stErr != nil:
+		return nil, fmt.Errorf("结构抽取失败: %w", stErr)
+	case st == nil || len(st.Categories) < manualMinCategories:
 		n := 0
 		if st != nil {
 			n = len(st.Categories)
 		}
 		return nil, fmt.Errorf("只抽出 %d 个分类（需要 ≥%d），按通用素材处理", n, manualMinCategories)
+	default:
+		return nil, fmt.Errorf("分类抽出 %d 个但一篇范文都切不出来（%v），按章重抽也没救回来，按通用素材处理",
+			len(st.Categories), packErr)
 	}
+}
 
+// packFromStructure 按分类切范文并组装手册产物，是手册模式唯一的「切范文」入口。
+//
+// 每类依次尝试两条路，从严到宽：
+//  1. 模型给的锚点（SplitByAnchors）——精确，是首选；
+//  2. 锚点不可用 → 用原文自己的章节标题兜底切整章（manual_chapters.go）——
+//     切法降级但内容仍是原文逐字，且让这一类**不至于没有范文**。
+//
+// 为什么兜底是必须的：锚点短、唯一、逐字，恰恰是 reasoning 模型在长输入下最先
+// 牺牲的东西（实测：分类抽出来了，anchor 全带省略号）。没有兜底时，这一类一张
+// 范文都没有，Step 8.5 的确定性硬校验会直接否决整份技能——模型给 100 分也救不回，
+// 而手册本身其实完全可用。兜底把「永久否决」变成「可用但切法降级」，并且
+// **显性记进 Fallbacks**（fidelity.md 单独一节），管理员看得见、可人工改进。
+//
+// notes 是调用方带来的整体说明（如「已改用按章抽取」），先于逐类记录写进 Warnings。
+func (g *Generator) packFromStructure(src string, st *Structure, spans []chapterSpan, notes []string) (*manualPack, error) {
 	mp := &manualPack{
 		Structure: st,
 		Examples:  map[string][]string{},
 		Paths:     map[string][]string{},
 		Source:    src,
+		Warnings:  append([]string(nil), notes...),
 	}
 	for _, c := range st.Categories {
 		segs, err := SplitByAnchors(src, c.Anchor)
-		if err != nil {
-			// 单个分类切不准不算致命：其余分类仍然可用，问题记进 Warnings
-			// 让人能在 UI 上看到「这一类的范文没切出来」而不是整体失败。
-			mp.Warnings = append(mp.Warnings, fmt.Sprintf("分类「%s」范文未切出：%v", c.Name, err))
+		if err == nil && len(segs) > 0 {
+			mp.Examples[c.Name] = segs
 			continue
 		}
-		mp.Examples[c.Name] = segs
+		reason := "模型没给锚点"
+		switch {
+		case err != nil:
+			reason = err.Error()
+		case len(segs) == 0:
+			reason = "锚点切出 0 段"
+		}
+		if text, why, ok := chapterFallbackText(spans, c.Name); ok {
+			mp.Examples[c.Name] = []string{text}
+			mp.Fallbacks = append(mp.Fallbacks, fmt.Sprintf("分类「%s」模型锚点不可用（%s），%s", c.Name, reason, why))
+			continue
+		}
+		// 单个分类切不准不算致命：其余分类仍然可用，问题记进 Warnings
+		// 让人能在 UI 上看到「这一类的范文没切出来」而不是整体失败。
+		mp.Warnings = append(mp.Warnings, fmt.Sprintf("分类「%s」范文未切出：%s", c.Name, reason))
 	}
 	if mp.ExampleCount() == 0 {
 		return nil, errors.New("所有分类的范文锚点都定位失败，按通用素材处理")
@@ -505,6 +682,13 @@ func (mp *manualPack) writeFidelity(dir string) error {
 	fmt.Fprintf(&b, "- 手册分类：%d 个\n", total)
 	fmt.Fprintf(&b, "- 范文覆盖：%d/%d 类，共 %d 篇\n", covered, total, mp.ExampleCount())
 
+	// 章节兜底必须单独占一行：它和「范文覆盖」是两个不同的量——覆盖数好看不代表
+	// 每篇都是精确锚出来的。只报覆盖数会让「整章兜底」伪装成正常结果，
+	// 管理员就没法判断该不该回去改锚点。
+	if n := len(mp.Fallbacks); n > 0 {
+		fmt.Fprintf(&b, "- 章节兜底：%d 类（模型锚点不可用，已改用原文整章作范文）\n", n)
+	}
+
 	// 保真核对是这份报告的立身之本：范文必须是原文连续子串。这一条是机械可验的，
 	// 所以直接报数字，而不是写「已确保保真」这种无法证伪的话。
 	if found, checked := mp.countFidelity(); checked > 0 {
@@ -535,9 +719,28 @@ func (mp *manualPack) writeFidelity(dir string) error {
 		}
 	}
 
-	if len(mp.Warnings) == 0 {
+	// 兜底明细单列一节：结论区只写「有几类降级」不够，管理员需要知道是哪些类、
+	// 为什么降级、兜底出来多少字，才能判断要不要人工补锚点。
+	if len(mp.Fallbacks) > 0 {
+		fmt.Fprintf(&b, "\n## ⚠️ 章节兜底：%d 类未按锚点切出\n\n", len(mp.Fallbacks))
+		for _, f := range mp.Fallbacks {
+			fmt.Fprintf(&b, "- %s\n", f)
+		}
+		b.WriteString("\n兜底范文取自原文章节的正文，仍是逐字切片（保真核对照样通过），" +
+			"但粒度是「整章」而非手册里那一篇范文，可能混入该章的写法说明。" +
+			"运行时会注入这一章当作该类的参考范文，效果弱于精确范文；" +
+			"若要改回精确切分，可核对 categories/ 下对应文件里的锚点。\n")
+	}
+
+	switch {
+	case len(mp.Warnings) == 0 && len(mp.Fallbacks) == 0:
 		b.WriteString("\n## 结论\n\n全部类别的范文均已按锚点从原文切出，无待处理项。\n")
-	} else {
+	case len(mp.Warnings) == 0:
+		// 全集都有范文，但「全部按锚点切出」是假话——兜底那几类不是按锚点切的。
+		// 结论区是这个模块唯一会被人快速扫一眼的地方，不能在这里模糊降级。
+		fmt.Fprintf(&b, "\n## 结论\n\n全部 %d 类都取到了范文，其中 %d 类为章节兜底（见上节），无缺失分类。\n",
+			total, len(mp.Fallbacks))
+	default:
 		fmt.Fprintf(&b, "\n## ⚠️ 待处理：%d 类范文未切出\n\n", len(mp.Warnings))
 		for _, w := range mp.Warnings {
 			fmt.Fprintf(&b, "- %s\n", w)

@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/lizhemin15/skillforge/internal/agent"
 	"github.com/lizhemin15/skillforge/internal/llm"
@@ -39,8 +41,11 @@ func NewHandler(s *store.SkillStore, l *llm.Client, secret string) (*Handler, er
 	// 文档解析服务（ocrd）：两条通道共用同一地址——管理端「给技能上传文件抽取文本」
 	// 与训练时「上传扫描件识别写作手册」。此前 ocrURL 从未被赋值，两条通道都静默失效。
 	ocrURL := ocrServiceURL()
+	ocrTmo := ocrTimeout()
 	admin.SetOCR(ocrURL)
+	admin.SetOCRTimeout(ocrTmo)
 	gen.SetOCR(ocrURL)
+	gen.SetOCRTimeout(ocrTmo)
 	genCache := newGenCache()
 	// 工具能力：按环境变量装配（默认开，SKILLFORGE_TOOLS=off 可回退纯对话）
 	toolReg := buildToolRegistry(s)
@@ -78,6 +83,26 @@ func ocrServiceURL() string {
 	return v
 }
 
+// ocrTimeout 返回单次文档解析的客户端超时上限（默认 30 分钟，见 DefaultOCRTimeout）。
+// 接受 "20m" / "90s" 这类时长写法，也接受纯秒数（"600" = 600 秒）；
+// 非法值只会打一行警告并回退默认，不会让服务起不来——解析慢是性能问题，
+// 不该升级成启动失败。
+func ocrTimeout() time.Duration {
+	v := strings.TrimSpace(os.Getenv("SKILLFORGE_OCR_TIMEOUT"))
+	if v == "" {
+		return skillgen.DefaultOCRTimeout
+	}
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d
+	}
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	fmt.Fprintf(os.Stderr, "[ocr] SKILLFORGE_OCR_TIMEOUT=%q 不合法（如 30m / 600），回退默认 %s\n",
+		v, skillgen.DefaultOCRTimeout)
+	return skillgen.DefaultOCRTimeout
+}
+
 func dataDirFor(s *store.SkillStore) string {
 	// derive data dir from skills dir (parent of skills/)
 	dir := s.SkillsDir()
@@ -110,6 +135,9 @@ func (h *Handler) Routes() *http.ServeMux {
 			"commit":  version.Commit,
 			"date":    version.Date,
 			"go":      runtime.Version(),
+			// 生效中的文档解析超时：运维改完 SKILLFORGE_OCR_TIMEOUT 重启后，
+			// 不看日志也能一眼确认配置真的吃进去了（解析慢是最容易怀疑配置没生效的场景）。
+			"ocr_timeout": ocrTimeout().String(),
 		})
 	})
 	mux.HandleFunc("/admin", serveStatic("admin.html"))

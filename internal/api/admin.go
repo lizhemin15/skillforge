@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/lizhemin15/skillforge/internal/agent"
 	"github.com/lizhemin15/skillforge/internal/llm"
@@ -26,6 +27,8 @@ type Admin struct {
 	eng    *agent.Engine // chat engine; kept in sync with the live LLM
 	mu     sync.Mutex    // serialize training to one run (simple)
 	ocrURL string        // scanned-PDF OCR microservice base URL (empty = disabled)
+	// ocrTimeout 是上传解析的客户端超时；<=0 表示用 skillgen.DefaultOCRTimeout。
+	ocrTimeout time.Duration
 	// toolAllow 是拉取模型清单时的内网白名单，与 http_request 工具同源同策略
 	// （同一个 SKILLFORGE_TOOL_HTTP_ALLOW）。两处各写一套规则迟早会不一致。
 	toolAllow []string
@@ -45,6 +48,18 @@ func (a *Admin) SetEngine(e *agent.Engine) { a.eng = e }
 
 // SetOCR 注入文档解析服务地址（空串 = 禁用）。地址来源见 ocrServiceURL()。
 func (a *Admin) SetOCR(url string) { a.ocrURL = url }
+
+// SetOCRTimeout 注入上传解析的客户端超时（<=0 = 用 skillgen.DefaultOCRTimeout）。
+func (a *Admin) SetOCRTimeout(d time.Duration) { a.ocrTimeout = d }
+
+// ocrTimeoutOrDefault 返回生效的上传解析超时；与训练通道共用同一个默认值，
+// 免得两条通道各写一个数字、改一条忘一条。
+func (a *Admin) ocrTimeoutOrDefault() time.Duration {
+	if a.ocrTimeout > 0 {
+		return a.ocrTimeout
+	}
+	return skillgen.DefaultOCRTimeout
+}
 
 // maxDocBytes 是单个参考文档的体积上限。
 //
@@ -125,8 +140,13 @@ func (a *Admin) Train(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "流式输出不可用")
 		return
 	}
+	// send 会被「训练主流程」和「OCR 心跳 goroutine」同时调用，必须串行化：
+	// 两处并发写同一个 ResponseWriter 会交错出坏帧（更别说 data race）。
+	var sendMu sync.Mutex
 	send := func(t, data string) {
 		b, _ := json.Marshal(map[string]string{"type": t, "data": data})
+		sendMu.Lock()
+		defer sendMu.Unlock()
 		fmt.Fprintf(w, "data: %s\n\n", b)
 		flusher.Flush()
 	}

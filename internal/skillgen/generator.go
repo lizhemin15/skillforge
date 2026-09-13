@@ -36,6 +36,9 @@ type Generator struct {
 	// 是因为它和 llm 一样属于「生成器依赖的外部服务」，生命周期一致；为空时
 	// 二进制素材无法文本化，会降级为告警而不是报错。
 	ocrURL string
+	// ocrTimeout 是单次文档解析的客户端超时上限；<=0 表示用 DefaultOCRTimeout。
+	// 不写死常量：不同部署的机器算力差距很大，运维要能自己调。
+	ocrTimeout time.Duration
 }
 
 func NewGenerator(l *llm.Client, s *store.SkillStore, dataDir string) *Generator {

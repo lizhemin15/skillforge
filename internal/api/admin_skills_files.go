@@ -303,7 +303,8 @@ func (a *Admin) extractAndLand(slug, filename string, data []byte) {
 
 // extractDoc calls the ocrd microservice (POST /extract) and returns the text.
 func (a *Admin) extractDoc(filename string, data []byte) (string, error) {
-	client := &http.Client{Timeout: 300 * time.Second}
+	// 超时必须可配：写死 300s 而真实扫描件要 397.5s，只会让上传解析永远失败。
+	client := &http.Client{Timeout: a.ocrTimeoutOrDefault()}
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	name := path.Base(filename)
