@@ -1,0 +1,15 @@
+[Unit]
+Description=SkillForge OCR service (RapidOCR PP-OCRv4, scanned PDF -> text)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/skillforge/bin/ocrd --port 8093
+Restart=on-failure
+RestartSec=3
+# 50 页扫描件实测峰值约 1.8G（无引擎回收时），1G 会被 cgroup OOM 杀掉。
+# ocrd 侧每 20 页重建引擎压低峰值，这里给 2G 留余量。
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

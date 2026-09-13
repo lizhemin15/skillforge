@@ -43,6 +43,18 @@ func NewAdmin(s *store.SkillStore, g *skillgen.Generator) *Admin {
 // SetEngine links the chat engine so LLM hot-swaps also reach it.
 func (a *Admin) SetEngine(e *agent.Engine) { a.eng = e }
 
+// SetOCR 注入文档解析服务地址（空串 = 禁用）。地址来源见 ocrServiceURL()。
+func (a *Admin) SetOCR(url string) { a.ocrURL = url }
+
+// maxDocBytes 是单个参考文档的体积上限。
+//
+// 取 64MB 的依据：50 页 300dpi 的扫描件约 35MB，而这里原来写的是 2MB——
+// 上传大 PDF 时字节被静默截断，OCR 只认出前几页却当成整本手册用（比直接报错更危险）。
+const maxDocBytes = 64 << 20
+
+// maxFormBytes 是整个 multipart 表单的内存阈值（超出部分落临时文件，不是硬上限）。
+const maxFormBytes = 128 << 20
+
 // ===== Skill generation (训练 skill 造新技能) =====
 
 // Train accepts a multipart form: name, category, description, requirement,
@@ -54,7 +66,7 @@ func (a *Admin) Train(w http.ResponseWriter, r *http.Request) {
 	}
 	defer a.mu.Unlock()
 
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	if err := r.ParseMultipartForm(maxFormBytes); err != nil {
 		writeErr(w, http.StatusBadRequest, "表单过大或无效")
 		return
 	}
@@ -74,6 +86,9 @@ func (a *Admin) Train(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.gen.SetLLM(llm.New(lcfg))
+	// 注入文档解析服务（ocrd）：创建技能时上传的 PDF/docx 靠它文本化。
+	// 这条通道以前没接线——上传的扫描件字节被当文本直接喂给 LLM，必然乱码。
+	a.gen.SetOCR(a.ocrURL)
 	if a.eng != nil {
 		a.eng.SetLLM(llm.New(lcfg))
 	}
@@ -87,7 +102,7 @@ func (a *Admin) Train(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		b, _ := io.ReadAll(io.LimitReader(f, 2<<20)) // 2MB cap
+		b, _ := io.ReadAll(io.LimitReader(f, maxDocBytes))
 		f.Close()
 		if len(b) > 0 {
 			in.Files = append(in.Files, &skillgen.UploadedFile{Filename: h.Filename, Content: string(b)})

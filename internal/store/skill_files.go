@@ -17,7 +17,11 @@ import (
 //   system_prompt.md   — the core writing instructions (editable)
 //   template.md        — article skeleton (editable, optional)
 //   requirement.md     — the training requirement (editable)
+//   reviewer.md        — review criteria / scoring rubric (editable, optional)
+//   fidelity.md        — machine-generated factuality report (read-only, optional)
+//   categories/*.md    — per-category writing requirements (editable, optional)
 //   examples/*.md      — few-shot sample articles (CRUD)
+//   examples/<类别>/*.md — samples grouped into category folders (CRUD)
 //   source/*           — raw uploaded reference files (managed: add/edit/delete)
 //
 // All paths exposed to the API are RELATIVE to the skill dir. Every entry
@@ -35,9 +39,29 @@ func fileKind(rel string) (kind string, editable bool) {
 	case "style_profile.md":
 		// immutable style anchor — read-only, never editable/deletable.
 		return "style", false
+	case "reviewer.md":
+		// 审稿标准：像 requirement 一样是人工维护的写作约束（「什么算好稿」），
+		// 管理员要能改，所以 editable=true。放在 switch 里而不是走前缀判断，
+		// 是为了跟别的顶层核心 md 一个入口，将来加限制时不会漏掉这条。
+		return "reviewer", true
+	case "fidelity.md":
+		// 事实保真度的机器产物（review/optimize 流程自己写的），人不该手改——
+		// 手改会在下次自动评测时被覆盖，界面给编辑框等于承诺一个存不住的操作，
+		// 所以只读（跟 style_profile.md 同类）。
+		return "fidelity", false
 	}
 	if strings.HasPrefix(rel, "examples/") && strings.HasSuffix(rel, ".md") {
+		// 这里放行 examples/ 下的**任意深度**路径（含 examples/经营业绩/01.md）：
+		// 范文本来就是按类别分文件夹存的，早先只认一级目录，子目录范文在
+		// 管理端一个都看不到（用户报的「左侧分类各不一样」根因之一）。
+		// 路径里已由 safeRel 挡掉 ".."，这里不必再限制层级。
 		return "example", true
+	}
+	if strings.HasPrefix(rel, "categories/") && strings.HasSuffix(rel, ".md") {
+		// 「分类要求」：分类目录下的写作口径（categories/_index.md 是总纲，
+		// categories/01-经营业绩.md 这类是分册）。跟 examples/ 一样按前缀认，
+		// 不写死文件名，否则用户自定义的分类名（如 02-政务信息.md）会被判成 other。
+		return "category", true
 	}
 	if strings.HasPrefix(rel, "source/") {
 		// raw reference material — binary files are previewable but not text-editable.
@@ -167,15 +191,56 @@ func (s *SkillStore) ListFiles(slug string) ([]model.SkillFile, error) {
 		"template.md":      "template",
 		"requirement.md":   "requirement",
 		"style_profile.md": "style",
+		"reviewer.md":      "reviewer",
+		"fidelity.md":      "fidelity",
 	}
-	// top-level known files
-	for _, base := range []string{"system_prompt.md", "template.md", "requirement.md", "style_profile.md"} {
+	// top-level known files.
+	// reviewer.md / fidelity.md 是可选文件：add() 内部先 os.Stat，不存在就直接返回，
+	// 所以把名字写死在这里**不会**凭空多出条目（这正是「不存在的不许造」的守点）。
+	// 一旦用「读目录再按名字挑」的写法，就得自己记 os.IsNotExist，反而更容易漏。
+	for _, base := range []string{
+		"system_prompt.md", "template.md", "requirement.md", "style_profile.md",
+		"reviewer.md", "fidelity.md",
+	} {
 		add(filepath.Join(dir, base), base, knownKinds[base])
 	}
-	// examples/*.md
-	if entries, err := os.ReadDir(filepath.Join(dir, "examples")); err == nil {
+	// categories/*.md —— 「分类要求」。
+	// 跟 instructions 里的 style_profile.md 一样是顶层白名单列不全的可变数量文件，
+	// 所以必须真去读目录：分类是用户自己加删的（01-经营业绩.md、02-政务信息.md…），
+	// 白名单写不出来。只扫一级，categories/ 下再套子目录不属于契约。
+	if entries, err := os.ReadDir(filepath.Join(dir, "categories")); err == nil {
 		for _, en := range entries {
 			if en.IsDir() || !strings.HasSuffix(en.Name(), ".md") {
+				continue
+			}
+			add(filepath.Join(dir, "categories", en.Name()), "categories/"+en.Name(), "category")
+		}
+	}
+	// examples/*.md 以及 examples/<类别名>/*.md。
+	// 「向下多扫一层」是这次的新能力：范文实际是按类别分文件夹存的
+	// （examples/经营业绩/01.md），老代码 en.IsDir() 直接 continue，
+	// 子目录范文在管理端一个都列不出来。向后兼容：老的扁平
+	// examples/example01.md 仍在第一层被收进来，两种布局并存不冲突。
+	// 只递归一层 —— examples/ 下的三级目录（归档/年份/…）没有产品语义，
+	// 深扫只会让树无限长、还容易把临时目录里的杂文件当范文。
+	if entries, err := os.ReadDir(filepath.Join(dir, "examples")); err == nil {
+		for _, en := range entries {
+			if en.IsDir() {
+				sub := filepath.Join(dir, "examples", en.Name())
+				subEntries, err := os.ReadDir(sub)
+				if err != nil {
+					continue
+				}
+				for _, se := range subEntries {
+					if se.IsDir() || !strings.HasSuffix(se.Name(), ".md") {
+						continue
+					}
+					rel := "examples/" + en.Name() + "/" + se.Name()
+					add(filepath.Join(sub, se.Name()), rel, "example")
+				}
+				continue
+			}
+			if !strings.HasSuffix(en.Name(), ".md") {
 				continue
 			}
 			add(filepath.Join(dir, "examples", en.Name()), "examples/"+en.Name(), "example")
@@ -228,14 +293,28 @@ func orderOf(kind string) int {
 		return 3
 	case "requirement":
 		return 4
-	case "style":
+	case "category":
+		// 紧跟 requirement：用户的行为顺序是先看「训练需求（要什么）」，
+		// 再看「分类要求（各类别怎么写）」，两者是同一段叙事，挨着才找得到。
 		return 5
-	case "example":
+	case "style":
 		return 6
-	case "source":
+	case "example":
 		return 7
+	case "source":
+		return 8
+	case "reviewer":
+		// 新 kind 一律追加到末尾（reviewer=9、fidelity=10），
+		// 不插队去改既有 order 的数值——既有的相对顺序一变，
+		// 老用户习惯的树形分组顺序就全乱了，那是没必要的回归。
+		return 9
+	case "fidelity":
+		return 10
 	}
-	return 9
+	// 未知 kind（如 "other"）排在最后。这里必须大于所有已知 kind：
+	// 早先返回 9，加入 reviewer=9 后会和未知项撞号，撞号会让 sort 的
+	// 比较不满足严格弱序（比较结果不稳定），"other" 可能被排到 reviewer 前面。
+	return 99
 }
 
 // ReadFile returns content of one managed file.

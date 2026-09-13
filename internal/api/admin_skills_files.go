@@ -194,7 +194,7 @@ func (a *Admin) UpdateSkillMeta(w http.ResponseWriter, r *http.Request) {
 // 所以这里不能另起文件名（那会变成同一个技能挂两个模板，模型随机挑一个，行为不可复现）。
 func (a *Admin) UploadSkillFile(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
-	if err := r.ParseMultipartForm(20 << 20); err != nil {
+	if err := r.ParseMultipartForm(maxFormBytes); err != nil {
 		writeErr(w, http.StatusBadRequest, "multipart 解析失败: "+err.Error())
 		return
 	}
@@ -207,7 +207,7 @@ func (a *Admin) UploadSkillFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, 20<<20))
+	data, err := io.ReadAll(io.LimitReader(file, maxDocBytes))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "读取文件失败")
 		return

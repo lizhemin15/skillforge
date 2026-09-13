@@ -29,3 +29,8 @@ deploy.env
 
 # ---- 本地打包产物（离线包体积大，由 CI 产出并附到 Release，不入库）----
 /dist/
+
+# 真实手册素材：PDF 54MB + 扫描页 jpg 都是中间产物，不入库。
+# 测试用「合成样本」替代（internal/skillgen/binary_sniff_test.go），不骑本机环境。
+/testdata/manual/*.pdf
+/testdata/manual/.*

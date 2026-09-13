@@ -365,12 +365,25 @@
   // templatefile = 技能目录里真被 fill_template 填充的 .docx/.xlsx 模板；
   // 和 template（写作模板 template.md，教模型「怎么写」）是两回事，必须分开列，
   // 否则用户会去改那份 md，以为改了模板样式。
-  const KIND_LABEL = { prompt: '核心提示词', template: '写作模板', templatefile: '模板文件（可填）', requirement: '训练需求', style: '风格画像', example: '参考范文', source: '原始素材', other: '其他' };
-  const KIND_ICON = { prompt: '🧠', template: '📋', templatefile: '📃', requirement: '📐', style: '🎯', example: '📄', source: '📁', other: '📎' };
+  //
+  // 本轮新增三个 kind（字符串是与后端的契约，不许改）：
+  //   category —「分类要求」：categories/_index.md（分类路由表）+ categories/01-经营业绩.md…
+  //              人工可编辑，是这次的核心新功能（后端 fileKind 返回 editable=true）。
+  //   reviewer —「审稿清单」：reviewer.md，审稿人逐条核对的判据，可编辑。
+  //   fidelity —「质量报告」：fidelity.md，机器产出的裁判试跑报告，**只读**（后端 editable=false）。
+  // 图标刻意与既有 8 个不撞车：📚 分类手册 / 🔍 逐条核对 / 📊 试跑报告。
+  const KIND_LABEL = { prompt: '核心提示词', template: '写作模板', templatefile: '模板文件（可填）', requirement: '训练需求', category: '分类要求', style: '风格画像', example: '参考范文', source: '原始素材', reviewer: '审稿清单', fidelity: '质量报告', other: '其他' };
+  const KIND_ICON = { prompt: '🧠', template: '📋', templatefile: '📃', requirement: '📐', category: '📚', style: '🎯', example: '📄', source: '📁', reviewer: '🔍', fidelity: '📊', other: '📎' };
   // 空分组也要显示的 kind（用户来这里就是为了找模板/加范文，隐藏空组等于把入口藏了）
+  // category 进这张表是**有意的**：它是本轮核心新功能，用户是专门来找「分类要求」的，
+  // 而分类由训练流程抽取后才有文件 —— 如果空着就藏起来，用户看到的就是「这功能是不是没上线」，
+  // 正是这次反馈的「左侧分类各不一样、看不懂什么逻辑」的根因。空组 + 一句说明比静默消失清楚。
+  // reviewer / fidelity 不放：它们是流程/机器产物，用户在这两个分组里没有可做的动作，
+  // 空着显示只会占屏（内容生成后分组自然出现）。
   const KIND_EMPTY_HINT = {
     templatefile: '暂无模板文件，点上方「上传模板」加一个（.docx/.xlsx，同名重传即替换）',
     example: '暂无，下方添加',
+    category: '暂无分类要求：训练抽取各分类后会在此生成（categories/_index.md 为分类路由表）',
   };
   let curSkillSlug = null;
   let curEditPath = null; // last file open in the IDE editor (persists across reloads)
@@ -409,7 +422,15 @@
   }
 
   function renderSkillFiles(body, files) {
-    const groups = ['prompt', 'template', 'templatefile', 'requirement', 'style', 'example', 'source'];
+    // 分组显示顺序。**必须与后端 store.orderOf() 逐项一致**，否则同一个技能目录
+    // 在接口里是一种顺序、在树上又是另一种，用户会以为「两处内容不一样」。
+    // 后端 orderOf：prompt=1, template=2, templatefile=3, requirement=4, category=5,
+    //               style=6, example=7, source=8, reviewer=9, fidelity=10。
+    // 语义：核心提示词 → 模板类 → 需求/分类（「要什么」与「各类别怎么写」是一段叙事，挨着放）
+    //       → 风格 → 范文/素材 → 审稿清单 → 质量报告垫底（机器产物，放最后看）。
+    // 这个数组同时是「哪些 kind 会出现在树上」的**白名单**：不在这里的 kind 一律不渲染
+    // （other 故意不在其中）。所以后端新加 kind 时，这里不补上 = 用户在界面上根本看不到那个文件。
+    const groups = ['prompt', 'template', 'templatefile', 'requirement', 'category', 'style', 'example', 'source', 'reviewer', 'fidelity'];
     // LEFT: file tree; RIGHT: editor
     let tree = '', right = '';
     // top action row (new example / upload source) pinned above tree
@@ -432,6 +453,12 @@
       } else {
         for (const f of items) {
           const canEdit = f.editable;
+          // 可删白名单 = 后端 store.DeleteFile 真正允许删的三类（example / source /
+          // templatefile，见 internal/store/skill_files.go）。**别把它放宽成「canEdit 就可删」**：
+          // 后端对 prompt/template/requirement/category/reviewer 一律回「核心文件不可删除」，
+          // 前端多给一个删除按钮 = 承诺一个点下去只会报错的操作。
+          // fidelity（质量报告）与 style（风格锚点）是只读的**质量证据**，既不可编辑也不可删，
+          // 所以两个入口都不能有 —— 这里靠身不在白名单里达成，不要顺手加进去。
           const canDel = f.kind === 'example' || f.kind === 'source' || f.kind === 'templatefile';
           // 只读文本在树上就要看得出来，别等点进去才发现改不了
           const roTag = fileViewMode(f) === 'readonly' ? ` <span class="chip">只读</span>` : '';
@@ -533,6 +560,12 @@
     function readOnlyNotice(f) {
       if (f && f.kind === 'style') {
         return '风格锚点由训练流程固化：改了会让后续生成的文风漂移，故不可编辑';
+      }
+      if (f && f.kind === 'fidelity') {
+        // fidelity.md 是 review/optimize 流程自己写的裁判试跑报告。这里给出具体原因，
+        // 而不是落到下面那句泛泛的「只读内容」——用户看到「质量报告」只想改，得先知道
+        // 改了也会在下次评测被覆盖，才不会来回试。
+        return '质量报告由评测流程自动产出：手动改动会在下次试跑时被覆盖，故不可编辑';
       }
       return '该文件为只读内容，不可编辑';
     }

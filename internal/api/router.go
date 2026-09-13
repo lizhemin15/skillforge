@@ -36,6 +36,11 @@ func NewHandler(s *store.SkillStore, l *llm.Client, secret string) (*Handler, er
 	eng := agent.New(l, s)
 	// Keep generator + engine in sync with the live LLM.
 	admin.SetEngine(eng)
+	// 文档解析服务（ocrd）：两条通道共用同一地址——管理端「给技能上传文件抽取文本」
+	// 与训练时「上传扫描件识别写作手册」。此前 ocrURL 从未被赋值，两条通道都静默失效。
+	ocrURL := ocrServiceURL()
+	admin.SetOCR(ocrURL)
+	gen.SetOCR(ocrURL)
 	genCache := newGenCache()
 	// 工具能力：按环境变量装配（默认开，SKILLFORGE_TOOLS=off 可回退纯对话）
 	toolReg := buildToolRegistry(s)
@@ -57,6 +62,20 @@ func toolMaxRounds() int {
 		fmt.Fprintf(os.Stderr, "[tools] SKILLFORGE_TOOL_ROUNDS=%q 不合法（1-20），回退默认 6\n", v)
 	}
 	return 6
+}
+
+// ocrServiceURL 返回文档解析微服务（ocrd）的地址。
+// 约定优于配置：不设置环境变量就走本机默认端口，运维不必额外配；
+// 显式设为 off/-/none 表示禁用（返回空串），此时二进制素材降级为告警而不是报错。
+func ocrServiceURL() string {
+	v := strings.TrimSpace(os.Getenv("SKILLFORGE_OCR_URL"))
+	switch strings.ToLower(v) {
+	case "":
+		return "http://127.0.0.1:8093"
+	case "off", "-", "none", "disable", "disabled":
+		return ""
+	}
+	return v
 }
 
 func dataDirFor(s *store.SkillStore) string {
