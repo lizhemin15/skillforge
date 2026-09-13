@@ -201,11 +201,32 @@ func TestResolvePDFFontEnvOverride(t *testing.T) {
 	})
 
 	t.Run("指定不存在的路径则优雅回落", func(t *testing.T) {
-		t.Setenv(pdfFontFileEnv, filepath.Join(t.TempDir(), "not-there.ttf"))
+		// 期望值**不能**沿用 good。本机（systemd / 部署脚本就是这么跑的）导出了
+		// SKILLFORGE_PDF_FONT_FILE，于是 good 本身就来自那个环境变量；而这条用例考的是
+		// 「env 指歪了 → 退回正常探测」这条路，两者本来就不该相等。
+		// 沿用 good 的写法只在「机器上没设这个变量」时成立：干净 CI 上假绿、配了字体的
+		// 真实机器上假红。所以要压的不变量是「env 失效时回落到探测结果，而不是崩或变空」，
+		// 期望值必须在同样「没有 env」的条件下现算。
+		t.Setenv(pdfFontFileEnv, "")
+		restore()
+		want := PDFFontPath()
+		if want == "" {
+			t.Skip("本机无可用 PDF 字体，跳过（CI 会安装字体后执行）")
+		}
+
+		bad := filepath.Join(t.TempDir(), "not-there.ttf")
+		t.Setenv(pdfFontFileEnv, bad)
 		restore()
 		defer restore()
-		if got := PDFFontPath(); got != good {
-			t.Fatalf("路径无效时应回落到正常探测（期望 %s），实际 %s", good, got)
+		got := PDFFontPath()
+		if got == "" {
+			t.Fatalf("%s 指向不存在的路径时字体解析结果为空——静默变空比报错更糟，PDF 会画成方框", pdfFontFileEnv)
+		}
+		if got == bad {
+			t.Fatalf("用了不存在的路径 %s（应该回落到正常探测）", bad)
+		}
+		if got != want {
+			t.Fatalf("路径无效时应回落到正常探测（无 env 时探测得 %s），实际 %s", want, got)
 		}
 	})
 }
