@@ -99,3 +99,6 @@ RUN chmod +x /verify_ocrd.sh && /verify_ocrd.sh
 # ---- artifact：只留一个文件，便于导出 ----
 FROM scratch AS artifact
 COPY --from=build /build/dist/ocrd /ocrd
+# 必须有 CMD：scratch 段没有 CMD/ENTRYPOINT 时 `docker create` 会直接
+# 报 "no command specified"，导出步骤连容器都建不起来（踩过）。
+CMD ["/ocrd"]

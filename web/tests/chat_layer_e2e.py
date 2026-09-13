@@ -81,6 +81,9 @@ def run_checks(pg):
     def trigger_text():
         return pg.eval_on_selector('#chips button', 'e => e.textContent.trim()')
 
+    def trigger_title():
+        return pg.eval_on_selector('#chips button', 'e => (e.title || e.getAttribute("aria-label") || "")')
+
     def trigger_cls():
         return pg.eval_on_selector('#chips button', 'e => e.className')
 
@@ -133,7 +136,15 @@ def run_checks(pg):
     pg.wait_for_timeout(200)
     check('勾完自动关层（下一步一定是打字）', not (layer_state() or {}).get('visible'),
           f'{layer_state()}')
-    check('勾完触发器显示"已指定"', '已指定' in trigger_text(), f'实际={trigger_text()}')
+    # 设计：选完技能胶囊显示**技能名**（锁了哪个要一眼看得见），"已指定"落在 title。
+    # 早先这里断言可见文字含"已指定" → 设计对、断言错，是假红。改成三段锚定：
+    #   ① 可见文字含被选技能名（没更新就是红）② 不再是默认提示 ③ title 表达已指定状态
+    t_txt, t_title = trigger_text(), trigger_title()
+    check('勾完触发器显示已选技能名', ('办公文档管家' in t_txt) and ('选择技能' not in t_txt), f'实际={t_txt}')
+    # title 也要跟着换：默认态是'勾一个来指定'，已指定态必须告诉你"再点=取消"。
+    # （早先两版断言都写错了位置：一次要求可见文字含"已指定"、一次要求 title 含"已指定"——
+    #  那两个字只出现在面板页脚，胶囊上从来不显示。锚点错了就是假红，不是产物错。）
+    check('勾完触发器 title 换成"可换/取消"', ('取消' in t_title) and ('勾一个来指定' not in t_title), f'title={t_title}')
     picked = pg.evaluate("() => localStorage.getItem('skillforge.chatskill')")
     check('指定技能写进 localStorage（刷新不丢）', bool(picked), f'值={picked}')
 
@@ -143,7 +154,8 @@ def run_checks(pg):
     if check('再点能重新打开（取消路径的入口）', (layer_state() or {}).get('visible'), ''):
         pg.click('.ch-skrow')
         pg.wait_for_timeout(200)
-        check('再勾一次 = 取消指定', '已指定' not in trigger_text(), f'实际={trigger_text()}')
+        t_txt2 = trigger_text()
+        check('再勾一次 = 取消指定', ('选择技能' in t_txt2) and ('办公文档管家' not in t_txt2), f'实际={t_txt2}')
 
     # —— 6. 点层外关层 ——
     pg.click('#chips button')

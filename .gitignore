@@ -34,3 +34,6 @@ deploy.env
 # 测试用「合成样本」替代（internal/skillgen/binary_sniff_test.go），不骑本机环境。
 /testdata/manual/*.pdf
 /testdata/manual/.*
+
+# ocrd 构建产物（143M，只进离线包，不入库）
+/dist-bin/

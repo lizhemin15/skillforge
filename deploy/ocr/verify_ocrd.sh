@@ -47,10 +47,15 @@ echo "=== 3) 真 OCR 一轮（纯图像 PDF → 必须读回关键词 '$EXPECT'�
 if [ -f /fixture/scan.pdf ]; then
   RESP=$(curl -fsS -F "file=@/fixture/scan.pdf" "http://127.0.0.1:$PORT/extract" 2>/dev/null || echo '{"ok":false}')
   echo "  resp: $(printf '%s' "$RESP" | head -c 400)"
-  case "$RESP" in
+  # 结构判定先去空白：服务端 JSON 是 `"ok": true`（冒号后有空格），
+  # 早先这里写死 `*'"ok":true'*` → 明明 ok=true 却报「ok 不是 true」，是**假红**
+  # （断言本身错，不是产物错）。这类「靠字面量比对」的断言最容易被格式变化骗到。
+  FLAT=$(printf '%s' "$RESP" | tr -d '[:space:]')
+  case "$FLAT" in
     *'"ok":true'*) ok "ok=true" ;;
     *) fail "ok 不是 true" ;;
   esac
+  # 关键词判定留在原始响应上（关键词本身可能含空格，不能先去空白）
   case "$RESP" in
     *"$EXPECT"*) ok "抽到预期关键词 '$EXPECT'" ;;
     *) fail "抽取结果里没有 '$EXPECT'（OCR 引擎没真跑起来）" ;;

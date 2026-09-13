@@ -123,13 +123,30 @@ jobs:
       - name: 回归防线（卸载器路径引用判定 · Bug O）
         run: bash deploy/offline/test-fontref.sh
 
+      # ocrd（文档解析服务）也必须在 CI 里现编译：`build-offline-bundle.sh` 默认强制要
+      # --ocr，不传就直接 die → 这一步失败 → `needs: offline-bundle` 不满足 →
+      # **整个 GitHub Release 被 skip**（v0.3.21 / v0.3.22 就是这么没有 Release 产物的）。
+      # amd64：真编译，并在 almalinux:8 里自检「OCR 真读出了字」（--selfcheck）；
+      # arm64：走 QEMU 要 10–30 分钟，本轮明确不做 → 显式 --no-ocr（包里不含解析服务）。
+      - name: 编译 ocrd（文档解析服务 · linux/${{ matrix.goarch }}）
+        if: matrix.goarch == 'amd64'
+        run: |
+          chmod +x scripts/build-ocr.sh
+          scripts/build-ocr.sh --arch amd64 --selfcheck --out dist-bin/ocrd-amd64
+          sha256sum dist-bin/ocrd-amd64 | tee dist-bin/ocrd-amd64.sha256
+
       - name: 打离线包（自动挑字体 + 带许可证 + 确定性 tar）
         run: |
           chmod +x scripts/build-offline-bundle.sh
-          scripts/build-offline-bundle.sh \
-            --version "${{ steps.vars.outputs.version }}" \
-            --arch "${{ matrix.goarch }}" \
-            --binary "/tmp/skillforge-linux-${{ matrix.goarch }}"
+          ARGS=(--version "${{ steps.vars.outputs.version }}"
+                --arch "${{ matrix.goarch }}"
+                --binary "/tmp/skillforge-linux-${{ matrix.goarch }}")
+          if [ "${{ matrix.goarch }}" = "amd64" ]; then
+            ARGS+=(--ocr dist-bin/ocrd-amd64)
+          else
+            ARGS+=(--no-ocr)   # 见上一步注释：arm64 离线包暂不带文档解析服务
+          fi
+          scripts/build-offline-bundle.sh "${ARGS[@]}"
 
       # 出厂前验货：包里的东西必须能一步步装起来，缺一样就挡在这里，别让用户发现。
       - name: 验货（内容 / 脚本语法 / 校验和 / 许可证）
