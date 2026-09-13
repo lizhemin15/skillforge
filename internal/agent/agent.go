@@ -176,6 +176,23 @@ func (e *Engine) HasLLM() bool {
 	return e.llm != nil
 }
 
+// PlainJSON 是一次性的非流式 JSON 调用：不给工具、不读也不写会话历史、
+// 不做意图分类。专给「首页推荐行」这类 UI 糖用（api 层的 suggestHandler）。
+//
+// 为什么不复用 Chat：Chat 那条路带记忆、带路由、带工具循环，一次请求可能
+// 跑几十秒、几十次模型调用。推荐行的价值全在「用户还没开始打字的那两秒」，
+// 它必须便宜、可超时、失败无所谓——所以要在引擎上开一条最短的通道，
+// 而不是把糖挂在重路径上。
+func (e *Engine) PlainJSON(ctx context.Context, sys, user string) (string, error) {
+	if err := e.ensureLLM(); err != nil {
+		return "", err
+	}
+	e.mu.Lock()
+	cli := e.llm
+	e.mu.Unlock()
+	return cli.Chat(ctx, sys, user, true)
+}
+
 // ChatTools 是工具循环所需的模型调用入口（引擎持有 LLM 客户端，
 // 让 api 层不必自己再持有一份，也避免两处配置漂移）。
 func (e *Engine) ChatTools(ctx context.Context, msgs []llm.Msg, defs []llm.ToolDef) (llm.Msg, error) {

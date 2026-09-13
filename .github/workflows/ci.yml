@@ -17,6 +17,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # fetch-depth: 2 —— asset_version.test.mjs 的第四道断言要拿 HEAD~1 比对
+          # 「资源内容变了没有」。浅克隆（默认 depth=1）只有 1 个提交，那条会打印
+          # skip 并静默失去作用：守卫退化成装饰，而 CI 依然全绿。
+          fetch-depth: 2
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -126,8 +131,19 @@ jobs:
       # 后端也真修好了 —— 只有老浏览器还在跑旧文件，用户看到的现象是"你没修"。
       # 这个坑本项目栽过两次（chat.js 在 v0.3.12 改过、?v= 却停在 v0.3.11 的值），
       # 靠人眼 review 抓不住，所以用 manifest 把"某段内容的哈希曾经挂在哪个 ?v= 下"记死。
-      - name: 前端回归（缓存版本号一致性）
-        run: node web/tests/asset_version.test.mjs
+      - name: 前端回归（缓存版本号一致性 + 断言自证）
+        run: |
+          node web/tests/asset_version.test.mjs
+          bash web/tests/asset_version_mutation_check.sh
+
+      # 推荐行（输入框上方那几颗小胶囊）的后端：/api/chat/suggest。
+      # 它的失败形态全是「静默降级」——前端 fetch 挂在 .catch 里，404/500/超时
+      # 都只是退回规则版推荐行，页面上没有任何异常，日志里也没有。
+      # 所以这里既跑单测，也跑注入自证：证明这些断言真的抓得住那几种静默降级。
+      - name: 后端回归（推荐行 + 断言自证）
+        run: |
+          go test ./internal/api/ -run Suggest -count=1
+          bash internal/api/suggest_mutation_check.sh
 
       - name: Build
         run: |

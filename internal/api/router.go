@@ -153,6 +153,13 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/chat", h.Chat.ServeHTTP)
 	mux.HandleFunc("GET /api/chat/attachment/{slug}", h.Chat.Attachment)
 	mux.HandleFunc("GET /api/chat/gen/{token}", h.GenFile(h.gen))
+	// 推荐行（输入框上方的小胶囊）的模型侧：见 suggest.go 的包注释。
+	// 无鉴权（和 /api/chat 同级，面向首页访客），代价靠超时 + 并发闸门控制。
+	// GET 也放行：SSR/预取/无 body 的探测都走它，语义同 POST（只读、无副作用）。
+	// 只建**一个** handler：并发闸门在 handlers 内部，两个实例等于把闸门放宽一倍。
+	suggest := newSuggestHandler(h.Eng, 5*time.Second)
+	mux.Handle("POST /api/chat/suggest", suggest)
+	mux.Handle("GET /api/chat/suggest", suggest)
 
 	// ---- admin API ----
 	mux.HandleFunc("POST /api/login", h.Auth.Login)

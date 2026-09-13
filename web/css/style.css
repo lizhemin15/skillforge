@@ -1631,3 +1631,103 @@ header.topbar {
   .ch-tools { flex-wrap: wrap; }
   .ch-skbtn { max-width: 100%; }
 }
+
+/* ============================================================
+   推荐行 + 单胶囊双档切换（极简对话界面 · 第五轮）
+   ------------------------------------------------------------
+   这一轮砍掉的是"入口的层数"，不是设计基调：毛玻璃、亮边、品牌蓝
+   一律沿用（.ch-sug 直接复用为推荐 chip）。刻意不做的事：
+     · 不给 chip 加图标/emoji —— 一行四颗已经是上限，加了就散；
+     · 滑块位移不写死 50% —— 两档文案宽度不同（自动调度4字 / 指定技能4字
+       但字体回退下不等宽），几何由 chat.js 的 syncThumb() 实测后写 inline
+       transform，这里只给过渡曲线。
+   ============================================================ */
+
+/* —— 推荐行：全页唯一的多入口 —— */
+.ch-chips {
+  flex: none;                       /* .ch-main 是 flex 列，别被拉伸 */
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  /* 与 .ch-input-box 左缘对齐：输入栏 padding 24px + 内容栏 max 860px */
+  max-width: 908px; margin: 0 auto; padding: 0 24px 10px;
+  min-height: 34px;                 /* 占位，避免内容增减时输入框上下跳 */
+  animation: ch-in .25s ease;
+}
+.ch-chips-h {
+  font-size: 11.5px; color: var(--text-faint); letter-spacing: .02em;
+  margin-right: 2px; user-select: none; white-space: nowrap;
+}
+/* 推荐 chip：比欢迎区的胶囊紧一档（它常驻在输入框上方，不能抢正文） */
+.ch-chips .ch-sug { padding: 6px 13px; font-size: 12.5px; line-height: 1.35; }
+.ch-chips .ch-sug.is-pick { border-style: dashed; }        /* 可指定：虚线=还能选 */
+.ch-chips .ch-sug.is-core { color: var(--text); }          /* 星标已在 label 里 */
+.ch-chips .ch-sug.is-on {                                  /* 已指定 / 当前档位 */
+  border-style: solid; border-color: rgba(77,107,254,.5);
+  color: var(--ds-color-text-link); background: rgba(77,107,254,.1);
+}
+/* LLM 精修回来的那批：原地淡入，别让整行闪一下 */
+.ch-chips.refined { animation: ch-in .2s ease; }
+
+/* 指定技能档却没选技能 → 抖一下并高亮。
+   "点了发送毫无反应"只能靠这一行来解释，所以反馈必须落在用户该点的地方。 */
+@keyframes ch-need {
+  0%, 100% { transform: none; }
+  18% { transform: translateX(-5px); }
+  38% { transform: translateX(5px); }
+  58% { transform: translateX(-3px); }
+  78% { transform: translateX(3px); }
+}
+.ch-chips.need { animation: ch-need .42s ease 2; }
+.ch-chips.need .ch-sug {
+  border-color: rgba(77,107,254,.55);
+  box-shadow: 0 0 0 3px rgba(77,107,254,.12);
+}
+.ch-chips.need .ch-chips-h { color: var(--ds-color-text-link); font-weight: 600; }
+
+/* —— 输入框内的单胶囊：滑动在「自动调度 / 指定技能」之间 —— */
+.ch-switch {
+  position: relative; flex: none; align-self: flex-end; margin-bottom: 4px;
+  display: inline-flex; align-items: center; padding: 3px;
+  border-radius: 999px;
+  background: rgba(9,45,78,.06);
+  border: 1px solid var(--ds-glass-edge-cool);
+  -webkit-backdrop-filter: blur(var(--ds-glass-blur-sm)) saturate(var(--ds-glass-sat));
+  backdrop-filter: blur(var(--ds-glass-blur-sm)) saturate(var(--ds-glass-sat));
+  box-shadow: inset 0 1px 1px rgba(9,45,78,.05);
+  user-select: none;
+}
+.ch-switch-thumb {
+  position: absolute; top: 3px; left: 3px; z-index: 0;
+  height: calc(100% - 6px); width: 0;         /* 宽度由 syncThumb() 实测写入 */
+  border-radius: 999px;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(9,45,78,.14), 0 2px 6px -2px rgba(9,45,78,.18);
+  transition: transform .24s cubic-bezier(.4,0,.2,1), width .24s cubic-bezier(.4,0,.2,1);
+  pointer-events: none;
+}
+.ch-switch-opt {
+  position: relative; z-index: 1;
+  border: none; background: transparent; cursor: pointer;
+  padding: 5px 13px; border-radius: 999px;
+  font: inherit; font-size: 12px; font-weight: 500; line-height: 1.4;
+  color: var(--text-faint); white-space: nowrap;
+  transition: color .18s ease;
+}
+.ch-switch-opt:hover { color: var(--text-dim); }
+.ch-switch-opt.is-on { color: var(--text); font-weight: 600; }
+.ch-switch-opt:focus-visible { outline: 2px solid rgba(77,107,254,.5); outline-offset: 2px; }
+
+/* 胶囊进了输入框，左内边距要收一档，否则视觉上顶到玻璃边 */
+.ch-input-box { padding: 8px 8px 8px 10px; gap: 8px; }
+
+/* —— 空态：一句话，居中，别处不再有任何可点元素 —— */
+.ch-welcome { padding: 14vh 0 24px; }
+.ch-welcome h1 { font-size: 26px; }
+
+@media (max-width: 720px) {
+  .ch-chips { padding: 0 14px 8px; gap: 6px; }
+  .ch-chips .ch-sug { padding: 5px 11px; font-size: 12px; }
+  .ch-switch-opt { padding: 4px 9px; font-size: 11px; }
+  .ch-input-box { padding: 7px 7px 7px 8px; gap: 6px; }
+  .ch-welcome { padding: 8vh 0 16px; }
+  .ch-welcome h1 { font-size: 22px; }
+}

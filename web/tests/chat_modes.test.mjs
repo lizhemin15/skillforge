@@ -6,13 +6,17 @@
 //   Bug U — 手动选了技能，发出去却退化成自动调度（mode/skill 漏发或在自动模式下
 //           残留了上一次选的技能）。表现是"我明明锁定了采购合同，它却给我写了篇通稿"，
 //           聊天里没有任何报错，最难查。
-//   Bug V — 技能面板不分组：核心技能（通用能力）混在业务技能里，用户每次都要
+//   Bug V — 技能候选不分组：核心技能（通用能力）混在业务技能里，用户每次都要
 //           从头找"办公文档管家"。
 //   Bug W — 手动模式没选技能就直接发出去，后端替你猜一个 —— 那就等于没有"指定技能"。
+//   Bug X — 手动没选技能点发送，界面必须**当场**告诉用户"差一步"。
+//           这一条升级过一次：原来是弹技能面板（面板自己还有 Bug X：点发送的冒泡
+//           立刻把它关掉 → "点了毫无反应"）；现在没有面板了，改为推荐行抖动高亮。
+//           坑的性质没变：反馈必须落在用户该点的地方，不能只写控制台。
 //
 // 做法：**从出货文件里抠出真正跑的那个函数来跑**（web/js/chat.js 里的
-// chatPayload / sendBlocked / skPanelHTML / skItemHtml），而不是在测试里抄一份实现。
-// 抄一份的话，改坏了真文件测试照样绿。
+// chatPayload / sendBlocked / chipPlan / runChip / syncThumb），而不是在测试里
+// 抄一份实现。抄一份的话，改坏了真文件测试照样绿。
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -52,32 +56,53 @@ function bind(src, signature, deps = [], values = []) {
 }
 
 // ---------- 真实的依赖（从出货文件里抠，避免测试自带一份"理想实现"）----------
-const esc = bind(CHAT_JS, 'function esc(');
-const TYPE_META = { write: { tag: '写作' }, docgen: { tag: '文档' }, template: { tag: '模板' }, query: { tag: '查询' } };
-const cardDesc = (sk, tag) => sk.description || tag;
+const CHIP_HINT = (() => {
+  const m = CHAT_JS.match(/const\s+CHIP_HINT\s*=\s*\{[\s\S]*?\n\s*\};/);
+  if (!m) throw new Error('抽不到配置表：CHIP_HINT');
+  return new Function(m[0] + '\nreturn CHIP_HINT;')();
+})();
+// chipPlan 不是孤立函数：它调的 askFor / askedFor / quickExample 全在同一个闭包里。
+// 所以不能只抽 chipPlan 一个 —— 那会 ReferenceError。这里把整条链都从出货文件抽出来
+// 再互相注入，等于**在测试里重建同一个闭包**，跑的还是真代码，一行没抄。
+const TYPE_META = (() => {
+  const m = CHAT_JS.match(/const\s+TYPE_META\s*=\s*\{[\s\S]*?\n\s*\};/);
+  if (!m) throw new Error('抽不到配置表：TYPE_META');
+  return new Function(m[0] + '\nreturn TYPE_META;')();
+})();
+const quickExample = bind(CHAT_JS, 'function quickExample(', ['TYPE_META'], [TYPE_META]);
+const askFor = bind(CHAT_JS, 'function askFor(', ['quickExample'], [quickExample]);
+const shortAskLabel = bind(CHAT_JS, 'function shortAskLabel(');
+// allSkills 是运行态闭包变量 —— 这里当成参数注入，等价于"索引已加载"的状态。
+const buildChipPlan = (allSkills = []) => {
+  const askedFor = bind(CHAT_JS, 'function askedFor(',
+    ['askFor', 'allSkills', 'shortAskLabel'], [askFor, allSkills, shortAskLabel]);
+  return bind(CHAT_JS, 'function chipPlan(',
+    ['CHIP_HINT', 'askedFor', 'askFor', 'quickExample'],
+    [CHIP_HINT, askedFor, askFor, quickExample]);
+};
+// runChip 依赖 pickSkill/clearSkill/setMode/setInput/submit 这些动作，这里全部换成
+// 探针 —— 测的是"点了 chip 有没有接到该接的动作"，不是那几个动作自身的行为。
+function makeRunChip(log, opts = {}) {
+  const deps = {
+    pickSkill: (sk) => log.push('pick:' + sk.slug),
+    clearSkill: () => log.push('unpick'),
+    setMode: (m) => log.push('mode:' + m),
+    setInput: (t) => log.push('input:' + t),
+    submit: () => log.push('submit'),
+    input: { value: opts.inputValue || '', focus: () => log.push('focus') },
+    allSkills: opts.skills || [],
+  };
+  const names = Object.keys(deps);
+  const fn = bind(CHAT_JS, 'function runChip(', names, names.map((n) => deps[n]));
+  return { runChip: fn, log };
+}
 
-const skItemHtml = bind(CHAT_JS, 'function skItemHtml(', ['TYPE_META', 'esc', 'cardDesc'], [TYPE_META, esc, cardDesc]);
-const skPanelHTML = bind(CHAT_JS, 'function skPanelHTML(', ['TYPE_META', 'esc', 'cardDesc', 'skItemHtml'], [TYPE_META, esc, cardDesc, skItemHtml]);
-// chatPayload 依赖三个闭包状态（sessionId/chatMode/pickedSkill），这里做成柯里化调用：
-//   chatPayload('s1','manual',skill)('要发的话')
+// chatPayload / sendBlocked 是纯函数，直接抽真代码。
 const chatPayload = (sid, mode, picked) =>
   bind(CHAT_JS, 'function chatPayload(', ['sessionId', 'chatMode', 'pickedSkill'], [sid, mode, picked]);
 const sendBlocked = bind(CHAT_JS, 'function sendBlocked(');
-const panelClosesOnClick = bind(CHAT_JS, 'function panelClosesOnClick(');
-
-// 从出货文件里抠出配置表（FOOTNOTE / PLACEHOLDER / HERO_SUB / HERO_EG），
-// 而不是在测试里另抄一份文案 —— 抄一份的话，改了真文件测试照样绿。
-function extractObj(src, name) {
-  const m = src.match(new RegExp('const\\s+' + name + '\\s*=\\s*\\{[\\s\\S]*?\\n\\s*\\};'));
-  if (!m) throw new Error('抽不到配置表：' + name);
-  // 注意：不能写成 'return ' + 定义 —— return 后面接不了 const/var 声明。
-  // 要让声明留在函数体里，再单独 return 出来。
-  return new Function(m[0] + '\nreturn ' + name + ';')();
-}
-const FOOTNOTE = extractObj(CHAT_JS, 'FOOTNOTE');
-const PLACEHOLDER = extractObj(CHAT_JS, 'PLACEHOLDER');
-const HERO_SUB = extractObj(CHAT_JS, 'HERO_SUB');
-const HERO_EG = extractObj(CHAT_JS, 'HERO_EG');
+// 滑块几何：必须用实测宽度，不能把 50% 写死（两档文案宽度不同、字体回退会错位）。
+const syncThumb = bind(CHAT_JS, 'function syncThumb(');
 
 const SKILLS = [
   { slug: '办公文档管家', name: '办公文档管家', description: '生成或填写 Word/Excel/PDF/PPT', skill_type: 'docgen', is_core: 1 },
@@ -85,6 +110,9 @@ const SKILLS = [
   { slug: '采购合同', name: '采购合同', description: '按模板生成采购合同', skill_type: 'template', is_core: 0 },
   { slug: '公司新闻通稿', name: '公司新闻通稿', description: '写公司新闻通稿', skill_type: 'write', is_core: 0 },
 ];
+
+// 默认沙箱：技能索引已加载（allSkills = SKILLS）
+const chipPlan = buildChipPlan(SKILLS);
 
 console.log('聊天方式 · 请求体（Bug U）');
 {
@@ -111,101 +139,293 @@ console.log('聊天方式 · 发送守卫（Bug W）');
   check('手动+未选技能 → 拦住', sendBlocked('manual', null) === true);
   check('手动+已选技能 → 放行', sendBlocked('manual', { slug: 'x' }) === false);
   check('自动+未选技能 → 放行', sendBlocked('auto', null) === false);
+
+  // Bug X（升级版）：被拦住那一帧必须让用户看见"差一步"。
+  // 面板删掉之后，唯一能解释这件事的就是推荐行抖动 → 断言必须钉在
+  // 「拦住 → nudgeChips() → 立即 return（不发请求）」这个整段形状上。
+  // 只写 includes('nudgeChips') 会命中函数定义，恒真 —— 那是假绿。
+  const guarded = /if \(sendBlocked\(chatMode, pickedSkill\)\) \{ nudgeChips\(\); return; \}/.test(CHAT_JS);
+  check('★ 拦住后抖动推荐行并立即返回（不静默吞掉）', guarded);
+  // nudgeChips 必须真的把 .need 类挂上去（只弹个 toast 的话，用户视线在输入框上）
+  const nudge = extractFn(CHAT_JS, 'function nudgeChips(');
+  check('抽到了 nudgeChips', !!nudge);
+  check('抖动前先重算推荐行（保证抖的就是该点的那一行）',
+    /renderChips\(\)[\s\S]*?classList\.add\('need'\)/.test(nudge || ''));
+  check('抖完会摘掉 .need（不留下永久高亮）', /remove\('need'\)/.test(nudge || ''));
+  check('抖完聚焦输入框（用户下一步是打字）', /input\.focus\(\)/.test(nudge || ''));
 }
 
-console.log('聊天方式 · 面板与提示跟随模式（Bug X）');
+console.log('聊天方式 · 技能候选分组（Bug V）');
 {
-  // Bug X —— 手动没选技能点发送：submit() 会 openSkPanel 提示补选，
-  // 但这次点击继续冒泡到 document 的"点外面就收起"监听上，面板刚开就被关掉。
-  // 界面上表现为「点了发送毫无反应」，不报错、控制台干净，只能靠真浏览器复现。
-  const opts = (o) => Object.assign(
-    { panelHidden: false, inPanel: false, inPickBtn: false, inSend: false, inInput: false }, o);
-  check('点发送键不收起面板', panelClosesOnClick(opts({ inSend: true })) === false);
-  check('点输入框不收起面板', panelClosesOnClick(opts({ inInput: true })) === false);
-  check('点面板内不收起面板', panelClosesOnClick(opts({ inPanel: true })) === false);
-  check('点技能钮不收起面板', panelClosesOnClick(opts({ inPickBtn: true })) === false);
-  check('点真正的空白处才收起', panelClosesOnClick(opts()) === true);
-  check('面板本就没开时不动', panelClosesOnClick(opts({ panelHidden: true })) === false);
+  // 手动档没选技能 → 推荐行整行变成候选清单，核心技能必须排在业务技能前面。
+  const plan = chipPlan({ skills: SKILLS, mode: 'manual', picked: null, turns: 0 });
+  const labels = plan.items.map((c) => c.label).join('|');
+  const iCore1 = labels.indexOf('办公文档管家');
+  const iCore2 = labels.indexOf('技能工厂');
+  const iBiz = labels.indexOf('采购合同');
+  check('候选全是 pick 类', plan.items.every((c) => c.kind === 'pick'), labels);
+  check('两个核心技能都在候选里', iCore1 >= 0 && iCore2 >= 0, labels);
+  check('核心技能排在业务技能前面', iCore1 >= 0 && iBiz > iCore1, labels);
+  check('核心技能带 is_core 标记（界面据此加星）', plan.items.some((c) => c.slug === '办公文档管家' && c.core));
+  // 排序无关：即使后端把业务技能排在前面，前端也得分对先后
+  const rev = chipPlan({
+    skills: [SKILLS[2], SKILLS[1], SKILLS[3], SKILLS[0]], mode: 'manual', picked: null, turns: 0,
+  });
+  check('乱序输入也把核心排前面',
+    rev.items.findIndex((c) => c.slug === '技能工厂') < rev.items.findIndex((c) => c.slug === '采购合同'));
+  // 一行最多 4 颗：多了会折行，把输入框顶下去
+  check('候选不超过 4 颗', plan.items.length <= 4, 'len=' + plan.items.length);
+  check('候选抬头提醒"先选技能"', plan.hint === CHIP_HINT.manual, plan.hint);
 
-  // 三处提示文案都得跟模式走：只改其中一处，用户会看到自相矛盾的界面
-  //（tab 写着"指定技能"，欢迎语却说"我帮你挑技能"）。
-  for (const t of [FOOTNOTE, PLACEHOLDER, HERO_SUB, HERO_EG]) {
-    check('文案两档都有', !!t.auto && !!t.manual);
-    check('文案两档不同', t.auto !== t.manual);
+  // 已指定技能 → 候选让位给"取消指定" + 一句该技能的示范问句（否则用户被锁死）
+  const picked = chipPlan({
+    skills: SKILLS, mode: 'manual', picked: { slug: '采购合同', name: '采购合同' }, turns: 1,
+  });
+  check('已指定时给出取消入口', picked.items.some((c) => c.kind === 'unpick' && c.label.includes('采购合同')));
+  check('已指定时给出示范问句', picked.items.some((c) => c.kind === 'ask' && c.send));
+  check('已指定时不再堆技能候选',
+    !picked.items.some((c) => c.kind === 'pick' && c.slug === '办公文档管家'));
+
+  // ★ 两颗同名 chip 是纯噪声：实测并排出现「✓ 办公文档管家」+「办公文档管家」，
+  // 用户看不出哪颗是取消指定、哪颗是发送问句 → 示范 chip 的标签必须是**要发出去的那句话**。
+  const labelsOf = (r) => r.items.map((c) => c.label);
+  // ⚠️ 不能直接比字符串：取消那颗的真值是「✓ 采购合同」，跟「采购合同」不相等，
+  // 但用户眼里就是两颗同名的 —— 撞名的是去掉勾号标记之后的显示文本。
+  const bare = (l) => String(l).replace(/^[✓✔\s]+/, '');
+  check('两颗 chip 去掉勾号后不撞名（撞了就分不清取消/发送）',
+    new Set(labelsOf(picked).map(bare)).size === picked.items.length,
+    labelsOf(picked).map(bare).join(' | '));
+  const dAsk = picked.items.find((c) => c.kind === 'ask');
+  check('示范 chip 标签不等于技能名（否则跟「✓」那颗撞在一起）',
+    !!dAsk && dAsk.label !== '采购合同', dAsk && dAsk.label);
+  check('标签不过长（一行胶囊不至于把输入框顶下去）',
+    !!dAsk && dAsk.label.length <= 21, dAsk && dAsk.label);
+  // docgen 技能走 quickExample 的干净问句分支 → 标签就该是这句的截断
+  const docPicked = chipPlan({
+    skills: SKILLS, mode: 'manual', picked: { slug: '办公文档管家', name: '办公文档管家' }, turns: 1,
+  });
+  const pAsk = docPicked.items.find((c) => c.kind === 'ask');
+  check('干净问句→标签是 send 的截断（点下去发的仍是全文）',
+    !!pAsk && pAsk.send.startsWith(pAsk.label.replace(/…$/, '')), pAsk && (pAsk.label + ' / ' + pAsk.send));
+
+  // 非 docgen 技能走的是 quickExample 兜底串「（用「名」标签：描述）」——
+  // 整串糊在胶囊上又长又绕，标签该取冒号后的描述。
+  const bizPicked = chipPlan({
+    skills: SKILLS, mode: 'manual', picked: { slug: '采购合同', name: '采购合同' }, turns: 1,
+  });
+  const bAsk = bizPicked.items.find((c) => c.kind === 'ask');
+  check('兜底串的标签取描述段，不把整串括号糊上去',
+    !!bAsk && !bAsk.label.includes('（') && bAsk.label.includes('按模板生成采购合同'), bAsk && bAsk.label);
+  check('标签摘掉了「用「技能名」」前缀', !!bAsk && !bAsk.label.startsWith('用「'), bAsk && bAsk.label);
+  // 截断只动标签，不许动 send —— 发出去的必须还是完整那句
+  check('截断不伤 send（send 里没有省略号）', !!bAsk && !bAsk.send.includes('…'), bAsk && bAsk.send);
+
+  // 空技能库不能炸（后端还没 seed 完 / 全停用时）
+  const empty = chipPlan({ skills: [], mode: 'manual', picked: null, turns: 0 });
+  check('空技能库不炸', empty.items.length === 0);
+  check('skills 为 undefined 不炸', chipPlan({ mode: 'manual', picked: null }).items.length === 0);
+}
+
+console.log('推荐行 · 随对话状态变化');
+{
+  const auto0 = chipPlan({ skills: SKILLS, mode: 'auto', picked: null, turns: 0 });
+  check('空态给得出推荐动作', auto0.items.length > 0);
+  check('空态不依赖技能库也有两条通用问话（seed 没跑完也能用）',
+    auto0.items.filter((c) => c.kind === 'ask').length >= 2, JSON.stringify(auto0.items.map((c) => c.label)));
+  check('空态抬头是"试试"', auto0.hint === CHIP_HINT.auto);
+
+  const asking = chipPlan({ skills: SKILLS, mode: 'auto', picked: null, turns: 2, askedBack: true });
+  check('模型在追问时，第一条就是"接着写"（当下唯一能推进的事）',
+    asking.items[0].kind === 'ask' && /按你的思路/.test(asking.items[0].send), JSON.stringify(asking.items[0]));
+
+  const withFile = chipPlan({ skills: SKILLS, mode: 'auto', picked: null, turns: 2, hasFile: true });
+  check('已有产出后给出"再精简一半"', withFile.items.some((c) => /精简|压缩/.test(c.send)));
+
+  const used = chipPlan({ skills: SKILLS, mode: 'auto', picked: null, turns: 2, lastSkill: '采购合同' });
+  const again = used.items.find((c) => c.kind === 'again');
+  check('上一轮用过技能 → 给出"继续用它"', !!again && again.slug === '采购合同');
+
+  for (const st of [auto0, asking, withFile, used]) {
+    check('每种状态都不超过 4 颗', st.items.length <= 4, 'len=' + st.items.length);
+    check('每颗都有可点的 label', st.items.every((c) => !!c.label));
   }
-  // 自动档说"我来调度"，手动档不能再说"我帮你挑" —— 技能是用户自己锁的
-  check('自动档欢迎语提调度', /调度|挑/.test(HERO_SUB.auto));
-  check('手动档欢迎语不提"我来挑"', !/调度|我来挑/.test(HERO_SUB.manual));
-  check('手动档欢迎语要求先指定技能', /指定|先选|锁定/.test(HERO_SUB.manual));
-  check('手动档占位符要求写材料', /材料/.test(PLACEHOLDER.manual));
-
-  // 欢迎语元素必须真的存在于出货 HTML 里，否则 setMode 里改了也没人看
-  check('index.html 有 #ch-w-sub', INDEX_HTML.includes('id="ch-w-sub"'));
-  check('index.html 有 #ch-w-eg', INDEX_HTML.includes('id="ch-w-eg"'));
-  // 光有文案表和元素还不够 —— setMode 必须真的把它们接上。
-  // 漏接的表现是：切到手动档，脚注变了、占位符变了，欢迎语还写着"我来挑技能"。
-  check('setMode 接了 heroSub', /heroSub\.textContent\s*=\s*HERO_SUB\[chatMode\]/.test(CHAT_JS));
-  check('setMode 接了 heroEg', /heroEg\.textContent\s*=\s*HERO_EG\[chatMode\]/.test(CHAT_JS));
-  check('取到了欢迎语元素', /heroSub\s*=\s*\$\('#ch-w-sub'\)/.test(CHAT_JS));
 }
 
-console.log('技能面板 · 分组（Bug V）');
+console.log('推荐行 · 点击真的接到动作');
 {
-  const html = skPanelHTML('', null, SKILLS);
-  const iCore = html.indexOf('核心技能');
-  const iBiz = html.indexOf('业务技能');
-  check('有核心技能分组', iCore >= 0);
-  check('有业务技能分组', iBiz >= 0);
-  check('核心分组排在业务分组前面', iCore >= 0 && iBiz > iCore, `core@${iCore} biz@${iBiz}`);
-  // 两个核心技能都必须在核心组里（而不是靠名字里有没有"通用"两字）
-  const head = html.slice(0, iBiz);
-  check('办公文档管家在核心组', head.includes('办公文档管家'));
-  check('技能工厂在核心组', head.includes('技能工厂'));
-  const tail = html.slice(iBiz);
-  check('采购合同在业务组', tail.includes('采购合同'));
-  check('公司新闻通稿在业务组', tail.includes('公司新闻通稿'));
-  check('核心技能带核心角标', (html.match(/class="ch-core">核心</g) || []).length === 2,
-    '核心角标数=' + (html.match(/class="ch-core">核心</g) || []).length);
-  check('核心组计数为 2', /核心技能 · 通用能力<i>2<\/i>/.test(html));
-  check('业务组计数为 2', /业务技能<i>2<\/i>/.test(html));
-
-  // 未选技能时不出现"退路"行；选了技能必须出现（否则用户找不到取消入口）
-  check('未选技能无退路行', !html.includes('data-reset'));
-  const picked = skPanelHTML('', { slug: '采购合同', name: '采购合同' }, SKILLS);
-  check('已选技能出现退路行', picked.includes('data-reset="1"'));
-  check('退路行排在核心组之前', picked.indexOf('data-reset') < picked.indexOf('核心技能'));
-  check('已选项标记 on', /class="ch-skitem on" data-slug="采购合同"/.test(picked));
-
-  // 搜索必须同时命中名称与描述
-  check('搜索命中名称', skPanelHTML('采购', null, SKILLS).includes('采购合同'));
-  check('搜索命中描述', skPanelHTML('通稿', null, SKILLS).includes('公司新闻通稿'));
-  check('搜索不误命中', !skPanelHTML('采购', null, SKILLS).includes('办公文档管家'));
-  check('搜索无结果返回空串', skPanelHTML('不存在的技能', null, SKILLS) === '');
-
-  // 空列表不能炸（后端还没 seed 完 / 全部停用时）
-  check('空列表不炸', skPanelHTML('', null, []) === '');
-  check('skills 为 undefined 不炸', skPanelHTML('', null, undefined) === '');
-
-  // 排序无关：即使后端把业务技能排在前面，前端也得分对组
-  const reversed = skPanelHTML('', null, [SKILLS[2], SKILLS[1], SKILLS[3], SKILLS[0]]);
-  check('乱序输入也分对组', reversed.indexOf('技能工厂') < reversed.indexOf('采购合同'));
+  // ask：点一下就该发出去（推荐操作的价值就在于省掉"再按一次回车"）
+  {
+    const { runChip, log } = makeRunChip([]);
+    runChip({ kind: 'ask', label: '再短一点', send: '把上面的内容再压缩一些' });
+    check('点 ask → 填入并提交', log.join(',') === 'input:把上面的内容再压缩一些,submit', log.join(','));
+  }
+  // 有草稿时不覆盖：草稿是用户自己敲的，优先级更高
+  {
+    const { runChip, log } = makeRunChip([], { inputValue: '我自己写的' });
+    runChip({ kind: 'ask', label: '再短一点', send: '压缩' });
+    check('有草稿时不被推荐句覆盖', log.join(',') === 'submit', log.join(','));
+  }
+  // pick：只选不发送 —— 选完还要让用户自己说材料
+  {
+    const { runChip, log } = makeRunChip([], { skills: SKILLS });
+    runChip({ kind: 'pick', slug: '采购合同' });
+    check('点 pick → 指定技能且不提交', log.join(',') === 'pick:采购合同,focus', log.join(','));
+  }
+  {
+    const { runChip, log } = makeRunChip([], { skills: SKILLS });
+    runChip({ kind: 'unpick' });
+    check('点 unpick → 取消指定且不提交', log.join(',') === 'unpick,focus', log.join(','));
+  }
+  // again：切回手动档并锁定那个技能（否则"继续用它"只改了界面文案）
+  {
+    const { runChip, log } = makeRunChip([], { skills: SKILLS });
+    runChip({ kind: 'again', slug: '采购合同' });
+    check('点"继续用这个技能" → 指定 + 切手动档', log.join(',') === 'pick:采购合同,mode:manual,focus', log.join(','));
+  }
+  // 技能已被删/停用（索引里找不到）也要能继续用 —— 后端有降级说明，前端不能卡住
+  {
+    const { runChip, log } = makeRunChip([], { skills: [] });
+    runChip({ kind: 'again', slug: '已经删掉的技能' });
+    check('技能已失效时仍能锁定（后端给降级说明）', /^pick:已经删掉的技能,mode:manual/.test(log.join(',')), log.join(','));
+  }
+  // 空 chip 不能炸
+  {
+    const { runChip, log } = makeRunChip([]);
+    runChip(null); runChip({});
+    check('空 chip 不炸（点了也不该有副作用）', log.length === 0, log.join(','));
+  }
 }
 
-console.log('聊天界面 · 结构与样式');
+console.log('推荐行 · LLM 精修是"可失败的旁路"');
 {
-  for (const th of ['mode-auto', 'mode-manual', 'skill-pick-btn', 'skill-panel', 'skill-search', 'ch-footnote']) {
-    check(`index.html 有 #${th}`, INDEX_HTML.includes('id="' + th + '"'));
+  // 规则版必须先渲染出来（用户零等待），精修只是替换。
+  // 一批最容易踩的坑：接口不存在/超时/解析失败时把推荐行清空 —— 那还不如不做。
+  check('精修打到 POST /api/chat/suggest', /fetch\('\/api\/chat\/suggest'/.test(CHAT_JS));
+  check('带 6s 超时（不让推荐行等一个慢模型）', /setTimeout\([\s\S]{0,80}6000\)/.test(CHAT_JS));
+  const refine = extractFn(CHAT_JS, 'function refineChips(');
+  check('抽到了 refineChips', !!refine);
+  check('精修只在自动档、且没指定技能时跑', /chatMode !== 'auto' \|\| pickedSkill/.test(refine || ''));
+  check('★ 非 2xx 走 reject（不把错误当结果渲染）', /r\.ok \? r\.json\(\) : Promise\.reject\(\)/.test(refine || ''));
+  check('★ 模型没给建议时保留规则版（不清空）', /if \(!list\.length\) return;/.test(refine || ''));
+  check('★ 失败兜底不抛到控制台外（catch 里不渲染）', /\.catch\(\(\) => \{ clearTimeout\(timer\); \}\)/.test(refine || ''));
+  check('过期响应被丢弃（连发几轮时不覆盖新界面）', /token !== chipToken/.test(refine || ''));
+  check('⚠️ 先渲染规则版再精修（顺序反了用户就要干等）',
+    /renderChips\(\)[\s\S]{0,120}refineChips\(\)/.test(extractFn(CHAT_JS, 'function submit(') || '')
+    || /renderChips\(\);?\s*\n\s*refineChips\(\);/.test(CHAT_JS));
+}
+
+console.log('聊天界面 · 单胶囊双档');
+{
+  for (const id of ['ch-switch', 'ch-switch-thumb', 'mode-auto', 'mode-manual', 'chips', 'chat-input', 'chat-send']) {
+    check(`index.html 有 #${id}`, INDEX_HTML.includes('id="' + id + '"'));
   }
   check('两种方式都有文案', INDEX_HTML.includes('自动调度') && INDEX_HTML.includes('指定技能'));
-  check('默认档=自动调度', /id="mode-auto"[^>]*class="ch-mode on"/.test(INDEX_HTML)
-    || /class="ch-mode on"[^>]*id="mode-auto"/.test(INDEX_HTML));
-  check('未选技能时默认不显示技能钮（自动档）', /id="skill-pick-btn"[^>]*hidden/.test(INDEX_HTML)
-    || /hidden[^>]*id="skill-pick-btn"/.test(INDEX_HTML));
-  // 样式必须真的存在：丢了 CSS 面板会变成一片裸文字堆在页面里
-  for (const sel of ['.ch-modes', '.ch-mode.on', '.ch-skpanel', '.ch-skitem.on', '.ch-core', '.ch-card.is-core']) {
+  // ⚠️ 不能假设属性顺序：HTML 里 class 写在 id 前面，按 id 在前拼正则会恒假红。
+  const tagOf = (id) => (INDEX_HTML.match(new RegExp('<button[^>]*id="' + id + '"[^>]*>')) || [''])[0];
+  const autoTag = tagOf('mode-auto'), manualTag = tagOf('mode-manual');
+  check('两档按钮都在', !!autoTag && !!manualTag);
+  check('默认档=自动调度', /\bis-on\b/.test(autoTag));
+  check('另一档默认不亮', manualTag && !/\bis-on\b/.test(manualTag));
+  check('两档默认 aria-selected 与视觉一致',
+    /aria-selected="true"/.test(autoTag) && /aria-selected="false"/.test(manualTag));
+
+  // ★ 选中态漏网之鱼（补防）：上面几条只断言了**静态 HTML 的初始态**，
+  // 而 JS 切换时 toggle 的是另一个类名（'on'），CSS 认的却是 'is-on' →
+  // 滑块照滑、aria 照改，文字选中态一动不动，HTML 预置的 is-on 谁也摘不掉，
+  // 界面就永远像停在「自动调度」上：不报错、控制台干净，只有人眼能发现。
+  // 断言不看注释怎么写，类名两侧都从出货文件里读真值 —— 改一边不改另一边即红。
+  {
+    const mm = CHAT_JS.match(/const ON_CLASS\s*=\s*'([^']+)'/);
+    const ON = mm ? mm[1] : '';
+    check('chat.js 的选中类名是具名常量（不是散落字面量）', !!ON, String(mm));
+    check('★ 该类名在 style.css 里有对应选择器',
+      !!ON && STYLE_CSS.includes('.ch-switch-opt.' + ON), 'ON=' + ON);
+    const clsOf = (tag) => ((tag.match(/class="([^"]*)"/) || [])[1] || '').split(/\s+/).filter(Boolean);
+    const autoCls = clsOf(autoTag), manCls = clsOf(manualTag);
+    check('静态初始态：自动档只带「基础类+选中类」两个 token',
+      autoCls.length === 2 && autoCls.includes('ch-switch-opt') && autoCls.includes(ON), autoCls.join(' '));
+    check('静态初始态：另一档不带选中类',
+      manCls.length === 1 && manCls[0] === 'ch-switch-opt', manCls.join(' '));
+
+    // 跑真函数而不是抄一份：两档各切一次，看类名跟不跟着走、旧档摘没摘干净
+    const mkBtn = () => {
+      const set = new Set();
+      return { set, attrs: {},
+        classList: { toggle: (c, on) => { if (on) set.add(c); else set.delete(c); } },
+        setAttribute(k, v) { this.attrs[k] = v; } };
+    };
+    const run = (mode) => {
+      const A = mkBtn(), M = mkBtn();
+      bind(CHAT_JS, 'function paintMode(', ['ON_CLASS'], [ON])(mode, A, M);
+      return { A, M };
+    };
+    const ra = run('auto');
+    check('自动档：选中档带上 CSS 类', ra.A.set.has(ON));
+    check('自动档：另一档不亮', !ra.M.set.has(ON));
+    const rm = run('manual');
+    check('指定技能档：选中档带上 CSS 类', rm.M.set.has(ON));
+    check('★ 切档后旧档选中态被摘掉（否则两档同时亮）', !rm.A.set.has(ON));
+    check('aria-selected 跟着视觉走（自动档）',
+      ra.A.attrs['aria-selected'] === 'true' && ra.M.attrs['aria-selected'] === 'false');
+    check('aria-selected 跟着视觉走（指定技能档）',
+      rm.M.attrs['aria-selected'] === 'true' && rm.A.attrs['aria-selected'] === 'false');
+
+    // 视觉同步只能有一处：setMode 必须调 paintMode，不能再悄悄 toggle 别的类名
+    const sm = extractFn(CHAT_JS, 'function setMode(');
+    check('setMode 走 paintMode', /paintMode\(chatMode, modeAuto, modeManual\)/.test(sm || ''));
+    check('setMode 里不再直接 toggle 别的类名', !!sm && !/classList\.toggle\('on'/.test(sm));
+  }
+
+  // 滑块几何必须实测：写死 50% 在字体回退/窄屏下会错位（滑块压住文字/留半格）
+  check('滑块宽度用实测 offsetWidth', /thumb\.style\.width = [^;]*offsetWidth/.test(CHAT_JS));
+  check('滑块位移用实测 offsetLeft', /translateX\([^)]*offsetLeft/.test(CHAT_JS));
+  check('宽度为 0 时不动（字体未就绪不写死错值）', /if \(!thumb \|\| !modeAuto \|\| !modeAuto\.offsetWidth\) return;/.test(CHAT_JS));
+  // 直接跑：两档宽度不同 → 位移应等于两按钮左缘之差，宽度应等于当前档按钮宽度
+  {
+    const mk = (w, left) => ({ offsetWidth: w, offsetLeft: left, style: {} });
+    const A = mk(84, 3), M = mk(90, 87);
+    const thumbStub = { style: {} };
+    const run = (mode) => new Function('chatMode', 'thumb', 'modeAuto', 'modeManual',
+      'return ' + extractFn(CHAT_JS, 'function syncThumb('))(mode, thumbStub, A, M)();
+    // ⚠️ 上面那两个括号不是手滑：new Function(...) 拿到的是「返回该函数的工厂」，
+    // 少调一次就等于把 syncThumb 当无参函数跑掉，样式对象永远空 —— 看着像功能坏了。
+    run('auto');
+    check('自动档：滑块宽=该档宽、位移=0', thumbStub.style.width === '84px' && thumbStub.style.transform === 'translateX(0px)',
+      JSON.stringify(thumbStub.style));
+    run('manual');
+    check('手动档：滑块宽=该档宽、位移=两档左缘之差',
+      thumbStub.style.width === '90px' && thumbStub.style.transform === 'translateX(84px)',
+      JSON.stringify(thumbStub.style));
+  }
+  // role=tablist 的可达性：方向键也要能切档
+  check('键盘左右方向键能切档', /ArrowLeft[\s\S]{0,80}ArrowRight/.test(CHAT_JS));
+
+  // 样式必须真的存在：丢了 CSS 会在输入框里变成两坨裸文字
+  for (const sel of ['.ch-switch', '.ch-switch-thumb', '.ch-switch-opt', '.ch-switch-opt.is-on',
+    '.ch-chips', '.ch-chips-h', '.ch-chips.need', '.ch-sug.is-pick']) {
     check(`style.css 有 ${sel}`, STYLE_CSS.includes(sel));
   }
+  check('滑块有位移过渡（不是瞬移）', /\.ch-switch-thumb\s*\{[\s\S]*?transition:[^;]*transform/.test(STYLE_CSS));
+  // 抖动动画真存在：JS 挂 .need，CSS 里如果没有 keyframes 就是白挂
+  check('抖动 keyframes 存在', /@keyframes ch-need/.test(STYLE_CSS));
+  check('抖动有次数上限（不无限抖）', /\.ch-chips\.need\s*\{[^}]*animation:[^;]*2/.test(STYLE_CSS));
+  check('推荐行有最小高度占位（内容增减时输入框不上下跳）', /\.ch-chips\s*\{[\s\S]*?min-height/.test(STYLE_CSS));
   check('本页资源带缓存版本号', /\?v=20\d{6}[A-Z]/.test(INDEX_HTML));
+}
+
+console.log('聊天界面 · 极简（砍掉的入口不许偷偷回来）');
+{
+  // 用户的原话是"一堆可点击的，太复杂了"。这一节就是防止哪天又顺手加回来。
+  for (const dead of ['skill-panel', 'skill-search', 'skill-pick-btn', 'ch-footnote', 'ch-w-sub', 'ch-w-eg', 'ch-modes']) {
+    check(`index.html 不再有 ${dead}`, !INDEX_HTML.includes(dead));
+  }
+  for (const dead of ['skPanelHTML', 'skItemHtml', 'openSkPanel', 'panelClosesOnClick', 'renderSug', 'skillChoicesHTML', 'FOOTNOTE']) {
+    check(`chat.js 不再有死代码 ${dead}`, !CHAT_JS.includes(dead));
+  }
+  // 空态只留一句话：欢迎块里不许再有可点元素
+  const w = (INDEX_HTML.match(/<div class="ch-welcome"[\s\S]*?<\/div>/) || [''])[0];
+  check('空态块内没有 button/a（点不到东西）', w && !/<button|<a\s/.test(w), w);
+  check('空态保留一句欢迎语', /想写点什么/.test(w));
 }
 
 console.log('聊天方式 · 技能失效降级说明');
@@ -230,6 +450,12 @@ console.log('聊天方式 · 技能失效降级说明');
   // 但那样就退回成"轨迹面板不在=这句话被吞"。所以必须证明它排在守卫之前。
   check('降级说明排在 if (trace) 守卫之前（面板缺失也不会被吞）',
     iTraceGuard > 0 && iNote < iTraceGuard);
+  // 只比顺序还不够：往里再补一行重复调用也满足顺序，但那时"那一行"到底在守卫内
+  // 还是守卫外就变得看运气。渲染这句话的地方只能有一处，且必须是守卫外那一处。
+  // ⚠️ 数的是整段调用 appendText(bubble, metaNoteLine(obj))，不是 metaNoteLine(obj))
+  // —— 后者在那一行里天然出现两次（if 判 + 调用），计数从 2 起，断言会恒红。
+  check('降级说明只在一处渲染（没有第二处可以悄悄生效）',
+    CHAT_JS.split('appendText(bubble, metaNoteLine(obj))').length - 1 === 1);
   check('不再直接用 obj.note 拼引用行（免得又挪回 trace 里面）',
     !CHAT_JS.includes('if (obj.note) appendText(bubble'));
 }

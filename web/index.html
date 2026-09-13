@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SkillForge — 智能写作工坊</title>
   <meta name="description" content="以 Skill 为核心的文章写作 AI 系统。像聊天一样，告诉它你想写什么，引擎自动调度最合适的写作技能帮你成文。">
-  <link rel="stylesheet" href="/assets/css/style.css?v=20260913A">
+  <link rel="stylesheet" href="/assets/css/style.css?v=20260913B">
   <link rel="preload" as="font" type="font/woff2" href="/assets/fonts/dm-sans-latin.woff2" crossorigin>
   <link rel="preload" as="font" type="font/woff2" href="/assets/fonts/montserrat-latin.woff2" crossorigin>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%234d6bfe'/><rect x='9' y='9' width='6' height='14' rx='2' fill='%23ffffff'/><rect x='17' y='9' width='6' height='14' rx='2' fill='%23c3d0ff'/></svg>">
@@ -50,59 +50,37 @@
   <main class="ch-main">
     <div class="ch-scroll" id="chat-scroll">
       <div class="ch-col" id="chat-col">
-        <!-- 消息列表（chat.js 渲染） -->
+        <!-- 空态：只留一句话。欢迎语/示例句/技能卡片全部搬到输入框上方的推荐行，
+             界面上"可点的东西"从 20+ 个降到 3 处（推荐行 · 模式胶囊 · 发送）。 -->
         <div class="ch-welcome" id="welcome">
-          <div class="ch-w-badge">✦</div>
           <h1>想写点什么？</h1>
-          <p class="ch-w-sub"><span id="ch-w-sub">直接说你想要的文章，我来调度最合适的技能为你起草。</span><br><span id="ch-w-eg">例如：「写一段写给客户的产品介绍，200 字左右」</span></p>
-          <div class="ch-sugs" id="suggestions"></div>
         </div>
       </div>
     </div>
 
-    <!-- 输入区：两种对话方式 —— 自动调度（引擎挑技能）/ 指定技能（自己挑） -->
+    <!-- 推荐行：全页唯一的多入口。内容随对话动态生成（chat.js renderChips），
+         默认是"你可以这样说"的推荐动作；切到「指定技能」后变成技能候选。 -->
+    <div class="ch-chips" id="chips" aria-live="polite"></div>
+
+    <!-- 输入区：框内只有一个胶囊，滑动在「自动调度 / 指定技能」两档之间 -->
     <div class="ch-input-bar">
       <div class="ch-input-box">
-        <div class="ch-tools">
-          <div class="ch-modes" role="tablist" aria-label="对话方式">
-            <button type="button" class="ch-mode on" id="mode-auto" data-mode="auto" role="tab" aria-selected="true">
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg>
-              <span>自动调度</span>
-            </button>
-            <button type="button" class="ch-mode" id="mode-manual" data-mode="manual" role="tab" aria-selected="false">
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h10M4 17h7"/><circle cx="18.5" cy="16.5" r="3.2"/><path d="m21 19 2 2"/></svg>
-              <span>指定技能</span>
-            </button>
-          </div>
-          <button type="button" class="ch-skbtn hidden" id="skill-pick-btn" aria-haspopup="listbox" aria-expanded="false">
-            <span class="ch-skbtn-dot"></span>
-            <span class="ch-skbtn-txt" id="skill-pick-label">选择技能</span>
-            <svg class="ch-skbtn-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-          </button>
+        <div class="ch-switch" id="ch-switch" data-mode="auto">
+          <span class="ch-switch-thumb" id="ch-switch-thumb" aria-hidden="true"></span>
+          <button type="button" class="ch-switch-opt is-on" id="mode-auto" data-mode="auto" role="tab" aria-selected="true">自动调度</button>
+          <button type="button" class="ch-switch-opt" id="mode-manual" data-mode="manual" role="tab" aria-selected="false">指定技能</button>
         </div>
-
-        <!-- 技能选择面板（浮在输入框上方，不挤压消息区） -->
-        <div class="ch-skpanel hidden" id="skill-panel" role="listbox" aria-label="选择技能">
-          <div class="ch-sksearch">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
-            <input type="text" id="skill-search" placeholder="搜索技能…" autocomplete="off">
-          </div>
-          <div class="ch-sklist" id="skill-list"></div>
-        </div>
-
-        <div class="ch-skill-pill hidden" id="active-skill-pill"></div>
         <textarea id="chat-input" class="ch-input" rows="1" placeholder="说说你想写什么…（Enter 发送，Shift+Enter 换行）"></textarea>
         <button class="ch-send" id="chat-send" aria-label="发送">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M12 20V4M6 10l6-6 6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
       </div>
-      <div class="ch-footnote" id="ch-footnote">引擎会自己理解你的需求，从技能库里挑最合适的技能</div>
     </div>
   </main>
 </div>
 
 <script src="/assets/vendor/marked/marked.min.js?v=20260909I"></script>
 <script src="/assets/js/site.js?v=20260911M"></script>
-<script src="/assets/js/chat.js?v=20260913B"></script>
+<script src="/assets/js/chat.js?v=20260913D"></script>
 </body>
 </html>

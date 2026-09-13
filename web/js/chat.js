@@ -3,13 +3,13 @@
   const $ = (s) => document.querySelector(s);
   const scroll = $('#chat-scroll'), col = $('#chat-col');
   const input = $('#chat-input'), send = $('#chat-send');
-  const welcome = $('#welcome'), suggs = $('#suggestions');
-  const pill = $('#active-skill-pill');
+  const welcome = $('#welcome');
+  // 全页唯一的"多入口"：输入框上方那一条推荐行。内容由 renderChips() 按对话状态现算，
+  // 不再有技能卡片网格 / 技能下拉面板 / 搜索框 / 脚注那四套并存的入口。
+  const chipsBox = $('#chips');
+  const switchBox = $('#ch-switch');
   const modeAuto = $('#mode-auto'), modeManual = $('#mode-manual');
-  const skBtn = $('#skill-pick-btn'), skLabel = $('#skill-pick-label');
-  const skPanel = $('#skill-panel'), skSearch = $('#skill-search'), skList = $('#skill-list');
-  const footnote = $('#ch-footnote');
-  const heroSub = $('#ch-w-sub'), heroEg = $('#ch-w-eg');
+  const thumb = $('#ch-switch-thumb');
 
   // —— 两种对话方式 ——
   // auto   : 让引擎自己理解意图，从技能库里挑（默认，适合"我也不知道该用哪个"）
@@ -18,26 +18,22 @@
   const SKILL_KEY = 'skillforge.chatskill';
   let chatMode = 'auto';
   let pickedSkill = null;   // { slug, name } —— manual 模式下锁定发送的技能
-  let allSkills = [];       // /api/skills 缓存（面板与欢迎卡片共用）
+  let allSkills = [];       // /api/skills 缓存（推荐行与技能候选共用）
   let skFetched = false;
+  // 推荐行的运行态：轮次、上一轮说了什么、上一轮模型回了什么、上一轮用了哪个技能、
+  // 是否在等用户补信息、产出物。这些全部喂给 chipPlan() 现算"现在能干哪几件事"。
+  const flow = { turns: 0, lastUser: '', lastReply: '', lastSkill: '', askedBack: false, hasFile: false };
+  let chipToken = 0;        // 丢弃过期的一次 LLM 精修响应（连发几轮时防止旧结果覆盖新界面）
 
-  const FOOTNOTE = {
-    auto: '引擎会自己理解你的需求，从技能库里挑最合适的技能',
-    manual: '已锁定技能，全程只按这一个技能的规矩来 —— 跳过意图识别，出结果更快',
-  };
   const PLACEHOLDER = {
     auto: '说说你想写什么…（Enter 发送，Shift+Enter 换行）',
     manual: '把材料和要求直接写在这里…（Enter 发送，Shift+Enter 换行）',
   };
-  // 欢迎语也得跟着模式变。自动模式下说"我帮你挑最合适的技能"是对的；
-  // 手动模式下还这么说就是骗人 —— 技能是你自己锁的，界面得说清楚。
-  const HERO_SUB = {
-    auto: '直接说你想要的文章，我来调度最合适的技能为你起草。',
-    manual: '先在下方指定一个技能，再说要写什么 —— 全程只按这个技能来，跳过意图识别。',
-  };
-  const HERO_EG = {
-    auto: '例如：「写一段写给客户的产品介绍，200 字左右」',
-    manual: '例如：选「采购合同」→「甲方 XX 公司，采购 30 台服务器，含税」',
+  // 推荐行的抬头也得跟档走：自动档说"我推荐"，手动档不能说"我推荐" ——
+  // 手动档是用户在点名技能，此时抬头的职责是提醒他"先选一个"。
+  const CHIP_HINT = {
+    auto: '试试',
+    manual: '指定技能',
   };
 
   // sessionId tracks the ACTIVE local session; restored on boot so a refresh
@@ -330,7 +326,7 @@
       }
     });
 
-    renderSuggestions();
+    renderChips();
     wireModes();
     initModes();
     autoGrow();
@@ -346,13 +342,6 @@
   }
 
   // 默认兜底建议（API 拉取失败或技能为空时使用）
-  const FALLBACK_SUGGESTIONS = [
-    '写一段 200 字的产品介绍',
-    '给客户写一封正式的邮件',
-    '把这段话改得更有文采',
-  ];
-
-  // 技能类型 → 人话标签 + 克制图标（黑白灰，无 emoji）
   const TYPE_META = {
     write:    { tag: '写文章',   icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>' },
     docgen:   { tag: '生成文档', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h8"/></svg>' },
@@ -372,165 +361,222 @@
     return sk.name ? `用「${sk.name}」帮我写一段内容` : '';
   }
 
-  // 组装把表单字段变成自然语言请求（submitSkillForm 中处理）
+  /* ---------- 推荐行：全页唯一的入口 ----------
+     上一版把入口铺满整屏：12 张技能卡（点开还有填空表单）+ 模式按钮 + 技能下拉 +
+     搜索框 + 脚注。用户第一眼不知道该动哪个。这一版只留一条推荐行，而且它的内容
+     不是静态菜单 —— 由 chipPlan() 按对话状态现算"现在能干哪几件事"：
 
-  function renderSuggestions() {
-    suggs.innerHTML = '';
-    fetch('/api/skills')
-      .then((r) => (r.ok ? r.json() : Promise.reject()))
-      .then((data) => {
-        const sk = (data && data.skills) || [];
-        if (!sk.length) { renderFallback(); return; }
-        renderSkillCards(sk);
-      })
-      .catch(renderFallback);
-  }
+       没说过话     → 两条通用问话 + 两个通用技能（最该先看见的）
+       模型在追问   → "就按你的思路写"
+       已有产出     → "再精简一半""换个更正式的语气"
+       上一轮用了X  → "继续用「X」"（点了直接切到指定技能档）
+       指定技能档   → 这一行变成技能候选，选了之后变成该技能的示范问句
 
-  function renderFallback() {
-    suggs.innerHTML = '';
-    suggs.className = 'ch-sugs-row'; // 重置容器，避免残留卡片网格样式
-    const items = FALLBACK_SUGGESTIONS.slice();
-    const b = el('div', 'ch-sugs-row');
-    items.forEach((t) => {
-      const p = el('button', 'ch-sug', t);
-      p.onclick = () => { setInput(t); input.focus(); };
-      b.appendChild(p);
-    });
-    suggs.appendChild(b);
-  }
+     chipPlan 是纯函数：状态进、清单出，不碰 DOM。推荐得对不对能直接被回归测试
+     喂状态验证，不用靠人肉点界面看。 */
+  function chipPlan(st) {
+    const s = st || {};
+    const skills = Array.isArray(s.skills) ? s.skills : [];
+    const core = skills.filter((k) => k.is_core);
+    const biz = skills.filter((k) => !k.is_core);
+    const mode = s.mode === 'manual' ? 'manual' : 'auto';
+    const picked = s.picked || null;
+    const turns = Number(s.turns) || 0;
+    const items = [];
+    const cap = 4;
 
-  // —— 场景卡片网格（一卡 = 一件事，点开即填）——
-  // 核心技能排最前：它们是"通用能力"，用户第一次来最该看见的就是这两张卡。
-  function renderSkillCards(list) {
-    suggs.className = 'ch-card-grid';
-    suggs.innerHTML = '';
-    const sorted = list.slice().sort((a, b) => (b.is_core ? 1 : 0) - (a.is_core ? 1 : 0));
-    sorted.forEach((sk) => {
-      const t = TYPE_META[sk.skill_type] || TYPE_META.write;
-      const card = el('button', 'ch-card' + (sk.is_core ? ' is-core' : ''));
-      card.type = 'button';
-      card.dataset.slug = sk.slug;
-      const hasForm = Array.isArray(sk.input_params) && sk.input_params.length > 0;
-      card.innerHTML =
-        '<span class="ch-card-ic">' + (sk.is_core ? CORE_STAR : t.icon) + '</span>' +
-        '<span class="ch-card-txt">' +
-          '<span class="ch-card-name">' + esc(sk.name || sk.slug || '') +
-            (sk.is_core ? '<span class="ch-card-core">核心</span>' : '') + '</span>' +
-          '<span class="ch-card-desc">' + esc(cardDesc(sk, t.tag)) + '</span>' +
-        '</span>' +
-        '<span class="ch-card-tag">' + esc(t.tag) + '</span>';
-      card.addEventListener('click', () => {
-        if (chatMode === 'manual') {
-          // 手动模式：点卡片 = 指定这个技能，并顺手把示例填进去
-          pickSkill(sk);
-          const q = quickExample(sk);
-          if (q) { setInput(q); input.focus(); }
-          return;
-        }
-        if (hasForm && Array.isArray(sk.input_params)) openSkillForm(sk, card);
-        else { const q = quickExample(sk); if (q) { setInput(q); input.focus(); } }
-      });
-      suggs.appendChild(card);
-    });
-  }
-
-  const CORE_STAR = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 14.4 9l6 .5-4.6 4 1.4 5.9L12 16.4 6.8 19.4 8.2 13.5 3.6 9.5l6-.5z"/></svg>';
-
-  function cardDesc(sk, tag) {
-    const d = sk.description ? sk.description.trim() : '';
-    if (d) return d;
-    const base = { write: '帮你起草', docgen: '帮你生成文件', query: '帮你办', template: '帮你办' }[sk.skill_type] || '帮你';
-    return sk.category ? (base + '「' + sk.category + '」相关') : (base + '一件事');
-  }
-
-  // —— 填空表单：技能参数 → 待填字段 → 组装成一条请求发送 ——
-  function openSkillForm(sk, card) {
-    // 已展开则收起
-    const existing = card.parentElement.querySelector('.ch-card-form');
-    if (existing && existing.dataset.slug === sk.slug) { existing.remove(); card.classList.remove('open'); return; }
-    card.parentElement.querySelectorAll('.ch-card-form').forEach((f) => f.remove());
-    card.parentElement.querySelectorAll('.ch-card.open').forEach((c) => c.classList.remove('open'));
-
-    const form = el('div', 'ch-card-form');
-    form.dataset.slug = sk.slug;
-    const title = el('div', 'ch-card-form-title', sk.name + ' — 填几个关键信息，帮你生成');
-    form.appendChild(title);
-    const body = el('div', 'ch-card-form-body');
-    const fields = [];
-    sk.input_params.forEach((p) => {
-      const fld = el('div', 'ch-field');
-      const lbl = el('label', 'ch-field-label', (p.label || p.name) + (p.required ? ' *' : ''));
-      fld.appendChild(lbl);
-      let ctl = null;
-      if (p.type === 'select') {
-        ctl = document.createElement('select');
-        ctl.className = 'ch-field-ctl';
-        (p.options || []).forEach((o) => {
-          const op = el('option', '', o); op.value = o; ctl.appendChild(op);
-        });
-      } else if (p.type === 'textarea') {
-        ctl = document.createElement('textarea');
-        ctl.className = 'ch-field-ctl';
-        ctl.rows = 3;
-      } else if (p.type === 'number') {
-        ctl = document.createElement('input');
-        ctl.type = 'number'; ctl.className = 'ch-field-ctl';
-        if (typeof p.min === 'number') ctl.min = p.min;
-        if (typeof p.max === 'number') ctl.max = p.max;
-      } else {
-        ctl = document.createElement('input');
-        ctl.type = 'text'; ctl.className = 'ch-field-ctl';
+    // —— 指定技能档 ——
+    // 这一档没选技能就发不出去（见 sendBlocked），所以推荐行必须给出候选；
+    // 否则用户被卡在"不能发 + 没有地方选"里 —— 面板删掉之后这是唯一的入口。
+    if (mode === 'manual') {
+      if (picked) {
+        items.push({ kind: 'unpick', label: '✓ ' + (picked.name || picked.slug), title: '点一下取消指定，回到自动调度' });
+        // 锁定了技能，此时最有用的是"用它写点什么"：给示范问句而不是技能列表
+        askedFor(picked).forEach((a) => items.push(a));
+        return { hint: '已指定', items: items.slice(0, cap) };
       }
-      if (p.placeholder) ctl.placeholder = p.placeholder;
-      if (p.default) ctl.value = p.default;
-      ctl.dataset.required = p.required ? '1' : '0';
-      ctl.dataset.plabel = p.label || p.name;
-      ctl.dataset.pname = p.name || '';
-      fld.appendChild(ctl);
-      if (p.help) { const h = el('div', 'ch-field-help', p.help); fld.appendChild(h); }
-      body.appendChild(fld);
-      fields.push(ctl);
-    });
-    form.appendChild(body);
-    const actions = el('div', 'ch-card-form-actions');
-    const go = el('button', 'ch-btn primary', '生成');
-    go.type = 'button';
-    go.addEventListener('click', () => submitSkillForm(sk, fields, form));
-    const cancel = el('button', 'ch-btn', '取消');
-    cancel.type = 'button';
-    cancel.addEventListener('click', () => { form.remove(); card.classList.remove('open'); });
-    actions.appendChild(go); actions.appendChild(cancel);
-    form.appendChild(actions);
-    card.appendChild(form);
-    card.classList.add('open');
-    const first = fields[0]; if (first && first.focus) first.focus();
+      core.concat(biz).slice(0, cap).forEach((k) => {
+        items.push({ kind: 'pick', slug: k.slug, label: k.name || k.slug, core: !!k.is_core, title: '指定这个技能' });
+      });
+      return { hint: CHIP_HINT.manual, items: items };
+    }
+
+    // —— 自动调度档 · 空态 ——
+    if (turns === 0) {
+      // 前两条是纯文本问话：不依赖技能库，后端还没 seed 完也能点。
+      items.push({ kind: 'ask', label: '写一段产品介绍', send: '写一段给客户看的产品介绍，200 字左右' });
+      items.push({ kind: 'ask', label: '做一份会议纪要', send: '帮我做一份会议纪要模板，导出成 Word 文件' });
+      core.slice(0, cap - items.length).forEach((k) => items.push(askFor(k)));
+      return { hint: CHIP_HINT.auto, items: items };
+    }
+
+    // —— 自动调度档 · 对话中 ——
+    // 优先级：先把"模型正等你回话"这条顶上去 —— 那是当下唯一能推进的事。
+    if (s.askedBack) {
+      items.push({ kind: 'ask', label: '就按你的思路写', send: '按你的思路先出一版，缺的信息我后面补' });
+    }
+    if (s.hasFile) {
+      items.push({ kind: 'ask', label: '再精简一半', send: '把上面这份内容压缩到一半长度，保留关键信息' });
+      items.push({ kind: 'ask', label: '换个更正式的语气', send: '语气改得更正式一些，适合直接发给客户' });
+    }
+    if (s.lastSkill) {
+      items.push({ kind: 'again', slug: s.lastSkill, label: '继续用这个技能', title: '切到指定技能档并锁定「' + s.lastSkill + '」' });
+    }
+    // 不管聊到哪一步，"再短一点 / 换个开头"永远是合理的下一步
+    if (items.length < cap) items.push({ kind: 'ask', label: '再短一点', send: '把上面的内容再压缩一些，保留结论' });
+    if (items.length < cap) items.push({ kind: 'ask', label: '换个开头', send: '换一个更有吸引力的开头重写，其余保持不变' });
+    return { hint: CHIP_HINT.auto, items: items.slice(0, cap) };
   }
 
-  function submitSkillForm(sk, fields, form) {
-    const filled = [];
-    let missing = false;
-    fields.forEach((c) => {
-      const v = (c.value || '').trim();
-      if (!v && c.dataset.required === '1') { missing = true; c.classList.add('err'); return; }
-      c.classList.remove('err');
-      if (v) filled.push(v);
-    });
-    if (missing) return;
-    form.remove();
-    // 组装成一句话给后端（保持参数名映射，让意图/参数提取能命中）
-    const label = (TYPE_META[sk.skill_type] || {}).tag || '内容';
-    const q = filled.length
-      ? '用「' + sk.name + '」' + label + '，' + filled.join('；')
-      : quickExample(sk);
-    setInput(q);
+  // 一个技能 → 一颗可点的推荐问话。label 必须短（一行塞得下 4 颗），
+  // 真正发出去的句子放 send，悬停可见 —— 用户点之前就知道会发生什么。
+  function askFor(sk) {
+    const q = quickExample(sk) || ('用「' + (sk.name || sk.slug) + '」帮我写一段内容');
+    return { kind: 'ask', label: sk.name || sk.slug, send: q, title: q };
+  }
+  function askedFor(picked) {
+    if (!picked) return [];
+    const sk = (allSkills || []).find((k) => k.slug === picked.slug) || picked;
+    const a = askFor(sk);
+    // ⚠️ 锁定技能后，这一行里已经躺着一颗「✓ 技能名」了（取消指定）。
+    // 再挂一颗同名 chip，用户根本分不清哪颗是取消、哪颗是发送 ——
+    // 实测就是「✓ 办公文档管家」+「办公文档管家」并排，纯噪声。
+    // 所以这里的标签必须换成**点下去会发出去的那句话**。
+    a.label = shortAskLabel(a.send, sk.name || sk.slug);
+    return [a];
+  }
+
+  // chip 是一行胶囊，标签太长就把输入框顶下去。全句照发（title 里有全文）。
+  function shortAskLabel(q, name) {
+    let t = String(q || '').replace(/\s+/g, ' ').trim();
+    // quickExample 的兜底形态是「（用「技能名」标签：描述）」：
+    // 整串糊在胶囊上又长又绕，取冒号后面的描述才是"点了会发生什么"。
+    if (t.startsWith('（')) {
+      const seg = t.replace(/^（/, '').replace(/）$/, '').split('：');
+      t = seg.length > 1 ? seg.slice(1).join('：') : t;
+    }
+    const p = '用「' + name + '」';
+    if (name && t.startsWith(p)) t = t.slice(p.length);
+    t = t.trim();
+    return t.length > 20 ? t.slice(0, 19) + '…' : t;
+  }
+
+
+  function chipNode(c) {
+    const b = el('button', 'ch-sug'
+      + (c.kind === 'pick' ? ' is-pick' : '')
+      + (c.kind === 'pick' && c.core ? ' is-core' : '')
+      + (c.kind === 'unpick' ? ' is-on' : '')
+      + (c.kind === 'again' ? ' is-pick' : ''));
+    b.type = 'button';
+    b.textContent = c.label;
+    if (c.title) b.title = c.title;
+    b.dataset.kind = c.kind;
+    if (c.slug) b.dataset.slug = c.slug;
+    if (c.send) b.dataset.send = c.send;
+    b.addEventListener('click', () => runChip(c));
+    return b;
+  }
+
+  function runChip(c) {
+    if (!c) return;
+    if (c.kind === 'pick') {
+      const sk = (allSkills || []).find((k) => k.slug === c.slug);
+      if (sk) pickSkill(sk);
+      input.focus();
+      return;
+    }
+    if (c.kind === 'unpick') { clearSkill(); input.focus(); return; }
+    if (c.kind === 'again') {
+      const sk = (allSkills || []).find((k) => k.slug === c.slug)
+        || { slug: c.slug, name: c.slug };
+      pickSkill(sk);
+      setMode('manual');
+      input.focus();
+      return;
+    }
+    // ask：点了就直接发，不让用户再按一次回车 —— 推荐操作的价值就在于省这一步。
+    // 但已经有草稿时不覆盖：草稿是用户自己敲的，优先级更高。
+    // 没有文案的 chip 一律当无效：input.value = undefined 会把字面量 "undefined"
+    // 写进输入框，submit() 再把它当用户说的话发出去 —— 一个空 chip 能发出一条假消息。
+    const q = c.send || c.label;
+    if (!q) return;
+    if (!(input.value || '').trim()) { setInput(q); }
     submit();
   }
 
-  function renderSug(t) {
-    const b = document.createElement('button');
-    b.className = 'ch-sug'; b.textContent = t;
-    b.onclick = () => { setInput(t); input.focus(); };
-    suggs.appendChild(b);
+  // 把当前状态渲染成推荐行。hint 用一个不起眼的小字标签，不抢视觉。
+  function renderChips(extra) {
+    if (!chipsBox) return;
+    const plan = chipPlan(Object.assign({
+      skills: allSkills,
+      mode: chatMode,
+      picked: pickedSkill,
+      turns: flow.turns,
+      askedBack: flow.askedBack,
+      hasFile: flow.hasFile,
+      lastSkill: flow.lastSkill,
+    }, extra || {}));
+    chipsBox.innerHTML = '';
+    if (plan.hint && plan.items.length) {
+      chipsBox.appendChild(el('span', 'ch-chips-h', plan.hint));
+    }
+    plan.items.forEach((c) => chipsBox.appendChild(chipNode(c)));
+    return plan;
+  }
+
+  // —— LLM 精修 ——
+  // 规则版是"保底且瞬时"的：先把上面那几条渲染出去（用户零等待），
+  // 再异步问后端"就这段对话，接下来最可能想干什么"，回来若有更像样的建议就换上去。
+  // 失败/超时一律保留规则版 —— 推荐行宁愿平庸，也不能空着或闪。
+  function refineChips() {
+    if (chatMode !== 'auto' || pickedSkill) return;
+    if (!flow.turns) return;
+    const token = ++chipToken;
+    let payload;
+    try {
+      payload = JSON.stringify({
+        session_id: sessionId,
+        last_user: flow.lastUser,
+        last_reply: flow.lastReply.slice(0, 600),
+        used_skill: flow.lastSkill || '',
+        skills: (allSkills || []).slice(0, 12).map((k) => ({ slug: k.slug, name: k.name })),
+      });
+    } catch (e) { return; }
+    const ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+    const timer = setTimeout(() => { if (ctl) ctl.abort(); }, 6000);
+    fetch('/api/chat/suggest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: payload,
+      signal: ctl ? ctl.signal : undefined,
+    })
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((d) => {
+        clearTimeout(timer);
+        if (token !== chipToken) return;              // 已经又聊了一轮，这批建议过期了
+        if (chatMode !== 'auto' || pickedSkill) return;
+        const list = ((d && d.chips) || [])
+          .filter((x) => x && x.label)
+          .map((x) => ({ kind: 'ask', label: String(x.label).slice(0, 20), send: String(x.send || x.label) }))
+          .slice(0, 4);
+        if (!list.length) return;                     // 模型没给出东西：保留规则版
+        if (!chipsBox) return;
+        chipsBox.innerHTML = '';
+        chipsBox.appendChild(el('span', 'ch-chips-h', '接下来'));
+        list.forEach((c) => chipsBox.appendChild(chipNode(c)));
+        chipsBox.classList.add('refined');
+      })
+      .catch(() => { clearTimeout(timer); });
+  }
+
+  // 模型是否在问用户要东西？—— 推荐行据此优先给"补上它"的选项，
+  // 而不是继续塞新任务：用户正被反问时，最该点的就是回答那个问题。
+  function asksBack(reply) {
+    const t = String(reply || '').trim();
+    if (!t) return false;
+    if (/[?？]\s*$/.test(t)) return true;
+    return /(请|麻烦|需要你|希望你)(补充|提供|告诉|明确|确认|发一下|给一下|上传)/.test(t);
   }
 
   function setInput(t) { input.value = t; autoGrow(); }
@@ -588,31 +634,60 @@
 
   function keepBottom() { scroll.scrollTop = scroll.scrollHeight; }
 
-  function setPill(name) {
-    if (name) {
-      pill.classList.remove('hidden');
-      pill.innerHTML = '✦ 技能 · <span>' + esc(name) + '</span>';
-    } else {
-      pill.classList.add('hidden');
-    }
+  // 引擎这一轮挑中的技能：不再有常驻胶囊显示它（消息气泡里本来就有「正在使用技能」），
+  // 这里只记进状态，供推荐行下一轮算"继续用这个技能"。
+  function setPill(name) { flow.lastSkill = name || ''; }
+
+  /* ---------- 对话方式切换 ---------- */
+  // setMode 只做三件事：改状态、把视觉同步过去、把推荐行重算。
+  // 技能选择不再有独立面板 —— 推荐行本身就是候选列表（见 chipPlan 的 manual 分支）：
+  // 少一个浮层、少一套"点外面收起"的判断，也少一处能不一致的状态。
+  // 选中态的类名**只能有一个来源**，且必须与 CSS 里的选择器逐字一致：
+  // style.css 写的是 `.ch-switch-opt.is-on`。
+  // ⚠️ 这里曾经 toggle 的是 'on' —— 滑块照滑、aria 照改，但文字选中态一动不动，
+  // 而 HTML 预置的 is-on 谁也摘不掉，看着就永远停在「自动调度」上：
+  // 界面不报错、控制台干净，只有人眼能发现。测试见 chat_modes.test.mjs 的
+  // 「选中类名必须与 CSS 对得上」一节（改一侧不改另一侧就变红）。
+  const ON_CLASS = 'is-on';
+  function paintMode(mode, auto, manual) {
+    auto.classList.toggle(ON_CLASS, mode === 'auto');
+    manual.classList.toggle(ON_CLASS, mode === 'manual');
+    auto.setAttribute('aria-selected', String(mode === 'auto'));
+    manual.setAttribute('aria-selected', String(mode === 'manual'));
   }
 
-  /* ---------- 对话方式切换 + 技能选择面板 ---------- */
   function setMode(m, silent) {
     chatMode = m === 'manual' ? 'manual' : 'auto';
     try { localStorage.setItem(MODE_KEY, chatMode); } catch (e) {}
-    modeAuto.classList.toggle('on', chatMode === 'auto');
-    modeManual.classList.toggle('on', chatMode === 'manual');
-    modeAuto.setAttribute('aria-selected', String(chatMode === 'auto'));
-    modeManual.setAttribute('aria-selected', String(chatMode === 'manual'));
-    skBtn.classList.toggle('hidden', chatMode !== 'manual');
-    footnote.textContent = FOOTNOTE[chatMode];
+    if (switchBox) switchBox.dataset.mode = chatMode;   // 滑块位置由 CSS 读这个属性
+    paintMode(chatMode, modeAuto, modeManual);
+    syncThumb();
     input.placeholder = PLACEHOLDER[chatMode];
-    if (heroSub) heroSub.textContent = HERO_SUB[chatMode];
-    if (heroEg) heroEg.textContent = HERO_EG[chatMode];
-    // 切到手动却还没选技能 → 直接把面板打开，别让用户猜下一步干什么
-    if (chatMode === 'manual' && !pickedSkill && !silent) openSkPanel(true);
-    else if (chatMode === 'auto') closeSkPanel();
+    renderChips();
+    if (chatMode === 'manual' && !pickedSkill && !silent) nudgeChips();
+  }
+
+  // 滑块几何：thumb 的宽度与位移都按两个按钮的实测位置算。
+  // 两档文字宽度不同，写死 50% 会在字体回退/窄屏下错位。
+  function syncThumb() {
+    if (!thumb || !modeAuto || !modeAuto.offsetWidth) return;
+    const from = chatMode === 'auto' ? modeAuto : modeManual;
+    thumb.style.width = from.offsetWidth + 'px';
+    thumb.style.transform = 'translateX(' + (from.offsetLeft - modeAuto.offsetLeft) + 'px)';
+  }
+
+  // 手动档还没选技能 → 推荐行抖一下 + 高亮。
+  // 这是"点了发送毫无反应"的唯一解药：必须让用户立刻知道还差一步，就差在这一行里。
+  // 先 renderChips()：此刻这一行应该已经是"技能候选清单"（chipPlan 的 manual 分支），
+  // 保证抖的那一行就是用户该点的那一行。
+  function nudgeChips() {
+    if (!chipsBox) { input.focus(); return; }
+    renderChips();
+    chipsBox.classList.remove('need');
+    void chipsBox.offsetWidth;        // 强制重排，连按两次也能重放动画
+    chipsBox.classList.add('need');
+    setTimeout(() => chipsBox.classList.remove('need'), 1600);
+    input.focus();
   }
 
   function initModes() {
@@ -630,6 +705,8 @@
       } else if (pendingSlug) {
         try { localStorage.removeItem(SKILL_KEY); } catch (e) {}
       }
+      renderChips();
+      syncThumb();   // 索引/字体就位后再校一次滑块
     });
   }
   let pendingSlug = '';
@@ -639,105 +716,30 @@
     return fetch('/api/skills')
       .then((r) => (r.ok ? r.json() : Promise.reject()))
       .then((data) => {
+        // 核心技能（通用能力）排最前：推荐行只显示前 4 个，顺序就是"先看见谁"。
+        // 不靠后端排序兜底 —— 后端多塞一个技能就可能把通用能力挤出屏幕。
         allSkills = ((data && data.skills) || []).slice()
           .sort((a, b) => (b.is_core ? 1 : 0) - (a.is_core ? 1 : 0));
         skFetched = true;
-        renderSkList('');
+        renderChips();
         return allSkills;
       })
       .catch(() => allSkills);
-  }
-
-  // 技能面板的 HTML 由这个纯函数产出（skills/picked 全部走参数）。
-  // 抽成纯函数不是为了好看：分组与「核心标」是这一轮的核心交付物，
-  // 必须能被 web/tests 直接喂数据跑，而不是靠人肉点界面确认。
-  function skPanelHTML(q, picked, skills) {
-    const kw = (q || '').trim().toLowerCase();
-    const all = Array.isArray(skills) ? skills : [];
-    const hit = all.filter((sk) => {
-      if (!kw) return true;
-      return (String(sk.name || '') + ' ' + String(sk.slug || '') + ' ' + String(sk.description || ''))
-        .toLowerCase().includes(kw);
-    });
-    // 核心技能（通用能力）永远独占一组且排在业务技能前面 —— 顺序不靠后端排序兜底。
-    const core = hit.filter((s) => s.is_core), biz = hit.filter((s) => !s.is_core);
-    const block = (title, items) => items.length
-      ? '<div class="ch-skgroup"><div class="ch-skgroup-h">' + title + '<i>' + items.length + '</i></div>' +
-        items.map((sk) => skItemHtml(sk, picked)).join('') + '</div>'
-      : '';
-    // 已锁定技能时给一条"退路"：一键回到自动调度，免得用户找不到取消入口
-    const reset = picked
-      ? '<button type="button" class="ch-skitem ch-skreset" data-reset="1">' +
-        '<span class="ch-skitem-ic">↺</span>' +
-        '<span class="ch-skitem-txt"><span class="ch-skitem-name">不指定技能</span>' +
-        '<span class="ch-skitem-desc">改由引擎自己理解需求、按需挑技能</span></span>' +
-        '<span class="ch-skitem-tag">自动调度</span></button>'
-      : '';
-    return reset + block('核心技能 · 通用能力', core) + block('业务技能', biz);
-  }
-
-  function renderSkList(q) {
-    skList.innerHTML = skPanelHTML(q, pickedSkill, allSkills) || '<div class="ch-skempty">没有匹配的技能</div>';
-    skList.querySelectorAll('.ch-skitem').forEach((n) => {
-      n.addEventListener('click', () => {
-        if (n.dataset.reset) { clearSkill(); setMode('auto'); closeSkPanel(); input.focus(); return; }
-        const sk = allSkills.find((s) => s.slug === n.dataset.slug);
-        if (sk) { pickSkill(sk); input.focus(); }
-      });
-    });
-  }
-
-  function skItemHtml(sk, picked) {
-    const t = TYPE_META[sk.skill_type] || TYPE_META.write;
-    const on = picked && picked.slug === sk.slug ? ' on' : '';
-    return '<button type="button" class="ch-skitem' + on + '" data-slug="' + esc(sk.slug) + '">' +
-      '<span class="ch-skitem-ic">' + (sk.is_core ? '★' : '✦') + '</span>' +
-      '<span class="ch-skitem-txt">' +
-        '<span class="ch-skitem-name">' + esc(sk.name || sk.slug) +
-          (sk.is_core ? '<span class="ch-core">核心</span>' : '') + '</span>' +
-        '<span class="ch-skitem-desc">' + esc(cardDesc(sk, t.tag)) + '</span>' +
-      '</span>' +
-      '<span class="ch-skitem-tag">' + esc(t.tag) + '</span>' +
-    '</button>';
   }
 
   function pickSkill(sk, silent) {
     if (!sk) return;
     pickedSkill = { slug: sk.slug, name: sk.name || sk.slug };
     try { localStorage.setItem(SKILL_KEY, pickedSkill.slug); } catch (e) {}
-    skLabel.textContent = pickedSkill.name;
-    skBtn.classList.add('picked');
-    if (!silent) {
-      closeSkPanel();
-      footnote.textContent = '已指定「' + pickedSkill.name + '」· 跳过意图识别，出结果更快';
-      document.querySelectorAll('.ch-card').forEach((c) => c.classList.toggle('on', c.dataset.slug === pickedSkill.slug));
-    }
-    renderSkList(skSearch.value);
+    renderChips();
   }
 
   function clearSkill() {
     pickedSkill = null;
     try { localStorage.removeItem(SKILL_KEY); } catch (e) {}
-    skLabel.textContent = '选择技能';
-    skBtn.classList.remove('picked');
-    document.querySelectorAll('.ch-card.on').forEach((c) => c.classList.remove('on'));
-    renderSkList(skSearch.value);
+    renderChips();
   }
 
-  function openSkPanel(nudge) {
-    skPanel.classList.remove('hidden');
-    skBtn.setAttribute('aria-expanded', 'true');
-    loadSkillIndex();
-    if (nudge) {
-      skPanel.classList.add('nudge');
-      setTimeout(() => skPanel.classList.remove('nudge'), 600);
-      try { skSearch.focus(); } catch (e) {}
-    }
-  }
-  function closeSkPanel() {
-    skPanel.classList.add('hidden');
-    skBtn.setAttribute('aria-expanded', 'false');
-  }
   // 后端降级说明 → 渲染成回复开头的引用行。
   // 单独抽出来是为了能被回归测试直接调用：这句话只有一条，丢了用户就抓瞎。
   function metaNoteLine(obj) {
@@ -745,39 +747,20 @@
     return '> ' + obj.note + '\n\n';
   }
 
-  function toggleSkPanel() {
-    if (skPanel.classList.contains('hidden')) openSkPanel(false); else closeSkPanel();
-  }
-
-  // 面板开着时，这次点击该不该把它收起来？
-  // 返回 true = 收起。纯函数：入参是"点在哪"，不碰 DOM，方便回归测试。
-  function panelClosesOnClick(o) {
-    if (o.panelHidden) return false;                       // 本来就没开，无所谓
-    if (o.inPanel || o.inPickBtn) return false;            // 点在面板/技能钮上：那不是"点外面"
-    if (o.inSend || o.inInput) return false;               // 点在发送键/输入框上：见调用处注释
-    return true;
-  }
-
   function wireModes() {
     modeAuto.addEventListener('click', () => setMode('auto'));
     modeManual.addEventListener('click', () => setMode('manual'));
-    skBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleSkPanel(); });
-    skSearch.addEventListener('input', () => renderSkList(skSearch.value));
-    // 点面板外面 / 按 Esc 收起。
-    // ⚠️ 这条判断必须放过"发送键"和输入框：手动模式没选技能时，submit() 正是靠
-    // openSkPanel 来提示用户补选技能，而这次点击会继续冒泡到这里 —— 若把它当成
-    // "点在外面"，面板刚开就被同一击关掉，用户看到的是「点了发送毫无反应」。
-    // 抽成纯函数是为了能被 web/tests 跑真代码、并且突变注入能精确变红。
-    document.addEventListener('click', (e) => {
-      if (panelClosesOnClick({
-        panelHidden: skPanel.classList.contains('hidden'),
-        inPanel: skPanel.contains(e.target),
-        inPickBtn: skBtn.contains(e.target),
-        inSend: send.contains(e.target),
-        inInput: input.contains(e.target),
-      })) closeSkPanel();
+    // role=tablist 的可达性要求：左右方向键也能切档
+    if (switchBox) switchBox.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowLeft') { setMode('auto'); modeAuto.focus(); }
+      if (e.key === 'ArrowRight') { setMode('manual'); modeManual.focus(); }
     });
-    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSkPanel(); });
+    // 字体没就绪时 offsetWidth 可能为 0 → 滑块停在起点（视觉上等于没切档）。
+    // 字体加载完和窗口尺寸变化时各校正一次。
+    if (document.fonts && document.fonts.ready && document.fonts.ready.then) {
+      document.fonts.ready.then(syncThumb);
+    }
+    window.addEventListener('resize', syncThumb);
   }
 
   /* ---------- core send ---------- */
@@ -803,7 +786,7 @@
     if (!text || busy) return;
     // 手动模式却没选技能 —— 不能偷偷退回自动（用户以为是"指定"的），
     // 直接打开面板并把搜索框聚焦，把这一步补上。
-    if (sendBlocked(chatMode, pickedSkill)) { openSkPanel(true); return; }
+    if (sendBlocked(chatMode, pickedSkill)) { nudgeChips(); return; }
     input.value = ''; input.focus(); autoGrow();
     if (welcome && !welcome.classList.contains('hidden')) welcome.classList.add('hidden');
 
@@ -815,6 +798,13 @@
     saveStore(); router.render();
 
     addUser(text);
+    // 推荐行的输入 = 这一轮开始之前的状态：先归档再重置。不重置的话 askedBack /
+    // hasFile 会带着上一轮的结论进来（该反问时不反问）。
+    flow.turns += 1;
+    flow.lastUser = text;
+    flow.askedBack = false;
+    flow.hasFile = false;
+    flow.lastReply = '';
     busy = true;
     send.disabled = true;
 
@@ -841,8 +831,9 @@
       send.disabled = false;
       // persist assistant answer (full raw markdown) after streaming finishes
       const full = bubble.dataset.md || '';
+      const hadFiles = pendingFiles.length > 0;
       const msg = { role: 'assistant', text: full, skill: trace?.dataset?.skill || null };
-      if (pendingFiles.length) msg.files = pendingFiles.slice();
+      if (hadFiles) msg.files = pendingFiles.slice();
       pendingFiles = [];
       if (full) {
         const s = activeSession();
@@ -850,6 +841,12 @@
         s.updated = Date.now();
         saveStore(); router.render(); prune();
       }
+      // 这一轮的结果决定下一轮推荐什么：答完就重算，再异步请模型精修。
+      flow.lastReply = full;
+      flow.hasFile = hadFiles;
+      flow.askedBack = asksBack(full);
+      renderChips();
+      refineChips();
     }
   }
 
