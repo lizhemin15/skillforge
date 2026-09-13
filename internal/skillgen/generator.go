@@ -21,6 +21,10 @@ type Generator struct {
 	llm       *llm.Client
 	store     *store.SkillStore
 	skillsDir string
+	// ocrURL 是文档解析微服务（ocrd）的地址。放在结构体里而不是逐个调用点传参，
+	// 是因为它和 llm 一样属于「生成器依赖的外部服务」，生命周期一致；为空时
+	// 二进制素材无法文本化，会降级为告警而不是报错。
+	ocrURL string
 }
 
 func NewGenerator(l *llm.Client, s *store.SkillStore, dataDir string) *Generator {
@@ -46,6 +50,12 @@ type Input struct {
 type UploadedFile struct {
 	Filename string
 	Content  string
+	// Raw 保存上传的原始字节，仅在 Content 由 OCR 抽取得到时非空。
+	// 为什么要留原始字节：source/ 是素材留档区，管理员需要能下载回原始扫描件
+	// 做人工核对；而锚点定位只能用文本，两者必须分开存。
+	Raw []byte
+	// Extracted 标记 Content 是否来自 OCR 抽取（而非上传副本本身就是文本）。
+	Extracted bool
 }
 
 // Result reports what the generator produced.
@@ -78,58 +88,99 @@ func (g *Generator) Generate(ctx context.Context, in *Input, onStep func(string)
 	}
 	dir := filepath.Join(g.skillsDir, in.Slug)
 
+	// ---- Step 0: 素材入库（二进制文档先过 OCR 解析） ----
+	// 旧流程把上传字节直接当文本塞给 LLM：上传一本扫描版手册，模型看到的
+	// 是二进制乱码，「抽取写作特征」自然全军覆没。这一步把素材真正文本化，
+	// 也是后面手册结构抽取能成立的前提。
+	g.ingestFiles(ctx, in, steps)
+
 	// ---- Step 1: ingest files → extract key attributes ----
-	steps("1/7 分析参考文件，提取写作特征…")
+	steps("1/9 分析参考文件，提取写作特征…")
 	attrs, err := g.extractAttributes(ctx, in)
 	if err != nil {
 		return nil, fmt.Errorf("step1: %w", err)
 	}
 
 	// ---- Step 2: synthesize frontmatter (description + input params) ----
-	steps("2/8 生成技能元数据与表单参数…")
+	steps("2/9 生成技能元数据与表单参数…")
 	meta, err := g.synthesizeMetadata(ctx, in, attrs)
 	if err != nil {
 		return nil, fmt.Errorf("step2: %w", err)
 	}
 
 	// ---- Step 3: detect the skill type (write / query / template) ----
-	steps("3/8 识别技能类型（写作 / 办事流程 / 模板下发）…")
+	steps("3/9 识别技能类型（写作 / 办事流程 / 模板下发）…")
 	dtype, err := g.detectType(ctx, in)
 	if err != nil {
 		return nil, fmt.Errorf("step3: %w", err)
 	}
-	steps("3/8 技能类型: " + dtype.Type)
+	steps("3/9 技能类型: " + dtype.Type)
 
 	// ---- Step 4: build system_prompt.md from母线 (typed) ----
-	steps("4/8 撰写系统提示词（按类型/文风/结构/禁忌/长度）…")
+	steps("4/9 撰写系统提示词（按类型/文风/结构/禁忌/长度）…")
 	sysPrompt, err := g.buildSystemPrompt(ctx, in, attrs, meta, dtype.Type)
 	if err != nil {
 		return nil, fmt.Errorf("step4: %w", err)
 	}
 
-	// ---- Step 5: build template.md skeleton ----
-	steps("5/8 生成骨架模板…")
-	tpl, err := g.buildTemplate(ctx, in, attrs, dtype.Type)
-	if err != nil {
-		return nil, fmt.Errorf("step5: %w", err)
+	// ---- Step 5: 手册识别（分类结构 + 范文原样切分 + 审稿清单） ----
+	// 只在写作类技能上尝试：办事流程/模板下发的素材不是写作手册，抽结构纯属浪费。
+	// 抽不出来即降级回通用流程——这是设计好的退路，不是故障，所以只记 trace 不报错。
+	var mp *manualPack
+	if dtype.Type == model.SkillTypeWrite {
+		steps("5/9 检测素材是否为写作手册（分类结构 / 范文锚点）…")
+		cand, mErr := g.buildManual(ctx, in)
+		if mErr != nil {
+			steps("5/9 未按手册处理，走通用流程：" + mErr.Error())
+		} else {
+			mp = cand
+			steps(fmt.Sprintf("5/9 识别到手册：%d 个分类，切出 %d 篇原文范文",
+				len(mp.Structure.Categories), mp.ExampleCount()))
+			for _, w := range mp.Warnings {
+				steps("5/9 ⚠️ " + w)
+			}
+			// 分类路由与「拿不准就问」协议要写进 system_prompt，
+			// 技能才能脱离本平台独立运行（路由表是轻量的，重的范文留给运行时按需注入）。
+			sysPrompt = augmentPromptForManual(sysPrompt, mp.Structure)
+			if rev, rErr := g.buildReviewer(ctx, mp.Structure); rErr != nil {
+				steps("5/9 ⚠️ 审稿清单生成失败（不影响生成）：" + rErr.Error())
+			} else {
+				mp.Reviewer = rev
+				steps("5/9 已生成审稿清单 reviewer.md（可逐条核对）")
+			}
+		}
 	}
 
-	// ---- Step 6: pick/forge examples ----
-	steps("6/8 挑选范文 / 生成示例…")
-	exFiles, err := g.buildExamples(ctx, in, attrs, dtype.Type)
+	// ---- Step 6: build template.md skeleton ----
+	steps("6/9 生成骨架模板…")
+	tpl, err := g.buildTemplate(ctx, in, attrs, dtype.Type)
 	if err != nil {
 		return nil, fmt.Errorf("step6: %w", err)
 	}
 
-	// ---- Step 7: local validation (hard gate) ----
-	steps("7/8 本地校验（不齐不放行）…")
-	if err := g.validate(sysPrompt, tpl, exFiles, dtype.Type); err != nil {
+	// ---- Step 7: 范文 ----
+	// 手册模式下范文全部来自原文切分，**绝不再让 LLM 编**：编出来的「范文」
+	// 手册里根本没有，等于给用户喂一份伪手册（这是旧流程最要命的问题）。
+	var exFiles []string
+	if mp != nil {
+		steps("7/9 范文取自手册原文切分（不重写，可机械校验保真）")
+	} else {
+		steps("7/9 挑选范文 / 生成示例…")
+		exFiles, err = g.buildExamples(ctx, in, attrs, dtype.Type)
+		if err != nil {
+			return nil, fmt.Errorf("step7: %w", err)
+		}
+	}
+
+	// ---- Step 8: local validation (hard gate) ----
+	steps("8/9 本地校验（不齐不放行）…")
+	if err := g.validate(sysPrompt, tpl, exFiles, mp.ExampleCount(), dtype.Type); err != nil {
 		return nil, err
 	}
 
-	// ---- Step 8: land to disk + register in DB ----
-	steps("8/8 落盘并注册…")
-	if err := g.land(dir, sysPrompt, tpl, exFiles, in, attrs, dtype); err != nil {
+	// ---- Step 9: land to disk + register in DB ----
+	steps("9/9 落盘并注册…")
+	if err := g.land(dir, sysPrompt, tpl, exFiles, in, attrs, dtype, mp); err != nil {
 		return nil, err
 	}
 	sk := &model.Skill{
@@ -147,13 +198,13 @@ func (g *Generator) Generate(ctx context.Context, in *Input, onStep func(string)
 		Slug: in.Slug, Name: meta.Name, Description: meta.Description,
 		Category: firstNonEmpty(in.Category, "general"),
 		Params:   meta.Params, Steps: nil,
-		PromptLen: len(sysPrompt), ExampleN: len(exFiles),
+		PromptLen: len(sysPrompt), ExampleN: len(exFiles) + mp.ExampleCount(),
 		SkillType: dtype.Type, Attachment: dtype.Attachment,
 	}, nil
 }
 
 // ---- Step 7: validation ----
-func (g *Generator) validate(sysPrompt, tpl string, exFiles []string, typ string) error {
+func (g *Generator) validate(sysPrompt, tpl string, exFiles []string, manualExamples int, typ string) error {
 	var missing []string
 	sysPrompt = strings.TrimSpace(sysPrompt)
 	if len(sysPrompt) < 300 {
@@ -161,7 +212,11 @@ func (g *Generator) validate(sysPrompt, tpl string, exFiles []string, typ string
 	}
 	// write skills need at least one example范文 anchor; query/template skills
 	// are flow-based and don't necessarily have one.
-	if typ == model.SkillTypeWrite && len(exFiles) == 0 {
+	//
+	// manualExamples 必须计入：手册模式下范文由锚点切分产生、落在
+	// examples/<分类>/ 而不是 exFiles，少算这一项会让一本明明切出 12 篇原文
+	// 范文的手册被判「缺少示例范文」而拒收。
+	if typ == model.SkillTypeWrite && len(exFiles)+manualExamples == 0 {
 		missing = append(missing, "缺少示例范文(examples/)")
 	}
 	_ = tpl
@@ -173,7 +228,7 @@ func (g *Generator) validate(sysPrompt, tpl string, exFiles []string, typ string
 }
 
 // ---- Step 8: write files ----
-func (g *Generator) land(dir, sysPrompt, tpl string, exFiles []string, in *Input, attrs string, dtype *typeOut) error {
+func (g *Generator) land(dir, sysPrompt, tpl string, exFiles []string, in *Input, attrs string, dtype *typeOut, mp *manualPack) error {
 	if err := os.MkdirAll(filepath.Join(dir, "examples"), 0o755); err != nil {
 		return err
 	}
@@ -214,6 +269,15 @@ func (g *Generator) land(dir, sysPrompt, tpl string, exFiles []string, in *Input
 			stem := strings.TrimSuffix(base, ext)
 			fn = fmt.Sprintf("%s-%d%s", stem, n+1, ext)
 		}
+		// 原始字节优先写回原文件：source/ 是素材留档区，管理员要能下载回原始
+		// 扫描件做人工核对；OCR 抽出的文本另存为 <stem>.txt。两者分开存，
+		// 避免出现「留档只剩文本、溯源时拿不到原件」的情况。
+		if len(uf.Raw) > 0 {
+			_ = os.WriteFile(filepath.Join(dir, "source", fn), uf.Raw, 0o644)
+			stem := strings.TrimSuffix(fn, filepath.Ext(fn))
+			_ = os.WriteFile(filepath.Join(dir, "source", stem+".txt"), []byte(uf.Content), 0o644)
+			continue
+		}
 		_ = os.WriteFile(filepath.Join(dir, "source", fn), []byte(uf.Content), 0o644)
 	}
 	for i, ex := range exFiles {
@@ -222,7 +286,25 @@ func (g *Generator) land(dir, sysPrompt, tpl string, exFiles []string, in *Input
 			return err
 		}
 	}
+	// 手册模式：范文按分类落进 examples/<分类>/，同时写 categories/ 与 reviewer.md。
+	// 放在通用 examples 之后写，是为了让 source/ 与 example01.md 这类通用产物先就位，
+	// 分类目录再补上——人工翻目录时的顺序符合「先素材、后结论」的直觉。
+	if mp != nil {
+		if _, err := mp.WriteTo(dir); err != nil {
+			return fmt.Errorf("落盘手册结构: %w", err)
+		}
+	}
 	meta := map[string]any{"name": in.Name, "category": in.Category, "description": in.Description, "created_at": time.Now().Format(time.RFC3339), "generator_version": 1}
+	// 手册模式的元信息也落进 meta.json：排查「这个技能到底按哪一类回答」时，
+	// 打开 meta.json 就能看到分类清单，不必去反解 system_prompt。
+	if mp != nil {
+		meta["manual"] = map[string]any{
+			"categories":     mp.CategoryNames(),
+			"category_count": len(mp.Structure.Categories),
+			"example_count":  mp.ExampleCount(),
+			"warnings":       mp.Warnings,
+		}
+	}
 	if dtype != nil {
 		meta["skill_type"] = dtype.Type
 		meta["rationale"] = dtype.Rationale
