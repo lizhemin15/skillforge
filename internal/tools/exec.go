@@ -442,9 +442,22 @@ func SandboxDiagnosticsFor(ctx context.Context, secretPaths []string) map[string
 	// 用它把路径安全嵌进代码；用占位符替换而不是 Sprintf——探针里有 `%s` 会打架。
 	encoded, _ := json.Marshal(secretPaths)
 	probe := strings.Replace(probeTemplate, "__SECRET_PATHS__", string(encoded), 1)
+	out := map[string]string{}
+	if py := DefaultExecConfig().Python; py != "" {
+		// 探针解释器缺失必须在这里单独报：缺 python3 时 systemd-run 只把
+		// 「Failed to find executable …」写进 display，不算 error，上层拿到的是
+		// 一份没有 uid 的「正常」输出，于是把「环境缺 python3」误诊成「沙箱没降权」。
+		// 与其让上层去猜，不如在跑探针之前就查一次，报一句真话。
+		if _, err := exec.LookPath(py); err != nil {
+			out["error"] = fmt.Sprintf(
+				"目标机没有 python3（探针解释器 %s 不存在）：代码沙箱的探针与「执行代码」工具都依赖它，"+
+					"这不是沙箱降权失败。修复：Debian/Ubuntu 用 apt install python3；"+
+					"RHEL/AlmaLinux 最小安装用 dnf install -y python3（离线机挂 ISO 或配本地源）", py)
+			return out
+		}
+	}
 	t := NewRunPythonTool(DefaultExecConfig())
 	res, err := t.Run(ctx, map[string]any{"code": probe})
-	out := map[string]string{}
 	if err != nil {
 		out["error"] = err.Error()
 		return out

@@ -217,6 +217,17 @@ func judgeSandbox(diag map[string]string, secretPaths []string, err error) selfC
 		c.detail = append(c.detail, "沙箱探针执行失败："+diag["error"])
 		return c
 	}
+	if diag["uid"] == "" {
+		// 真的发生过：almalinux:8 最小安装（默认不带 python3）上装完，自检报的是
+		// 「没有降权」，客户以为沙箱漏了、要开安全事故复盘，实际只是探针解释器不存在。
+		// 归因错了比不报还坏——它把「环境缺件」伪装成「安全缺陷」。
+		c.detail = append(c.detail, "沙箱探针没有报告 uid —— 这是「证据缺失」，不是「降权失败」："+
+			"探针的 python 解释器根本没跑起来，所以 uid 无从得知。"+
+			"最常见原因是目标机缺 python3（RHEL/AlmaLinux 最小安装默认不带它）。"+
+			"先装 python3 再重跑自检：dnf install -y python3（离线机挂 ISO 或配本地源）。"+
+			"在拿到 uid 证据之前，既不能说沙箱安全，也不能把责任算在降权上。")
+		return c
+	}
 	if diag["uid"] != "65534" {
 		c.detail = append(c.detail, fmt.Sprintf("没有降权：uid=%s（应为 65534 nobody）；沙箱内进程能以高权限读走机密", diag["uid"]))
 		return c

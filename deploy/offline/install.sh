@@ -146,6 +146,21 @@ command -v systemctl >/dev/null 2>&1 || die "找不到 systemctl（systemd 在�
 command -v systemd-run >/dev/null 2>&1 || die "找不到 systemd-run（systemd 太旧或安装不完整）。沙箱不可用，拒绝安装。"
 c_ok "systemd / systemd-run 可用"
 
+# python3：代码执行沙箱（自检探针 + 「执行代码」工具）的解释器，路径写死在
+# /usr/bin/python3，所以这里就查这个路径。
+# 为什么只警告不拦：写作主功能不依赖它，硬拦会把本来能用的客户挡在门外；但也不能
+# 不吭声——装完自检里那条会红，客户看到的是「代码执行沙箱 失败」，得让他一眼看懂
+# 是缺解释器，不是安全加固漏了。（真机上这就是 almalinux 最小安装的现场。）
+if [ ! -x /usr/bin/python3 ]; then
+	c_warn "这台机器没有 /usr/bin/python3 —— 代码执行沙箱（探针与「执行代码」工具）需要它"
+	c_warn "  影响：装完自检的「代码执行沙箱」一项会失败，AI 无法跑代码/脚本校验"
+	c_warn "  修复：dnf install -y python3（RHEL/AlmaLinux 最小安装默认不带；Debian/Ubuntu 用 apt install python3）"
+	c_warn "  离线机：挂发行版 ISO 或配本地源后按上面装，装完补跑一次自检：/opt/skillforge/skillforge -selftest"
+	c_warn "  确实接受这一项不可用：加 --skip-selftest 跳过装后自检（自担风险，不推荐）"
+else
+	c_ok "python3 可用（代码执行沙箱的解释器）"
+fi
+
 # ---------- 0.5 服务单元占用检查（Bug M）----------
 # 服务名默认就是 skillforge。如果这台机器上已经装过一份（单元文件已存在）而它的安装
 # 前缀跟本次不同，直接覆盖单元的后果极其隐蔽：

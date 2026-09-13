@@ -187,6 +187,30 @@ func TestJudgeSandbox(t *testing.T) {
 	}
 }
 
+// TestJudgeSandboxEmptyUIDIsNotBlamedOnPrivilegeDrop 锁住一条真实发生过的误诊。
+//
+// 现场：almalinux:8 最小安装默认不带 python3 → 沙箱探针的解释器起不来 → 探针输出里
+// 压根没有 uid 这一项 → 旧逻辑掉进「uid != 65534」分支，打印「没有降权：uid=」。
+// 客户看到的是「安全加固失效」，实际只是目标机缺个解释器。归因错了比不报还坏：
+// 它把「环境缺件」伪装成「安全缺陷」，会把人带去查错方向。
+func TestJudgeSandboxEmptyUIDIsNotBlamedOnPrivilegeDrop(t *testing.T) {
+	got := judgeSandbox(map[string]string{
+		"network":    "断(OK)",
+		"write:work": "可以(OK)",
+	}, []string{"/opt/skillforge/skillforge.env"}, nil)
+
+	if got.ok {
+		t.Fatalf("没拿到 uid 证据却判 ok=true（假绿灯）：%v", got.detail)
+	}
+	joined := strings.Join(got.detail, "\n")
+	if !strings.Contains(joined, "python3") {
+		t.Fatalf("明细没点出真因 python3：%v", got.detail)
+	}
+	if strings.Contains(joined, "没有降权") {
+		t.Fatalf("把「证据缺失」误诊成「没有降权」——这条误诊必须绝迹：%v", got.detail)
+	}
+}
+
 // TestJudgeSandboxHealthyKeepsEveryEvidence 健康路径也要把每条证据摊开——
 // 客户要能看见「探针真的逐项检查了」，而不是一句「OK」。
 func TestJudgeSandboxHealthyKeepsEveryEvidence(t *testing.T) {
