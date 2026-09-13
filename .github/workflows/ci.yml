@@ -64,76 +64,60 @@ jobs:
       - name: Unit tests
         run: go test -race -count=1 ./...
 
-      # 管理端前端防线：只读文件（style_profile.md 这类不可变锚点）不能渲染出
-      # 编辑框和「保存」按钮——后端 store.WriteFile 会 400 拒绝，界面在承诺一个
-      # 做不到的操作。Go 测试抓不住这半边，只能在前端守。
-      - name: 前端回归（只读文件不得渲染保存入口）
+      # ---- 前端闸门。这里每个用例都对应一次真实的「静默故障」——
+      # 坏了页面上没有任何报错，只是行为悄悄退化，Go 测试抓不住，只能在前端守：
+      #   · 只读文件（style_profile.md 这类不可变锚点）渲染出编辑框+保存按钮
+      #     （后端 store.WriteFile 会 400 拒绝，界面在承诺一个做不到的操作）
+      #   · 毛玻璃层被删、颗粒层被删、外层又加回 backdrop-filter → 玻璃变回纯色块
+      #   · 站点名：保存后页面不刷新 / 站名被当 HTML 注入
+      #   · 技能模板文件：后端列了模板、前端一个都不画（用户原话「skill 里怎么没有模板源文件」）
+      #   · AI 调度过程可见性：时间线不运行中自动展开 → 用户「一直加载、白等」
+      #   · 聊天两种方式：手动选了技能却退化成自动调度（mode/skill 漏发）→「它没听我的」
+      #   · 核心技能归类 / 分类结构管理：分组画错、切分类不带鉴权头、按钮不带自己那行的分类名
+      #   · 缓存版本号：改了 JS/CSS 忘 bump ?v= → 代码全对但老浏览器跑旧文件，用户看到「你没修」
+      #   · 推荐行 /api/chat/suggest：失败全是静默降级（404/500/超时都只退回规则版，无日志）
+      #
+      # **必须枚举，不许写死清单**：这里曾经写死 9 个 step，于是
+      # skill_file_tree_edit_button 和 suggest_timeout_budget 两个测试文件
+      # 躺在磁盘上、CI 里从来没跑过 —— 新加测试自动等于不存在。
+      # 「枚举」这半边由 web/tests/preflight_parity.test.mjs 跨文件守着：
+      # 谁把清单写回去、或让本地 preflight 与 CI 的 go test 参数分叉，都会红。
+      - name: 前端语法检查（枚举 web/js/*.js）
         run: |
-          node --version
-          node --check web/js/admin.js
-          node web/tests/readonly_file_editor.test.mjs
+          set -uo pipefail
+          shopt -s nullglob
+          files=(web/js/*.js)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::web/js 下没找到任何 .js —— 目录选错或资源被删光，拒绝静默通过"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            node --check "$f"
+            echo "语法 OK  $f"
+          done
 
-      # 毛玻璃层回归：复刻 deepseek.com 的那套玻璃，坏起来是"静默的"——
-      # 背景层被删、颗粒层被删、外层又加回 backdrop-filter、聊天页不再锁视口，
-      # 页面都不会报错，只是玻璃变回纯色块。肉眼很难发现，必须机器守。
-      - name: 前端回归（毛玻璃层契约）
-        run: node web/tests/glassmorphism.test.mjs
-
-      # 站点名自定义回归：站名是运行时数据，改错了不报错——只是全站名字不对/
-      # 保存后页面不刷新/站名被当 HTML 注入。前端这半边 Go 测试抓不住。
-      - name: 前端回归（站点名自定义）
+      - name: 前端回归（枚举 web/tests/*.test.mjs）
         run: |
-          node --check web/js/site.js
-          node web/tests/site_config.test.mjs
+          set -uo pipefail
+          shopt -s nullglob
+          files=(web/tests/*.test.mjs)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::web/tests 下没找到任何 *.test.mjs —— 目录选错或测试被删光，拒绝静默通过"
+            exit 1
+          fi
+          echo "共 ${#files[@]} 个前端回归文件"
+          fail=0
+          for f in "${files[@]}"; do
+            echo "============================= $f"
+            node "$f" || { echo "::error::$f 失败"; fail=1; }
+          done
+          [ $fail -eq 0 ] || exit 1
 
-      # 技能模板文件可见性：模板 .docx/.xlsx 躺在技能目录顶层、fill_template 真在读它，
-      # 但管理端文件树曾经一个都不列（用户原话「skill 里怎么没有模板源文件」）。
-      # 后端那半由 internal/store 的单测守；「后端列了、前端不画」是同一种用户可见结果，
-      # 所以前端这半（分组渲染 + 上传时 target=template 接线）必须也守上。
-      - name: 前端回归（技能模板文件）
-        run: node web/tests/skill_template_files.test.mjs
-
-      # 调度过程可见性：用户原话「问完以后中间步骤都没有显示，一直加载状态，
-      # 最后显示一个最终答案」。后端那半（心跳帧、闲聊也发步骤）由 internal/api
-      # 的单测守；这半边是前端——时间线必须运行中自动展开、跑完自动收起、手动开合
-      # 优先于自动。函数写对了但没人调用、或展开逻辑被删，界面都会退回「白等」。
-      - name: 前端回归（AI 调度台过程可见性）
+      # 断言自证：往出货文件里注入真实故障，要求对应断言变红。
+      # 全绿的断言集不代表真能抓住故障，这两个脚本把「抓得住」本身也守上。
+      - name: 前端断言自证（分类结构管理 / 缓存版本号）
         run: |
-          node --check web/js/chat.js
-          node web/tests/chat_trace.test.mjs
-
-      # 聊天两种方式（自动调度 / 指定技能）：坏了界面上没有任何报错——
-      # 手动选了技能却退化成自动调度（mode/skill 漏发），用户只会觉得"它没听我的"。
-      # 后端那半（ManualEval/ManualSteps）由 internal/agent 的单测守；这半边守
-      # 请求体组装、发送守卫、技能面板分组与样式。
-      - name: 前端回归（聊天两种方式）
-        run: node web/tests/chat_modes.test.mjs
-
-      # 核心技能 = 通用能力（办公文档管家 / 技能工厂），其余归业务技能：
-      # 分组画错、核心技能被删掉、切换标记没打鉴权头，界面都不会报错。
-      - name: 前端回归（核心技能归类）
-        run: node web/tests/core_skills.test.mjs
-
-      # 分类结构管理（新增分类 / 改名 / 删除）：分类清单是训练期从写作手册里
-      # 抽出来的章节骨架，所以每个技能都不一样，且手册里没写的类别只能靠界面补。
-      # 这半边 Go 测试守不住 —— 入口显示判据（必须用后端下发的 manual_mode、
-      # 不许前端数分类行数）、按钮必须带自己那一行的分类名、删除的二次确认
-      # 必须靠 need_force 这个机器可读标记（而不是匹配会随时改的中文文案）。
-      # 后半段的 mutation 脚本往出货文件里注入 8 个真实故障，要求对应断言变红：
-      # 全绿的断言集不代表真能抓住故障，这里把"抓得住"本身也守上。
-      - name: 前端回归（分类结构管理 + 断言自证）
-        run: |
-          node --check web/js/admin.js
-          node web/tests/skill_category_admin_ui.test.mjs
           bash web/tests/category_ui_mutation_check.sh
-
-      # 缓存版本号：改了 JS/CSS 却忘了 bump ?v= 时，代码本身没毛病、测试全绿、
-      # 后端也真修好了 —— 只有老浏览器还在跑旧文件，用户看到的现象是"你没修"。
-      # 这个坑本项目栽过两次（chat.js 在 v0.3.12 改过、?v= 却停在 v0.3.11 的值），
-      # 靠人眼 review 抓不住，所以用 manifest 把"某段内容的哈希曾经挂在哪个 ?v= 下"记死。
-      - name: 前端回归（缓存版本号一致性 + 断言自证）
-        run: |
-          node web/tests/asset_version.test.mjs
           bash web/tests/asset_version_mutation_check.sh
 
       # 推荐行（输入框上方那几颗小胶囊）的后端：/api/chat/suggest。

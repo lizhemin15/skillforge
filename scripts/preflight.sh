@@ -100,12 +100,18 @@ fi
 
 # ---- 5) Go 单测（CI: Unit tests）----
 if [ "$QUICK" = 0 ]; then
-  step '5/6 go test ./...'
-  if go test ./... >/tmp/.pf-gotest.log 2>&1; then
-    ok 'Go 单测全过'
+  step '5/6 go test -race -count=1 ./...'
+  # **必须与 CI 逐字一致**：CI 跑的是 `go test -race -count=1 ./...`，
+  # 本地跑裸 `go test ./...` 会漏掉两类真缺陷：
+  #   - 数据竞争（只有 -race 能看见，2026-09-13 白红一次）
+  #   - 测试间互相污染（只有 -count=1 关缓存才暴露）
+  # 这条命令的「一致性」由 web/tests/preflight_parity.test.mjs 跨文件守着，
+  # 改一边不改另一边会红。
+  if go test -race -count=1 ./... >/tmp/.pf-gotest.log 2>&1; then
+    ok 'Go 单测全过（含 -race）'
   else
     bad 'Go 单测有失败（细节：/tmp/.pf-gotest.log）'
-    grep -E '^(--- )?FAIL|^\s+--- FAIL' /tmp/.pf-gotest.log | head -10 | sed 's/^/      /'
+    grep -E 'WARNING: DATA RACE|^(--- )?FAIL|race detected' /tmp/.pf-gotest.log | head -10 | sed 's/^/      /'
   fi
 fi
 
