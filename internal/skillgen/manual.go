@@ -348,6 +348,9 @@ type manualPack struct {
 	Paths    map[string][]string
 	Reviewer string
 	Warnings []string
+	// Source 是切出范文用的原文（OCR 后的手册全文）。只为 fidelity.md 的保真
+	// 核对服务——「这篇范文确实能在原文里逐字找到」这句结论需要原文在手。
+	Source string
 }
 
 // ExampleCount 返回成功切出的范文总数。
@@ -404,6 +407,7 @@ func (g *Generator) buildManual(ctx context.Context, in *Input) (*manualPack, er
 		Structure: st,
 		Examples:  map[string][]string{},
 		Paths:     map[string][]string{},
+		Source:    src,
 	}
 	for _, c := range st.Categories {
 		segs, err := SplitByAnchors(src, c.Anchor)
@@ -465,7 +469,73 @@ func (mp *manualPack) WriteTo(dir string) ([]string, error) {
 		}
 		written = append(written, "reviewer.md")
 	}
+	// fidelity.md：机器产出的质量报告，左树挂在只读的「质量报告」分组下。
+	//
+	// 为什么必须落盘（契约 docs/writing-skill-pipeline-design.md 3.2 步骤 4）：
+	// 切分失败此前只进 meta.json 的 warnings 字段 + 一句一闪而过的 SSE step。
+	// meta.json 管理员在左树里根本看不见，于是「12 类里 7 类范文没切出来」变成
+	// 静默降级——技能照建照注册，用户拿到的是个残缺技能却毫不知情（实测事故）。
+	// 写成只读文件是把「降级」变成「看得见的证据」。
+	if err := mp.writeFidelity(dir); err != nil {
+		return written, err
+	}
+	written = append(written, "fidelity.md")
 	return written, nil
+}
+
+// writeFidelity 写 fidelity.md：把范文覆盖情况与切分失败原因摊开成一份人可读的
+// 质量报告。内容刻意用朴素 Markdown，因为管理员可能直接编辑别的文件、顺手看它。
+func (mp *manualPack) writeFidelity(dir string) error {
+	var b strings.Builder
+	b.WriteString("# 范文保真报告（机器生成 · 只读）\n\n")
+	fmt.Fprintf(&b, "- 生成时间：%s\n", time.Now().Format("2006-01-02 15:04:05"))
+
+	total := len(mp.Structure.Categories)
+	covered := 0
+	for _, c := range mp.Structure.Categories {
+		if len(mp.Examples[c.Name]) > 0 {
+			covered++
+		}
+	}
+	fmt.Fprintf(&b, "- 手册分类：%d 个\n", total)
+	fmt.Fprintf(&b, "- 范文覆盖：%d/%d 类，共 %d 篇\n", covered, total, mp.ExampleCount())
+
+	// 保真核对是这份报告的立身之本：范文必须是原文连续子串。这一条是机械可验的，
+	// 所以直接报数字，而不是写「已确保保真」这种无法证伪的话。
+	if found, checked := mp.countFidelity(); checked > 0 {
+		fmt.Fprintf(&b, "- 保真核对：%d/%d 篇可在 source/ 原文中逐字找到（未经模型改写）\n", found, checked)
+	}
+
+	if len(mp.Warnings) == 0 {
+		b.WriteString("\n## 结论\n\n全部类别的范文均已按锚点从原文切出，无待处理项。\n")
+	} else {
+		fmt.Fprintf(&b, "\n## ⚠️ 待处理：%d 类范文未切出\n\n", len(mp.Warnings))
+		for _, w := range mp.Warnings {
+			fmt.Fprintf(&b, "- %s\n", w)
+		}
+		b.WriteString("\n这类失败通常不是手册的问题，而是模型摘录锚点时改动了原文" +
+			"（吞掉换行、替换标点、把长句截断后加「…」）。已切出的分类不受影响；" +
+			"未切出的分类在运行时不会注入范文。可打开 categories/ 下对应文件核对该类要求。\n")
+	}
+	return os.WriteFile(filepath.Join(dir, "fidelity.md"), []byte(b.String()), 0o644)
+}
+
+// countFidelity 逐篇核对范文是否为 source 原文的连续子串，返回（命中数, 总数）。
+// Source 为空时返回 (0,0)，让调用方知道「没核对过」而不是「核对全过」——
+// 后者会让报告谎报保真。
+func (mp *manualPack) countFidelity() (found, total int) {
+	if mp.Source == "" {
+		return 0, 0
+	}
+	for _, segs := range mp.Examples {
+		for _, s := range segs {
+			total++
+			if strings.Contains(mp.Source, s) {
+				found++
+			}
+		}
+	}
+	return found, total
 }
 
 // augmentPromptForManual 把「分类路由 + 工作协议」追加进 system_prompt。
