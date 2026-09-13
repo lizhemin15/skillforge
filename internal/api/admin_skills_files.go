@@ -31,7 +31,16 @@ func (a *Admin) ListSkillFiles(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"files": files})
+	// manual_mode = 这个技能是不是「手册模式」（目录里有 categories/）。
+	// 管理端左树靠它决定要不要摆「+ 新增分类」：非手册技能上摆这个按钮，
+	// 点下去后端只能回「该技能不是手册模式」——等于承诺一个只会报错的操作。
+	// 信号由后端给而不是前端去数「有没有 category 行」：空分类目录（分类被删光
+	// 但目录还在）在前端看起来就像非手册，那就是**该给入口却不给**、
+	// 用户以为功能没了。HasCategories 看的是目录，不是行数。
+	writeJSON(w, http.StatusOK, map[string]any{
+		"files":       files,
+		"manual_mode": a.store.HasCategories(slug),
+	})
 }
 
 // ReadSkillFile returns the content of one managed file.

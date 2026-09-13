@@ -109,6 +109,19 @@ jobs:
       - name: 前端回归（核心技能归类）
         run: node web/tests/core_skills.test.mjs
 
+      # 分类结构管理（新增分类 / 改名 / 删除）：分类清单是训练期从写作手册里
+      # 抽出来的章节骨架，所以每个技能都不一样，且手册里没写的类别只能靠界面补。
+      # 这半边 Go 测试守不住 —— 入口显示判据（必须用后端下发的 manual_mode、
+      # 不许前端数分类行数）、按钮必须带自己那一行的分类名、删除的二次确认
+      # 必须靠 need_force 这个机器可读标记（而不是匹配会随时改的中文文案）。
+      # 后半段的 mutation 脚本往出货文件里注入 8 个真实故障，要求对应断言变红：
+      # 全绿的断言集不代表真能抓住故障，这里把"抓得住"本身也守上。
+      - name: 前端回归（分类结构管理 + 断言自证）
+        run: |
+          node --check web/js/admin.js
+          node web/tests/skill_category_admin_ui.test.mjs
+          bash web/tests/category_ui_mutation_check.sh
+
       # 缓存版本号：改了 JS/CSS 却忘了 bump ?v= 时，代码本身没毛病、测试全绿、
       # 后端也真修好了 —— 只有老浏览器还在跑旧文件，用户看到的现象是"你没修"。
       # 这个坑本项目栽过两次（chat.js 在 v0.3.12 改过、?v= 却停在 v0.3.11 的值），

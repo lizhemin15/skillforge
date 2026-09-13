@@ -196,9 +196,9 @@ func TestTraceBoardCloseIsSafe(t *testing.T) {
 	b.Close(i, hitDetail("会议纪要", "high", "用户要一份会议纪要"))
 	before := digest(b.Steps())
 
-	b.Close(i+7, "越界")     // 越界：静默忽略
-	b.Close(i, "   ")      // 空白 detail：不能把已有结论擦成空白
-	b.Close(-1, "负数下标")   // 负数：静默忽略
+	b.Close(i+7, "越界")  // 越界：静默忽略
+	b.Close(i, "   ")   // 空白 detail：不能把已有结论擦成空白
+	b.Close(-1, "负数下标") // 负数：静默忽略
 
 	if after := digest(b.Steps()); after != before {
 		t.Fatalf("越界/空 detail 的 Close 改动了已有内容：\n改前：\n%s\n改后：\n%s", before, after)

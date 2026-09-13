@@ -12,7 +12,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/lizhemin15/skillforge/internal/llm"
+	"github.com/lizhemin15/skillforge/internal/store"
 )
 
 // 本文件实现「写作手册 → 分类 skill」的抽取与落盘，是旧流水线的关键修正：
@@ -115,9 +115,9 @@ type Segment struct {
 type normLevel int
 
 const (
-	levelExact  normLevel = iota // 逐字相等（旧行为，优先）
-	levelNoSpace                 // 忽略所有空白（换行、空格、全角空格）
-	levelNoPunct                 // 再忽略中英文标点
+	levelExact   normLevel = iota // 逐字相等（旧行为，优先）
+	levelNoSpace                  // 忽略所有空白（换行、空格、全角空格）
+	levelNoPunct                  // 再忽略中英文标点
 )
 
 var normLevels = []normLevel{levelExact, levelNoSpace, levelNoPunct}
@@ -417,9 +417,12 @@ const extractionSystemPrompt = `你是写作手册的结构抽取器。你的唯
 // ExtractStructure 让 LLM 只做摘录与定位（prompt 里必须强约束「禁止创作新句子」）。
 // 这是薄封装：真正的职责边界是「模型给锚点 → 纯代码 SplitByAnchors 切原文」，
 // 所以这里不解析、不重排、不动原文，只把模型输出交给 parseStructure。
-func ExtractStructure(ctx context.Context, c *llm.Client, sourceText string) (*Structure, error) {
+func ExtractStructure(ctx context.Context, c chatClient, sourceText string) (*Structure, error) {
 	if strings.TrimSpace(sourceText) == "" {
 		return nil, errors.New("ExtractStructure: 原文为空，无法抽取结构")
+	}
+	if c == nil {
+		return nil, errors.New("ExtractStructure: 未配置模型客户端")
 	}
 	// jsonMode=true：让 provider 以 response_format 强约束输出 JSON 对象，
 	// 省掉大半"模型在 JSON 外面裹一段寒暄"的解析麻烦。
@@ -433,30 +436,22 @@ func ExtractStructure(ctx context.Context, c *llm.Client, sourceText string) (*S
 
 // mdCell 把一段文本压成能安全放进 markdown 表格单元格的形式：
 // 换行会破坏表格行结构，竖线会被当成列分隔符，必须先转义/折叠。
+//
+// 实现直接委托 store.MdCellText：管理端加分类时也要造同样的表格行，
+// 两处各留一份实现迟早会分叉（分叉的代价是「训练生成的表」与「管理端加的表」
+// 形状不同，运行时的解析可能只认一种）。
 func mdCell(s string) string {
-	s = strings.TrimSpace(s)
-	s = strings.ReplaceAll(s, "|", `\|`)
-	s = strings.ReplaceAll(s, "\r\n", " ")
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.ReplaceAll(s, "\r", " ")
-	return s
+	return store.MdCellText(s)
 }
 
 // safeCatFileName 把分类名清洗成安全的文件名片段（保留中文）。
 // 只挡路径分隔符与少数文件系统保留字符，不做拼音化——手册分类名就是中文，
 // 转成拼音反而让人认不出来。
+//
+// 同样委托 store.SafeCatFileName：清洗规则必须与「管理端新增/改名分类」逐字一致，
+// 否则训练期建的文件名与管理端建的文件名形态不同，catDirName 反推出的类别名会对不上。
 func safeCatFileName(name string) string {
-	name = strings.TrimSpace(name)
-	repl := strings.NewReplacer(
-		"/", "_", "\\", "_", ":", "_", "*", "_", "?", "_",
-		"\"", "_", "<", "_", ">", "_", "|", "_", "\n", "_", "\r", "_", "\t", "_",
-	)
-	name = repl.Replace(name)
-	name = strings.Trim(name, " .")
-	if name == "" {
-		name = "未命名"
-	}
-	return name
+	return store.SafeCatFileName(name)
 }
 
 // WriteCategories 落盘 categories/_index.md + categories/NN-<name>.md，

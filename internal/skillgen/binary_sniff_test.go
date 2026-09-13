@@ -144,7 +144,7 @@ func TestLookBinarySyntheticContainer(t *testing.T) {
 	if headTotal == 0 {
 		t.Fatal("合成样本头部为空")
 	}
-	headBad := float64(headCtrl+headNul)*100/float64(headTotal)
+	headBad := float64(headCtrl+headNul) * 100 / float64(headTotal)
 	if headBad > 10 {
 		t.Fatalf("合成样本头部控制字符占比 %.2f%%（>10%%），没能复现「头部干净」这个前提，测试无效", headBad)
 	}

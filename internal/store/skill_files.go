@@ -208,6 +208,15 @@ func (s *SkillStore) ListFiles(slug string) ([]model.SkillFile, error) {
 	// 跟 instructions 里的 style_profile.md 一样是顶层白名单列不全的可变数量文件，
 	// 所以必须真去读目录：分类是用户自己加删的（01-经营业绩.md、02-政务信息.md…），
 	// 白名单写不出来。只扫一级，categories/ 下再套子目录不属于契约。
+	// 真分类的展示名由 listCategories 统一解析（H1 优先），这里只做「文件 → 名字」
+	// 的映射，绝不在这里另写一份解析：分类名是这个 API 的身份，
+	// 与改名/删除走的必须是同一份解析结果。
+	catNames := map[string]string{}
+	if cats, err := s.listCategories(slug); err == nil {
+		for _, c := range cats {
+			catNames[c.File] = c.displayName()
+		}
+	}
 	if entries, err := os.ReadDir(filepath.Join(dir, "categories")); err == nil {
 		for _, en := range entries {
 			if en.IsDir() || !strings.HasSuffix(en.Name(), ".md") {
@@ -277,6 +286,8 @@ func (s *SkillStore) ListFiles(slug string) ([]model.SkillFile, error) {
 	// sync Editable flag from fileKind
 	for i := range out {
 		_, out[i].Editable = fileKind(out[i].Path)
+		// 分类名只给真分类文件；_index.md 不在 catNames 里，天然拿到空值。
+		out[i].CategoryName = catNames[out[i].Path]
 	}
 	return out, nil
 }

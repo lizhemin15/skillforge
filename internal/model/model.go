@@ -100,6 +100,14 @@ type SkillFile struct {
 	Editable bool   `json:"editable"`          // whether admin may edit/overwrite
 	Mime     string `json:"mime,omitempty"`    // MIME type for preview dispatch (raw endpoint)
 	Binary   bool   `json:"binary,omitempty"`  // true = not text; use GET /raw to preview
+	// CategoryName 只有 kind=category 的**真分类**才有值，且是解析出来的展示名
+	// （H1 优先，如 03-领导讲话.md → 「领导讲话稿」）。管理端靠「有没有值」
+	// 决定给不给这一行「改名/删除分类」入口：
+	//   - categories/_index.md 是路由表的人读版本，不是分类，名字为空 → 不给入口；
+	//   - 非手册技能整棵树都没有分类行 → 不给「新增分类」。
+	// 不让前端按路径前缀自己猜，是因为那等于把 store.categoryFileOf 的规则
+	// 抄第二份，漂移的结果就是「界面上能点、后端 400」。
+	CategoryName string `json:"category_name,omitempty"`
 }
 
 // TrainRequest is admin body to create a new skill via skill-generator.

@@ -411,7 +411,10 @@
       const j = await r.json();
       if (!r.ok) { body.innerHTML = `<p class="msg err">${esc(j.error || '加载失败')}</p>`; return; }
       const files = j.files || [];
-      renderSkillFiles(body, files);
+      // manual_mode 由后端下发（= 技能目录里有没有 categories/），前端不自己推断：
+      // 前端要是靠「有没有分类行」来猜，分类被删空时就会误判成非手册技能，
+      // 于是把「+ 新增分类」藏掉 —— 而那正是最需要它的时刻。
+      renderSkillFiles(body, files, !!j.manual_mode);
       // auto-open: prefer last edited file (still present), else system_prompt.md, else first editable
       const keep = curEditPath ? files.find(f => f.path === curEditPath && f.editable) : null;
       const primary = keep
@@ -421,7 +424,7 @@
     } catch (e) { body.innerHTML = '<p class="msg err">网络错误</p>'; }
   }
 
-  function renderSkillFiles(body, files) {
+  function renderSkillFiles(body, files, manualMode) {
     // 分组显示顺序。**必须与后端 store.orderOf() 逐项一致**，否则同一个技能目录
     // 在接口里是一种顺序、在树上又是另一种，用户会以为「两处内容不一样」。
     // 后端 orderOf：prompt=1, template=2, templatefile=3, requirement=4, category=5,
@@ -445,8 +448,18 @@
     for (const k of groups) {
       const items = files.filter(f => f.kind === k);
       if (!items.length && !KIND_EMPTY_HINT[k]) continue;
+      // 「分类要求」组的标题右侧挂「+ 新增分类」。只在手册模式技能上出现：
+      // 非手册技能没有 categories/ 目录，后端 create 只会回「该技能不是手册模式」（400）——
+      // 摆出来就是承诺一个必然失败的操作。判据用后端下发的 manual_mode，
+      // 不在前端数分类行数（见 loadSkillFiles 的注释）。
+      // 分类**不是固定枚举**：它是训练期从手册里抽出来的章节骨架，所以两个技能的
+      // 分类清单本来就不一样（一个手册 12 类、另一个 5 类）。这也是「左侧分类各不一样」的
+      // 正常原因，不是数据错乱。要加手册里没有的类别，用这个按钮。
+      const titleOps = (k === 'category' && manualMode)
+        ? ` <button class="link-btn" title="新增一个手册里没有的分类" onclick="window.newCategoryView()">+ 新增分类</button>`
+        : '';
       tree += `<div class="kb-group">
-        <div class="kb-group-title">${KIND_ICON[k]} ${KIND_LABEL[k]} <span class="dim" style="font-weight:400">(${items.length})</span></div>
+        <div class="kb-group-title">${KIND_ICON[k]} ${KIND_LABEL[k]} <span class="dim" style="font-weight:400">(${items.length})</span>${titleOps}</div>
         <div class="kb-list">`;
       if (!items.length) {
         tree += `<div class="kb-empty">${KIND_EMPTY_HINT[k] || '暂无'}</div>`;
@@ -460,11 +473,26 @@
           // fidelity（质量报告）与 style（风格锚点）是只读的**质量证据**，既不可编辑也不可删，
           // 所以两个入口都不能有 —— 这里靠身不在白名单里达成，不要顺手加进去。
           const canDel = f.kind === 'example' || f.kind === 'source' || f.kind === 'templatefile';
+          // 分类行的「改名 / 删除」入口。判据是后端下发的 category_name **有没有值**，
+          // 而不是「路径是不是以 categories/ 开头」：前缀猜法等于把 store 的命名规则
+          // 抄第二份，两份规则一漂移，界面就会摆出「点下去必 400」的按钮。
+          // categories/_index.md（路由表）与 _template.md 不是分类，后端不给 category_name，
+          // 于是天然没有这两个入口 —— 它们本来也不许删。
+          const isCategory = k === 'category' && !!f.category_name;
+          const catName = f.category_name || '';
           // 只读文本在树上就要看得出来，别等点进去才发现改不了
           const roTag = fileViewMode(f) === 'readonly' ? ` <span class="chip">只读</span>` : '';
+          // 分类的**展示名**取自分类文件里的首个标题（H1），和文件名可能不一致
+          // （03-新闻通稿.md 的 H1 就是「领导讲话稿」）。不显式标出来，用户看到
+          // 「文件名和界面上的名字对不上」只会以为是 bug；而运行时路由找的正是这个 H1 名。
+          // 没有 category_name 的（_index.md / _template.md）不打标签，一眼能区分
+          // 「这是分类」和「这是分类制度的说明文件」。
+          const catTag = isCategory ? ` <span class="chip" title="分类展示名（取自文件首个标题，运行时按它路由）">${esc(catName)}</span>` : '';
           tree += `<div class="kb-tree-row" data-path="${esc(f.path)}" onclick="window.openEditorFile('${encodeURIComponent(curSkillSlug)}','${escapeJs(f.path)}')" title="${esc(f.path)}">
-            <span class="kb-tree-name">${esc(f.name)} <span class="dim">${f.size}B</span>${roTag}</span>
+            <span class="kb-tree-name">${esc(f.name)} <span class="dim">${f.size}B</span>${catTag}${roTag}</span>
             <span class="kb-tree-ops">
+              ${isCategory ? `<button class="link-btn" title="改名（级联改写路由表与审稿清单；范文原文不动）" onclick="event.stopPropagation();window.renameCategoryView('${escapeJs(f.path)}','${escapeJs(catName)}')">改名</button>` +
+                `<button class="icon-btn danger" title="删除该分类" onclick="event.stopPropagation();window.delCategory('${encodeURIComponent(curSkillSlug)}','${escapeJs(f.path)}','${escapeJs(catName)}')">✕</button>` : ''}
               ${canEdit ? `<button class="link-btn" title="编辑" onclick="event.stopPropagation();window.openEditorFile('${encodeURIComponent(curSkillSlug)}','${escapeJs(f.path)}')">编辑</button>` : ''}
               <button class="link-btn" title="下载" onclick="event.stopPropagation();window.downloadSkillFile('${encodeURIComponent(curSkillSlug)}','${escapeJs(f.path)}')">⬇</button>
               ${canDel ? `<button class="icon-btn danger" title="删除" onclick="event.stopPropagation();window.delSkillFile('${encodeURIComponent(curSkillSlug)}','${escapeJs(f.path)}','${escapeJs(f.kind)}')">✕</button>` : ''}
@@ -864,6 +892,140 @@
     const j = await r.json();
     if (r.ok) { toast('已删除', 'ok'); loadSkillFiles(curSkillSlug); }
     else toast(j.error || '删除失败', 'err');
+  };
+
+  // ---------- 分类结构：新增 / 改名 / 删除（只对手册模式技能） ----------
+  //
+  // 为什么要有这三块界面：分类是训练期从写作手册抽出来的骨架，手册里没有的类别
+  // （本单位常写、但手册没写的那种稿子）以前只能去手改磁盘文件。手改很危险 ——
+  // 一个分类名同时散落在分类文件、范文目录、prompt 路由表、reviewer 审稿清单、
+  // meta 清单里，漏改一处就是「界面上看着改了、运行时还在按旧名字找类」的静默失效。
+  // 所以增删改一律走后端，由后端做整段锚定的级联改写；前端只负责把「改了哪些文件」
+  // 摊开给用户看。
+
+  // 变更回执：后端每个写接口都回 { ok, change }，change 里有 files_touched /
+  // files_deleted / example_count / warnings。**必须展示**：用户改个名字，
+  // 结果 6 个文件被改写，界面上如果只说一句「已保存」，出了问题只能靠猜。
+  // warnings 单独用红字：它表示「本该在却没在」（比如路由表里压根没有这个分类的行），
+  // 那是需要人知道的数据不一致，不能混在正常回执里被滑过去。
+  window.showCategoryChange = (title, ch) => {
+    const p = $('kb-panel');
+    if (!p || !ch) return;
+    const list = (arr) => (arr && arr.length)
+      ? arr.map(x => `<div class="dim" style="padding:2px 0">· ${esc(x)}</div>`).join('')
+      : '<div class="dim">（无）</div>';
+    const warns = (ch.warnings && ch.warnings.length)
+      ? `<div class="msg err" style="margin-top:10px">${ch.warnings.map(esc).join('<br>')}</div>` : '';
+    const head = esc(ch.name || '') + (ch.old_name ? '（原 ' + esc(ch.old_name) + '）' : '');
+    p.classList.remove('hidden'); p.style.display = 'block';
+    p.innerHTML = `<div class="kb-panel-head">
+        <div>
+          <b>${esc(title)}</b>
+          <div class="card-sub">${head} · 涉及范文 ${ch.example_count || 0} 篇</div>
+          <div style="margin-top:10px"><b style="font-size:13px">已改写</b>${list(ch.files_touched)}</div>
+          ${(ch.files_deleted && ch.files_deleted.length) ? `<div style="margin-top:10px"><b style="font-size:13px">已删除</b>${list(ch.files_deleted)}</div>` : ''}
+          <div class="card-sub" style="margin-top:10px">范文原文（examples/、source/）不在改写范围内，内容一个字都没动。</div>
+          ${warns}
+        </div>
+        <button class="btn ghost" onclick="closeDetailEditor()">关闭</button>
+      </div>`;
+  };
+
+  // 变更成功后的统一收尾：先重载左树（分类清单变了），再把回执浮出来。
+  // 顺序不能反 —— loadSkillFiles 会重建右栏 DOM，先弹回执会被下一次渲染抹掉。
+  async function afterCategoryChange(title, ch) {
+    await loadSkillFiles(curSkillSlug);
+    window.showCategoryChange(title, ch);
+  }
+
+  // 三个动作的公共错误出口。
+  // 400 = 用户自己能改的（名字非法、重名、要 force…），直接把后端那句中文原样显示；
+  // 5xx = 服务端的事，别让用户以为是自己的输入错了。
+  function catErrMsg(r, j) {
+    return (j && j.error) || (r.status >= 500 ? '服务端错误（' + r.status + '）' : '操作失败');
+  }
+
+  window.newCategoryView = () => {
+    destroyCm();
+    const ed = $('kb-editor');
+    ed.style.display = 'block'; ed.classList.remove('hidden');
+    ed.classList.remove('ide-mode'); ed.classList.add('form-mode');
+    ed.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <b>新增分类</b>
+        <div><button class="btn ghost" onclick="closeDetailEditor()">取消</button>
+        <button class="btn primary" onclick="window.doNewCategory('${encodeURIComponent(curSkillSlug)}')">创建</button></div>
+      </div>
+      <div class="field"><label>分类名</label><input type="text" id="nc-name" placeholder="例如：会议纪要"></div>
+      <div class="field"><label>触发词（选填）</label><input type="text" id="nc-trigger" placeholder="用户说这些话就该走这个类，逗号分隔"></div>
+      <div class="field"><label>写作要求（选填）</label><textarea id="nc-req" rows="6" style="width:100%" placeholder="该类稿子的写法要求；留空则稍后手动补 categories/*.md"></textarea></div>
+      <p class="dim" style="margin:8px 0 0">只建骨架、不塞范文：建完到左树该分类下用「上传范文」往里加稿子。新分类一开始没有范文，运行时会明确告诉模型「本类暂无范文」，不会拿别的类凑数。</p>`;
+  };
+  window.doNewCategory = async (slug) => {
+    const name = ($('nc-name').value || '').trim();
+    if (!name) { toast('分类名不能为空', 'err'); return; }
+    const r = await fetch(`/api/admin/skills/${urlSlug(slug)}/categories`, {
+      method: 'POST', headers: authHdr(),
+      body: JSON.stringify({ name, trigger: ($('nc-trigger').value || '').trim(), requirement: ($('nc-req').value || '').trim() })
+    });
+    let j = {}; try { j = await r.json(); } catch (e) { /* 非 JSON */ }
+    if (r.ok) { toast('分类已创建', 'ok'); afterCategoryChange('分类已创建', j.change); }
+    else toast(catErrMsg(r, j), 'err');
+  };
+
+  // 改名。file 是分类文件路径（categories/03-x.md），newName 是展示名。
+  // 传同名也算合法修改：H1 可能本来就和文件名不一致，用户点「改名」只想把两者对齐。
+  window.renameCategoryView = (file, name) => {
+    destroyCm();
+    const ed = $('kb-editor');
+    ed.style.display = 'block'; ed.classList.remove('hidden');
+    ed.classList.remove('ide-mode'); ed.classList.add('form-mode');
+    ed.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <b>分类改名</b>
+        <div><button class="btn ghost" onclick="closeDetailEditor()">取消</button>
+        <button class="btn primary" onclick="window.doRenameCategory('${encodeURIComponent(curSkillSlug)}','${escapeJs(file)}')">确认改名</button></div>
+      </div>
+      <div class="field"><label>当前分类名</label><input type="text" value="${esc(name)}" readonly></div>
+      <div class="field"><label>新分类名</label><input type="text" id="rc-name" value="${esc(name)}"></div>
+      <p class="dim" style="margin:8px 0 0">改名会级联改写：分类文件、范文目录、prompt 路由表、reviewer 审稿清单、meta 清单。范文原文（examples/、source/）一个字都不动。改完左侧分类清单会立刻刷新，运行时就按新名字路由。</p>`;
+  };
+  window.doRenameCategory = async (slug, file) => {
+    const newName = ($('rc-name').value || '').trim();
+    if (!newName) { toast('新分类名不能为空', 'err'); return; }
+    const r = await fetch(`/api/admin/skills/${urlSlug(slug)}/categories/rename`, {
+      method: 'POST', headers: authHdr(), body: JSON.stringify({ file, new_name: newName })
+    });
+    let j = {}; try { j = await r.json(); } catch (e) { /* 非 JSON */ }
+    if (r.ok) { toast('已改名', 'ok'); afterCategoryChange('分类已改名', j.change); }
+    else toast(catErrMsg(r, j), 'err');
+  };
+
+  // 删除分类。两段确认：第一段是常规「你确定吗」，第二段只在**这一类下面还有范文**时出现。
+  // 有范文时后端不删、只回 need_force + example_count，这里就拿真实篇数再问一次 ——
+  // 那十几篇是手册原文，删掉界面上恢复不了，所以确认框里必须写出「几篇」这个具体数字，
+  // 而不是一句含糊的「该分类非空」。空分类不需要第二段：删个空壳还要点两次是折腾人。
+  window.delCategory = async (slug, file, name) => {
+    if (!confirm('删除分类「' + name + '」？\n会同时删掉它的分类文件与范文目录，界面上无法恢复。')) return;
+    const url = (force) => `/api/admin/skills/${urlSlug(slug)}/categories?file=${encodeURIComponent(file)}`
+      + (force ? '&force=1' : '');
+    let r = await fetch(url(false), { method: 'DELETE', headers: authHdr() });
+    let j = {}; try { j = await r.json(); } catch (e) { /* 非 JSON */ }
+    // 靠 need_force 这个机器可读标记走第二段，**不去匹配错误文案**：
+    // 文案是给人看的、随时会改，一旦匹配不上，有范文的分类就永远删不掉 ——
+    // 用户只会看到一句「删除失败」，没有下一步可走。
+    if (!r.ok && j && j.need_force) {
+      const n = j.example_count || 0;
+      if (!confirm('「' + name + '」下面还有 ' + n + ' 篇范文，删除后无法从界面恢复。\n确定连同这 ' + n + ' 篇一起删除？')) return;
+    } else if (!r.ok) {
+      toast(catErrMsg(r, j), 'err');
+      return;
+    }
+    if (r.ok) { toast('分类已删除', 'ok'); afterCategoryChange('分类已删除', j.change); return; }
+    r = await fetch(url(true), { method: 'DELETE', headers: authHdr() });
+    try { j = await r.json(); } catch (e) { j = {}; }
+    if (r.ok) { toast('分类已删除', 'ok'); afterCategoryChange('分类已删除', j.change); }
+    else toast(catErrMsg(r, j), 'err');
   };
 
   // edit metadata

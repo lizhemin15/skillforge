@@ -16,10 +16,20 @@ import (
 	"github.com/lizhemin15/skillforge/internal/store"
 )
 
+// chatClient 是生成器用到的**模型能力面**：一次不带历史的对话调用。
+//
+// 为什么这里要抽一个接口（而不是继续用 *llm.Client）：训练裁判的验收
+// （「残缺手册必须被判不通过并点名范文缺失」）要求结果**确定性可复现**——
+// 拿真模型跑只能看「像不像」，判分每次都不一样。只有能注入替身，
+// 才能把断言钉在「产物与判定」上而不是「模型今天心情如何」。
+type chatClient interface {
+	Chat(ctx context.Context, sys, user string, jsonMode ...bool) (string, error)
+}
+
 // Generator is the "skill-generator" (女娲) pipeline: it ingests reference
 // files + a requirement, and produces a complete, validated writing skill.
 type Generator struct {
-	llm       *llm.Client
+	llm       chatClient
 	store     *store.SkillStore
 	skillsDir string
 	// ocrURL 是文档解析微服务（ocrd）的地址。放在结构体里而不是逐个调用点传参，
@@ -29,11 +39,27 @@ type Generator struct {
 }
 
 func NewGenerator(l *llm.Client, s *store.SkillStore, dataDir string) *Generator {
-	return &Generator{llm: l, store: s, skillsDir: filepath.Join(dataDir, "skills")}
+	g := &Generator{store: s, skillsDir: filepath.Join(dataDir, "skills")}
+	g.SetLLM(l)
+	return g
 }
 
 // SetLLM swaps the underlying client (used to hot-swap provider per request).
-func (g *Generator) SetLLM(l *llm.Client) { g.llm = l }
+//
+// 显式处理 l == nil：把「nil 的 *llm.Client」赋给接口字段会得到一个**非 nil 的接口**
+// （类型已知、值为 nil），于是所有 `g.llm == nil` 的守卫全部失效，后面第一步调用
+// 就 panic 在解析地址上。未配置模型的部署路径必须能安全降级，所以这里把 typed-nil
+// 归一化成真 nil。
+func (g *Generator) SetLLM(l *llm.Client) {
+	if l == nil {
+		g.llm = nil
+		return
+	}
+	g.llm = l
+}
+
+// SetChatClient 注入替身模型（测试专用）。生产路径一律走 SetLLM。
+func (g *Generator) SetChatClient(c chatClient) { g.llm = c }
 
 // Input bundles the admin's raw material for training a new skill.
 type Input struct {
@@ -744,7 +770,9 @@ func looksLikeArticle(s string) bool {
 //
 // 为什么需要它：Go 的 json 解析错误对非 ASCII 字节是按 latin1 打印的，中文首字节
 // 0xE4 会显示成 'ä'。所以线上只看得到
-//     meta json: invalid character 'ä' after object key:value pair
+//
+//	meta json: invalid character 'ä' after object key:value pair
+//
 // 完全看不出模型把哪里写坏了。这里把原文（rune 安全截断）一起回带出来。
 func jsonErrDetail(step, raw string, err error) error {
 	return fmt.Errorf("%s：模型输出不是合法 JSON：%w；原文=<<%s>>", step, err, snippet(raw, 400))

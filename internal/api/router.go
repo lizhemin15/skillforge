@@ -145,6 +145,11 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("PUT /api/admin/skills/{slug}/file", h.Auth.Middleware(h.Admin.WriteSkillFile))
 	mux.HandleFunc("POST /api/admin/skills/{slug}/file", h.Auth.Middleware(h.Admin.UploadSkillFile))
 	mux.HandleFunc("POST /api/admin/skills/{slug}/example", h.Auth.Middleware(h.Admin.AddSkillExample))
+	// 分类结构增删改（只对手册模式技能生效）。改名/删除会级联改多个文件，
+	// 所以走独立接口而不是复用 WriteSkillFile——手写级联必然漏。
+	mux.HandleFunc("POST /api/admin/skills/{slug}/categories", h.Auth.Middleware(h.Admin.CreateSkillCategory))
+	mux.HandleFunc("POST /api/admin/skills/{slug}/categories/rename", h.Auth.Middleware(h.Admin.RenameSkillCategory))
+	mux.HandleFunc("DELETE /api/admin/skills/{slug}/categories", h.Auth.Middleware(h.Admin.DeleteSkillCategory))
 	mux.HandleFunc("DELETE /api/admin/skills/{slug}/file", h.Auth.Middleware(h.Admin.DeleteSkillFile))
 	mux.HandleFunc("PATCH /api/admin/skills/{slug}", h.Auth.Middleware(h.Admin.UpdateSkillMeta))
 	mux.HandleFunc("POST /api/admin/skills", h.Auth.Middleware(h.Admin.CreateSkill))

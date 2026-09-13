@@ -66,7 +66,7 @@ const binaryMinHits = 8
 var binaryMagic = [][]byte{
 	[]byte("%PDF-"),
 	[]byte("PK\x03\x04"), []byte("PK\x05\x06"), []byte("PK\x07\x08"), // zip / docx / xlsx / pptx
-	[]byte("\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"), // OLE2：老式 doc/xls/ppt
+	[]byte("\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"),                                            // OLE2：老式 doc/xls/ppt
 	[]byte("\x1F\x8B"), []byte("BZh"), []byte("\xFD7zXZ\x00"), []byte("\x28\xB5\x2F\xFD"), // gzip/bz2/xz/zstd
 	[]byte("\x89PNG\r\n\x1a\n"), []byte("\xFF\xD8\xFF"), []byte("GIF87a"), []byte("GIF89a"),
 	[]byte("II*\x00"), []byte("MM\x00*"), []byte("RIFF"), []byte("OggS"),
