@@ -124,7 +124,22 @@ func firstFrame(t *testing.T, h *chatHandler, body string) string {
 	ctx, cancel := context.WithCancel(req.Context())
 	defer cancel()
 	req = req.WithContext(ctx)
-	go h.ServeHTTP(fw, req)
+	// ⚠️ handler goroutine 不会因为我们拿到第一帧就停下：它还要把会话/trace 落盘到
+	// dataDir/sessions。测试函数一返回，t.TempDir() 的清理就开始删这棵树，正好撞上
+	// 它正在建的文件 → RemoveAll 报「directory not empty」，测试以清理失败红掉。
+	// 这类红最坑：失败位置是 testing.go 的清理代码、测试自己的断言全过，看不出跟被测
+	// 逻辑有任何关系，于是人会去翻错地方（CI 上真实红过一次，就是这么红的）。
+	// 所以必须等它退场再让 TempDir 去删；但要带超时 —— 它万一卡死，宁可测试红一条
+	// 明确的「没退出」，也不要整个包挂死。
+	done := make(chan struct{})
+	go func() { defer close(done); h.ServeHTTP(fw, req) }()
+	t.Cleanup(func() {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Errorf("handler goroutine 2 秒内没退出：它可能还在往数据目录写，TempDir 清理会因此 flake")
+		}
+	})
 
 	select {
 	case frame := <-fw.frames:
