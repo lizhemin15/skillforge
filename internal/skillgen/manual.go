@@ -351,6 +351,11 @@ type manualPack struct {
 	// Source 是切出范文用的原文（OCR 后的手册全文）。只为 fidelity.md 的保真
 	// 核对服务——「这篇范文确实能在原文里逐字找到」这句结论需要原文在手。
 	Source string
+	// Judge 是 Step 8.5 裁判循环的结论，nil 表示没跑裁判（通用流程）。
+	// 挂在 manualPack 上而不是另开一个参数传给 land：两者是同一件事的两面
+	// （手册给标尺、裁判按标尺判手册类技能），一份数据一条路径写盘，
+	// 免得出现「传了裁判结果却漏传给 fidelity」这种缺失。
+	Judge *JudgeReport
 }
 
 // ExampleCount 返回成功切出的范文总数。
@@ -504,6 +509,30 @@ func (mp *manualPack) writeFidelity(dir string) error {
 	// 所以直接报数字，而不是写「已确保保真」这种无法证伪的话。
 	if found, checked := mp.countFidelity(); checked > 0 {
 		fmt.Fprintf(&b, "- 保真核对：%d/%d 篇可在 source/ 原文中逐字找到（未经模型改写）\n", found, checked)
+	}
+
+	// 裁判评分表（Generate 的 Step 8.5）。跟保真核对的落盘理由一样：
+	// 把「这个技能到底有没有被独立验收过」变成看得见的证据。三种情况必须显性——
+	// 裁判没跑成、提前止损、到上限带薄弱项交付；只写「通过」二字的话，
+	// 没验收过的技能看起来就跟验过的一样，那正是静默降级的藏身处。
+	b.WriteString("\n## 裁判评分（独立评审 · 上限 ")
+	fmt.Fprintf(&b, "%d 轮）\n\n", judgeMaxRounds)
+	if mp.Judge == nil {
+		b.WriteString("（未启用裁判评分）\n")
+	} else {
+		b.WriteString(judgeRoundTable(mp.Judge.Rounds))
+		if mp.Judge.BestRound > 0 {
+			fmt.Fprintf(&b, "\n- 交付轮次：第 %d 轮（同分取更早轮次，保证结果可复核）\n", mp.Judge.BestRound)
+		}
+		if mp.Judge.EarlyStop != "" {
+			fmt.Fprintf(&b, "- 提前止损：%s\n", mp.Judge.EarlyStop)
+		}
+		if mp.Judge.Err != "" {
+			fmt.Fprintf(&b, "- ⚠️ 裁判未跑完：%s\n", mp.Judge.Err)
+		}
+		if w := mp.Judge.WeakDims(3); len(w) > 0 {
+			fmt.Fprintf(&b, "- 薄弱维度：%s\n", strings.Join(w, " · "))
+		}
 	}
 
 	if len(mp.Warnings) == 0 {

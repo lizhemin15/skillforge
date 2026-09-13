@@ -205,6 +205,30 @@ func (g *Generator) Generate(ctx context.Context, in *Input, onStep func(string)
 		return nil, err
 	}
 
+	// ---- Step 8.5: 裁判试用与回炉（仅手册模式） ----
+	// 放在 validate **之后**：校验是本地硬门（提示词过短直接拒收），先拒掉明显残次品，
+	// 免得把 3 轮模型调用花在一份明知不合格的提示词上。
+	// 放在 land **之前**：交付的是「最优一轮」那份提示词（见 JudgeReport.Best），
+	// 落盘必须在裁判跑完之后，否则磁盘上留的是没验收过的版本。
+	if mp != nil && len(mp.Structure.Categories) > 0 {
+		steps("8.5/9 裁判独立试用评分（上限 3 轮，不过线按扣分项回炉）…")
+		rep := g.judgeLoop(ctx, mp, sysPrompt, func(ctx context.Context, res *JudgeResult, prev string) (string, error) {
+			return g.reviseSystemPrompt(ctx, in, attrs, dtype.Type, prev, res)
+		}, steps)
+		mp.Judge = rep
+		if rep.DeliveredPrompt != "" && rep.DeliveredPrompt != sysPrompt {
+			// 回炉后的版本可能更短、甚至被模型删掉了范文注入段——它同样要过本地硬门，
+			// 否则等于用「裁判说更好」换来一份校验没管过的提示词。
+			if err := g.validate(rep.DeliveredPrompt, tpl, exFiles, mp.ExampleCount(), dtype.Type); err != nil {
+				steps("8.5/9 回炉版本未过本地校验，保留原版：" + err.Error())
+				rep.DeliveredPrompt = ""
+			} else {
+				sysPrompt = rep.DeliveredPrompt
+				steps(fmt.Sprintf("8.5/9 交付第 %d 轮版本（%d 字）", rep.BestRound, len([]rune(sysPrompt))))
+			}
+		}
+	}
+
 	// ---- Step 9: land to disk + register in DB ----
 	steps("9/9 落盘并注册…")
 	if err := g.land(dir, sysPrompt, tpl, exFiles, in, attrs, dtype, mp); err != nil {
@@ -616,6 +640,56 @@ func (g *Generator) buildSystemPrompt(ctx context.Context, in *Input, attrs stri
 直接输出正文,不要用代码块包裹,不要输出解释。` + extra
 	user := "需求:\n" + in.Requirement + "\n\n特征分析:\n" + attrs + "\n\n母模板:\n" + tpl
 	out, err := g.llm.Chat(ctx, sys, user)
+	if err != nil {
+		return "", err
+	}
+	return cleanCodeFence(out), nil
+}
+
+// reviseSystemPrompt 是 Step 8.5 的回炉动作：拿裁判的扣分项把 system_prompt 改好。
+//
+// 为什么是「改」而不是「重新生成一份」：重生成会连已经拿满分的部分一起洗掉
+// （分类路由表、禁用项、范文注入段都是上一版对了的东西）。用一次模型调用换一份
+// 随机重写，那不叫优化，叫掷骰子。所以这里明确要求**只改被扣分的维度**，
+// 并且把上一版原文交给模型，让它做差别最小的修订。
+//
+// reviewer.md 不参与回炉：它是「按手册条款逐条核对」的清单，条款来自手册原文，
+// 裁判扣的是稿子/提示词的分，改提示词不该顺手改标尺——那等于让被判的人改考卷。
+func (g *Generator) reviseSystemPrompt(ctx context.Context, in *Input, attrs, typ, prev string, res *JudgeResult) (string, error) {
+	if res == nil || len(res.Findings) == 0 {
+		// 没扣分项就无从改起。宁可停下并让 fidelity.md 写明「回炉失败」，
+		// 也不要原样再跑一轮：那会白烧一轮模型调用，还让 trace 看起来很忙。
+		return "", fmt.Errorf("裁判未给出扣分项，无法回炉")
+	}
+	var tpl string
+	if typ == model.SkillTypeWrite {
+		tpl = g.motherTemplate()
+	} else {
+		tpl = g.flowMotherTemplate()
+	}
+	sys := `你是一位顶尖的提示词工程师。这是一次**修订**任务,不是重写任务。
+上一版 system_prompt 已经能跑,但它在一份独立评审里丢了分。请只针对评审扣分项做修改,输出完整的新版本。
+硬性要求:
+- 保留上一版中已经拿满分的部分,不要在无关段落上改写措辞;
+- 逐条回应扣分项,并在被改段落里补上评审要求的具体内容;
+- 完整覆盖"身份/任务/执行步骤/结构规范/文风与措辞/长度/禁用项/特殊要求";
+- 直接输出正文,不要用代码块包裹,不要输出解释,不要写"修改说明"。`
+	var b strings.Builder
+	b.WriteString("需求:\n" + in.Requirement + "\n\n特征分析:\n" + attrs + "\n\n母模板:\n" + tpl)
+	b.WriteString("\n\n【上一版 system_prompt】\n" + prev)
+	b.WriteString("\n\n【独立评审扣分项(逐条改掉)】\n")
+	for i, f := range res.Findings {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, f)
+	}
+	if res.Total > 0 {
+		fmt.Fprintf(&b, "\n本轮总分 %d/100,未过线。\n", res.Total)
+	}
+	for _, d := range judgeDimsSorted(res) {
+		if d.Score < d.Weight {
+			fmt.Fprintf(&b, "- %s 丢分 %d/%d：%s\n", d.Label, d.Score, d.Weight, strings.TrimSpace(d.Reason))
+		}
+	}
+	out, err := g.llm.Chat(ctx, sys, b.String())
 	if err != nil {
 		return "", err
 	}

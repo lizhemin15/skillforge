@@ -116,6 +116,10 @@ type JudgeRound struct {
 	Category string       `json:"category"`
 	Draft    string       `json:"-"`
 	Result   *JudgeResult `json:"result"`
+	// Prompt 是本轮试用的那份 system_prompt。必须逐轮记下来：
+	// 交付取的是「最优一轮」的提示词（见 Best），如果只留最后一版，
+	// 就永远取不回第 1 轮那份更好的——「交付最优」会变成一句空话。
+	Prompt string `json:"-"`
 }
 
 // ---- 确定性硬校验 ----
@@ -544,6 +548,105 @@ func dedupStrings(in []string) []string {
 
 // ---- 裁判报告的交付决策 ----
 
+// ---- 裁判循环（Generate 的 Step 8.5） ----
+
+// judgeRevise 是回炉回调：拿到本轮扣分项后重写 system_prompt。
+//
+// 为什么做成回调而不是让 judge.go 自己重写：重写提示词要用生成期上下文
+// （用户需求、特征画像、母模板），那些东西在 Generate 手里；judge.go 只负责
+// 「什么时候该回炉、什么时候该止损」。两件事分开，循环的止损规则才能脱离模型被测试。
+type judgeRevise func(ctx context.Context, res *JudgeResult, prev string) (string, error)
+
+// judgeLoop 跑「试用 → 独立裁判打分 → 不通过则回炉重写提示词」循环（上限 judgeMaxRounds）。
+//
+// 三条止损规则各自对应一种具体的浪费或欺骗：
+//
+//	① 通过即停：过线后再试一轮只是烧钱，而且可能试出一个更差的版本；
+//	② 扣分项全来自确定性硬校验（手册数据缺陷）→ 立刻停：回炉改的是提示词，
+//	   改不动「范文没切出来」这件事，继续跑只会把「手册有问题」掩盖成「提示词不够好」；
+//	③ 到上限即停：设计约定不做无限打磨，带薄弱项交付并在 fidelity.md 写明。
+//
+// 注意它**不返回 error**：裁判跑没跑成不阻断落盘（技能本身已经能用），
+// 但失败必须进 rep.Err 并写进 fidelity.md 与 trace ——「裁判没跑成」和
+// 「裁判判通过」是两件事，混起来就是静默降级。
+func (g *Generator) judgeLoop(ctx context.Context, mp *manualPack, sysPrompt string, revise judgeRevise, steps func(string)) *JudgeReport {
+	rep := &JudgeReport{}
+	if mp == nil || mp.Structure == nil || len(mp.Structure.Categories) == 0 {
+		// 没有手册结构就没有标尺。此时绝不能编一个「通过」出来。
+		rep.Err = "无手册结构，裁判无从对齐标尺"
+		return rep
+	}
+	if g.llm == nil {
+		rep.Err = "未配置模型客户端"
+		return rep
+	}
+
+	cur := sysPrompt
+	for round := 1; round <= judgeMaxRounds; round++ {
+		cat, ok := pickTrialCategory(mp.Structure, round)
+		if !ok {
+			rep.EarlyStop = "没有可试用的分类"
+			break
+		}
+		material := trialMaterial(mp, cat)
+		draft, err := g.trialDraft(ctx, cur, mp, cat, material)
+		if err != nil {
+			rep.Err = err.Error()
+			steps(fmt.Sprintf("8.5/9 第 %d 轮试用失败：%s", round, err.Error()))
+			break
+		}
+		res, err := g.judgeDraft(ctx, mp, cat, material, draft)
+		if err != nil {
+			rep.Err = err.Error()
+			steps(fmt.Sprintf("8.5/9 第 %d 轮裁判失败：%s", round, err.Error()))
+			break
+		}
+		rd := JudgeRound{Round: round, Category: cat.Name, Draft: draft, Result: res, Prompt: cur}
+		rep.Rounds = append(rep.Rounds, rd)
+		steps("8.5/9 " + judgeRoundLine(rd))
+
+		if res.Pass {
+			break
+		}
+		if allFindingsHard(res) {
+			rep.EarlyStop = "扣分项全部来自确定性硬校验（手册数据缺陷），回炉改不动"
+			steps("8.5/9 " + rep.EarlyStop)
+			break
+		}
+		if round == judgeMaxRounds {
+			rep.EarlyStop = fmt.Sprintf("已达回炉上限 %d 轮，带薄弱项交付", judgeMaxRounds)
+			steps("8.5/9 " + rep.EarlyStop)
+			break
+		}
+		if revise == nil {
+			rep.EarlyStop = "未提供回炉通道，无法重生成"
+			steps("8.5/9 " + rep.EarlyStop)
+			break
+		}
+		steps(fmt.Sprintf("8.5/9 第 %d 轮未过线，按扣分项回炉重写提示词…", round))
+		next, rErr := revise(ctx, res, cur)
+		if rErr != nil {
+			rep.Err = "回炉失败: " + rErr.Error()
+			steps("8.5/9 回炉失败（保留当前版本）：" + rErr.Error())
+			break
+		}
+		if strings.TrimSpace(next) == "" {
+			rep.Err = "回炉产出的提示词为空"
+			steps("8.5/9 回炉产出的提示词为空（保留当前版本）")
+			break
+		}
+		cur = next
+	}
+
+	// 交付「最优一轮」而不是「最后一轮」：裁判的另一半是模型，分数有噪声，
+	// 第 3 轮回炉后的提示词完全可能比第 1 轮差（见 Best 的注释）。
+	if best := rep.Best(); best != nil {
+		rep.BestRound = best.Round
+		rep.DeliveredPrompt = best.Prompt
+	}
+	return rep
+}
+
 // JudgeReport 是一场裁判的完整结论：每轮明细 + 交付决策。
 //
 // 它同时承担两件事：喂给 fidelity.md 做人可读的质量报告（s7d），
@@ -562,8 +665,6 @@ type JudgeReport struct {
 	EarlyStop string `json:"early_stop,omitempty"`
 	// DeliveredPrompt 是交付用的 system_prompt（最优一轮那份）。
 	DeliveredPrompt string `json:"-"`
-	// DeliveredReviewer 是交付用的审稿清单（最优一轮那份），可能为空。
-	DeliveredReviewer string `json:"-"`
 }
 
 // Passed 表示是否有一轮通过。
@@ -619,19 +720,21 @@ func (r *JudgeReport) WeakDims(n int) []string {
 
 // judgeRoundLine 把一轮判分压成一行 trace 帧文案，例如：
 //
-//	裁判第 1 轮：62/100 不通过 · 分类判定 18/25 · 范文对齐 12/20 · 硬校验 1 项
+//	裁判第 1 轮（会议纪要）：62/100 不通过 · 分类判定 18/25 · 范文对齐 12/20 · 硬校验 1 项
 //
 // 显性写出「哪几维丢了分」而不是只报总分：总分相同的两轮，问题可能完全不同，
 // 只留总分等于让管理员无从下手。
+// 分类名也必须写：不同分类的严格程度天然不同（会议纪要与工作总结的范文规范差得远），
+// 只说「62 分」而不说「按哪一类的标尺量的」，这个分数就没法解读、也没法复核。
 func judgeRoundLine(r JudgeRound) string {
 	if r.Result == nil {
-		return fmt.Sprintf("裁判第 %d 轮：无结论", r.Round)
+		return fmt.Sprintf("裁判第 %d 轮（%s）：无结论", r.Round, r.Category)
 	}
 	verdict := "不通过"
 	if r.Result.Pass {
 		verdict = "通过"
 	}
-	parts := []string{fmt.Sprintf("裁判第 %d 轮：%d/100 %s", r.Round, r.Result.Total, verdict)}
+	parts := []string{fmt.Sprintf("裁判第 %d 轮（%s）：%d/100 %s", r.Round, r.Category, r.Result.Total, verdict)}
 	var weak []string
 	for _, d := range judgeDimsSorted(r.Result) {
 		if d.Score < d.Weight {
@@ -673,9 +776,14 @@ func allFindingsHard(res *JudgeResult) bool {
 
 // judgeRoundTable 把多轮判分结果渲染成 Markdown 表格行，供 fidelity.md 使用。
 // 单独抽出来是为了让「表格长什么样」可被测试直接断言，而不是靠人肉看落盘文件。
+//
+// 无轮次时**不写「未启用裁判评分」**：启用过但一次都没跑成（上游 502、解析失败）
+// 和无轮次长得一样，而「未启用」是一句关于配置的断言。写成未启用，报告就会
+// 一边说「没启用」一边说「未跑完」，读者只会更糊涂。空表也不写——空表壳像是
+// 「判过了但没记录」。两种真实情况都交给调用方按 Judge 是否为 nil 分支说明。
 func judgeRoundTable(rounds []JudgeRound) string {
 	if len(rounds) == 0 {
-		return "（未启用裁判评分）\n"
+		return "（没有可展示的判分记录）\n"
 	}
 	var b strings.Builder
 	b.WriteString("| 轮次 | 试用分类 | 总分 | 结论 | 扣分项 |\n")
