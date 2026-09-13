@@ -21,12 +21,29 @@ cp web/assets.manifest.json "$BAK/manifest.json"
 for h in "${HTMLS[@]}"; do cp "$h" "$BAK/$(basename $h)"; done
 cp web/css/style.css "$BAK/style.css"
 
+# 第 1 条注入要造出「这次提交里资源内容变了、?v= 没动」这个状态，而它只能靠
+# git 比对才看得见 —— 所以注入会临时提交一次（见下面第 1 条）。这里记住原始
+# 提交，还原时回滚。
+#
+# ⚠️ 回滚用 `reset --mixed` + 只 checkout 本脚本碰过的两个文件，**不能用
+# `reset --hard`**：hard 会把工作区里所有未提交改动一起抹掉 —— 包括此刻正在
+# 改这个脚本的人（写完脚本还没提交就来跑一次自证，是很自然的动作）。
+# 实测踩过：hard 版把本脚本自己那版未提交的修改直接吃掉了，表现是「改完跑一次
+# 自证，改动消失」，人只会以为是自己没保存。
+ORIG_HEAD_SHA="$(git rev-parse HEAD)"
+TOUCHED_PATHS=(web/css/style.css web/assets.manifest.json)
+
 restore() {
+  # HEAD 先回到原始提交（临时提交只含上面两个文件，按 mixed 撤回不会动工作区）。
+  if [ "$(git rev-parse HEAD 2>/dev/null)" != "$ORIG_HEAD_SHA" ]; then
+    git reset --mixed "$ORIG_HEAD_SHA" >/dev/null 2>&1 || true
+  fi
   cp "$BAK/$(basename $TEST)" "$TEST"
   cp "$BAK/$(basename $GEN)" "$GEN"
   cp "$BAK/manifest.json" web/assets.manifest.json
   for h in "${HTMLS[@]}"; do cp "$BAK/$(basename $h)" "$h"; done
   cp "$BAK/style.css" web/css/style.css
+  for p in "${TOUCHED_PATHS[@]}"; do git checkout -- "$p" >/dev/null 2>&1 || true; done
 }
 trap restore EXIT
 
@@ -59,8 +76,19 @@ echo "注入自证（每条都必须变红）"
 
 # 1) 内容变了、?v= 一个字没动，且按文档重新生成过 manifest。
 #    这正是前三道断言的盲区：全绿，老浏览器继续吃旧 CSS。
-sed -i 's|style.css?v=20260913B|style.css?v=20260913A|g' "${HTMLS[@]}"
-node "$GEN" >/dev/null
+#
+#    ⚠️ 必须自己造出「这次提交里内容变了」这个 git 事实（临时提交），不能只改工作区：
+#    第四道断言是拿 HEAD~1 和**工作区**比，而 CI 上 HEAD~1 往往已经包含上一次
+#    那波资源改动 —— 有一版 CI 里这条注入直接变绿（HEAD~1 的 style.css 已经是新
+#    内容，比较结果「没变」，断言当然不红）。同一份注入换个历史位置就失效，
+#    那就不叫自证。临时提交后 HEAD~1 = 刚推上去的提交，注入才成为真实的「相对
+#    上一提交的变化」。
+printf '\n/* mutation: 内容变了但 ?v= 没动 */\n' >> web/css/style.css
+node "$GEN" >/dev/null                       # 真实作者也会照文档重新生成一次
+# 只 stage 这两个文件：临时提交越小，回滚越不可能误伤别的改动。
+git add "${TOUCHED_PATHS[@]}"
+git -c user.email=mutation@local -c user.name=mutation \
+  commit -qm "mutation: style.css 内容变了，?v= 没 bump"
 check_expect_red '内容变了却没 bump ?v=（git 第四道）' '内容与上一提交不同，但 ?v= 还是'
 
 # 2) 只 bump 了一个 HTML 里的 v（另一处漏了）。
