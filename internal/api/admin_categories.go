@@ -7,13 +7,18 @@ import (
 	"github.com/lizhemin15/skillforge/internal/store"
 )
 
-// 分类结构管理（只对「手册模式」技能开放，即训练期从写作手册抽出了 categories/ 的技能）。
+// 分类结构管理（对**所有**技能开放；手册技能与非手册技能的区别只在于分类从哪来）。
 //
 // 为什么要有这层：训练期抽出来的分类是手册的骨架，但真实使用中会碰到
 // 「手册里没有、我们单位常写的那类稿子」——用户只能干瞪眼，或者去手改磁盘文件。
 // 手改是很危险的：分类名同时散落在 6 个地方（见 store.RenameCategory），
 // 漏一个就是「界面上看着改了、运行时模型还在按旧分类名找类」的静默失效。
 // 所以增删改一律走后端，由后端做整段锚定的级联改写。
+//
+// 「只给手册技能开」这条限制已经取消（产品拍板）——理由和代价见 store.CreateCategory
+// 的注释：非手册技能建分类时会自动补出 categories/ 骨架，技能就此从
+// 「一步直执笔」变成「判类 → 按类执笔 → 审稿」三段，这个后果通过
+// CategoryChange.notes 回给前端说明，而不是拦着不让建。
 //
 // 三个动作的共同点：改完立刻读回生效——categories/*.md 就是运行时读的那份文件，
 // 不另存 JSON 副本。这样「界面上能编辑」和「运行时用得上」是同一份数据。
@@ -105,17 +110,20 @@ func (a *Admin) DeleteSkillCategory(w http.ResponseWriter, r *http.Request) {
 }
 
 // categoryErrStatus 把 store 的错误分成两类：
-//   - 用户能自己修的（名字非法、重名、目标已存在、找不到分类、要 force、
-//     不是手册模式）→ 400。前端直接把消息显示出来，用户改一下输入就能成功；
+//   - 用户能自己修的（名字非法、重名、目标已存在、找不到分类、要 force）→ 400。
+//     前端直接把消息显示出来，用户改一下输入就能成功；
 //   - 其它（读盘/写盘失败）→ 500，那是服务端的事，不该让用户以为是自己的输入问题。
 //
 // 判类型靠错误链（errors.Is）而不是匹配文案：文案改一次字符串匹配就悄悄失效，
 // 失效的表现是 500——用户看到「服务器错误」去翻日志，而真正原因是自己名字填错了。
+//
+// ErrNotManualSkill 曾经也在这个 400 列表里；方案 C 放开后 store 不再抛它，
+// 所以这里同步删掉——留着一个永不命中的分支，下一个人读代码会以为
+// 「非手册技能还是被拦着」，从而写出错误的判断。
 func categoryErrStatus(err error) int {
 	switch {
 	case errors.Is(err, store.ErrCategoryBadInput),
-		errors.Is(err, store.ErrCategoryInUse),
-		errors.Is(err, store.ErrNotManualSkill):
+		errors.Is(err, store.ErrCategoryInUse):
 		return http.StatusBadRequest
 	}
 	return http.StatusInternalServerError

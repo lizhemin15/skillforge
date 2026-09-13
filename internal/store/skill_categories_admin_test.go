@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -612,22 +613,200 @@ func TestDeleteCategory_EmptyNeedsNoForce(t *testing.T) {
 	}
 }
 
-// 非手册模式技能（没有 categories/ 目录）：新增/改名/删除都要明确报错，
-// 不能偷偷建出一个半套结构（只有 categories/ 没有 system_prompt 路由表＝运行时判不出类）。
-func TestCategoryAdmin_NonManualSkillRejected(t *testing.T) {
+// ----- 方案 C：非手册技能也能建分类（2026-09 放开） -----
+//
+// 老防线 TestCategoryAdmin_NonManualSkillRejected 守的是「一律拒绝」；那条产品
+// 决定已被推翻，但**它想防的事故没变**：偷偷建出一个半套结构
+// （只有 categories/ 没有 _index.md、范文目录没建、或者技能被切成三段流程而用户
+// 完全不知道）。所以这条防线不是删掉，而是把断言从「必须报错」改成
+// 「必须补齐 + 必须说明」——放开 ≠ 免责。
+
+// 非手册技能建分类：目录/索引/范文目录都要自动补齐，并且 Notes 必须说明
+// 「技能从此走三段流程」这件事。
+func TestCreateCategory_NonManualSkillAllowedAndBootstrap(t *testing.T) {
 	s := newStoreForTest(t, t.TempDir())
 	const slug = "普通技能"
 	mustWrite(t, filepath.Join(s.SkillsDir(), slug, "system_prompt.md"), "你是普通写作助手")
-	if _, err := s.CreateCategory(slug, "新类", "t", "r"); err == nil {
-		t.Fatal("非手册模式技能不该能新增分类")
-	} else if !strings.Contains(err.Error(), ErrNotManualSkill.Error()) {
-		t.Fatalf("错误应说明不是手册模式：%v", err)
+	mustWrite(t, filepath.Join(s.SkillsDir(), slug, "reviewer.md"), "")
+
+	if s.HasCategories(slug) {
+		t.Fatal("前提不成立：这个技能此刻不该有 categories/")
 	}
-	if _, err := s.RenameCategory(slug, "categories/01-x.md", "y"); err == nil {
-		t.Fatal("非手册模式技能不该能改名")
+	ch, err := s.CreateCategory(slug, "会议纪要", "开会后的纪要", "三日内发布")
+	if err != nil {
+		t.Fatalf("非手册技能应能建分类（方案 C 已放开）：%v", err)
 	}
-	if _, err := s.DeleteCategory(slug, "categories/01-x.md", true); err == nil {
-		t.Fatal("非手册模式技能不该能删分类")
+
+	// ① 分类文件与骨架
+	body := readSkillFile(t, s, slug, "categories/01-会议纪要.md")
+	mustContain(t, "骨架要带分类名", body, "会议纪要")
+	// ② 范文目录要预建（不预建的话用户传范文时才发现没地方放）
+	if fi, err := os.Stat(filepath.Join(s.SkillsDir(), slug, "examples", "会议纪要")); err != nil || !fi.IsDir() {
+		t.Fatalf("范文目录应预建：err=%v", err)
+	}
+	// ③ categories/_index.md 要补出来（这是目录里的常驻索引，缺了左树就读不出路由）
+	idx := readSkillFile(t, s, slug, "categories/_index.md")
+	mustContain(t, "_index.md 要有这一类", idx, "会议纪要")
+	// ④ 技能确实切成手册模式了（拿掉这条，前端左树就还是当成非手册技能渲染）
+	if !s.HasCategories(slug) {
+		t.Fatal("建完分类后 HasCategories 应为真——运行时会走判类三段流程")
+	}
+	// ⑤ 后果必须说清楚：这条是本防线的核心，放开权限的代价就是它
+	if len(ch.Notes) == 0 {
+		t.Fatal("非手册技能建分类是「换掉运行方式」，Notes 不能空（用户必须知道技能变三段流程了）")
+	}
+	joined := strings.Join(ch.Notes, "\n")
+	mustContain(t, "要说明流程变化", joined, "判类 → 按类执笔")
+	// 没有 reviewer.md 正文时要提示审稿那步会跳过（这就是它的意义）
+	mustContain(t, "没有审稿清单要提示", joined, "reviewer.md")
+}
+
+// Notes 的**双向**自证：第一个分类要说「三段流程」，第二个分类不该再说一遍。
+//
+// 只测一边会漏掉一个很隐蔽的写法错误：把 wasManual 的取值挪到写盘之后，
+// 于是「是不是第一个分类」永远算成 false —— 第一条测试仍然全绿（Notes 里
+// 还有别的话），用户却再也看不到那句最关键的流程变化提示。所以必须两个方向都钉。
+func TestCreateCategory_NotesOnlyOnFirstCategory(t *testing.T) {
+	s := newStoreForTest(t, t.TempDir())
+	const slug = "普通技能"
+	mustWrite(t, filepath.Join(s.SkillsDir(), slug, "system_prompt.md"), "你是普通写作助手")
+
+	first, err := s.CreateCategory(slug, "会议纪要", "", "")
+	if err != nil {
+		t.Fatalf("第一个分类建失败：%v", err)
+	}
+	if !strings.Contains(strings.Join(first.Notes, "\n"), "判类 → 按类执笔") {
+		t.Fatalf("第一个分类必须提示流程切换，实际 notes=%v", first.Notes)
+	}
+
+	second, err := s.CreateCategory(slug, "工作计划", "", "")
+	if err != nil {
+		t.Fatalf("第二个分类建失败：%v", err)
+	}
+	if strings.Contains(strings.Join(second.Notes, "\n"), "判类 → 按类执笔") {
+		t.Fatalf("第二个分类不该再提示流程切换（说一次就够，重复就是噪音）：%v", second.Notes)
+	}
+	// 序号要接在 01 后面（非手册技能建类时 listCategories 走的是同一个分支，
+	// 但这条路径以前从没跑过——目录是本次新建的）
+	readSkillFile(t, s, slug, "categories/02-工作计划.md")
+}
+
+// 非手册技能的 system_prompt.md 里没有分类路由表，这是**正常**的，
+// 不能报成 Warning（红字会让人以为建分类失败了，跑去手补一张表）。
+// 表缺了要落到 Notes 里照实说明：判类读的是 categories/ 下的文件，不受影响。
+func TestCreateCategory_NonManualSkillRouteTableIsNoteNotWarning(t *testing.T) {
+	s := newStoreForTest(t, t.TempDir())
+	const slug = "普通技能"
+	mustWrite(t, filepath.Join(s.SkillsDir(), slug, "system_prompt.md"), "你是普通写作助手")
+
+	ch, err := s.CreateCategory(slug, "会议纪要", "开会后的纪要", "三日内发布")
+	if err != nil {
+		t.Fatalf("建分类失败：%v", err)
+	}
+	if len(ch.Warnings) != 0 {
+		t.Fatalf("非手册技能没有路由表是正常的，不该报 Warning（用户会以为建失败了）：%v", ch.Warnings)
+	}
+	joined := strings.Join(ch.Notes, "\n")
+	mustContain(t, "路由表缺失要照实说明", joined, "判类")
+	mustContain(t, "要点明判类不受影响", joined, "不受影响")
+}
+
+// 手册技能那条路不能被改坏：有路由表时照旧追加一行，不要因为「也可能是非手册」
+// 就把 Warning 分支整个删掉——手册技能里找不到表头是真异常。
+func TestCreateCategory_ManualSkillStillWarnsWhenRouteTableMissing(t *testing.T) {
+	s := newStoreForTest(t, t.TempDir())
+	const slug = "残手册技能"
+	mustWrite(t, filepath.Join(s.SkillsDir(), slug, "categories", "_index.md"), "# 分类索引\n")
+	mustWrite(t, filepath.Join(s.SkillsDir(), slug, "categories", "01-新闻通稿.md"), "# 新闻通稿\n")
+	// system_prompt.md 里**没有**路由表：手册技能到这个状态就是异常。
+	mustWrite(t, filepath.Join(s.SkillsDir(), slug, "system_prompt.md"), "你是写作助手，没有路由表。")
+
+	ch, err := s.CreateCategory(slug, "会议纪要", "开会后的纪要", "三日内发布")
+	if err != nil {
+		t.Fatalf("建分类失败：%v", err)
+	}
+	found := false
+	for _, w := range ch.Warnings {
+		if strings.Contains(w, "system_prompt.md") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("手册技能缺路由表是真异常，必须报 Warning（不能降级成沉默的 Note）：%v", ch.Warnings)
+	}
+}
+
+// createCategoryNotes 是个纯函数（只看 wasManual/skillType/trigger/requirement），
+// 所以直接钉它的三件事：类型不符要说、空输入要提示、都齐了就闭嘴。
+func TestCreateCategoryNotes_Content(t *testing.T) {
+	s := &SkillStore{}
+	// ① 类型不是 write：分类在这个技能里一行都不会被读到，不说清楚就是
+	//    「我加了分类怎么没效果」——必须点到 skill_type 本身。
+	notes := s.createCategoryNotes("x", true, "docgen", "开会后写纪要", "三日内发布")
+	if len(notes) != 1 || !strings.Contains(notes[0], "docgen") {
+		t.Fatalf("非 write 类型要提示分类不生效且带上类型名，实际 %v", notes)
+	}
+	// ② 类型就是 write：不提类型，只提示空的触发场景/写作要求
+	notes = s.createCategoryNotes("x", true, "write", "", "")
+	if len(notes) != 2 {
+		t.Fatalf("空触发场景与空写作要求各要一条提示，实际 %v", notes)
+	}
+	for _, n := range notes {
+		if strings.Contains(n, "skill_type") || strings.Contains(n, "类型是") {
+			t.Fatalf("type=write 时不该提示类型问题：%v", n)
+		}
+	}
+	// ③ 都填齐了：一条都不该有（噪音会让用户以后不看提示）
+	if notes = s.createCategoryNotes("x", true, "write", "开会后写纪要", "三日内发布"); len(notes) != 0 {
+		t.Fatalf("信息齐备时不该有任何提示，实际 %v", notes)
+	}
+	// ④ skillTypeOf 读不到（库不可用）时返回空串，而不是拿错误去阻断建分类
+	if got := (&SkillStore{}).skillTypeOf("x"); got != "" {
+		t.Fatalf("库不可用时应返回空串，实际 %q", got)
+	}
+}
+
+// 非手册技能删/改一个**不存在**的分类：必须还是报错。
+// 放开的是「能不能建」，不是「操作可以静默失败」——找不到的分类照样是 bad input。
+func TestCategoryAdmin_NonManualSkillMissingCategoryStillErrors(t *testing.T) {
+	s := newStoreForTest(t, t.TempDir())
+	const slug = "普通技能"
+	mustWrite(t, filepath.Join(s.SkillsDir(), slug, "system_prompt.md"), "你是普通写作助手")
+	for _, tc := range []struct {
+		name string
+		run  func() error
+	}{
+		{"改名", func() error { _, err := s.RenameCategory(slug, "categories/01-x.md", "y"); return err }},
+		{"删除", func() error { _, err := s.DeleteCategory(slug, "categories/01-x.md", true); return err }},
+	} {
+		err := tc.run()
+		if err == nil {
+			t.Fatalf("%s 一个不存在的分类必须报错，不能静默成功", tc.name)
+		}
+		if !errors.Is(err, ErrCategoryBadInput) {
+			t.Fatalf("%s 的错误应是 bad input（400 给用户看），实际：%v", tc.name, err)
+		}
+	}
+}
+
+// 删掉最后一个分类：技能回到无分类状态（运行时退回一步直执笔），
+// 这件事必须说出来。不自动删 categories/ 目录，所以「有 categories/ 目录」
+// 这个信号会一直为真，用户容易误以为技能还在三段流程上。
+func TestDeleteCategory_LastOneExplainsFallbackToOneStep(t *testing.T) {
+	s, slug := catAdminFixture(t)
+	var last *CategoryChange
+	for _, f := range []string{"categories/01-新闻通稿.md", "categories/02-公司新闻通稿.md"} {
+		ch, err := s.DeleteCategory(slug, f, true)
+		if err != nil {
+			t.Fatalf("删 %s 失败：%v", f, err)
+		}
+		last = ch
+	}
+	joined := strings.Join(last.Notes, "\n")
+	mustContain(t, "删空了要点明退回一步流程", joined, "直接执笔")
+	// 还剩一个分类时不该有这句（否则就是「每次都喊，用户就不看了」）
+	if docs, _ := s.ReadCategoryDocs(slug); len(docs) != 0 {
+		t.Fatalf("前提不成立：应已删空，实际还剩 %d 类", len(docs))
 	}
 }
 

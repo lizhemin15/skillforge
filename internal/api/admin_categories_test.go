@@ -348,11 +348,18 @@ func TestDeleteCategoryAPI_EmptyNeedsNoForce(t *testing.T) {
 	}
 }
 
-// TestCategoryAPI_NonManualSkillRejected 普通技能（没有 categories/）不许加分类。
+// TestCategoryAPI_NonManualSkillFirstCategory 非手册技能也能加分类——2026-09 产品拍板放开。
 //
-// 加一个分类会把技能推进「写文章三段式」路线，而它的范文/模板都是按单段准备的，
-// 行为不可复现。要变赛道请走训练流程（重新拿手册训练），不是随手一点。
-func TestCategoryAPI_NonManualSkillRejected(t *testing.T) {
+// 这条用例以前断言的是反面（400 + 「不是手册模式」），现在整体反转。
+// 反转之后它守的东西也换了一件事：放开本身没什么可测的，真正会出事的是
+// 「放开的同时该付的两件事没付」——
+//   - 目录得凭空建出来（非手册技能根本没有 categories/），否则用户看到的是
+//     「写入分类文件失败：no such file or directory」，完全猜不到跟模式有关；
+//   - 后果得用 Notes 说清楚（这个技能从此走三段流程），而不是悄悄换掉它的运行方式。
+//
+// 顺带守「中性提示不能报成红色告警」：非手册技能缺 system_prompt.md 路由表是**正常**的，
+// 报成 Warnings 会让用户去瞎补一张表（判类读的是 categories/，补不补都不影响）。
+func TestCategoryAPI_NonManualSkillFirstCategory(t *testing.T) {
 	dir := t.TempDir()
 	st := newStoreForTest(t, dir)
 	adm := &Admin{store: st}
@@ -361,14 +368,48 @@ func TestCategoryAPI_NonManualSkillRejected(t *testing.T) {
 
 	code, body := postCategoryJSON(t, adm, http.MethodPost,
 		"/api/admin/skills/"+slug+"/categories", slug, map[string]string{"name": "新分类"})
-	if code != http.StatusBadRequest {
-		t.Fatalf("非手册技能加分类应 400，实际 %d（body=%s）", code, body)
+	if code != http.StatusOK {
+		t.Fatalf("非手册技能加分类应 200（已放开），实际 %d（body=%s）", code, body)
 	}
-	if !strings.Contains(body, "手册") {
-		t.Errorf("拒绝理由应说明「不是手册模式」，实际 body=%s", body)
+
+	// 分类文件必须真的落盘（放开的第一件事：目录凭空建出来）。
+	rel := findAPICatFile(t, dir, slug, "新分类")
+	if got := readAPIFile(t, dir, slug, rel); !strings.Contains(got, "# 新分类") {
+		t.Errorf("分类文件没写出标题：\n%s", got)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "skills", slug, "categories")); !os.IsNotExist(err) {
-		t.Errorf("被拒的新增竟然建了 categories/ 目录（err=%v）", err)
+
+	// 索引文件也必须被造出来。这是 cascadeFileOrCreate 存在的唯一理由：
+	// 用 cascadeFile 的话「文件不存在」= 静默跳过，分类建好了、索引却没出现，
+	// 左树里少一项「分类索引」，而且**全程不报错**。
+	idx := readAPIFile(t, dir, slug, "categories/_index.md")
+	if !strings.Contains(idx, "| 分类 | 触发场景 |") {
+		t.Errorf("categories/_index.md 没有表头（索引没被造出来）：\n%s", idx)
+	}
+	if !strings.Contains(idx, "新分类") {
+		t.Errorf("categories/_index.md 里没有新分类的路由行：\n%s", idx)
+	}
+
+	// 注意响应是 {"ok":true,"change":{…}} 包了一层——直接解顶层拿到的
+	// notes 永远是空数组（这份用例第一版就踩了这个坑：断言「没有 notes」
+	// 会通过，断言「有三段」才红，所以坑被抓住了）。
+	var resp struct {
+		Change struct {
+			Notes    []string `json:"notes"`
+			Warnings []string `json:"warnings"`
+		} `json:"change"`
+	}
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("响应不是 JSON：%v（%s）", err, body)
+	}
+	ch := resp.Change
+	// 「三种流程切换」必须出现在 Notes 里：前端照它渲染说明，用户才知道
+	// 从这里开始这个技能不再是一步直执笔。
+	joined := strings.Join(ch.Notes, "\n")
+	if !strings.Contains(joined, "三段") {
+		t.Errorf("notes 里没说「运行时会切成三段流程」（放开=必须如实告知后果）：%+v", ch.Notes)
+	}
+	if len(ch.Warnings) != 0 {
+		t.Errorf("非手册技能没有路由表是正常情况，不该报红色告警：%+v", ch.Warnings)
 	}
 }
 

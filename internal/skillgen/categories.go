@@ -474,12 +474,10 @@ func WriteCategories(dir string, st *Structure, examples map[string][]string) ([
 	var written []string
 
 	// ---- categories/_index.md：运行时的意图路由表 ----
+	// 开头统一用 store.CategoryIndexHeader：管理端手加分类时也要凭空造出这个文件
+	// （非手册技能的第一次加类），两处各写一份迟早会分叉。
 	var idx strings.Builder
-	idx.WriteString("# 分类索引\n\n")
-	idx.WriteString("本目录是写作手册的分类体系与范文索引。运行时先按「触发场景」把需求归到某一类，\n")
-	idx.WriteString("再读该类的要求与范文起草。下表可供人工编辑维护。\n\n")
-	idx.WriteString("| 分类 | 触发场景 |\n")
-	idx.WriteString("| --- | --- |\n")
+	idx.WriteString(store.CategoryIndexHeader)
 	for _, c := range st.Categories {
 		idx.WriteString("| " + mdCell(c.Name) + " | " + mdCell(c.Trigger) + " |\n")
 	}

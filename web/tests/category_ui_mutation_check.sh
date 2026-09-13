@@ -63,15 +63,20 @@ PY
 echo
 echo "注入自证（每条都必须变红）"
 
-inject_case '新增分类入口不看 manual_mode（非手册技能也摆按钮）' \
-  "const titleOps = (k === 'category' && manualMode)" \
+inject_case '前端又把新增入口门禁回去（非手册技能看不到按钮）' \
   "const titleOps = (k === 'category')" \
-  '非手册技能：不出现「+ 新增分类」'
+  "const titleOps = (k === 'category' && false)" \
+  '非手册技能也有「+ 新增分类」入口'
 
 inject_case '前端靠分类行数猜手册模式（删空后入口消失）' \
-  "const titleOps = (k === 'category' && manualMode)" \
+  "const titleOps = (k === 'category')" \
   "const titleOps = (k === 'category' && items.length > 0)" \
   '分类被删空后「+ 新增分类」仍在'
+
+inject_case '空的分类组被整组跳过（入口无处可挂）' \
+  "category: '暂无分类。分类由训练从手册抽出，各技能不一样；要加手册里没有的，点上面的「+ 新增分类」（categories/_index.md 是分类路由表）'," \
+  "category: ''," \
+  '空分类组仍然渲染'
 
 inject_case '路由表 _index.md 也发改名/删除入口' \
   "const isCategory = k === 'category' && !!f.category_name;" \

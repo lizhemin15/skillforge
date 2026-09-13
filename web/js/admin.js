@@ -378,12 +378,14 @@
   // category 进这张表是**有意的**：它是本轮核心新功能，用户是专门来找「分类要求」的，
   // 而分类由训练流程抽取后才有文件 —— 如果空着就藏起来，用户看到的就是「这功能是不是没上线」，
   // 正是这次反馈的「左侧分类各不一样、看不懂什么逻辑」的根因。空组 + 一句说明比静默消失清楚。
+  // 文案把两件事说清楚：(1) 分类是抽出来的、每个技能天生不一样（不是数据错乱）；
+  // (2) 想要手册里没有的分类，点本组标题右侧那颗按钮自己加。
   // reviewer / fidelity 不放：它们是流程/机器产物，用户在这两个分组里没有可做的动作，
   // 空着显示只会占屏（内容生成后分组自然出现）。
   const KIND_EMPTY_HINT = {
     templatefile: '暂无模板文件，点上方「上传模板」加一个（.docx/.xlsx，同名重传即替换）',
     example: '暂无，下方添加',
-    category: '暂无分类要求：训练抽取各分类后会在此生成（categories/_index.md 为分类路由表）',
+    category: '暂无分类。分类由训练从手册抽出，各技能不一样；要加手册里没有的，点上面的「+ 新增分类」（categories/_index.md 是分类路由表）',
   };
   let curSkillSlug = null;
   let curEditPath = null; // last file open in the IDE editor (persists across reloads)
@@ -411,10 +413,11 @@
       const j = await r.json();
       if (!r.ok) { body.innerHTML = `<p class="msg err">${esc(j.error || '加载失败')}</p>`; return; }
       const files = j.files || [];
-      // manual_mode 由后端下发（= 技能目录里有没有 categories/），前端不自己推断：
-      // 前端要是靠「有没有分类行」来猜，分类被删空时就会误判成非手册技能，
-      // 于是把「+ 新增分类」藏掉 —— 而那正是最需要它的时刻。
-      renderSkillFiles(body, files, !!j.manual_mode);
+      // 注：后端仍然下发 manual_mode（= 技能目录里有没有 categories/），但前端**不再拿它
+      // 当门禁**——分类的新增/改名/删除已对非手册技能放开（后端会把 categories/ 目录、
+      // _index.md 路由表一起建出来）。字段留着是因为「这个技能本来走哪条运行时路线」
+      // 仍是回执文案与后端提示要用的信息，不是死字段。
+      renderSkillFiles(body, files);
       // auto-open: prefer last edited file (still present), else system_prompt.md, else first editable
       const keep = curEditPath ? files.find(f => f.path === curEditPath && f.editable) : null;
       const primary = keep
@@ -424,7 +427,7 @@
     } catch (e) { body.innerHTML = '<p class="msg err">网络错误</p>'; }
   }
 
-  function renderSkillFiles(body, files, manualMode) {
+  function renderSkillFiles(body, files) {
     // 分组显示顺序。**必须与后端 store.orderOf() 逐项一致**，否则同一个技能目录
     // 在接口里是一种顺序、在树上又是另一种，用户会以为「两处内容不一样」。
     // 后端 orderOf：prompt=1, template=2, templatefile=3, requirement=4, category=5,
@@ -448,15 +451,16 @@
     for (const k of groups) {
       const items = files.filter(f => f.kind === k);
       if (!items.length && !KIND_EMPTY_HINT[k]) continue;
-      // 「分类要求」组的标题右侧挂「+ 新增分类」。只在手册模式技能上出现：
-      // 非手册技能没有 categories/ 目录，后端 create 只会回「该技能不是手册模式」（400）——
-      // 摆出来就是承诺一个必然失败的操作。判据用后端下发的 manual_mode，
-      // 不在前端数分类行数（见 loadSkillFiles 的注释）。
+      // 「分类要求」组的标题右侧挂「+ 新增分类」。**不再按手册模式门禁**（2026-09 放开）：
+      // 早先非手册技能没有 categories/ 目录、后端 create 只会回 400「不是手册模式」，
+      // 所以把这颗按钮藏起来；现在后端允许凭空建分类（连 categories/ 目录一起建），
+      // 门禁消失。留着门禁的后果是：非手册技能永远看不到这个入口，而它恰恰是
+      // 「手册里没有我们常写的那类稿子」时**唯一**的自助路径 —— 用户只能去 SSH 改磁盘。
       // 分类**不是固定枚举**：它是训练期从手册里抽出来的章节骨架，所以两个技能的
-      // 分类清单本来就不一样（一个手册 12 类、另一个 5 类）。这也是「左侧分类各不一样」的
-      // 正常原因，不是数据错乱。要加手册里没有的类别，用这个按钮。
-      const titleOps = (k === 'category' && manualMode)
-        ? ` <button class="link-btn" title="新增一个手册里没有的分类" onclick="window.newCategoryView()">+ 新增分类</button>`
+      // 分类清单本来就不一样（一个手册 12 类、另一个 5 类）。这正是「左侧分类各不一样」的
+      // 正常原因，不是数据错乱；KIND_EMPTY_HINT[category] 的空组文案负责把这件事讲出来。
+      const titleOps = (k === 'category')
+        ? ` <button class="link-btn" title="新增一个分类（手册里没有的也可以加；非手册技能会把分类体系一起建起来）" onclick="window.newCategoryView()">+ 新增分类</button>`
         : '';
       tree += `<div class="kb-group">
         <div class="kb-group-title">${KIND_ICON[k]} ${KIND_LABEL[k]} <span class="dim" style="font-weight:400">(${items.length})</span>${titleOps}</div>

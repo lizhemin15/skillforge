@@ -145,37 +145,47 @@ const CAT_ROWS = [
 const INDEX_ROW = { path: 'categories/_index.md', name: '_index.md', kind: 'category', size: 90, editable: true };
 
 // box = boot() 的返回值（不是 box.api —— 传错就是 box.api.api === undefined）
-function render(box, files, manualMode) {
+// 第三个参数（manualMode）**已删**：renderSkillFiles 不再接它。留着参数会让测试
+// 以为自己验的是「门禁」，而实际函数根本不读 —— 断言就成了自说自话。
+function render(box, files) {
   const body = { innerHTML: '' };
-  box.api.renderSkillFiles(body, files, manualMode);
+  box.api.renderSkillFiles(body, files);
   return body.innerHTML;
 }
 
 // ---------- A. 「+ 新增分类」入口 ----------
 console.log('A. 「+ 新增分类」入口的门禁');
 
-const manualHtml = render(boot(), CAT_ROWS, true);
+const manualHtml = render(boot(), CAT_ROWS);
 check('手册模式技能：分类分组标题上有「+ 新增分类」',
   /新增分类[\s\S]*?onclick="window\.newCategoryView\(\)"/.test(manualHtml) ||
   /onclick="window\.newCategoryView\(\)"[^>]*>\+ 新增分类/.test(manualHtml),
   '没有这个入口，手册里没写的类别就永远加不进来（只能 SSH 改磁盘）');
 
-const nonManualHtml = render(boot(), [{ path: 'system_prompt.md', name: 'system_prompt.md', kind: 'prompt', size: 1, editable: true }], false);
-check('非手册技能：不出现「+ 新增分类」',
-  !nonManualHtml.includes('newCategoryView'),
-  '非手册技能没有 categories/ 目录，后端 create 只会回 400「不是手册模式」——' +
-  '摆出这个按钮＝承诺一个必然失败的操作');
+// 非手册技能（没有 categories/ 目录、树上一行分类都没有）：**也要有这个入口**。
+// 后端已放开非手册技能建分类（会连 categories/ 目录与 _index.md 路由表一起建出来），
+// 所以前端藏按钮＝藏掉唯一自助路径。反向的旧契约（「非手册技能不出现这个按钮」）
+// 在 2026-09 被产品拍板推翻，本断言就是那条契约的替代物。
+const nonManualHtml = render(boot(), [{ path: 'system_prompt.md', name: 'system_prompt.md', kind: 'prompt', size: 1, editable: true }]);
+check('★ 非手册技能也有「+ 新增分类」入口（后端已放开，前端不许再门禁）',
+  nonManualHtml.includes('newCategoryView'),
+  '藏起来＝「手册里没有的那类稿子」永远加不进来，用户只能 SSH 改磁盘');
 
-// 最需要这个按钮的时刻：categories/ 目录还在（后端 manual_mode=true），但树上一行分类
-// 都没有了 —— 连路由表 _index.md 都没了。这在上传来的技能里是真会发生的（用户手工删过、
-// 或某次删除把 _index.md 一并带走），目录还在，所以后端仍然算手册模式。
-// 若前端靠「有没有分类行」猜手册模式，这里就会把入口藏掉，用户再也加不回分类。
+// 最需要这个按钮的时刻：categories/ 目录还在，但树上一行分类都没有了 —— 连路由表
+// _index.md 都没了。这在上传来的技能里是真会发生的（用户手工删过、或某次删除把
+// _index.md 一并带走）。若前端靠「有没有分类行」猜手册模式，这里就会把入口藏掉。
 // 注意 fixture 里**不能**留 _index.md：留了的话 kind==='category' 的行数就不是 0，
-// 「靠行数猜」和「看 manual_mode」在数据上恰好同解，这条断言就抓不住那个故障了。
-const emptiedHtml = render(boot(), [{ path: 'system_prompt.md', name: 'system_prompt.md', kind: 'prompt', size: 1, editable: true }], true);
-check('★ 分类被删空后「+ 新增分类」仍在（判据是后端的 manual_mode，不是前端的行数）',
+// 「靠行数猜」和「有条件渲染」在数据上恰好同解，这条断言就抓不住那个故障了。
+const emptiedHtml = render(boot(), [{ path: 'system_prompt.md', name: 'system_prompt.md', kind: 'prompt', size: 1, editable: true }]);
+check('★ 分类被删空后「+ 新增分类」仍在（不能靠数分类行推断）',
   emptiedHtml.includes('newCategoryView'),
-  '靠数分类行来推断手册模式 → 删空后入口消失，用户再也加不回分类');
+  '靠数分类行来推断 → 删空后入口消失，用户再也加不回分类');
+
+// 空分类组必须**渲染出来**（否则按钮无处可挂）：KIND_EMPTY_HINT 里没有 category 时
+// `if (!items.length && !KIND_EMPTY_HINT[k]) continue;` 会把整组跳过。
+check('★ 空分类组仍然渲染，且提示里点名了新增入口',
+  /暂无分类/.test(nonManualHtml) && /\+ 新增分类/.test(nonManualHtml),
+  '整组被 skip 掉的话，上面那条「有入口」的断言会红得莫名其妙（实际是组没渲染）');
 
 // ---------- B. 分类行的「改名 / 删除」归属性 ----------
 console.log('B. 分类行的「改名 / 删除」');

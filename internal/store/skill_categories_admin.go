@@ -68,10 +68,6 @@ func catBadInput(format string, a ...any) error {
 // ErrCategoryInUse 表示该分类下还有范文，删除需要 force 明确确认。
 var ErrCategoryInUse = errors.New("该分类下还有范文")
 
-// ErrNotManualSkill 表示该技能不是手册模式（没有 categories/），加分类属于
-// 「把技能切成另一条运行时路线」，必须由训练流程而不是随手一点来完成。
-var ErrNotManualSkill = errors.New("该技能不是手册模式（没有 categories/ 目录）")
-
 // CategoryChange 是一次分类结构变更的落点清单，直接回给前端展示
 // （让用户看到「我改个名到底动了哪些文件」，否则级联就是黑盒）。
 type CategoryChange struct {
@@ -85,6 +81,9 @@ type CategoryChange struct {
 	FilesTouched  []string `json:"files_touched"` // 内容被改写的文件
 	FilesDeleted  []string `json:"files_deleted"`
 	Warnings      []string `json:"warnings,omitempty"` // 「本该在却没在」的情况，不静默
+	// Notes 是「操作成功了，但你应该知道的事」——与 Warnings 的区别在于
+	// **没有失败也没有异常**，纯属因果说明。前端要用中性样式渲染，不能用红色。
+	Notes []string `json:"notes,omitempty"`
 }
 
 // categoryEntry 是 categories/ 下一个分类文件的三件事：
@@ -649,6 +648,31 @@ func (s *SkillStore) cascadeFile(slug, rel string, fn func(string) (string, int)
 	return true, hits, nil
 }
 
+// cascadeFileOrCreate 与 cascadeFile 相同，但当文件**不存在**时先用 initial 建出来。
+//
+// 为什么要单独一个：cascadeFile 对不存在的文件返回「跳过」(false, 0, nil)——
+// 这对 meta.json、requirement.md 这些可选落点是对的，但对 categories/_index.md
+// 是错的：它是我们自己生成的索引文件，用户第一次手加分类时本来就不存在，
+// 静默跳过会让技能落在「有分类文件、没有索引」的半套状态里，而且**不报错**。
+// 换到这里就是把「不存在」当成「空文件」来对待。
+//
+// 写盘前建父目录：非手册技能连 categories/ 目录都没有。
+func (s *SkillStore) cascadeFileOrCreate(slug, rel, initial string, fn func(string) (string, int)) (bool, int, error) {
+	abs, err := s.absFile(slug, rel)
+	if err != nil {
+		return false, 0, err
+	}
+	if _, statErr := os.Stat(abs); errors.Is(statErr, fs.ErrNotExist) {
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			return false, 0, fmt.Errorf("创建 %s 所在目录失败: %w", rel, err)
+		}
+		if err := os.WriteFile(abs, []byte(initial), 0o644); err != nil {
+			return false, 0, fmt.Errorf("创建 %s 失败: %w", rel, err)
+		}
+	}
+	return s.cascadeFile(slug, rel, fn)
+}
+
 // cascadeRenameMeta 改 meta.json 里的 manual.categories 清单。
 // 用 JSON 解析而不是文本替换：清单项与字段名可能同名，文本替换会改坏字段。
 func (s *SkillStore) cascadeRenameMeta(slug string, names []string, newName string) (bool, error) {
@@ -711,26 +735,43 @@ func routeRow(name, trigger string) string {
 		MdCellText(firstNonEmptyStr(strings.TrimSpace(trigger), "（待补充：写明什么样的需求落到这一类）")) + " |"
 }
 
+// CategoryIndexHeader 是 categories/_index.md 的固定开头（标题 + 说明 + 表头）。
+//
+// **唯一来源**：训练期写分类（skillgen.WriteCategories）与管理端手加分类
+// （addRouteRows 首次建索引）都拼这一段。放在 store 包而不是 skillgen：
+// skillgen 已经 import store（反向依赖会成环），所以出口只能在 store 这一侧。
+// 两处一旦分叉，用户会看到两种「分类索引」——一个来自训练期、一个来自手动加类，
+// 那种不一致极难被发现（两边都能用，只是长得不一样）。
+const CategoryIndexHeader = "# 分类索引\n\n" +
+	"本目录是写作手册的分类体系与范文索引。运行时先按「触发场景」把需求归到某一类，\n" +
+	"再读该类的要求与范文起草。下表可供人工编辑维护。\n\n" +
+	"| 分类 | 触发场景 |\n" +
+	"| --- | --- |\n"
+
 // addRouteRows 往 _index.md 与 system_prompt.md 两张路由表各追加一行。
 //
 // 两张表缺一不可：_index.md 给人看（用户在左树里点开就能核对路由），
 // system_prompt.md 给模型看（技能被拷走独立运行时，只有 prompt 里的表还在）。
-func (s *SkillStore) addRouteRows(slug, name, trigger string, ch *CategoryChange) {
+func (s *SkillStore) addRouteRows(slug, name, trigger string, ch *CategoryChange, wasManual bool) {
 	row := routeRow(name, trigger)
 
-	// categories/_index.md：这是我们自己生成的索引，缺表就补表头
-	touched, _, err := s.cascadeFile(slug, "categories/_index.md", func(c string) (string, int) {
-		if out, ok := appendRouteRow(c, row); ok {
-			return out, 1
-		}
-		body := strings.TrimRight(c, "\n")
-		if body == "" {
-			body = "# 分类索引\n\n| 分类 | 触发场景 |\n| --- | --- |"
-		} else {
-			body += "\n\n| 分类 | 触发场景 |\n| --- | --- |"
-		}
-		return body + "\n" + row + "\n", 1
-	})
+	// categories/_index.md：这是我们自己生成的索引，缺文件就按同样的格式造一份，
+	// 缺表头就补表头。**必须能凭空造**——非手册技能（第一次手加分类）本来就没有
+	// 这个文件，而 cascadeFile 对不存在的文件是「静默跳过」，于是分类建好了、
+	// 索引文件却没出现：左树里少了「分类索引」这一项，用户以后想核对路由没有入口。
+	touched, _, err := s.cascadeFileOrCreate(slug, "categories/_index.md", CategoryIndexHeader,
+		func(c string) (string, int) {
+			if out, ok := appendRouteRow(c, row); ok {
+				return out, 1
+			}
+			body := strings.TrimRight(c, "\n")
+			if body == "" {
+				body = strings.TrimRight(CategoryIndexHeader, "\n")
+			} else {
+				body += "\n\n| 分类 | 触发场景 |\n| --- | --- |"
+			}
+			return body + "\n" + row + "\n", 1
+		})
 	if err != nil {
 		ch.Warnings = append(ch.Warnings, "categories/_index.md 未更新: "+err.Error())
 	} else if touched {
@@ -744,14 +785,26 @@ func (s *SkillStore) addRouteRows(slug, name, trigger string, ch *CategoryChange
 		}
 		return c, 0
 	})
-	if err != nil {
+	switch {
+	case err != nil:
 		ch.Warnings = append(ch.Warnings, "system_prompt.md 未更新: "+err.Error())
-	} else if touched {
+	case touched:
 		ch.FilesTouched = append(ch.FilesTouched, "system_prompt.md")
-	} else {
-		ch.Warnings = append(ch.Warnings,
-			"system_prompt.md 里没有找到分类路由表（表头应为「| 分类 | 触发场景 |」），未追加分类行——"+
-				"运行时模型可能判不出这一类，请手工补一行")
+	default:
+		// 没找到表头。这有两种完全不同的成因，不该用同一句话打发：
+		//   - 手册技能本该有这张表 → 真异常，是 Warning（红）；
+		//   - 非手册技能（手加分类）本来就没这张表 → 正常，是 Note（中性）。
+		// 运行时判类读的是 categories/ 下的分类文件（engine.RouteCategory 的入参就是
+		// 这些文件解析出的 Trigger），所以这两种情况下判类都不受影响——照实说清楚，
+		// 用户才不会因为一句「模型可能判不出」去瞎补表。
+		msg := "system_prompt.md 里没有分类路由表（表头应为「| 分类 | 触发场景 |」），未追加分类行。" +
+			"运行时判类读的是 categories/ 下的分类文件，判类不受影响；" +
+			"但 system_prompt.md 里那份清单会少这一类，要给模型看完整清单就手工补一行"
+		if wasManual {
+			ch.Warnings = append(ch.Warnings, msg)
+		} else {
+			ch.Notes = append(ch.Notes, msg)
+		}
 	}
 }
 
@@ -791,16 +844,31 @@ func renameCascadeTargets(catFile string) []string {
 
 // ----- 对外：新增 / 改名 / 删除 / 加范文 -----
 
-// CreateCategory 在手册模式技能下新增一个分类（文件 + 范文目录 + 两张路由表）。
+// CreateCategory 新增一个分类（文件 + 范文目录 + 两张路由表）。
+
+// 非手册技能（没有 categories/ 目录）也允许建分类——这是产品拍板放开的（2026-09）。
+//
+// 早先这里挂着 ErrNotManualSkill 硬门，理由是「加分类 = 把技能切到另一条运行时路线，
+// 该由训练流程决定」。真实使用里这个理由站不住：
+//   - 训练流程是**抽**分类（手册有什么章节就抽什么），它回答不了「手册里没有、
+//     但我们单位常写的那类稿子怎么办」——而这恰恰是用户要手加分类的场景；
+//   - 拒掉之后用户没有任何替代路径，只能去手改磁盘文件，比放开更危险。
+//
+// 放开的同时必须付两件事，否则就是「不动声色地换掉技能的运行方式」：
+//  1. 目录可能不存在 → 写文件前先建好（os.MkdirAll），并补上 categories/_index.md
+//     （addRouteRows 负责，前提是目录已经在了）；
+//  2. 后果写进 CategoryChange.Notes，让用户看见「从这里开始这个技能走三段流程了」。
+//     硬门换成可见提示，比留一个拒绝更诚实。
 func (s *SkillStore) CreateCategory(slug, name, trigger, requirement string) (*CategoryChange, error) {
 	if err := validateCategoryName(name); err != nil {
 		return nil, err
 	}
 	name = strings.TrimSpace(name)
-	if !s.HasCategories(slug) {
-		return nil, fmt.Errorf("%w；分类结构由训练期从写作手册抽取生成，"+
-			"技能要按分类写作请先用写作手册训练", ErrNotManualSkill)
-	}
+	// 建分类之前的模式状态要**先记下来**：写盘之后 HasCategories 就恒为 true 了，
+	// 之后再判断「这是不是第一个分类」永远得到 false，Notes 会静默消失。
+	// 这是个典型的「顺序错了就没提示、而且看不出来」的坑。
+	wasManual := s.HasCategories(slug)
+	skillType := s.skillTypeOf(slug)
 	list, err := s.listCategories(slug)
 	if err != nil {
 		return nil, err
@@ -823,6 +891,12 @@ func (s *SkillStore) CreateCategory(slug, name, trigger, requirement string) (*C
 	if _, err := os.Stat(abs); err == nil {
 		return nil, catBadInput("文件已存在：%s", rel)
 	}
+	// 非手册技能没有 categories/ 目录：不先建目录，os.WriteFile 会以
+	// 「no such file or directory」失败——用户看到的是「写入分类文件失败」，
+	// 完全猜不到原因是「这个技能不是手册模式」。所以目录在这里补。
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		return nil, fmt.Errorf("创建分类目录失败: %w", err)
+	}
 	if err := os.WriteFile(abs, []byte(buildCategorySkeleton(name, trigger, requirement)), 0o644); err != nil {
 		return nil, fmt.Errorf("写入分类文件失败: %w", err)
 	}
@@ -835,8 +909,56 @@ func (s *SkillStore) CreateCategory(slug, name, trigger, requirement string) (*C
 		Action: "create", Name: name, CategoryFile: rel, ExampleDir: exampleRel,
 		FilesTouched: []string{rel},
 	}
-	s.addRouteRows(slug, name, trigger, ch)
+	s.addRouteRows(slug, name, trigger, ch, wasManual)
+	ch.Notes = append(ch.Notes, s.createCategoryNotes(slug, wasManual, skillType, trigger, requirement)...)
 	return ch, nil
+}
+
+// createCategoryNotes 生成新增分类后的中性提示（见 CategoryChange.Notes）。
+//
+// 只在**真的需要提醒**的时候吐东西，宁可少说：
+// 手册技能的常规加类不该弹一堆说明，那是噪音，用户下次就不看了。
+func (s *SkillStore) createCategoryNotes(slug string, wasManual bool, skillType, trigger, requirement string) []string {
+	var notes []string
+	if !wasManual {
+		// 这是「第一个分类」，技能从通用流程切到三段流程，必须说。
+		note := "这个技能此前没有分类（不是手册模式），现在有了第一个分类。" +
+			"运行时会从「直接执笔」切成「判类 → 按类执笔 → 审稿」三段；" +
+			"分类靠「触发场景」判，所以下面的触发场景建议补清楚。"
+		if rev, err := s.ReadReviewer(slug); err == nil && strings.TrimSpace(rev) == "" {
+			note += "这个技能没有 reviewer.md（审稿清单），审稿那一步会跳过；" +
+				"要审稿标准就往 reviewer.md 里写。"
+		}
+		notes = append(notes, note)
+	}
+	// 类型不符要说：分类只在写作流程里被读，一个 type=template/docgen 的技能
+	// 加了分类，对话时一行都不会用到——不说清楚就是「我加了分类怎么没效果」。
+	if skillType != "" && skillType != "write" {
+		notes = append(notes, fmt.Sprintf(
+			"注意：这个技能的类型是 %s，不是「写作」（write）。分类只在写作流程里生效，"+
+				"现在建的分类不会影响这个技能的对话结果。", skillType))
+	}
+	if strings.TrimSpace(trigger) == "" {
+		notes = append(notes, "触发场景留空：运行时判类主要靠它，留空就只能靠分类名猜，建议补一句「什么需求落到这一类」。")
+	}
+	if strings.TrimSpace(requirement) == "" {
+		notes = append(notes, "写作要求留空：这类稿子暂时只吃到分类名，建议补上这类文章的硬约束。")
+	}
+	return notes
+}
+
+// skillTypeOf 尽力读出技能类型；读不到（库不可用 / 技能不在库里）返回空串，
+// 调用方据此**只跳过「类型不符」那条提示**，不阻断建分类本身。
+// 提示缺一条是可以接受的降级；因为读不到类型就不让用户建分类，是拿用户当库的替罪羊。
+func (s *SkillStore) skillTypeOf(slug string) string {
+	if s.db == nil {
+		return ""
+	}
+	sk, err := s.Get(slug)
+	if err != nil || sk == nil {
+		return ""
+	}
+	return strings.TrimSpace(sk.SkillType)
 }
 
 // RenameCategory 改名并级联到 6 个落点（详见文件头注释）。
@@ -999,6 +1121,20 @@ func (s *SkillStore) DeleteCategory(slug, file string, force bool) (*CategoryCha
 		ch.Warnings = append(ch.Warnings, "meta.json 未更新: "+err.Error())
 	} else if touched {
 		ch.FilesTouched = append(ch.FilesTouched, "meta.json")
+	}
+	// 6) 删空了要说清楚：这是**状态切换**，不是「少了一个分类」而已。
+	//
+	// 运行时的判据是「有没有解析出分类文件」（LoadWritePack 空 → 退回一步直执笔），
+	// 所以删到 0 个分类时技能确实回到了无分类状态，和从没建过分类等价。
+	// 但磁盘上的 categories/ 目录与 _index.md 还在（_index.md 是目录里的常驻文件，
+	// 删不掉），于是「有没有 categories/ 目录」这个信号会**永远为真**：
+	// 前端据此说「这个技能的分类来自手册章节」就变成了假话。
+	// 这里不自动删目录（删 _index.md 是可逆性更差的动作，收益也仅仅是让一句提示更准），
+	// 只把这个状态说明白，让用户知道技能已经回到通用流程。
+	if rest, err := s.listCategories(slug); err == nil && len(rest) == 0 {
+		ch.Notes = append(ch.Notes, "这是最后一个分类。技能现在没有分类了，"+
+			"运行时会退回「直接执笔」一步流程（和从没建过分类的技能一样）；"+
+			"categories/ 目录和 _index.md 保留着，方便你随时再加回来")
 	}
 	return ch, nil
 }
