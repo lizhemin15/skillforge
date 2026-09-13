@@ -24,6 +24,16 @@
 #   glibc 2.28）：产物在 RHEL/CentOS 8+、Debian 10+、Ubuntu 18.10+ 上都能跑。
 #   verify 阶段就在 almalinux:8（glibc 2.28，正好是基线）里跑，把这条要求钉死。
 #
+# 坑 3：manylinux 自带的 /opt/python/* 不能用 PyInstaller（这个最阴）。pypa 编的 CPython
+#   是 **--enable-shared=no**（实测 cp311-cp311 的 Py_ENABLE_SHARED=0），而 PyInstaller 6
+#   在 Linux 上必须链 libpython，直接报：
+#     "Python was built without a shared library, which is required by PyInstaller."
+#   注意别被 /usr/lib64/libpython3.11.so.1.0 骗了：AlmaLinux 8 的 appstream python3.11
+#   （/usr/bin/python3.11，3.11.13）**是** shared（Py_ENABLE_SHARED=1），跟 pypa 那个不同物。
+#   而且 manylinux 镜像把 /opt/python/cp311-cp311/bin 放在 PATH 前面，`python3.11` 会解析到
+#   那个坏的 → 必须**写绝对路径 /usr/bin/python3.11**，不能用 PATH 上的名字。
+#   好处：appstream 的 python3.11 也是 glibc 2.28 基线，坑 2 的要求一点没破。
+#
 # 目标（stage）：
 #   build    → 产物在 /build/dist/ocrd
 #   verify   → 在基线镜像里跑真 OCR 一轮，不过就构建失败
@@ -31,9 +41,8 @@
 ARG MANYLINUX_IMAGE=quay.io/pypa/manylinux_2_28_x86_64
 FROM ${MANYLINUX_IMAGE} AS build
 
-# manylinux 镜像里每个 Python 版本装在 /opt/python/<abi>/ 下，系统 python3 是 3.6（太老）
-ARG PYABI=cp311-cp311
-ENV PY=/opt/python/${PYABI}/bin/python \
+# 用发行版 python3.11（shared），不用 manylinux 的 /opt/python/*（见坑 3）。
+ENV PY=/usr/bin/python3.11 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1
@@ -44,13 +53,13 @@ ARG OPENCV=opencv-python-headless==5.0.0.93
 ARG PYI=pyinstaller==6.22.2
 
 # binutils 提供 objdump（PyInstaller 分析 ELF 依赖时必需，缺了直接报错退出）
-RUN yum install -y -q binutils patchelf \
- && yum clean all \
+RUN dnf install -y -q binutils patchelf python3.11 python3.11-pip \
+ && dnf clean all \
+ && $PY -m pip install -q -U pip setuptools wheel \
  && $PY -m pip install -q "$RAPIDOCR" "$PYMUPDF" "$PYI" \
  && $PY -m pip uninstall -y -q opencv-python opencv-contrib-python \
  && $PY -m pip install -q --force-reinstall --no-deps "$OPENCV" \
- && $PY -c "import cv2, sys; print('cv2', cv2.__version__, sys.version)" \
- && ls -l /opt/python/${PYABI}/bin/pyinstaller
+ && $PY -c "import cv2, sysconfig, sys; print('cv2', cv2.__version__, sys.version.split()[0], 'shared', sysconfig.get_config_var('Py_ENABLE_SHARED'))"
 
 WORKDIR /build
 COPY ocrd.py make_fixture.py ./
@@ -59,7 +68,7 @@ COPY ocrd.py make_fixture.py ./
 # 目标机不需要 Python、不需要模型文件、不需要联网下模型。
 RUN RC="$($PY -c 'import rapidocr_onnxruntime,os;print(os.path.dirname(rapidocr_onnxruntime.__file__))')" \
  && echo "rapidocr at $RC" \
- && /opt/python/${PYABI}/bin/pyinstaller -F -n ocrd \
+ && $PY -m PyInstaller -F -n ocrd \
       --add-data "$RC:rapidocr_onnxruntime" \
       --collect-submodules rapidocr_onnxruntime \
       --exclude-module tkinter \

@@ -86,6 +86,18 @@ INJECTIONS = [
     ('13) 勾选层挪进 #chips（被 renderChips 清掉）',
      HTML, '      <div class="ch-sklayer" id="sk-layer" hidden>',
      '      <div id="chips" aria-live="polite"></div>\n      <div class="ch-sklayer-tmp" id="sk-layer" hidden>'),
+
+    # —— 本轮新契约 C：点外关闭必须活到"用户真的点了别处" ——
+    # 退回冒泡阶段 —— 线上实测过的真故障：点「选择技能 ▾」时 openSkLayer() 里
+    # renderChips() 重建整行，被点的那颗 button 当场变游离节点，冒泡到 document 时
+    # chipsWrap.contains(t) 全 false（白名单源码里明明写着），层刚打开就被自己关掉。
+    # ★ 这条静态断言抓不住，只有真 DOM（chat_layer_e2e.py）抓得住 —— 它同时是
+    #   "读源码的断言不够用"的活证据，别删。
+    ('14) 点外关闭退回冒泡阶段（层自己关掉自己）',
+     JS, "      closeSkLayer();\n    }, true);", "      closeSkLayer();\n    });"),
+    # 删掉游离节点兜底：重渲染留下的旧按钮 isConnected=false，没这行会被误判成"点层外"。
+    ('15) 删掉游离节点兜底（isConnected 放行）',
+     JS, "      if (t && t.isConnected === false) return;\n", ""),
 ]
 
 bad = 0

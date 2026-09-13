@@ -391,9 +391,26 @@ console.log('技能勾选层 · 接线（层会不会被清掉 / 关掉）');
   check('打开后聚焦搜索框（打开即可打字）', /function openSkLayer[\s\S]{0,700}?skQ\.focus\(\)/.test(CHAT_JS));
   // ★ 点外面关层时必须排除推荐行和输入栏：手动档点发送会主动开层，
   //   文档级监听在冒泡末端跑，不排除就会把刚开的层当场关掉 → "点了发送毫无反应"。
-  check('★ 点外关闭排除了推荐行（chipsWrap）', /chipsWrap\.contains\(t\)/.test(CHAT_JS));
-  check('★ 点外关闭排除了输入栏（inputBar）', /inputBar\.contains\(t\)/.test(CHAT_JS));
+  // ★ 断言必须锚在**代码语句**上（`if (... ) return;`），不能只比对 `chipsWrap.contains(t)`
+  //   这种片段 —— 注释里写一遍同样的字样，断言就被注释喂饱了，代码删掉照样绿。
+  //   这个假绿真的发生过（chat_ui_mutation_check.py 注入 11 抓到），记着。
+  check('★ 点外关闭排除了推荐行（chipsWrap）',
+    /if \(chipsWrap && chipsWrap\.contains\(t\)\) return;/.test(CHAT_JS));
+  check('★ 点外关闭排除了输入栏（inputBar）',
+    /if \(inputBar && inputBar\.contains\(t\)\) return;/.test(CHAT_JS));
   check('点外关闭会真的关层', /document\.addEventListener\('click'[\s\S]{0,400}?closeSkLayer\(\)/.test(CHAT_JS));
+  // ★ 点外关闭必须在**捕获阶段**，且要放行游离节点。
+  //   线上实测翻车（2026-09-14）：点「选择技能 ▾」→ openSkLayer() 里 renderChips()
+  //   重建整行，被点的那颗 button 当场变游离节点 → 冒泡到 document 时
+  //   chipsWrap.contains(t) === false，白名单形同虚设 → 层刚 hidden=false 又被自己
+  //   关回 true。用户看到"点一下闪一下就没了"，而静态断言（白名单写着呢）全绿。
+  //   捕获阶段在事件往下走时判归属，那时 DOM 还没被重渲染。真 DOM 兜底见
+  //   web/tests/chat_layer_e2e.py —— 这条改动必须两边都有证据。
+  check('★ 点外关闭用捕获阶段（冒泡阶段会因重渲染丢白名单，层自己关掉自己）',
+    /document\.addEventListener\('click',\s*\(e\)\s*=>\s*\{[\s\S]{0,1200}?\}\s*,\s*true\s*\)/
+      .test(CHAT_JS.slice(CHAT_JS.indexOf("document.addEventListener('click'"))));
+  check('★ 点外关闭放行游离节点（isConnected 兜底）',
+    /if \(t && t\.isConnected === false\) return;/.test(CHAT_JS));
   check('Esc 能关层', /Escape[\s\S]{0,200}?closeSkLayer\(\)/.test(CHAT_JS));
   check('搜索框回车直接勾第一个（搜到就回车是最快路径）',
     /skQ\.addEventListener\('keydown'[\s\S]{0,400}?filterSkills\(allSkills, skQ\.value\)\[0\]/.test(CHAT_JS));

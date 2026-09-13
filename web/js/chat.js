@@ -912,14 +912,24 @@
     // 点层外关掉。**必须排除推荐行和输入栏**：手动档没选技能点发送时，submit() 会主动
     // 打开这一层，而文档级 click 监听在冒泡末端才跑 —— 不排除的话它会把刚打开的层
     // 当场关掉，用户看到的就是"点了发送毫无反应"（这个坑踩过一次，别再踩）。
+    //
+    // ★ 必须是**捕获阶段**（第三参 true），不能是冒泡阶段。
+    //   原因：点「选择技能 ▾」时 openSkLayer() 会 renderChips() 重建整行，被点的那颗
+    //   button 当场变成游离节点；冒泡到 document 时白名单的归属判断全失效，
+    //   白名单失效 → 层刚 hidden=false 又被自己关回 true。表现是"点一下闪一下就没了"，
+    //   静态文本断言看不出来（源码里白名单写着呢），只有真 DOM 跑一次才暴露。
+    //   捕获阶段在事件往下走时就判归属，此时 DOM 还没被重渲染，contains() 是真的。
     document.addEventListener('click', (e) => {
       if (!skOpen) return;
       const t = e.target;
+      // 游离节点（重渲染产生的旧按钮）没有祖先链，contains() 必然 false ——
+      // 用 isConnected 兜底：不连在文档上的东西不可能是"点层外"。
+      if (t && t.isConnected === false) return;
       if (skLayer.contains(t)) return;
       if (chipsWrap && chipsWrap.contains(t)) return;
       if (inputBar && inputBar.contains(t)) return;
       closeSkLayer();
-    });
+    }, true);
     // 焦点在输入框里时按 Esc 也要能关（不然只能去点外面）
     document.addEventListener('keydown', (e) => {
       if (skOpen && e.key === 'Escape' && !(skQ && document.activeElement === skQ)) {
