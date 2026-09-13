@@ -465,7 +465,7 @@
           tree += `<div class="kb-tree-row" data-path="${esc(f.path)}" onclick="window.openEditorFile('${encodeURIComponent(curSkillSlug)}','${escapeJs(f.path)}')" title="${esc(f.path)}">
             <span class="kb-tree-name">${esc(f.name)} <span class="dim">${f.size}B</span>${roTag}</span>
             <span class="kb-tree-ops">
-              ${canEdit ? `<button class="link-btn" onclick="event.stopPropagation()">编辑</button>` : ''}
+              ${canEdit ? `<button class="link-btn" title="编辑" onclick="event.stopPropagation();window.openEditorFile('${encodeURIComponent(curSkillSlug)}','${escapeJs(f.path)}')">编辑</button>` : ''}
               <button class="link-btn" title="下载" onclick="event.stopPropagation();window.downloadSkillFile('${encodeURIComponent(curSkillSlug)}','${escapeJs(f.path)}')">⬇</button>
               ${canDel ? `<button class="icon-btn danger" title="删除" onclick="event.stopPropagation();window.delSkillFile('${encodeURIComponent(curSkillSlug)}','${escapeJs(f.path)}','${escapeJs(f.kind)}')">✕</button>` : ''}
             </span>
