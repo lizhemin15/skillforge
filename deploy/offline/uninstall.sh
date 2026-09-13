@@ -45,7 +45,7 @@ usage() { sed -n '2,18p' "$SELF" | sed 's/^# \{0,1\}//'; exit 0; }
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--prefix)     PREFIX="${2:?--prefix 需要一个目录}"; shift 2 ;;
-		--service)    SERVICE_NAME="${2:?}"; shift 2 ;;
+		--service|--service-name) SERVICE_NAME="${2:?}"; shift 2 ;;
 		--data-dir)   DATA_DIR="${2:?}"; shift 2 ;;
 		--font-dir)   FONT_DIR="${2:?}"; FONT_DIR_SET=1; shift 2 ;;
 		--purge)      DO_PURGE=1; shift ;;

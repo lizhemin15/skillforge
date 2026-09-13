@@ -320,11 +320,34 @@ SkillForge 离线安装包
       补：dnf install -y python3（离线机挂发行版 ISO 或配本地源）
       缺了它安装仍会继续（写作功能不受影响），但自检里「代码执行沙箱」一项会失败，
       AI 也就无法跑代码/脚本校验。
+EOF
+
+# 包内容清单必须与包内实际文件一致。
+# 旧版把「包里带了两个程序（含 bin/ocrd）」写死在这个单引号 heredoc 里，而 arm64 离线包
+# 按设计不带 ocrd（CI 里 arm64 不编解析服务，见 release.yml 的注释），VERSION 也已经
+# 写着 ocr=no。结果说明与产物自相矛盾：arm64 用户照说明书以为有 OCR，装完才发现没有。
+if [ -n "$OCR_BIN" ]; then
+	cat >> "$STAGE/INSTALL.txt" <<'EOF'
 
 包里带了两个程序：
   bin/skillforge  主服务（Web 界面 + 技能引擎）
   bin/ocrd        文档解析服务（扫描件/Word/Excel 抽文本，含 OCR 模型，无需额外依赖）
 安装时会先扫描端口：默认主服务 8092、文档解析 8093。端口被占时会提示你指定新端口。
+EOF
+else
+	cat >> "$STAGE/INSTALL.txt" <<'EOF'
+
+包里带了一个程序：
+  bin/skillforge  主服务（Web 界面 + 技能引擎）
+
+注意：这个包里**没有** bin/ocrd（文档解析服务）—— 本包所在架构没有预编译的 ocrd。
+影响：扫描件 PDF / Word / Excel / PPT 的文本抽取不可用；写作、技能库、代码执行等
+其余功能不受影响。要补齐解析能力，请换用自带 ocrd 的那份离线包（amd64）。
+安装时会先扫描端口：默认主服务 8092、文档解析 8093。端口被占时会提示你指定新端口。
+EOF
+fi
+
+cat >> "$STAGE/INSTALL.txt" <<'EOF'
 
 装完会自动跑一次自检（skillforge -selftest），逐项验证：
   - 程序版本
@@ -336,6 +359,22 @@ SkillForge 离线安装包
 
 详细说明见 README.md。
 EOF
+
+# 出包前自检：INSTALL.txt 对「有没有 bin/ocrd」的说法必须与包内实际内容一致。
+# 为什么值得单独一条断言：说明与产物不一致时，别的检查全绿也没用——用户是照说明书装的。
+# 断言必须按形态锚定，不能只 grep 'bin/ocrd'：不含 ocrd 的那份说明里也会出现「bin/ocrd」
+# 字样（「这个包里没有 bin/ocrd」），裸子串会把正确的话判成错误的话。
+OCR_CLAIM='bin/ocrd[[:space:]]*文档解析服务'
+if [ -n "$OCR_BIN" ]; then
+	grep -q "$OCR_CLAIM" "$STAGE/INSTALL.txt" \
+		|| die "说明与产物不一致：包里有 ocrd（$OCR_BIN），INSTALL.txt 却没把它列为随包程序"
+else
+	if grep -q "$OCR_CLAIM" "$STAGE/INSTALL.txt"; then
+		die "说明与产物不一致：这次打了 --no-ocr，INSTALL.txt 却声称随包提供 bin/ocrd"
+	fi
+	grep -q '没有' "$STAGE/INSTALL.txt" \
+		|| die "说明与产物不一致：包里没有 ocrd，INSTALL.txt 却没如实告诉用户"
+fi
 
 # ---------- 3. 确定性打包 ----------
 # 固定时间戳 + 固定属主 + 名字排序：同样的输入产出逐字节相同的 tar.gz。

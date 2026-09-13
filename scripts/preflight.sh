@@ -53,6 +53,84 @@ need() {
 need go
 need node
 
+# ---- 工具链校验：PATH 里的 go 必须真的能编译本仓库 ----
+# 为什么必须做：本机 /usr/bin/go 是发行版自带的 go1.18，而 /usr/local/go/bin/go 才是
+# go1.25。preflight 原来直接用 PATH 里的 `go`，于是「闸门是绿是红」取决于调用者的 PATH
+# 里有没有 /usr/local/go/bin：后台/干净 env 下跑就解析到 1.18，go.mod 里 `go 1.25.0`
+# 被它判成格式错，一口气报出 vet / build / go test / 自证 4 项红 —— 看着像代码坏了，
+# 其实是工具链老了。这种假红最坑：会把人带到完全错误的方向去翻源码。
+# 规则：不写死绝对路径（写死绝对路径已在 CI runner 上翻车两次），改为「挑一个够新的 go」：
+#   1) PATH 里的 go 够新 → 用它
+#   2) 否则 /usr/local/go/bin/go 够新 → 用它，并把它前置进 PATH（子脚本/自证也一起受益）
+#   3) 都不够新 → 明确报错退出。宁可说「工具链太老」，也绝不放出一片假红。
+GOMIN="$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' go.mod | head -n 1)"
+GOMIN="${GOMIN:-1.21}"
+
+# 用 `go version` 而不是 `go env GOVERSION`：后者会去读 go.mod，老版本 go 读不了
+# 新格式的 go.mod 就直接失败，等于用「工具链太老」去证明「工具链太老」——能work但报错信息丢失。
+go_ver() {
+  "$1" version 2>/dev/null | awk '{print $3}' | sed 's/^go//'
+}
+go_ok() {
+  [ -x "$1" ] || return 1
+  local v
+  v="$(go_ver "$1")"
+  [ -n "$v" ] || return 1
+  # 用 sort -V 比版本，别自己拆三段数字（1.25.0 与 1.25.10 这类形态手拆必错）
+  [ "$(printf '%s\n%s\n' "$GOMIN" "$v" | sort -V | head -n 1)" = "$GOMIN" ]
+}
+
+if go_ok "$(command -v go)"; then
+  :
+elif go_ok /usr/local/go/bin/go; then
+  PATH="/usr/local/go/bin:$PATH"; export PATH
+  printf '  \033[33m·\033[0m PATH 里的 go 太老，已自动切到 /usr/local/go/bin/go（%s）\n' "$(go_ver /usr/local/go/bin/go)"
+else
+  printf '\033[31m✗ 本机 go 工具链太老，跑不了这个仓库（go.mod 要求 >= %s）\033[0m\n' "$GOMIN" >&2
+  printf '  PATH 里的 go ： %s → %s\n' "$(command -v go || echo 无)" "$(go_ver "$(command -v go)" || echo 不可用)" >&2
+  printf '  /usr/local/go ： %s\n' "$([ -x /usr/local/go/bin/go ] && go_ver /usr/local/go/bin/go || echo 不存在)" >&2
+  printf '  修法：export PATH=/usr/local/go/bin:$PATH（或装 go >= %s）\n' "$GOMIN" >&2
+  printf '  注意：这是环境问题，不是代码问题 —— 别去翻源码。\n' >&2
+  exit 2
+fi
+
+# ---- node 版本校验：同一个坑，先堵住 ----
+# 本机 /usr/bin/node 是发行版自带的 v12，而前端测试用了 node:test（要 18+）和 ESM 顶层
+# await（要 14.8+）。PATH 里没前置 nvm 时，7 个前端测试会报
+#   SyntaxError: Unexpected reserved word / No such built-in module: node:test
+# —— 看着像测试代码写坏了，其实只是 node 太老。
+# 这里只校验、不自动切换：node 的安装位置因人而异（nvm / n / 发行版），猜路径比直接报错更糟。
+NODEMIN=18
+NODE_V="$(node --version 2>/dev/null | sed 's/^v//')"
+NODE_MAJ="${NODE_V%%.*}"
+case "$NODE_MAJ" in
+  ''|*[!0-9]*)
+    printf '\033[31m✗ 取不到 node 版本（node --version 输出异常：%s）\033[0m\n' "$NODE_V" >&2
+    exit 2
+    ;;
+esac
+if [ "$NODE_MAJ" -lt "$NODEMIN" ]; then
+  # 在 PATH 之外还有哪些 node 里挑一个真正够新的来建议（别推荐 /bin/node 这种
+  # 和 /usr/bin/node 同体异名的老货，那种建议等于没说）
+  BEST_NODE=""
+  for c in $(which -a node 2>/dev/null); do
+    cv="$("$c" --version 2>/dev/null | sed 's/^v//')"
+    cmaj="${cv%%.*}"
+    case "$cmaj" in ''|*[!0-9]*) continue ;; esac
+    if [ "$cmaj" -ge "$NODEMIN" ]; then BEST_NODE="$c"; break; fi
+  done
+  printf '\033[31m✗ node 太老：v%s（前端测试要 >= %s）\033[0m\n' "$NODE_V" "$NODEMIN" >&2
+  printf '  PATH 里的 node   ： %s → v%s\n' "$(command -v node)" "$NODE_V" >&2
+  if [ -n "$BEST_NODE" ]; then
+    printf '  本机可用的新 node： %s → %s\n' "$BEST_NODE" "$("$BEST_NODE" --version 2>/dev/null)" >&2
+    printf '  修法：export PATH="%s:$PATH"\n' "$(dirname "$BEST_NODE")" >&2
+  else
+    printf '  修法：本机没找到 >= %s 的 node，装一个（nvm / 官方 tarball / 发行版都行）\n' "$NODEMIN" >&2
+  fi
+  printf '  注意：这是环境问题，不是测试代码坏了 —— 别去翻 web/tests 里的文件。\n' >&2
+  exit 2
+fi
+
 # ---- 1) go.mod / go.sum 是 tidy 状态（CI: Verify go.mod is tidy）----
 step '1/7 go.mod tidy'
 if [ -z "$(command -v go)" ]; then bad 'go 不可用'; else
