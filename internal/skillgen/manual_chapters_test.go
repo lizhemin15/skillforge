@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -253,10 +254,14 @@ func TestExtractByChaptersKeepsOrderAndHeadings(t *testing.T) {
 // 但**全部**失败必须报错——否则会产出一份「0 分类的手册包」冒充成功。
 func TestExtractByChaptersPartialFailure(t *testing.T) {
 	spans := pickChapterSpans(chaptersDoc)
-	var n int
+	// 计数必须原子：这个闭包被 extractStructureByChapters 的**多个 goroutine 并发**调用
+	// （实测 `-race` 报 DATA RACE，两端都是这里）。
+	// 而且它不只是「检测器不满意」——`n++` 非原子时两个 goroutine 可能都读到 0，
+	// 于是**两章**都返回失败，下面 `Categories == 1` 的断言随机变红（真 flake）。
+	// 换成原子自增后「恰好一章失败」才有保证。
+	var n int32
 	fc := &fakeChat{reply: func(call fakeCall) (string, error) {
-		n++
-		if n == 1 {
+		if atomic.AddInt32(&n, 1) == 1 {
 			return "", errors.New("provider 502")
 		}
 		return `{"is_category":true,"trigger":"t","requirement":"产品发布类稿件要交代产品定位","anchors":[]}`, nil
