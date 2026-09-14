@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -39,6 +40,24 @@ const trainMaxDuration = 30 * time.Minute
 // 返回的 ctx 必须还活着（改成 context.WithTimeout(reqCtx, …) 会立刻变红）。
 func trainingCtx(reqCtx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(reqCtx), trainMaxDuration)
+}
+
+// logTrainOutcome 把训练结论落到 stderr（journalctl）。
+//
+// 为什么非落日志不可：训练是挂在 SSE 上的十几分钟长任务，用户十有八九不等在页面上
+// （关页、刷新、断网）。以前失败只往 SSE 里写一行 error，连接一断这行错误就掉进虚空，
+// 运维在 journalctl 里只能看到「什么都没发生」——一个没过线的技能为什么没落盘、
+// 卡在哪一步，全靠猜。抽成函数是为了让「结论必须落 stderr」这条能被单测直接盯住。
+func logTrainOutcome(name, slug string, el time.Duration, res *skillgen.Result, err error) {
+	switch {
+	case err != nil:
+		log.Printf("[train] 技能 %q（slug=%s）失败，用时 %s：%v", name, slug, el.Round(time.Second), err)
+	case res == nil:
+		log.Printf("[train] 技能 %q（slug=%s）结束但结果为空，用时 %s", name, slug, el.Round(time.Second))
+	default:
+		log.Printf("[train] 技能 %q（slug=%s）完成，用时 %s，prompt %d 字，示例 %d 个，降级交付=%v（%s）",
+			name, slug, el.Round(time.Second), res.PromptLen, res.ExampleN, res.Degraded, res.DegradeReason)
+	}
 }
 
 // Admin serves authenticated endpoints: LLM config + skill training.
@@ -176,9 +195,13 @@ func (a *Admin) Train(w http.ResponseWriter, r *http.Request) {
 	}
 
 	send("status", fmt.Sprintf("开始训练技能：%s", name))
+	trainStart := time.Now()
 	res, err := a.gen.Generate(tctx, in, func(step string) {
 		send("step", step)
 	})
+	// 结论同时落 SSE 与 stderr：SSE 给当下还盯着的浏览器，stderr 给「人已经走了」的场景。
+	// 结论同时落 SSE 与 stderr：SSE 给当下还盯着的浏览器，stderr 给「人已经走了」的场景。
+	logTrainOutcome(name, in.Slug, time.Since(trainStart), res, err)
 	if err != nil {
 		send("error", err.Error())
 		return
