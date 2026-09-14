@@ -29,6 +29,14 @@
   PROMPT='...' python3 web/tests/chat_composer_geometry_e2e.py     # 换提示词
 
 SKIP 规则：playwright 不可用 / 页面打不开 → 打 SKIP 并 exit 0。SKIP != PASS。
+
+实测存证（2026-09-14，线上 8092，真 Chromium）：
+  正常跑：几何 7/7 + 流式 11/11 全绿；流式 304 帧采样 maxGap=0，
+          容器 scrollHeight=3407 / clientHeight=664 → 真溢出 2743px（不是空跑）。
+  负向自证（INJECT_SMOOTH=1，活页面注入 smooth 复刻根因）：maxGap=81 → S2 精确转红
+          （10/11），报的就是预期那条，S2b 仍绿 → 是流式中的落后，不是崩溃红。
+  为什么注入后是 81px 而不是历史 994px：无头 Chromium 帧间还能追上一些；真浏览器带
+  重渲染时落后更狠。断言有牙齿即可 —— 0 → 81 且必须红，就够了。
 """
 import hashlib
 import os
