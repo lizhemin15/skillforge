@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/lizhemin15/skillforge/internal/llm"
 	"github.com/lizhemin15/skillforge/internal/store"
 )
 
@@ -116,7 +117,15 @@ func (e *Engine) RouteCategory(ctx context.Context, pack *WritePack, userMsg str
 
 	// 第 4 个参数 true = 开 JSON 模式。结构化使用模型输出时不开 JSON 模式是
 	// 靠运气：中文内容里带个引号就能让 json 解析随机炸，而且炸得没法诊断。
-	out, err := e.llm.Chat(ctx, routeSys, user, true)
+	//
+	// 关思考链 + 流式：分类判定与意图识别同类（按给定表格选一格），但它是
+	// 「已经过了分类、正文一个字还没写」的**第二段静默**——实测 33s 分类回来之后
+	// 又静默 40s 才出第一个正文字，用户在这 40s 里只看到一个跳秒的计时。
+	out, err := e.llm.StreamChat(ctx, routeSys, user, llm.StreamOpts{
+		DisableThinking: true,
+		JSONMode:        true,
+		OnReasoning:     reasoningSink(ctx),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("分类判定失败: %w", err)
 	}
@@ -304,7 +313,12 @@ func (e *Engine) Review(ctx context.Context, pack *WritePack, cat *WriteCategory
 	fmt.Fprintf(&b, "## 用户这次的写作需求\n\n%s\n\n", strings.TrimSpace(userMsg))
 	fmt.Fprintf(&b, "## 待审稿件\n\n%s\n", strings.TrimSpace(draft))
 
-	out, err := e.llm.Chat(ctx, reviewSys, b.String(), true)
+	// 审稿这一跳**保留思考链**（要真挑得出问题才值），但思考片段当中间材料流出去：
+	// 审稿发生在草稿之后、最终答案之前，静默期同样只有计时在跳。
+	out, err := e.llm.StreamChat(ctx, reviewSys, b.String(), llm.StreamOpts{
+		JSONMode:    true,
+		OnReasoning: reasoningSink(ctx),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("审稿失败: %w", err)
 	}
@@ -357,7 +371,8 @@ func (e *Engine) Revise(ctx context.Context, sc *SkillContent, pack *WritePack, 
 	b.WriteString("\n请输出修改后的完整稿件。")
 
 	sys := e.generateSys(sc) + "\n\n" + extra + "\n\n" + reviseSys
-	return e.llm.Complete(ctx, sys, b.String(), onDelta)
+	// 改稿同样是执笔，同样保留思考链 + 把思考片段当中间材料。
+	return e.llm.CompleteEx(ctx, sys, b.String(), onDelta, reasoningSink(ctx))
 }
 
 // ===== 小工具 =====

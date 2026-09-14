@@ -75,6 +75,11 @@ type TraceStep struct {
 	Label  string `json:"label"`  // stage heading e.g. 「① 意图分析」
 	Detail string `json:"detail"` // one-line human note e.g. 命中：需要一份述职报告
 	Status string `json:"status"`
+	// Material 是模型侧正在流出来的**中间材料**（思考链片段 / 分析过程）。
+	// 与 Detail 分开而不是拼进 Detail：Detail 是稳定的一句话（也是顶部状态条的
+	// 文本源），Material 是每 400ms 滚动的长文本，混在一起会让状态条变成一个
+	// 不断变长的墙。只做展示，不参与任何判定。
+	Material string `json:"material,omitempty"`
 }
 
 // Engine orchestrates the dialogue.
@@ -406,10 +411,21 @@ action 必须根据上面「意图→动作」映射严格输出，不要省略�
 
 // classify runs one classifier completion. Returns (eval, retry) where retry
 // is true when the result was unusable (bad JSON or empty intent).
+//
+// 这一跳是**关思考链 + 流式**的（曾经是普通的阻塞 Chat）：
+//   - 关思考链：线上活跃模型是 reasoning 模型，同一段提示词实测带思考 63s、
+//     关思考 4.8s。分类是「按给定规则选一个格子」的活，思考链纯属浪费，
+//     而它挡在用户第一句话后面，是「点了发送几十秒没反应」的最大一笔账。
+//   - 流式：万一 provider 忽略开关照旧产思考链（astron 就会静默忽略
+//     enable_thinking），思考片段能当中间材料流出去，用户至少看得见它在干活。
 func (e *Engine) classify(ctx context.Context, id, sys string, history []Message, user string) (*Eval, bool) {
 	// 意图识别也吃上下文：用户说「整理成 word」时，识别「这是承接上一轮新闻稿」
 	// 才能路由到正确的技能，而不是当成一句没头没尾的新指令。
-	out, err := e.llm.Chat(ctx, sys, "对话历史（供参考，重点回应最新消息）：\n"+e.ContextBlock(ctx, id, history)+"\n\n用户最新消息：\n"+user, true)
+	out, err := e.llm.StreamChat(ctx, sys, "对话历史（供参考，重点回应最新消息）：\n"+e.ContextBlock(ctx, id, history)+"\n\n用户最新消息：\n"+user, llm.StreamOpts{
+		DisableThinking: true,
+		JSONMode:        true,
+		OnReasoning:     reasoningSink(ctx),
+	})
 	if err != nil {
 		return nil, false
 	}
@@ -530,7 +546,9 @@ func (e *Engine) generateWithExtra(ctx context.Context, sc *SkillContent, args m
 	} else {
 		done = "请据此给出结构化、可直接照做的办事流程/答案。"
 	}
-	return e.llm.Complete(ctx, sys, argBlockOf(sc, args)+"\n"+done, onDelta)
+	// 执笔这一跳**保留思考链**（质量优先），但把思考片段当中间材料流出去：
+	// 思考链期间正文一个字都没有，不流的话用户看到的就是「一直卡着计时」。
+	return e.llm.CompleteEx(ctx, sys, argBlockOf(sc, args)+"\n"+done, onDelta, reasoningSink(ctx))
 }
 
 // generateSys 拼出技能的 system prompt（身份 + 技能提示词 + 骨架模板 + 附件提示）。
@@ -717,7 +735,14 @@ func (e *Engine) GenerateDoc(ctx context.Context, id string, sc *SkillContent, a
 	}
 	argBlock.WriteString("\n只输出一个 JSON 对象（见技能提示词中的 DOCJSON 契约），不要输出任何其他文字，不要使用 markdown 代码块。")
 
-	out, err := e.llm.Chat(ctx, sys, argBlock.String(), true)
+	// 关思考链：这一步是「把用户说的话填进给定的 JSON 契约」，规则全在提示词里，
+	// 思考链只是把几十秒的等待摊在用户面前；真要产思考链（provider 忽略开关）时，
+	// 片段会被当成中间材料流出去。
+	out, err := e.llm.StreamChat(ctx, sys, argBlock.String(), llm.StreamOpts{
+		DisableThinking: true,
+		JSONMode:        true,
+		OnReasoning:     reasoningSink(ctx),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1041,7 +1066,12 @@ func (e *Engine) FillDoc(ctx context.Context, id string, sc *SkillContent, userM
 	if hist := e.ContextBlock(ctx, id, history); hist != "" && hist != "（无历史）" {
 		prompt = "对话历史（供参考，重点回应最新消息）：\n" + hist + "\n\n" + prompt
 	}
-	out, err := e.llm.Chat(ctx, sys, prompt, true)
+	// 同 720 那一跳：字段映射是结构化抽取，关思考链 + 流式（思考片段当中间材料）。
+	out, err := e.llm.StreamChat(ctx, sys, prompt, llm.StreamOpts{
+		DisableThinking: true,
+		JSONMode:        true,
+		OnReasoning:     reasoningSink(ctx),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1412,7 +1442,7 @@ func (e *Engine) PlainChat(ctx context.Context, id, user string, history []Messa
 	if len(history) > 0 {
 		combined = "对话历史（供参考，你只需回应最新用户消息）：\n" + histBlock + "\n\n最新用户消息：\n" + user
 	}
-	return e.llm.Complete(ctx, sys, combined, onDelta)
+	return e.llm.CompleteEx(ctx, sys, combined, onDelta, reasoningSink(ctx))
 }
 
 // ---------------------------------------------------------------------------

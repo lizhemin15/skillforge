@@ -176,6 +176,44 @@ console.log('A2. 手动开合优先于自动');
   check('手动展开后，收尾帧不得把它折回去', t.classList.contains('open'));
 }
 
+console.log('A3. 中间材料：计时之外必须有「正在动的内容」');
+{
+  // 用户抱怨：「速度过于慢了，中间可以流式输出思考的一些中间材料，现在一直卡着
+  // 计时」。所以材料必须真渲染进行里 —— 只有跳秒的计时器不算进度。
+  const t = mkTrace();
+  renderTrace(t, [{
+    phase: 'generate', label: '④ 内容执笔', status: 'active',
+    detail: '正在撰写内容…（已用 40s）',
+    material: '先看手册要求，这是一份通知，需要标题、正文、落款。',
+  }]);
+  const row = bodyOf(t).children[0];
+  check('有材料时渲染 .ctk-mat', row.innerHTML.includes('ctk-mat'), row.innerHTML.slice(0, 160));
+  check('材料文本真的进了行里', row.innerHTML.includes('这是一份通知'), row.innerHTML.slice(0, 160));
+  check('材料带「思考中」标签（让用户知道这是什么）', row.innerHTML.includes('思考中'), row.innerHTML.slice(0, 160));
+  check('detail（含计时）与材料并存', row.innerHTML.includes('已用 40s'), row.innerHTML.slice(0, 160));
+  const head = t.querySelector('.ch-tr-head');
+  check('材料不进顶部状态条（状态条只放一句话，否则会撑成一堵墙）',
+    !head.querySelector('.ch-tr-status').innerHTML.includes('这是一份通知'),
+    head.querySelector('.ch-tr-status').innerHTML);
+}
+{
+  const t = mkTrace();
+  renderTrace(t, [step('active', '正在撰写内容…（已用 3s）')]);
+  check('无材料时不留空壳', !bodyOf(t).children[0].innerHTML.includes('ctk-mat'),
+    bodyOf(t).children[0].innerHTML.slice(0, 120));
+}
+{
+  // 材料是模型原样吐出来的文本，什么都可能有；不转义就是一个注入点。
+  const t = mkTrace();
+  renderTrace(t, [{
+    phase: 'generate', label: '④ 内容执笔', status: 'active', detail: 'x',
+    material: '<img src=x onerror=alert(1)>',
+  }]);
+  const row = bodyOf(t).children[0];
+  check('材料被转义（不产生真标签）',
+    row.innerHTML.includes('&lt;img') && !/<img/.test(row.innerHTML), row.innerHTML.slice(0, 160));
+}
+
 console.log('B. 接线层');
 check('时间线插在答案上方（insertBefore 到首位）', /insertBefore\(trace,/.test(src),
   '没找到 insertBefore(trace, …)');

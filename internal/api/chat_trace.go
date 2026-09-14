@@ -13,6 +13,18 @@ import (
 // 用户就开始怀疑卡死——人对 <4s 的静默不敏感，对 >5s 就会去点刷新。
 const traceBeat = 3 * time.Second
 
+// 中间材料的两个常数。
+//
+// materialCap：材料只留**尾部** 160 字。思考链是几万字的长文，整段下发既刷爆
+// SSE 又没人读；用户要的是「它在动、动的是什么」这一个信号。
+//
+// materialThrottle：模型按 token 推片段，一片一片往 SSE 里塞会每秒几十帧。
+// 400ms 一帧是「看起来在连续滚动」的下限，也是帧数的上界（≈2.5 帧/秒）。
+const (
+	materialCap      = 160
+	materialThrottle = 400 * time.Millisecond
+)
+
 // traceClock 把「阻塞等待」变成「看得见的步骤流」。
 //
 // 为什么需要它：一轮对话里，意图分类和首 token 都是**几十秒的阻塞 LLM 调用**，
@@ -38,6 +50,10 @@ type traceClock struct {
 	mu    sync.Mutex
 	steps []agent.TraceStep
 	start time.Time
+	// material 是**当前进行中那一步**累积的中间材料尾部；lastMat 是上次因材料
+	// 而下发的时间戳（节流用）。
+	material string
+	lastMat  time.Time
 
 	stopOnce sync.Once
 	done     chan struct{}
@@ -73,8 +89,49 @@ func newTraceClockBeat(write func(ev, data string), steps []agent.TraceStep, bea
 func (c *traceClock) Set(steps []agent.TraceStep) {
 	c.mu.Lock()
 	c.steps = cloneSteps(steps)
+	// 换阶段了：上一阶段攒的材料属于上一件事，留着会挂在新步骤下面误导人。
+	c.material = ""
 	c.mu.Unlock()
 	c.emit()
+}
+
+// Thinking 收模型侧流出来的**中间材料**（思考链 / 分析片段），挂到进行中的那一步上。
+//
+// 它解决的是「计时器在跳，但屏幕上没有任何内容」：关掉思考链的那几跳本来就不产
+// 材料（也不需要，4~5 秒就回来了），保留思考链的执笔/审稿/改稿几跳才是几十秒的
+// 长活——那些跳的材料在这里滚动显示，用户看到的是「它在想什么」，不是「它花了多久」。
+//
+// 两个安全阀：只留尾部 materialCap 字（思考链是长文，整段下发既刷爆 SSE 又没人看），
+// 只按 materialThrottle 节流下发（token 级推流每秒几十片）。没有进行中的步骤时
+// 直接丢弃——等待用户补充的阶段不该继续滚材料。
+func (c *traceClock) Thinking(text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	c.mu.Lock()
+	if activePos(c.steps) < 0 {
+		c.mu.Unlock()
+		return
+	}
+	c.material = tailRunes(c.material+text, materialCap)
+	now := time.Now()
+	if !c.lastMat.IsZero() && now.Sub(c.lastMat) < materialThrottle {
+		c.mu.Unlock()
+		return
+	}
+	c.lastMat = now
+	c.mu.Unlock()
+	c.emit()
+}
+
+// tailRunes 取**尾部** n 个字符。按字符切而不是按字节：按字节切会把一个汉字
+// 劈成两半，前端显示成乱码。
+func tailRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[len(r)-n:])
 }
 
 // Awaiting 把步骤组推进到「等用户补充」：进行中那一步转 waiting，其余转 done。
@@ -89,6 +146,7 @@ func (c *traceClock) Awaiting(detail string) {
 			c.steps[i].Status = "done"
 		}
 	}
+	c.material = ""
 	c.mu.Unlock()
 	c.emit()
 }
@@ -99,6 +157,8 @@ func (c *traceClock) Finish() {
 	for i := range c.steps {
 		c.steps[i].Status = "done"
 	}
+	// 收口这帧是给用户看「都做完了」的，挂着最后一段思考材料反而像还没完。
+	c.material = ""
 	c.mu.Unlock()
 	c.emit()
 	c.stop()
@@ -159,12 +219,15 @@ func (c *traceClock) beatOnce() {
 func (c *traceClock) snapshot(decorate bool) []agent.TraceStep {
 	c.mu.Lock()
 	out := cloneSteps(c.steps)
+	mat := c.material
 	c.mu.Unlock()
 	if !decorate || len(out) == 0 {
 		return out
 	}
 	if i := activePos(out); i >= 0 {
 		out[i].Detail = withElapsed(out[i].Detail, c.Elapsed())
+		// 材料只挂进行中的那一步：它是「这一步正在干什么」的证据。
+		out[i].Material = mat
 	}
 	return out
 }

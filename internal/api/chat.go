@@ -110,7 +110,10 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	clock := newTraceClock(write, seed)
 	defer clock.Freeze() // 兜底：任何分支（含 error 早退）都必须让心跳停下
 
-	ctx := r.Context()
+	// 中间材料从这里接上：模型侧流出来的思考链片段（执笔/审稿/改稿那几跳最长）
+	// 会被 clock 挂到进行中的那一步上滚动显示。挂一次全链路可见，因为下游所有
+	// 跳用的是同一条 ctx。
+	ctx := agent.WithProgress(r.Context(), clock.Thinking)
 
 	// 0. persist the user turn
 	history := h.eng.Session(req.SessionID)

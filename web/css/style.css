@@ -882,6 +882,24 @@ select.ch-field-ctl { appearance: none; }
 .ctk-step.done .ctk-label { color: var(--text); }
 .ctk-step.done .ctk-detail { color: var(--text-faint); }
 
+/* 中间材料：模型侧流出来的思考片段，滚动显示在「谁在干活」下面。
+   后端已截成尾部 160 字并每 400ms 节流下发，这里只负责不让它撑破面板：
+   3 行封顶、按字符断行。它是「还在动」的证据，不是要读的正文。 */
+.ctk-mat {
+  display: block; margin-top: 5px; padding: 4px 8px;
+  border-left: 2px solid var(--line-soft);
+  background: rgba(0,0,0,.028);
+  border-radius: 0 6px 6px 0;
+  color: var(--text-faint); font-size: 11.5px; line-height: 1.6;
+  overflow-wrap: anywhere; white-space: pre-wrap;
+  max-height: 4.8em; overflow: hidden;
+}
+.ctk-mat-tag {
+  display: inline-block; margin-right: 5px; padding: 0 5px;
+  font-size: 10px; line-height: 1.7; color: var(--text-faint);
+  background: rgba(0,0,0,.05); border: 1px solid var(--line-soft); border-radius: 999px;
+}
+
 /* input bar */
 .ch-input-bar {
   /* DeepSeek 官网输入区：无分割线，靠磨砂玻璃与页面融为一体 */

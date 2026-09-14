@@ -1363,6 +1363,11 @@
             '<span class="ctk-agent' + (s.phase === 'generate' ? ' brand' : '') + '">' + esc(agent.role) + '</span>' +
           '</span>' +
           '<span class="ctk-detail">' + esc(s.detail || '') + '</span>' +
+          // 中间材料：模型正在想的片段。有它用户才看得到「在动的是什么」，
+          // 而不是只有一个跳秒的计时器。后端已截成尾部 160 字并节流下发。
+          (s.material
+            ? '<span class="ctk-mat"><span class="ctk-mat-tag">思考中</span>' + esc(s.material) + '</span>'
+            : '') +
         '</span>';
       body.appendChild(row);
     });

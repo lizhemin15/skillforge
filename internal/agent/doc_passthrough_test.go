@@ -28,7 +28,12 @@ import (
 // word/document.xml 里把 <w:t> 的文字按顺序取出，再跟上一轮正文比——中间隔着的
 // OOXML 打包、转义、段落切分全都被覆盖到。
 
-// docFakeLLM 是只走非流式 Chat 的假模型：GenerateDoc 全程非流式（要 JSON 模式）。
+// docFakeLLM 是假模型：**既支持非流式，也支持流式**。
+//
+// 为什么要两条路：GenerateDoc 的「文档规格」这一跳现在是流式的（关思考链 + 流式，
+// 见 agent.go 里那一跳的注释）——关思考链要自己拼 body，而那条路本来就是 SSE。
+// 假模型只回非流式的话，流式那一跳会解析出空串，测试里表现为「未找到文档规格
+// JSON」，看着像产品坏了，其实是替身没跟上契约。
 type docFakeLLM struct {
 	reply string
 	srv   *httptest.Server
@@ -38,6 +43,15 @@ func newDocFakeLLM(t *testing.T, reply string) *docFakeLLM {
 	t.Helper()
 	f := &docFakeLLM{reply: reply}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		_ = json.Unmarshal(raw, &body)
+		if stream, _ := body["stream"].(bool); stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			b, _ := json.Marshal(f.answer())
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":" + string(b) + "}}]}\n\ndata: [DONE]\n\n"))
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id":     "fake",

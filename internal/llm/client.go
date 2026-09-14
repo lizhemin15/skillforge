@@ -46,6 +46,17 @@ func (c *Client) usable() error {
 
 // Complete streams a chat completion, writing text deltas to onDelta.
 func (c *Client) Complete(ctx context.Context, system, user string, onDelta func(string)) (string, error) {
+	return c.CompleteEx(ctx, system, user, onDelta, nil)
+}
+
+// CompleteEx 是 Complete 的超集：除了正文片段，还额外把**思考链片段**交给
+// onReasoning（可为 nil）。
+//
+// 为什么需要它：长文执笔保留思考链（质量更好），但思考链期间正文一个字都没有，
+// 用户看到的就是「一直卡着计时」。reasoning_content 是 provider 在同一个流里推的
+// 非标准字段，只有接出来当「中间材料」显示，等待才是可见的——不额外多花一分钱、
+// 也不改模型的输出。onReasoning 拿到的文本**不进正文**，只用于过程展示。
+func (c *Client) CompleteEx(ctx context.Context, system, user string, onDelta func(string), onReasoning func(string)) (string, error) {
 	if err := c.usable(); err != nil {
 		return "", err
 	}
@@ -81,6 +92,10 @@ func (c *Client) Complete(ctx context.Context, system, user string, onDelta func
 			continue
 		}
 		delta := resp.Choices[0].Delta.Content
+		// 思考链片段先交出去：它不属于正文，只是「还在干活」的证据。
+		if r := resp.Choices[0].Delta.ReasoningContent; r != "" && onReasoning != nil {
+			onReasoning(r)
+		}
 		if delta != "" {
 			sb.WriteString(delta)
 			// onDelta 允许为 nil：调用方只关心最终文本（例如批量生成、审稿走的是
