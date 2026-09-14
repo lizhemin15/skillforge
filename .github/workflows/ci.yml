@@ -143,6 +143,7 @@ jobs:
         run: |
           python3 scripts/category_guard_inject.py
           python3 scripts/fastjson_knob_inject.py
+          python3 scripts/thinking_knob_inject.py
 
       # C1（线上逐页统计）的解析器自证。它原来写的是 grep 'text_pages' 进度流，
       # 而进度流里从来只有人话「共 4 页（文本层直取 2 / OCR 2）」——

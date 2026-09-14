@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""变异自证：把「提速 + 中间材料」这轮每条断言各注入一个**真故障**，确认它会红，再还原确认回绿。
+
+为什么必须有这个脚本：
+  这一轮的改动横跨 Go（思考开关、材料挂载、正文/思考分离）和前端（材料渲染）。Go 侧
+  `go test ./...` 全绿、SSE 侧 `chat-sse-timeline.py` 全绿，都只说明**现在**没坏，不说明
+  这些断言抓得住坏。一条写歪的断言（命中注释、只比子串、条件写反、`-run` 里测试名打错
+  导致根本没跑）永远是绿的 —— 这种假绿比没测试更危险，因为它让人以为这块有防线。
+
+判据（四重，缺一不可）：
+  1. 注入点必须存在且**唯一**（找不到 / 命中多处 = 注入无效 = 等于没测，直接不合格）
+  2. 注入后**必须出现 FAIL 行**。「红在崩溃上不算红」—— rc!=0 但没有 FAIL 行，说明注入把
+     代码改到跑不起来了，那种红证明不了任何断言有效。
+  3. FAIL 必须是**预期那条**。改坏 A 却让 B 跳红线，等于这条断言没在盯它该盯的东西。
+  4. 还原后必须回绿。
+
+本脚本比同族脚本多守两件事（都是真踩过的洞）：
+  * **环境红 ≠ 断言红**：go 工具链太旧 / 依赖拉不下来 / 编译失败时，rc!=0 且输出里也可能
+    出现 FAIL 字样（甚至什么 FAIL 都没有），一眼看去像「注入成功让它红了」，其实一条断言
+    都没跑到。这里显式识别编译/工具链失败签名，单独报「环境红」，并让整脚本以 2 退出，
+    跟「断言没抓住」区分开 —— 否则你会去改断言，而真正该修的是环境。
+  * **测试必须真的跑过**：还原那一步用 `-v` / 逐个断言名确认预期用例出现 `--- PASS`。
+    否则 `-run` 名字打错时「还原后回绿」也是假的（压根没跑）。
+
+只碰仓库工作区，任何路径都还原（含异常退出）。
+
+用法：python3 scripts/thinking_knob_inject.py
+"""
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+# go 必须用绝对路径：这台机器上 PATH 里还躺着 1.18 的 /usr/bin/go，它连 go.mod 里的
+# `go 1.25.0` 都解析不了（报 "must match format 1.23"）。挑到它的话，每条变异都"红"，
+# 但那是一条断言都没跑到的崩溃红。
+GO = "/usr/local/go/bin/go"
+
+# 编译/工具链失败的签名：出现这些就不算「断言抓住了故障」。
+ENV_RED = (
+    "errors parsing go.mod",
+    "must match format",
+    "invalid go version",
+    "[build failed]",
+    "cannot find package",
+    "no required module provides",
+    "cannot find module",
+    "syntax error",
+    "toolchain",
+)
+
+# (名字, 文件, 原文, 替换, 测试命令, 预期失败的用例名, 说明)
+MUTATIONS = [
+    (
+        "M1 材料不挂到进行中那一步", "internal/api/chat_trace.go",
+        "\t\tout[i].Material = mat",
+        "\t\t_ = mat // 注入：材料不挂上去",
+        [GO, "test", "-v", "./internal/api/", "-run", "TestTraceMaterial", "-count=1"],
+        "TestTraceMaterialAttachesToActiveStep",
+        "后端发了材料但没挂到 active 那一步 → 前端拿不到，用户又只剩跳秒的计时器。",
+    ),
+    (
+        "M2 关思考链的开关没发出去", "internal/llm/stream.go",
+        '\t\tbody["enable_thinking"] = false',
+        '\t\t_ = "注入：不发 enable_thinking"',
+        [GO, "test", "-v", "./internal/llm/", "-run", "TestStreamChat", "-count=1"],
+        "TestStreamChatSendsBothThinkKnobs",
+        "开关没进请求体 → 模型继续吐几十秒思考，提速归零。",
+    ),
+    (
+        "M3 分类那一跳不再请求关思考链", "internal/agent/agent.go",
+        "\t\tDisableThinking: true,\n\t\tJSONMode:        true,\n\t\tOnReasoning:     reasoningSink(ctx),\n\t})\n\tif err != nil {\n\t\treturn nil, false\n\t}",
+        "\t\tDisableThinking: false,\n\t\tJSONMode:        true,\n\t\tOnReasoning:     reasoningSink(ctx),\n\t})\n\tif err != nil {\n\t\treturn nil, false\n\t}",
+        [GO, "test", "-v", "./internal/agent/", "-run", "TestEvalTurn", "-count=1"],
+        "TestEvalTurnAsksProviderToDisableThinking",
+        "接线回归：分类那一跳又把思考链打开了 —— 单元/SSE 全绿，线上慢回 40s。",
+    ),
+    (
+        "M4 思考链漏进正文", "internal/llm/stream.go",
+        '\t\t\tif r := ch.Delta.ReasoningContent; r != "" && o.OnReasoning != nil {\n\t\t\t\to.OnReasoning(r)\n\t\t\t}',
+        '\t\t\tif r := ch.Delta.ReasoningContent; r != "" {\n\t\t\t\tsb.WriteString(r) // 注入：思考链混进正文\n\t\t\t}',
+        [GO, "test", "-v", "./internal/llm/", "-run", "TestStreamChatSeparates", "-count=1"],
+        "TestStreamChatSeparatesReasoningFromContent",
+        "思考链混进正文 → 用户看到一大段自我嘀咕被当成答案写进稿子。",
+    ),
+    (
+        "M5 前端不渲染中间材料", "web/js/chat.js",
+        "          (s.material\n            ? '<span class=\"ctk-mat\"><span class=\"ctk-mat-tag\">思考中</span>' + esc(s.material) + '</span>'\n            : '') +",
+        "          '' +",
+        ["node", "tests/chat_trace.test.mjs"],
+        "有材料时渲染 .ctk-mat",
+        "后端发了、前端不渲染 —— 这轮最阴的形态：go test 和 SSE 验收全绿，只有屏幕退回跳秒。",
+    ),
+]
+
+
+def run(cmd, cwd):
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=900)
+    return p.returncode, p.stdout + p.stderr
+
+
+def env_red(out):
+    """输出里有没有编译/工具链失败签名。"""
+    low = out.lower()
+    return [s for s in ENV_RED if s.lower() in low]
+
+
+def test_ran(out, expect, want):
+    """预期用例是否真的跑到了 want 这个结果。
+
+    go -v  : `--- FAIL: Name (0.00s)` / `--- PASS: Name (0.00s)`（顶格）
+    node   : `  FAIL Name — ...` / `  ok   Name`（**有前导空格**，所以必须容忍空白，
+             否则漏配 —— 那样「还原回绿」会被误判成没跑到）
+    """
+    e = re.escape(expect)
+    if want == "fail":
+        return re.search(r"---\s*FAIL:\s*" + e + r"\b", out) or \
+               re.search(r"^\s*FAIL\s+" + e, out, re.M)
+    return re.search(r"---\s*PASS:\s*" + e + r"\b", out) or \
+           re.search(r"^\s*ok\s+" + e, out, re.M)
+
+
+def main():
+    rc_bad, rc_env = [], []
+    for name, rel, old, new, cmd, expect, why in MUTATIONS:
+        path = ROOT / rel
+        if not path.exists():
+            print(f"✗ {name}: 文件不存在 {rel}")
+            rc_bad.append(name)
+            continue
+        original = path.read_text(encoding="utf-8")
+        n = original.count(old)
+        if n == 0:
+            print(f"✗ {name}: 注入点没找到 —— chat.js/Go 的实现变了，本脚本的自证对象已失效，"
+                  f"请对照实现更新锚点，别直接删脚本。")
+            rc_bad.append(name)
+            continue
+        if n != 1:
+            print(f"✗ {name}: 注入点命中 {n} 处不唯一（注错地方等于没测）")
+            rc_bad.append(name)
+            continue
+
+        cwd = ROOT / "web" if cmd[0] == "node" else ROOT
+        print(f"--- 注入：{name}（{why}）")
+        try:
+            path.write_text(original.replace(old, new, 1), encoding="utf-8")
+            _, out = run(cmd, cwd)
+            sig = env_red(out)
+            if sig:
+                print(f"✗ {name}: 环境红（{sig[0]}）—— 这不是断言红，一条断言都没跑到。"
+                      f"先修环境再来自证。")
+                print("\n".join(out.strip().splitlines()[-4:]))
+                rc_env.append(name)
+            elif test_ran(out, expect, "fail"):
+                print(f"✓ {name}: 精确转红（--- FAIL: {expect}）")
+            else:
+                print(f"✗ {name}: 注入后预期用例没有转红（校验名 {expect}）")
+                print("\n".join(out.strip().splitlines()[-6:]))
+                rc_bad.append(name)
+        finally:
+            path.write_text(original, encoding="utf-8")
+
+        # 还原后必须回绿，而且预期用例必须**真的跑过**
+        rc2, out2 = run(cmd, cwd)
+        sig = env_red(out2)
+        if sig:
+            print(f"✗ {name}: 还原后环境红（{sig[0]}），无法判定是否回绿")
+            rc_env.append(name)
+        elif not test_ran(out2, expect, "pass"):
+            print(f"✗ {name}: 还原后预期用例没跑到 PASS（校验名 {expect}）—— "
+                  f"「还原回绿」是假的，这条自证骑在空集上。")
+            rc_bad.append(name)
+        else:
+            print(f"  ↳ 还原回绿 ✓（--- PASS: {expect}）")
+
+    print()
+    if rc_env:
+        print(f"环境红（不是断言问题）：{sorted(set(rc_env))}")
+        print("先修工具链/依赖，再重跑本脚本；此时不要动断言。")
+        return 2
+    if rc_bad:
+        print(f"变异自证未通过：{rc_bad}")
+        return 1
+    print(f"变异自证全部通过（{len(MUTATIONS)}/{len(MUTATIONS)}：注入→精确红、还原→真绿）")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
