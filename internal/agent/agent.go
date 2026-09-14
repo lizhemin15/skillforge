@@ -619,6 +619,13 @@ type DocResult struct {
 	// turn ("再加一行") can rebuild the FULL document instead of asking the LLM
 	// to recollect content it never saw.
 	Spec string
+	// Passthrough 为 true 表示本轮没有采用模型给的内容，而是用上一轮产物原文
+	// 确定性渲染的（见 doc_passthrough.go）。给调用方/测试一个可判定的身份，
+	// 不必去猜 Summary 里的文案。
+	Passthrough bool
+	// Coverage 是本轮 doc 对上一轮正文的覆盖率（0~1）。仅当上一轮产物是长文
+	// 时才有意义，其余情况为 0。
+	Coverage float64
 }
 
 // GenerateDoc streams nothing; it drives a docgen skill to produce an office
@@ -715,6 +722,35 @@ func (e *Engine) GenerateDoc(ctx context.Context, id string, sc *SkillContent, a
 		}
 		doc.Filename = "document" + ext
 	}
+	// 渲染前的最后一道闸门：用户说「把上一轮那篇整理成 Word」时，语义是**搬运**
+	// ——内容不变、只换容器。这件事不能押在模型自觉上（prompt 已经给了原文，模型
+	// 仍可能重写/压缩/另写一篇，这正是用户抱怨的「没有管之前生成的内容」）。所以
+	// 用覆盖率做确定性判定：模型写的东西跟上一轮正文对不上，就丢掉它，用原文直通
+	// 渲染。上一轮产物原文来自产物层（splitArtifacts），与注入 prompt 的是同一份。
+	if prev := lastArtifactText(history); prev != "" {
+		hit, cov, note := shouldPassthrough(prev, doc, userMsg)
+		if hit {
+			fmt.Fprintf(os.Stderr, "[doc-passthrough] session=%s 上一轮正文覆盖率=%.2f，改用原文直通渲染\n", id, cov)
+			doc = buildPassthroughDoc(prev, doc)
+			return e.renderDocResult(doc, note, cov, true)
+		}
+		if cov > 0 && cov < passthroughCoverageMin {
+			// 覆盖率低却没兜底，只可能是本轮不是搬运意图（新话题）。同样要留痕：
+			// 否则「模型又在重写上一轮内容」这件事没人看得见。
+			fmt.Fprintf(os.Stderr, "[doc-passthrough] session=%s 上一轮正文覆盖率=%.2f（本轮非搬运意图，未启用直通）\n", id, cov)
+		}
+		// 覆盖率照常透出：单测与排查要能看见「模型确实搬运了」，而不是一个 0。
+		return e.renderDocResult(doc, "", cov, false)
+	}
+	return e.renderDocResult(doc, "", 0, false)
+}
+
+// renderDocResult 把一份已经定稿的 doc 规格渲染成文件并组装 DocResult。
+//
+// extraNote 非空时追加在 Summary 末尾：Summary 是既有 SSE 里就已经下发给用户的
+// 那段文本（「已为您生成《…》」），兜底说明走它，用户必然看得见，不需要新增事件
+// 类型、也不动 SSE 协议。
+func (e *Engine) renderDocResult(doc docgen.Doc, extraNote string, cov float64, passthrough bool) (*DocResult, error) {
 	data, err := docgen.Generate(doc)
 	if err != nil {
 		return nil, err
@@ -727,12 +763,18 @@ func (e *Engine) GenerateDoc(ctx context.Context, id string, sc *SkillContent, a
 		"rows":     doc.Rows,
 		"parags":   doc.Parags,
 	})
+	summary := "已为您生成《" + doc.Filename + "》，点击下方文件即可下载。"
+	if extraNote != "" {
+		summary += extraNote
+	}
 	return &DocResult{
 		Filename:    docgen.SafeFilenameAs(doc.Filename, doc.Format),
 		Bytes:       data,
 		ContentType: docgen.ContentType(doc.Format),
-		Summary:     "已为您生成《" + doc.Filename + "》，点击下方文件即可下载。",
+		Summary:     summary,
 		Spec:        string(spec),
+		Passthrough: passthrough,
+		Coverage:    cov,
 	}, nil
 }
 

@@ -259,14 +259,23 @@
               case 'stage': logLine('→', ev.data, ''); break;
               case 'done':
                 const r = ev.data && typeof ev.data === 'object' ? ev.data : JSON.parse(ev.data);
-                logLine('✔', '技能「' + r.name + '」训练完成', 'ok');
+                // 降级交付必须显性说出来：技能落盘了，但裁判没验收通过（没跑完或没过线）。
+                // 以前这种情况只在 fidelity.md 里留一行，前端照样显示「已就绪」——
+                // 于是「生成的技能和我给的素材没关系」这件事在界面上完全看不出来。
+                if (r.degraded) {
+                  logLine('⚠️', '技能已生成，但裁判未验收通过：' + (r.degrade_reason || '原因未知'), 'err');
+                } else {
+                  logLine('✔', '技能「' + r.name + '」训练完成', 'ok');
+                }
                 const rd = $('tr-result');
                 rd.style.display = 'block';
-                rd.innerHTML = `<h4>✔ 新技能已就绪</h4>
+                rd.innerHTML = `<h4${r.degraded ? ' style="color:#c0392b"' : ''}>${r.degraded ? '⚠️ 新技能已就绪（未验收通过）' : '✔ 新技能已就绪'}</h4>
                   <div class="row">名称：<b>${esc(r.name)}</b> (§ ${esc(r.slug)})</div>
                   <div class="row">版本：<b>v${r.version}</b></div>
                   <div class="row">参数：<b>${(r.input_params || []).length}</b> 个</div>
                   <div class="params">${(r.input_params || []).map(p => `<span class="param-tag">${esc(p.label || p.name)}</span>`).join('')}</div>
+                  ${r.degraded ? `<div class="row" style="margin-top:10px;color:#c0392b">裁判未验收通过：${esc(r.degrade_reason || '')}</div>
+                  <div class="row" style="color:#888">技能已落盘可用，但请人工复核 fidelity.md 与范文后再投入生产。</div>` : ''}
                   <div class="row" style="margin-top:10px">前台列表已可用，也可在「技能管理」里编辑。</div>`;
                 loadManageSkills();
                 break;

@@ -718,6 +718,40 @@ func (r *JudgeReport) Best() *JudgeRound {
 	return best
 }
 
+// Degraded 判定「这次交付是不是降级版本」，返回原因供人读。
+//
+// 为什么需要它：裁判存在两种失败姿态——(1) 一轮都没跑成（模型调用失败、
+// 输出无法解析），(2) 跑完了但最优一轮没过线。此前两者都只写进 fidelity.md
+// 然后**照常落盘交付**，管理员在左树里看到的技能和「验收通过」长得一模一样。
+// 用户视角就是「生成的技能和我给的素材没关系」而系统毫无提示。
+// 把判定收成一个方法而不是散在落盘分支里，是为了让调用点可以断言：
+// 降级必须被显性标记（SSE done 帧 + meta.json + fidelity.md），不能静默。
+func (r *JudgeReport) Degraded() (bool, string) {
+	if r == nil {
+		return false, ""
+	}
+	best := r.Best()
+	if best == nil {
+		reason := "裁判一轮都没跑完，本次交付未经试用验收"
+		if r.Err != "" {
+			reason += "：" + r.Err
+		}
+		return true, reason
+	}
+	if best.Result.Total < judgePassLine {
+		reason := fmt.Sprintf("裁判最优轮次 %d/%d 未过线（通过线 %d）",
+			best.Result.Total, judgeTotalWeight(), judgePassLine)
+		if r.Err != "" {
+			reason += "，且回炉未跑完：" + r.Err
+		}
+		if r.EarlyStop != "" {
+			reason += "，提前止损：" + r.EarlyStop
+		}
+		return true, reason
+	}
+	return false, ""
+}
+
 // WeakDims 列出不通过那一轮里丢分最多的维度标签（供 trace 与报告点名薄弱项）。
 func (r *JudgeReport) WeakDims(n int) []string {
 	b := r.Best()

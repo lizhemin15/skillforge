@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-# ocrd v4 — 多格式文档提取常驻微服务（资源优化版 + PDF 逐页择优）
+# ocrd v5 — 多格式文档提取常驻微服务（资源优化版 + PDF 逐页择优 + 文本层可读性判据）
 # 用法: ocrd [--port 8093] [--dpi 200] [--max-cache 64]
-# POST /health        → {"ok":true,"version":...,"min_page_chars":...}
+# POST /health        → {"ok":true,"version":...,"min_page_chars":...,"quality_rule":...}
 # POST /extract       → multipart, field "file"=<任意支持格式>, 表单 "name"=原文件名(可选)
 #   DOC: pdf, docx, doc, xlsx, xls, pptx, ppt, txt, md, csv, html, json
 #   → {"ok":true,"fmt":"pdf|docx|...","text":"...","pages":N,"chars":N,"hash":"<sha256>","from_cache":bool,"raw":bool}
 # POST /convert       → 兼容旧端点, 等价于 /extract(仅PDF), 返回旧结构 {ok,pages,text,...}
 #
 # 多格式设计：
-#   · PDF  → 既有三层优化: 文本层检测优先 / 渲染+OCR / 内存LRU缓存 / per-hash锁并发去重 / 全局推理锁
+#   · PDF  → 既有三层优化: 文本层检测优先(够厚且可读) / 渲染+OCR / 内存LRU缓存 / per-hash锁并发去重 / 全局推理锁
+#            文本层「够厚但乱码」(字体缺 ToUnicode) 会被判为不可信并回落到 OCR，见 _text_quality
 #   · OOXML(docx/xlsx/pptx) → zipfile + xml.etree 纯标准库解析, 零新依赖, 极轻量
 #   · 文本类(txt/md/csv/html/json) → 直接读, 自动猜编码
 #   · 老格式 doc/xls/ppt 无法纯标准库解析 → 降级返回 {ok:false,error:"unsupported_fmt_detected"} 供上层提示
@@ -40,11 +41,30 @@ MIN_PAGE_CHARS = int(os.environ.get("OCRD_MIN_PAGE_CHARS") or 40)
 # 「整本看起来不像正文」的下限：平均每页少于这么多字时给出 warning 让上层有机会中止。
 MIN_AVG_PAGE_CHARS = 20
 
+# ---------- 文本层可读性（乱码）判据 ----------
+# 为什么光看字数不够：字体缺 ToUnicode（PDF 里只存了字形编号，没有字→字符的映射）时
+# get_text() 照样吐几千字符，但内容是 U+FFFD / 私用区编码 / 符号汤。旧逻辑只比字数，
+# 这类页会被当「够厚」直取，把垃圾当正文喂给下游训练（生成物与素材完全无关）。
+#
+# 三个占比阈值都取 2%：正常可选中正文里替换符/私用区/控制字符几乎为 0（实测 0%），
+# 留 2% 只是容忍偶发一两个坏字形，不让整页白白回落到 OCR（OCR 一页约 1s）；而乱码页
+# 这类字符普遍占到一半以上，2% 这个量级足以在乱码刚出现时就抓住，两头都不误伤。
+GARBLED_SIGNAL_RATIO = 0.02
+# 可读字符占比下限 60%：好页的「汉字+字母+数字+标点+空白」接近 100%，乱码页则大面积
+# 落在符号/私用区上。不取 80%/90% 是为了不误伤公式、代码、表格线、非中英混排
+# （如西里尔文、日文假名）这类占比天然偏低的正文；低于 60% 说明多数字符压根不是文字。
+MIN_READABLE_RATIO = 0.6
+# 报给 /health 的判据串，让 CI/上层能断言线上跑的确实是这一版规则（见 VERSION 注释）。
+QUALITY_RULE = "fffd_or_pua>2%|readable<60%"
+# 乱码页明细最多回传这么多条：够上层定位「哪几页坏了」，又不至于让 response 因为
+# 整本几百页的乱码而膨胀到不可读。
+GARBLED_DETAIL_MAX = 20
+
 # 版本串只为了让运维能**从外部证明线上跑的是哪一版**。
 # 事故教训：换二进制后只靠 `systemctl restart` + 进程活着，看不出新逻辑有没有生效；
 # 一旦 /health 能把「逐页择优 + 阈值」报出来，部署验收就有可 curl 的证据，
 # 不用去猜「是不是没重启成功」。
-VERSION = "ocrd-v4-perpage"
+VERSION = "ocrd-v5-quality"
 
 # ---------- OOXML 命名空间 ----------
 NS = {
@@ -104,6 +124,63 @@ def decode_text(raw: bytes) -> str:
         except UnicodeDecodeError:
             continue
     return raw.decode("utf-8", "replace")
+
+# ---------- 文本层可读性判据 ----------
+def _is_readable_char(c: str) -> bool:
+    """单个字符是否算「读了有用的字符」：CJK 汉字/拉丁字母/数字/常见中英标点/空白。
+
+    刻意用白名单而非 c.isalnum()：isalnum() 会把西里尔、希腊、日文假名也判为可读，
+    而线上乱码页里恰恰混着大量「随意映射出来的符号」，白名单能把它们钉在可读之外。
+    """
+    if c.isspace():
+        return True
+    o = ord(c)
+    if o < 0x20 or o == 0xFFFD or 0xE000 <= o <= 0xF8FF:
+        return False                     # 控制字符 / 替换符 / 私用区：不是文字
+    if 0x20 <= o <= 0x7E:
+        return True                      # ASCII 可见：英文字母、数字、英文标点
+    if 0x00C0 <= o <= 0x024F:
+        return True                      # 带变音符的拉丁字母（法/德/西等正文常见）
+    if 0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF:
+        return True                      # CJK 汉字及其扩展 A
+    if 0x3000 <= o <= 0x303F or 0xFF01 <= o <= 0xFFEF:
+        return True                      # 中文标点、全角字符（U+FFFD 上面已排除）
+    if 0x2000 <= o <= 0x206F:
+        return True                      # 通用标点：破折号、引号、省略号、不换行空格
+    return False                         # 其余（emoji、符号表、其他文种）不计入可读
+
+
+def _text_quality(txt: str) -> tuple[bool, str]:
+    """判定一页文本层是否「可读」，返回 (ok, reason)；ok=True 时 reason 为空串。
+
+    回答的是 MIN_PAGE_CHARS 回答不了的问题：这些字符**是不是文字**。只用字符类别占比做
+    页级统计（不引模型/词典，无额外依赖、毫秒级），命中的第一类信号写进 reason，
+    供上层把「哪页坏、为什么坏」原样透出，而不是只报一个页码。
+    """
+    if not txt:
+        return False, "文本层为空"
+    n = len(txt)
+
+    def ratio(pred) -> float:
+        return sum(1 for c in txt if pred(c)) / n
+
+    fffd = ratio(lambda c: c == "\ufffd")
+    if fffd > GARBLED_SIGNAL_RATIO:
+        return False, "U+FFFD 替换符占比 %.0f%%（>%d%%），文本层是解码失败的乱码" % (
+            fffd * 100, int(GARBLED_SIGNAL_RATIO * 100))
+    pua = ratio(lambda c: 0xE000 <= ord(c) <= 0xF8FF)
+    if pua > GARBLED_SIGNAL_RATIO:
+        return False, "私用区字符(U+E000-U+F8FF)占比 %.0f%%（>%d%%），字体缺 ToUnicode 只剩字形编号" % (
+            pua * 100, int(GARBLED_SIGNAL_RATIO * 100))
+    ctrl = ratio(lambda c: ord(c) < 0x20 and c not in "\t\n\r")
+    if ctrl > GARBLED_SIGNAL_RATIO:
+        return False, "控制字符占比 %.0f%%（>%d%%），文本层不是正常排版文本" % (
+            ctrl * 100, int(GARBLED_SIGNAL_RATIO * 100))
+    readable = ratio(_is_readable_char)
+    if readable < MIN_READABLE_RATIO:
+        return False, "可读字符占比 %.0f%%（<%d%%），多数字符是符号而非文字" % (
+            readable * 100, int(MIN_READABLE_RATIO * 100))
+    return True, ""
 
 # ---------- OOXML 解析 ----------
 def _q(tag, ns):
@@ -304,11 +381,14 @@ class OcrEngine:
     def _pdf(self, raw: bytes):
         """既有三层优化 PDF 路径 (逐页文本层判定 + OCR + 流式)。返回 (fmt, text, stats)。
 
-        逐页判定的关键在 MIN_PAGE_CHARS：文本层**够厚**才直取（可选中 PDF 全走这条，
-        零 OCR，秒回）；只有水印/页码的薄文本层视为「实为扫描页」，渲染 OCR，并把
-        文本层与 OCR 结果**择优保留**（谁信息多要谁），绝不静默丢页。
+        逐页判定要过两道关：MIN_PAGE_CHARS（够厚）+ _text_quality（可读）。可选中 PDF 两关
+        都过，零 OCR 秒回；只叠了水印/页码的薄文本层、以及「字数够但全是乱码」的页
+        （字体缺 ToUnicode）都视为「实为扫描页」，渲染 OCR，并把 OCR 结果**择优保留**，
+        绝不静默丢页。
 
-        stats 回传逐页统计，供上层判断素材可信度（见 parse_warning）。
+        stats 回传逐页统计，供上层判断素材可信度（见 parse_warning）。除
+        pages/text_pages/ocr_pages/empty_pages 外，新增 garbled_pages（文本层被判乱码的
+        页数，与「最后用了谁」正交）+ garbled_detail（页码与原因，最多 GARBLED_DETAIL_MAX 条）。
         """
         tmpdir = tempfile.mkdtemp(prefix="ocrd_")
         pdf_path = os.path.join(tmpdir, "in.pdf")
@@ -316,34 +396,41 @@ class OcrEngine:
             f.write(raw)
         pieces = []
         doc = None
-        stats = {"pages": 0, "text_pages": 0, "ocr_pages": 0, "empty_pages": 0}
+        stats = {"pages": 0, "text_pages": 0, "ocr_pages": 0, "empty_pages": 0,
+                 "garbled_pages": 0, "garbled_detail": []}
         try:
             doc = pymupdf.open(pdf_path)
             total = len(doc)
             stats["pages"] = total
             for pno in range(total):
                 page = doc[pno]
-                # ① 文本层够厚 → 直取（最省，可选中 PDF 的正常路径）
                 txt = (page.get_text() or "").strip()
-                if len(txt) >= MIN_PAGE_CHARS:
+                txt_ok, txt_why = _text_quality(txt)
+                # ① 文本层够厚**且可读** → 直取（最省，可选中 PDF 的正常路径）
+                if len(txt) >= MIN_PAGE_CHARS and txt_ok:
                     stats["text_pages"] += 1
                     pieces.append(txt)
                     continue
-                # ② 文本层为空 / 只有水印页码 → 按扫描页处理，渲染 + OCR
+                # ② 文本层为空 / 只有水印页码 / 够厚但乱码 → 按扫描页处理，渲染 + OCR
                 ocr_txt = self._ocr_page(page, tmpdir, pno)
-                if ocr_txt and len(ocr_txt) >= len(txt):
-                    stats["ocr_pages"] += 1
-                    pieces.append(ocr_txt)
-                elif ocr_txt:
-                    # OCR 认得比文本层少，但两者都短：保留信息量大的那个
+                # 采信 OCR 的前提是它自己也「可读」：否则等于把乱码从文本层搬到 OCR 结果里。
+                ocr_ok = bool(ocr_txt) and _text_quality(ocr_txt)[0]
+                if ocr_txt and (ocr_ok or not txt):
+                    # 文本层本来就没字时，即便 OCR 结果不太可读也比空页强，照样采用
                     stats["ocr_pages"] += 1
                     pieces.append(ocr_txt)
                 elif txt:
-                    # OCR 彻底失败：宁可留薄文本层，也不要丢页
+                    # OCR 失败或结果同样不可读：宁可留下不可信的文本层，也不要丢页
                     stats["text_pages"] += 1
                     pieces.append(txt)
                 else:
                     stats["empty_pages"] += 1
+                # 文本层被判乱码的页单独记一笔：无论最后用 OCR 救回来还是留了原文，
+                # 对上层都是同一个问题（字体缺 ToUnicode），都要能查得到。
+                if txt and not txt_ok:
+                    stats["garbled_pages"] += 1
+                    if len(stats["garbled_detail"]) < GARBLED_DETAIL_MAX:
+                        stats["garbled_detail"].append("第%d页: %s" % (pno + 1, txt_why))
             return "pdf", "\n\n".join(pieces), stats
         finally:
             if doc: doc.close()
@@ -396,6 +483,11 @@ def parse_warning(stats, chars: int) -> str:
     empty = int(stats.get("empty_pages") or 0)
     if empty:
         parts.append(f"有 {empty}/{pages} 页未识别出任何文字")
+    # 乱码页要单独报：这类素材 chars 往往很大（几千字都算「成功解析」），
+    # 不看这条的话上层会觉得一切正常，直到训练出来的东西与素材无关。
+    garbled = int(stats.get("garbled_pages") or 0)
+    if garbled:
+        parts.append(f"有 {garbled} 页文本层疑似乱码（字体缺 ToUnicode），已改用 OCR 或保留原文")
     avg = chars / pages
     if avg < MIN_AVG_PAGE_CHARS:
         parts.append(f"共 {pages} 页只解析出 {chars} 字（平均每页 {avg:.0f} 字），"
@@ -419,6 +511,7 @@ class Handler(BaseHTTPRequestHandler):
             # 逐页择优的阈值是多少」，不用先进机器翻二进制（见 VERSION 处的注释）。
             self._send_json(200, {"ok": True, "service": "ocrd", "version": VERSION,
                                   "min_page_chars": MIN_PAGE_CHARS,
+                                  "quality_rule": QUALITY_RULE,
                                   "formats": "pdf|docx|xlsx|pptx|txt|md|csv|html", "rapidocr": True})
         else:
             self._send_json(404, {"ok": False, "error": "not_found"})
@@ -486,7 +579,7 @@ def main():
     ENGINE = OcrEngine(a.dpi, a.max_cache)
     try: ENGINE._ensure()
     except Exception as e: print("engine init warning:", e)
-    print(f"{VERSION} listening on 127.0.0.1:{a.port} (dpi={a.dpi}, max_cache={a.max_cache}MB, recycle_every={RECYCLE_EVERY}页, min_page_chars={MIN_PAGE_CHARS}, formats=pdf/docx/xlsx/pptx/txt)", flush=True)
+    print(f"{VERSION} listening on 127.0.0.1:{a.port} (dpi={a.dpi}, max_cache={a.max_cache}MB, recycle_every={RECYCLE_EVERY}页, min_page_chars={MIN_PAGE_CHARS}, quality_rule={QUALITY_RULE}, formats=pdf/docx/xlsx/pptx/txt)", flush=True)
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     srv.serve_forever()
 

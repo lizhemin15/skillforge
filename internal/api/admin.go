@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +20,26 @@ import (
 )
 
 func atoi(s string) (int, error) { return strconv.Atoi(s) }
+
+// trainMaxDuration 是训练流程的绝对时长上限。
+//
+// 训练要跑「生成 → 本地校验 → 最多 3 轮裁判试用与回炉」，慢的时候十几分钟，
+// 而它是挂在 SSE 请求上的：浏览器一关、刷新、或代理掐掉连接，r.Context()
+// 立刻被 cancel，cancel 会一路传到裁判层，fidelity.md 里留下
+// 「回炉失败: context canceled」，随后一份没过线的技能照样落盘——用户看到的
+// 就是「生成的技能和我给的素材完全没关系」而系统毫无提示。
+//
+// 所以训练 ctx 必须从请求生命周期里解绑（context.WithoutCancel：保留请求内的
+// value，只丢掉 cancel），再用这个绝对上限兜底，避免真卡死的运行永远占着
+// 训练锁（Admin.mu 是全局串行的）。
+const trainMaxDuration = 30 * time.Minute
+
+// trainingCtx 把训练从 HTTP 请求生命周期里解绑，只留绝对时长上限。
+// 单独抽成函数是为了让「解绑」这件事能被单测直接盯住：请求 ctx 一 cancel，
+// 返回的 ctx 必须还活着（改成 context.WithTimeout(reqCtx, …) 会立刻变红）。
+func trainingCtx(reqCtx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(reqCtx), trainMaxDuration)
+}
 
 // Admin serves authenticated endpoints: LLM config + skill training.
 type Admin struct {
@@ -140,6 +161,9 @@ func (a *Admin) Train(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "流式输出不可用")
 		return
 	}
+	// 训练全程用这个脱离请求的 ctx：客户端断连不该让 3 轮回炉预算凭空消失。
+	tctx, cancelTrain := trainingCtx(r.Context())
+	defer cancelTrain()
 	// send 会被「训练主流程」和「OCR 心跳 goroutine」同时调用，必须串行化：
 	// 两处并发写同一个 ResponseWriter 会交错出坏帧（更别说 data race）。
 	var sendMu sync.Mutex
@@ -152,7 +176,7 @@ func (a *Admin) Train(w http.ResponseWriter, r *http.Request) {
 	}
 
 	send("status", fmt.Sprintf("开始训练技能：%s", name))
-	res, err := a.gen.Generate(r.Context(), in, func(step string) {
+	res, err := a.gen.Generate(tctx, in, func(step string) {
 		send("step", step)
 	})
 	if err != nil {

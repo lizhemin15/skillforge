@@ -890,6 +890,11 @@ func (mp *manualPack) WriteTo(dir string) ([]string, error) {
 func (mp *manualPack) writeFidelity(dir string) error {
 	var b strings.Builder
 	b.WriteString("# 范文保真报告（机器生成 · 只读）\n\n")
+	// 降级告示放最顶上：这份技能是按「裁判未验收通过」的状态交付的。
+	// 报告下面的分数、薄弱项都是细节，只有这句话能让人 3 秒内知道该不该信这份技能。
+	if deg, reason := mp.Judge.Degraded(); deg {
+		fmt.Fprintf(&b, "> ⚠️ **本次为降级交付**：%s\n> 技能已落盘可用，但**未经裁判验收通过**，请人工复核后再投入生产。\n\n", reason)
+	}
 	fmt.Fprintf(&b, "- 生成时间：%s\n", time.Now().Format("2006-01-02 15:04:05"))
 
 	total := len(mp.Structure.Categories)

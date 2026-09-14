@@ -101,6 +101,13 @@ type Result struct {
 	ExampleN    int           `json:"example_count"`
 	SkillType   string        `json:"skill_type,omitempty"`
 	Attachment  string        `json:"attachment,omitempty"`
+	// Degraded 表示这次交付是「降级版本」：裁判没跑完，或最优一轮没过通过线。
+	// 技能照样落盘（素材与提示词本身可用），但前端必须显性提示，
+	// 不能让管理员以为拿到的是验收通过的产物——静默降级是「技能和素材
+	// 看起来没关系」这类投诉的藏身处。
+	Degraded bool `json:"degraded,omitempty"`
+	// DegradeReason 是降级原因（人可读，含分数与失败点），随 done 帧回前端。
+	DegradeReason string `json:"degrade_reason,omitempty"`
 }
 
 // Generate runs the full 7-step pipeline and lands the skill into store + disk.
@@ -268,6 +275,17 @@ func (g *Generator) Generate(ctx context.Context, in *Input, onStep func(string)
 		}
 	}
 
+	// 裁判跑完（或没跑成）后统一判一次降级，并在 SSE 里说出来：
+	// 前端只有拿到这句话，才有可能把「未验收的技能」和「验收通过的技能」区分开。
+	var degraded bool
+	var degradeReason string
+	if mp != nil && len(mp.Structure.Categories) > 0 {
+		degraded, degradeReason = mp.Judge.Degraded()
+		if degraded {
+			steps("8.5/9 ⚠️ 裁判未验收通过，降级交付：" + degradeReason)
+		}
+	}
+
 	// ---- Step 9: land to disk + register in DB ----
 	steps("9/9 落盘并注册…")
 	if err := g.land(dir, sysPrompt, tpl, exFiles, in, attrs, dtype, mp); err != nil {
@@ -290,6 +308,7 @@ func (g *Generator) Generate(ctx context.Context, in *Input, onStep func(string)
 		Params:   meta.Params, Steps: nil,
 		PromptLen: len(sysPrompt), ExampleN: len(exFiles) + mp.ExampleCount(),
 		SkillType: dtype.Type, Attachment: dtype.Attachment,
+		Degraded: degraded, DegradeReason: degradeReason,
 	}, nil
 }
 
@@ -393,6 +412,12 @@ func (g *Generator) land(dir, sysPrompt, tpl string, exFiles []string, in *Input
 			"category_count": len(mp.Structure.Categories),
 			"example_count":  mp.ExampleCount(),
 			"warnings":       mp.Warnings,
+		}
+		// 降级状态也写进 meta.json：管理员在左树点开技能时看不到 fidelity.md，
+		// meta.json 是唯一能一眼确认「这份技能验收过没有」的地方。
+		if deg, reason := mp.Judge.Degraded(); deg {
+			meta["degraded"] = true
+			meta["degrade_reason"] = reason
 		}
 	}
 	if dtype != nil {
