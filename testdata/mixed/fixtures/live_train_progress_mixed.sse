@@ -1,0 +1,8 @@
+data: {"data":"开始训练技能：线上掐线验收153847","type":"status"}
+
+data: {"data":"正在解析上传的文档（topic.pdf，扫描件逐页 OCR，可能需要数十秒）…","type":"step"}
+
+data: {"data":"topic.pdf 解析完成：833 字符（3.9s）共 4 页（文本层直取 2 / OCR 2）","type":"step"}
+
+data: {"data":"1/9 分析参考文件，提取写作特征…","type":"step"}
+

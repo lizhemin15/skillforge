@@ -10,7 +10,8 @@
 #   这个脚本打线上端口      → 证明「部署产物对」。两个都要有。
 #
 # 断言：
-#   C1) 线上 SSE 进度里能看到逐页统计（text_pages / ocr_pages 同时出现）→ 择优逻辑真跑了
+#   C1) 线上 SSE 进度里的逐页统计严格等于 4 页 = 文本层直取 2 + OCR 2 → 择优逻辑真跑了
+#       （断言实现与自证：stats_of_sse.py / verify_stats_selfcheck.sh）
 #   C2) 技能目录 source/*.txt 含扫描页正文（薄文本层页也走了 OCR，没被静默丢）
 #   C3) 技能产物里出现素材独有主题词 → 这个技能真的由这份素材长出来
 #   C4) 收尾删掉测试技能（不留垃圾在用户实例里）
@@ -56,10 +57,14 @@ code="$(curl -s -N -o "$WORK/train.sse" -w '%{http_code}' -H "$H1" -m 2400 -X PO
   -F "files=@$WORK/topic.pdf")"
 say "  训练 HTTP $code（SSE $(stat -c%s "$WORK/train.sse")B）"
 
-if grep -q 'text_pages' "$WORK/train.sse" && grep -q 'ocr_pages' "$WORK/train.sse"; then
-  ok "C1) 线上进度里有逐页统计：$(grep -o '"text_pages":[0-9]*[^}]*' "$WORK/train.sse" | head -1)"
+# C1 走共用解析器（stats_of_sse.py）：进度流里写的是人话，不是字段名。
+# 曾经这里 grep 'text_pages' 直接判红——线上永远不可能命中，属于假断言，
+# 自证见 verify_stats_selfcheck.sh。断言取严格相等：素材是 --scan 2 --text 2 造的，
+# 页数/直取页/OCR 页都是确定的，宽松成 >= 会漏掉「可选中页被送进 OCR」这种退步。
+if C1_OUT="$(python3 "$HERE/stats_of_sse.py" "$WORK/train.sse" --expect 4 2 2)"; then
+  ok "C1) 线上进度里逐页统计正确：$C1_OUT"
 else
-  bad "C1) 线上进度里没有逐页统计（text_pages/ocr_pages）"
+  bad "C1) $C1_OUT"
 fi
 
 # slug 必须从服务端 done 事件取 —— 本地 slugify 会算错中文（踩过，见 verify_train_e2e.sh 注释）
