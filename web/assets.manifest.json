@@ -2,8 +2,8 @@
   "_comment": "由 web/tests/gen-asset-manifest.mjs 生成；勿手改，改了会被 asset_version 测试抓住",
   "assets": {
     "/assets/css/style.css": {
-      "v": "20260914B",
-      "sha256": "bb2ccb43e0bb29d812f54ab636f308bb5d0a5682d028b9777239528fe0761bcd",
+      "v": "20260914F",
+      "sha256": "70a074d7d8fc1957e6f37959ec8b34537da5d0bdaea5986dd98f436850c9a6c7",
       "in": [
         "index.html",
         "admin.html"
@@ -17,8 +17,8 @@
       ]
     },
     "/assets/js/chat.js": {
-      "v": "20260914C",
-      "sha256": "158a1002396673eb883898e9b0a9188579b946299a6e2e2af175b64a42349acb",
+      "v": "20260914G",
+      "sha256": "bec6cd081e009a0422409e38477635ad4c36c43115f61a89856acb52dd788eb5",
       "in": [
         "index.html"
       ]

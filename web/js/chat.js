@@ -664,7 +664,28 @@
     return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
 
-  function keepBottom() { scroll.scrollTop = scroll.scrollHeight; }
+  // --- composer:stick-begin（回归测试按这两个标记切片抽取，改动请勿删标记）---
+  let stickRaf = 0;   // 合并补帧请求：流式期间每帧都会调 keepBottom，只排一次补帧
+  /* 贴底两条铁律（缺一条用户就看到「不自动往下滚」）：
+     ① 容器**不能**是 scroll-behavior: smooth —— 平滑滚动每次赋值都会重启一段动画，
+        而流式输出每几十毫秒就赋值一次，滚动永远追不上正文（实测落后 994px，
+        约三分之二答案在视口外）。见 style.css 里 `.ch-scroll` 的注释。
+     ② 赋值之后必须**再补一帧**：markdown 重排 / 字体图片落地会在本次赋值之后
+        继续改变 scrollHeight，只赋一次就会停在中途（观感是「差一行没到底」）。 */
+  function keepBottom() {
+    scroll.scrollTop = scroll.scrollHeight;
+    // 必须 `window.requestAnimationFrame(...)` 这样带接收者调用：拆成
+    // `const raf = window.requestAnimationFrame; raf(cb)` 在 Chrome 上会
+    // Illegal invocation（与 document.querySelector 同类）。
+    if (typeof window.requestAnimationFrame !== 'function' || stickRaf) return;
+    stickRaf = window.requestAnimationFrame(function () {
+      stickRaf = window.requestAnimationFrame(function () {
+        stickRaf = 0;
+        scroll.scrollTop = scroll.scrollHeight;
+      });
+    });
+  }
+  // --- composer:stick-end ---
 
   // 引擎这一轮挑中的技能：不再有常驻胶囊显示它（消息气泡里本来就有「正在使用技能」），
   // 这里只记进状态，供推荐行下一轮算"继续用这个技能"。

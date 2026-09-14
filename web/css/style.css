@@ -522,7 +522,10 @@ body.cm-fs-body { overflow: hidden; }
    Chat UI — conversation-first writing workspace
    ============================================================ */
 .ch-main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
-.ch-scroll { flex: 1; overflow-y: auto; scroll-behavior: smooth; }
+/* ⚠️ 这里**不能**写 scroll-behavior: smooth：流式输出每几十毫秒就
+   `scrollTop = scrollHeight` 一次，平滑动画会被每次赋值打断重启，滚动永远追不上正文
+   （实测落后 994px = 三分之二答案在视口外）。详情见文件末尾「Composer 布局」笔记。 */
+.ch-scroll { flex: 1; overflow-y: auto; }
 .ch-col { max-width: 860px; margin: 0 auto; padding: 40px 24px 12px; }
 
 .ch-welcome { text-align: center; padding: 48px 0 24px; animation: ch-in .4s ease; }
@@ -1824,3 +1827,25 @@ header.topbar {
   .ch-welcome { padding: 8vh 0 16px; }
   .ch-welcome h1 { font-size: 22px; }
 }
+
+/* ============================================================
+   Composer 布局 + 贴底滚动 · 20260914
+   ------------------------------------------------------------
+   触发（用户原话）：「输入框被自动调度、指定技能挤到右边，应当占据所有的位置。
+   此外对话的时候没有自动往下滚。」两条都是先实测取证再修的：
+
+   ① 胶囊独占一行：原来 `.ch-switch` 与 `textarea` 同行（`flex:none`，宽 166px），
+      textarea 要到框内 x≈518 才开始 —— 左边被占 176px、宽度只剩 630/860。
+      现在 `.ch-mrow` 是 `flex: 0 0 100%` 的整行，textarea 从框的左内边距起算。
+   ② `.ch-input` 必须显式 `min-height: 0`：本表顶部有一条**给 admin 表单用的全局**
+      `textarea { min-height: 96px }`（元素选择器），`.ch-input` 不写就会被它漏进来
+      —— 空输入框 96px 高、中间一大片摸不到的死区（实测 offsetHeight 96 vs 正文 23）。
+   ③ `.ch-scroll` 的 scroll-behavior 必须是 auto（原因见文件顶部 `.ch-scroll` 处注释）。
+
+   ⚠️ 这块必须留在**文件末尾**：本表同名规则多处覆盖，写在前面会被后面的规则翻掉
+   （毛玻璃那轮踩过：变异追加到末尾，前面的覆盖等于没写）。
+   ============================================================ */
+.ch-mrow { flex: 0 0 100%; display: flex; align-items: center; padding-bottom: 4px; }
+.ch-mrow .ch-switch { align-self: auto; margin-bottom: 0; }
+.ch-input { min-height: 0; }
+.ch-scroll { scroll-behavior: auto; }
