@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# ocrd v3 — 多格式文档提取常驻微服务（资源优化版）
+# ocrd v4 — 多格式文档提取常驻微服务（资源优化版 + PDF 逐页择优）
 # 用法: ocrd [--port 8093] [--dpi 200] [--max-cache 64]
-# POST /health        → {"ok":true}
+# POST /health        → {"ok":true,"version":...,"min_page_chars":...}
 # POST /extract       → multipart, field "file"=<任意支持格式>, 表单 "name"=原文件名(可选)
 #   DOC: pdf, docx, doc, xlsx, xls, pptx, ppt, txt, md, csv, html, json
 #   → {"ok":true,"fmt":"pdf|docx|...","text":"...","pages":N,"chars":N,"hash":"<sha256>","from_cache":bool,"raw":bool}
@@ -27,6 +27,24 @@ MAX_TEXT = 4 * 1024 * 1024  # 单文件解析出文本上限 4MB (防恶意超�
 # 对策：每 RECYCLE_EVERY 页重建一次引擎，把峰值压回基线（引擎重建 ~0.5s，模型已在磁盘缓存）。
 RECYCLE_EVERY = 20
 STALE_TMP_HOURS = 2       # 启动时清理崩溃残留的 /tmp/ocrd_*（进程被 kill -9 时 finally 不执行）
+
+# 文本层判定的最小有效字数。
+# 旧逻辑是 `if txt:` —— 只要该页 get_text() 拿到**任何**字符就当「有文字层，直接采用」。
+# 而真实扫描件（扫描全能王/夸克/Adobe Scan 导出）几乎都在扫描图上叠了一层很薄的文字层
+# 描述「扫描全能王 第 3 页」之类的页脚/水印。于是逐页判定全部命中，真扫描页**一页都不送 OCR**：
+# 整本正文被静默丢掉，只留下页码和水印。
+# 实测事故：前 2 页扫描 + 后 3 页可选的混合 PDF，两版都测出这种退化。带水印那版 0.08s 返回、
+# 零 OCR、正文两页全无 —— 素材只剩 15%，训练出来的技能与用户给的内容毫无关系。
+# 页码 + 水印通常 ≤ 20 字，真正文页远超 40 字，阈值取中间的 40（可用 OCRD_MIN_PAGE_CHARS 调）。
+MIN_PAGE_CHARS = int(os.environ.get("OCRD_MIN_PAGE_CHARS") or 40)
+# 「整本看起来不像正文」的下限：平均每页少于这么多字时给出 warning 让上层有机会中止。
+MIN_AVG_PAGE_CHARS = 20
+
+# 版本串只为了让运维能**从外部证明线上跑的是哪一版**。
+# 事故教训：换二进制后只靠 `systemctl restart` + 进程活着，看不出新逻辑有没有生效；
+# 一旦 /health 能把「逐页择优 + 阈值」报出来，部署验收就有可 curl 的证据，
+# 不用去猜「是不是没重启成功」。
+VERSION = "ocrd-v4-perpage"
 
 # ---------- OOXML 命名空间 ----------
 NS = {
@@ -160,7 +178,7 @@ def extract_pptx(raw: bytes) -> tuple[str, int]:
 
 # ---------- LRU 缓存 ----------
 class LRUCache:
-    """线程安全 LRU, max_bytes 按内容大小计。key=文件 hash, value=(fmt,text,raw,bytes)."""
+    """线程安全 LRU, max_bytes 按内容大小计。key=文件 hash, value=(fmt,text,stats,bytes)。"""
     def __init__(self, max_bytes):
         self.max = max_bytes
         self._d = OrderedDict()
@@ -172,18 +190,18 @@ class LRUCache:
             if v is None:
                 return None
             self._d[key] = v
-            return v[0], v[1]
+            return v[0], v[1], v[2]
     def put(self, key, value, bytes_):
         if self.max <= 0:
             return
         with self._lock:
             old = self._d.pop(key, None)
             if old:
-                self._size -= old[2]
-            self._d[key] = (value[0], value[1], bytes_)
+                self._size -= old[3]
+            self._d[key] = (value[0], value[1], value[2], bytes_)
             self._size += bytes_
             while self._size > self.max and self._d:
-                _, (_, _, b) = self._d.popitem(last=False)
+                _, (_, _, _, b) = self._d.popitem(last=False)
                 self._size -= b
 
 # ---------- OCR 引擎 (仅 PDF) ----------
@@ -220,72 +238,113 @@ class OcrEngine:
         gc.collect()
 
     def extract(self, raw: bytes, name: str):
-        """全格式入口: 返回 (fmt, text, chars, from_cache)。per-hash 锁并发去重。"""
+        """全格式入口: 返回 (fmt, text, chars, from_cache, stats)。per-hash 锁并发去重。
+
+        stats 是解析可信度诊断（PDF: pages/text_pages/ocr_pages/empty_pages），非 PDF 为 {}。
+        为什么要它：**char 数分辨不出「解析出 1129 字正文」和「解析出 1129 字水印」**。
+        线上事故里混合型 PDF 正好落进这个盲区——chars 非 0，全链路绿灯，训练出来的技能
+        与素材无关。上层需要逐页统计才能判断素材是否可信（见 parse_warning）。
+        """
         h = hashlib.sha256(raw).hexdigest()
         cached = self.cache.get(h)
         if cached is not None:
-            return cached[0], cached[1], len(cached[1]), True
+            return cached[0], cached[1], len(cached[1]), True, cached[2]
         lk = self._hash_lock(h)
         with lk:
             cached = self.cache.get(h)
             if cached is not None:
-                return cached[0], cached[1], len(cached[1]), True
-            fmt, text = self._do_extract(raw, name)
+                return cached[0], cached[1], len(cached[1]), True, cached[2]
+            fmt, text, stats = self._do_extract(raw, name)
             if len(text) > MAX_TEXT:
                 text = text[:MAX_TEXT]
-            self.cache.put(h, (fmt, text), len(raw))
-            return fmt, text, len(text), False
+                stats = dict(stats or {})
+                stats["truncated"] = True
+            self.cache.put(h, (fmt, text, stats), len(raw))
+            return fmt, text, len(text), False, stats
 
     def _do_extract(self, raw: bytes, name: str):
         fmt = detect_format(raw, name)
         if fmt == "text":
-            return "text", decode_text(raw)
+            return "text", decode_text(raw), {}
         if fmt in ("docx", "xlsx", "pptx"):
             fn = {"docx": extract_docx, "xlsx": extract_xlsx, "pptx": extract_pptx}[fmt]
             text, _ = fn(raw)
-            return fmt, text
+            return fmt, text, {}
         if fmt == "pdf":
             return self._pdf(raw)
         if fmt == "legacy_office":
             raise ValueError("老格式 .doc/.xls/.ppt 无法在线解析, 请另存为 docx/xlsx/pptx 后上传")
         raise ValueError("不支持的文件格式: %s" % name)
 
+    def _ocr_page(self, page, tmpdir: str, pno: int) -> str:
+        """渲染单页并 OCR，返回识别文本（失败返回 ""）。
+
+        流式释放：渲染图落盘→识别→立刻删，避免整本 render 把内存顶爆；
+        每 RECYCLE_EVERY 页重建引擎（ONNX arena 只增不还，见文件头注释）。
+        """
+        img = os.path.join(tmpdir, f"p{pno}.png")
+        pix = page.get_pixmap(dpi=self.dpi)
+        pix.save(img)
+        pix = None
+        res = None
+        try:
+            with self._infer_lock:  # 全局推理锁
+                eng = self._ensure()
+                res, _ = eng(img)
+                self._n_since_recycle += 1
+                if self._n_since_recycle >= RECYCLE_EVERY:
+                    eng = None          # 丢掉局部引用，让 _recycle 真正释放
+                    self._recycle()
+        finally:
+            try: os.remove(img)
+            except OSError: pass
+        lines = [ln[1] for ln in res] if res else []
+        return "\n".join(lines).strip()
+
     def _pdf(self, raw: bytes):
-        """既有三层优化 PDF 路径 (文本层优先 + OCR + 流式)。返回 (fmt, text, pages?)。
-        此处返回 (fmt='pdf', text), pages 用于 /convert 兼容需单独算, 但前端不需要。"""
+        """既有三层优化 PDF 路径 (逐页文本层判定 + OCR + 流式)。返回 (fmt, text, stats)。
+
+        逐页判定的关键在 MIN_PAGE_CHARS：文本层**够厚**才直取（可选中 PDF 全走这条，
+        零 OCR，秒回）；只有水印/页码的薄文本层视为「实为扫描页」，渲染 OCR，并把
+        文本层与 OCR 结果**择优保留**（谁信息多要谁），绝不静默丢页。
+
+        stats 回传逐页统计，供上层判断素材可信度（见 parse_warning）。
+        """
         tmpdir = tempfile.mkdtemp(prefix="ocrd_")
         pdf_path = os.path.join(tmpdir, "in.pdf")
         with open(pdf_path, "wb") as f:
             f.write(raw)
         pieces = []
         doc = None
+        stats = {"pages": 0, "text_pages": 0, "ocr_pages": 0, "empty_pages": 0}
         try:
             doc = pymupdf.open(pdf_path)
             total = len(doc)
+            stats["pages"] = total
             for pno in range(total):
                 page = doc[pno]
-                # ① 文本层检测 —— 最省
-                txt = page.get_text().strip()
-                if txt:
+                # ① 文本层够厚 → 直取（最省，可选中 PDF 的正常路径）
+                txt = (page.get_text() or "").strip()
+                if len(txt) >= MIN_PAGE_CHARS:
+                    stats["text_pages"] += 1
                     pieces.append(txt)
                     continue
-                # ② 真扫描页 → 渲染+OCR (流式释放)
-                img = os.path.join(tmpdir, f"p{pno}.png")
-                pix = page.get_pixmap(dpi=self.dpi)
-                pix.save(img)
-                pix = None
-                with self._infer_lock:  # ③ 全局推理锁
-                    eng = self._ensure()
-                    res, _ = eng(img)
-                    self._n_since_recycle += 1
-                    if self._n_since_recycle >= RECYCLE_EVERY:
-                        eng = None          # 丢掉局部引用，让 _recycle 真正释放
-                        self._recycle()
-                lines = [ln[1] for ln in res] if res else []
-                pieces.append("\n".join(lines))
-                try: os.remove(img)
-                except OSError: pass
-            return "pdf", "\n\n".join(pieces)
+                # ② 文本层为空 / 只有水印页码 → 按扫描页处理，渲染 + OCR
+                ocr_txt = self._ocr_page(page, tmpdir, pno)
+                if ocr_txt and len(ocr_txt) >= len(txt):
+                    stats["ocr_pages"] += 1
+                    pieces.append(ocr_txt)
+                elif ocr_txt:
+                    # OCR 认得比文本层少，但两者都短：保留信息量大的那个
+                    stats["ocr_pages"] += 1
+                    pieces.append(ocr_txt)
+                elif txt:
+                    # OCR 彻底失败：宁可留薄文本层，也不要丢页
+                    stats["text_pages"] += 1
+                    pieces.append(txt)
+                else:
+                    stats["empty_pages"] += 1
+            return "pdf", "\n\n".join(pieces), stats
         finally:
             if doc: doc.close()
             try: os.remove(pdf_path)
@@ -321,6 +380,29 @@ def _extract_file(body: bytes, content_type: str):
         return body[phead_end + 4:end], fname
     return None, None
 
+def parse_warning(stats, chars: int) -> str:
+    """把「素材可能不完整」翻译成一句话交给上层，让上层有机会中止而不是硬着头皮继续。
+
+    只看 chars 判断不了：混合型 PDF（前几页扫描 + 后几页可选）能解析出上千字符，但
+    那可能全是「扫描全能王 / 第 N 页」的水印。这里用逐页统计（页数、扫描页数、空页数）
+    给出「平均每页字数过低」「有整页没识别出文字」这类**可据以决策**的信号。
+    """
+    if not stats:
+        return ""
+    pages = int(stats.get("pages") or 0)
+    if pages <= 0:
+        return ""
+    parts = []
+    empty = int(stats.get("empty_pages") or 0)
+    if empty:
+        parts.append(f"有 {empty}/{pages} 页未识别出任何文字")
+    avg = chars / pages
+    if avg < MIN_AVG_PAGE_CHARS:
+        parts.append(f"共 {pages} 页只解析出 {chars} 字（平均每页 {avg:.0f} 字），"
+                     f"疑似只拿到了页码/水印而正文缺失")
+    return "；".join(parts)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -333,7 +415,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
     def do_GET(self):
         if self.path.rstrip("/") == "/health":
-            self._send_json(200, {"ok": True, "service": "ocrd", "formats": "pdf|docx|xlsx|pptx|txt|md|csv|html", "rapidocr": True})
+            # version / min_page_chars 一起报出来：部署验收可以直接 curl 出「跑的是哪一版、
+            # 逐页择优的阈值是多少」，不用先进机器翻二进制（见 VERSION 处的注释）。
+            self._send_json(200, {"ok": True, "service": "ocrd", "version": VERSION,
+                                  "min_page_chars": MIN_PAGE_CHARS,
+                                  "formats": "pdf|docx|xlsx|pptx|txt|md|csv|html", "rapidocr": True})
         else:
             self._send_json(404, {"ok": False, "error": "not_found"})
     def _handle_upload(self, path):
@@ -351,19 +437,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(400, {"ok": False, "error": "no_file_field"})
         t0 = time.time()
         try:
-            fmt, text, chars, from_cache = ENGINE.extract(raw, name or "")
+            fmt, text, chars, from_cache, stats = ENGINE.extract(raw, name or "")
             ms = round((time.time() - t0) * 1000)
+            warn = parse_warning(stats, chars)
             if path == "/extract":
                 return self._send_json(200, {
                     "ok": True, "fmt": fmt, "text": text, "chars": chars,
                     "name": name or "", "hash": hashlib.sha256(raw).hexdigest(),
                     "from_cache": from_cache, "total_ms": ms,
+                    "stats": stats, "warning": warn,
                 })
             # /convert 兼容旧结构
             return self._send_json(200, {
                 "ok": True, "fmt": fmt, "text": text, "chars": chars,
                 "hash": hashlib.sha256(raw).hexdigest(),
                 "from_cache": from_cache, "total_ms": ms,
+                "stats": stats, "warning": warn,
                 "pages": [{"page": 1, "src": fmt, "ms": ms, "text": text}] if fmt == "pdf" else [],
             })
         except Exception as e:
@@ -397,8 +486,7 @@ def main():
     ENGINE = OcrEngine(a.dpi, a.max_cache)
     try: ENGINE._ensure()
     except Exception as e: print("engine init warning:", e)
-    print(f"ocrd v3 listening on 127.0.0.1:{a.port} (dpi={a.dpi}, max_cache={a.max_cache}MB, recycle_every={RECYCLE_EVERY}页, formats=pdf/docx/xlsx/pptx/txt)",
-          flush=True)
+    print(f"{VERSION} listening on 127.0.0.1:{a.port} (dpi={a.dpi}, max_cache={a.max_cache}MB, recycle_every={RECYCLE_EVERY}页, min_page_chars={MIN_PAGE_CHARS}, formats=pdf/docx/xlsx/pptx/txt)", flush=True)
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     srv.serve_forever()
 

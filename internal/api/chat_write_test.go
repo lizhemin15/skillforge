@@ -298,7 +298,7 @@ func TestGenerateWithPackInjectsOnlyThisCategory(t *testing.T) {
 
 	sc := &agent.SkillContent{Slug: slug, Name: "手册写作", SkillType: model.SkillTypeWrite,
 		SystemPrompt: "你是公文写作助手，按手册要求写作。"}
-	got, err := eng.GenerateWithPack(context.Background(), sc, pack, cat, map[string]string{}, nil)
+	got, err := eng.GenerateWithPack(context.Background(), sc, pack, cat, map[string]string{}, "", nil)
 	if err != nil {
 		t.Fatalf("GenerateWithPack: %v", err)
 	}
@@ -448,7 +448,7 @@ func TestGenerateWithPackFailureIsNotSilent(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // 让底层 HTTP 调用直接失败
-	if _, err := eng.GenerateWithPack(ctx, sc, pack, pack.FindCategory("新闻通稿"), map[string]string{}, nil); err == nil {
+	if _, err := eng.GenerateWithPack(ctx, sc, pack, pack.FindCategory("新闻通稿"), map[string]string{}, "", nil); err == nil {
 		t.Fatal("底层调用失败时必须返回错误，不能静默返回空稿")
 	}
 }

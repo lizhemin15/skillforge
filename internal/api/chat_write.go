@@ -88,7 +88,9 @@ func (h *chatHandler) runManualWrite(
 	// 的心跳撑住（详情里带「已用 Ns」，看得见在动）。
 	draftIdx := tb.Active("generate", "④ 起草初稿", fmt.Sprintf("按《%s》的写作要求与本类范文起草…", catName))
 	clock.Set(tb.Steps())
-	draft, err := h.eng.GenerateWithPack(ctx, sc, pack, cat, args, nil)
+	// 起草前先把本会话前文（尤其是上一轮产物的原文）交给模型——续改类请求
+	// （「把语气改成公文」「在上一篇后面加一段」）全靠它，否则每轮都是重写。
+	draft, err := h.eng.GenerateWithPack(ctx, sc, pack, cat, args, h.eng.ContextBlock(ctx, sessionID, history), nil)
 	if err != nil {
 		write(evError, jsonSafe(map[string]string{"error": "生成失败: " + err.Error()}))
 		return true
@@ -116,7 +118,7 @@ func (h *chatHandler) runManualWrite(
 		write(evDelta, jsonSafe(map[string]string{"t": "\n\n---\n" + reviewNote}))
 		_ = leftover
 	}
-	h.eng.Push(sessionID, agent.Message{Role: "assistant", Content: final, SkillSlug: sc.Slug, At: time.Now()})
+	h.eng.Push(sessionID, agent.Message{Role: "assistant", Content: final, SkillSlug: sc.Slug, Kind: agent.KindArtifact, At: time.Now()})
 	clock.Finish()
 	if strings.TrimSpace(sc.Attachment) != "" {
 		write(evFile, jsonSafe(map[string]string{

@@ -39,6 +39,11 @@ type Message struct {
 	At      time.Time `json:"at"`
 	// SkillSlug is set on assistant messages that were generated using a skill.
 	SkillSlug string `json:"skill_slug,omitempty"`
+	// Kind 标记消息的**角色之外的用途**：KindArtifact 表示「这条是上一轮的产物
+	// （文章/文档/已填值）」，上下文注入时按原文保留、不参与压缩、不参与截断。
+	// 用结构化字段而不是扫正文关键词，是因为关键词随文案一变就漏——漏一次就是
+	// 用户又看到「它不管我上一轮生成的东西」。
+	Kind string `json:"kind,omitempty"`
 }
 
 // Eval is the orchestrator's decision after reading a user turn.
@@ -81,16 +86,24 @@ type Engine struct {
 	full     map[string][]Message // full history as persisted to disk (untouched by maxHist)
 	dataDir  string               // sessions persisted under <dataDir>/sessions/*.json
 	maxHist  int                  // max assistant+user turns kept for in-memory context
+
+	// summaries 存「旧对话被模型压缩的结果」及其 watermark（见 compact.go）。
+	// 为什么不在每次请求里现场压：压缩是一次真实模型调用（秒级），每轮都压会
+	// 把对话延迟翻倍；watermark 让同一段旧对话只压一次，之后多轮复用。
+	summaries map[string]*compaction
+	// summarize 是压缩函数，默认走真实 LLM；单测注入假实现（模型不可用也要能测）。
+	summarize func(context.Context, string) (string, error)
 }
 
 // New builds an engine over the existing store and LLM client.
 func New(l *llm.Client, s *store.SkillStore) *Engine {
 	e := &Engine{
-		llm:      l,
-		store:    s,
-		sessions: make(map[string][]Message),
-		full:     make(map[string][]Message),
-		maxHist:  12,
+		llm:       l,
+		store:     s,
+		sessions:  make(map[string][]Message),
+		full:      make(map[string][]Message),
+		maxHist:   12,
+		summaries: make(map[string]*compaction),
 	}
 	// sessions are persisted to <dataDir>/sessions/<id>.json so a service
 	// restart or page refresh does not wipe multi-turn fill context.
@@ -352,9 +365,9 @@ action 必须根据上面「意图→动作」映射严格输出，不要省略�
 	// Ask the classifier; if the first attempt comes back unusable (malformed
 	// JSON or empty intent), retry once with a stricter one-line-JSON nudge so a
 	// single flaky completion doesn't silently degrade the route.
-	eval, retry := e.classify(ctx, sys, history, user)
+	eval, retry := e.classify(ctx, id, sys, history, user)
 	if retry {
-		eval, _ = e.classify(ctx, sys, history, user)
+		eval, _ = e.classify(ctx, id, sys, history, user)
 	}
 	if eval == nil {
 		return &Eval{SkillSlug: "", Reason: "意图识别异常，按普通对话处理"}, nil
@@ -365,8 +378,10 @@ action 必须根据上面「意图→动作」映射严格输出，不要省略�
 
 // classify runs one classifier completion. Returns (eval, retry) where retry
 // is true when the result was unusable (bad JSON or empty intent).
-func (e *Engine) classify(ctx context.Context, sys string, history []Message, user string) (*Eval, bool) {
-	out, err := e.llm.Chat(ctx, sys, "对话历史（供参考，重点回应最新消息）：\n"+compactHistory(history)+"\n\n用户最新消息：\n"+user, true)
+func (e *Engine) classify(ctx context.Context, id, sys string, history []Message, user string) (*Eval, bool) {
+	// 意图识别也吃上下文：用户说「整理成 word」时，识别「这是承接上一轮新闻稿」
+	// 才能路由到正确的技能，而不是当成一句没头没尾的新指令。
+	out, err := e.llm.Chat(ctx, sys, "对话历史（供参考，重点回应最新消息）：\n"+e.ContextBlock(ctx, id, history)+"\n\n用户最新消息：\n"+user, true)
 	if err != nil {
 		return nil, false
 	}
@@ -615,7 +630,7 @@ type DocResult struct {
 // the same session already generated a document, its spec is replayed into the
 // prompt as the base so "再加一行 / 把单价改成 8000" produces the full updated
 // table instead of a brand-new table containing only the delta.
-func (e *Engine) GenerateDoc(ctx context.Context, sc *SkillContent, args map[string]string, userMsg string, history []Message) (*DocResult, error) {
+func (e *Engine) GenerateDoc(ctx context.Context, id string, sc *SkillContent, args map[string]string, userMsg string, history []Message) (*DocResult, error) {
 	sys := "你是" + sc.Name + "的执行者。严格遵循下面的技能提示词。\n\n==== 技能提示词 ====\n" + sc.SystemPrompt
 
 	var argBlock strings.Builder
@@ -631,6 +646,18 @@ func (e *Engine) GenerateDoc(ctx context.Context, sc *SkillContent, args map[str
 			"你必须输出**完整的**更新后规格：保留上一轮的所有列（cols）、所有数据行（rows）与段落（parags），" +
 			"只把用户这次的改动应用上去。禁止只输出新增或修改的那一部分，禁止改变原有列名/表头，禁止丢行。" +
 			"格式（format）也保持与上一轮一致，除非用户明确要求换成别的格式。\n\n")
+	}
+	// 上一轮的**正文产物**必须原样进 prompt。
+	// 老实现只回放上一轮的「文档规格」（extractLastDocSpec），对「用户先让技能
+	// 写了一篇新闻稿、这一轮说『整理成 word』」这条链路完全是盲的：规格还没生成
+	// 过 → 什么都不注入 → 模型凭空造一份新文档，用户看到的就是「它不管我上一轮
+	// 写的东西」。产物正文走 ContextBlock 的产物层（逐字保留、不压缩）。
+	if block := e.ContextBlock(ctx, id, history); block != "" && block != "（无历史）" {
+		argBlock.WriteString("## 本会话前文（含用户已认可的产物原文）\n")
+		argBlock.WriteString("用户说「整理成…/导出成…/改一下…」时，指的就是下面的产物；")
+		argBlock.WriteString("必须把它的正文原样放进本轮文档，不要重写、不要压缩、不要另起炉灶。\n\n")
+		argBlock.WriteString(block)
+		argBlock.WriteString("\n\n")
 	}
 	if strings.TrimSpace(userMsg) != "" {
 		argBlock.WriteString("## 用户的原始请求（格式与内容以此为准）：\n")
@@ -824,7 +851,7 @@ type FillClarify struct {
 // the untouched fields, instead of blanking them. Previous values are gen from
 // the history (via prior assistant fill summaries) and passed into the mapping
 // prompt as the current state.
-func (e *Engine) FillDoc(ctx context.Context, sc *SkillContent, userMsg string, history []Message) (*FillResult, error) {
+func (e *Engine) FillDoc(ctx context.Context, id string, sc *SkillContent, userMsg string, history []Message) (*FillResult, error) {
 	if sc.Attachment == "" {
 		return nil, errors.New("该技能没有可填充的模板文件")
 	}
@@ -941,7 +968,7 @@ func (e *Engine) FillDoc(ctx context.Context, sc *SkillContent, userMsg string, 
 		"3. 不要重复：一个由 ops 新增的行，其数据就放 ops 的 values 里，不要再塞进 fields 对应 key。\n" +
 		"4. **追加新行务必选对 table 索引**（装明细的那个表），千万别往甲乙方/签字区那张表里加品目。"
 	prompt := "用户请求：\n" + userMsg
-	if hist := compactHistory(history); hist != "" && hist != "（无历史）" {
+	if hist := e.ContextBlock(ctx, id, history); hist != "" && hist != "（无历史）" {
 		prompt = "对话历史（供参考，重点回应最新消息）：\n" + hist + "\n\n" + prompt
 	}
 	out, err := e.llm.Chat(ctx, sys, prompt, true)
@@ -1299,7 +1326,7 @@ func (e *Engine) PlainChat(ctx context.Context, id, user string, history []Messa
 技能清单：
 ` + rosterStr
 
-	histBlock := compactHistory(history)
+	histBlock := e.ContextBlock(ctx, id, history)
 	combined := user
 	if len(history) > 0 {
 		combined = "对话历史（供参考，你只需回应最新用户消息）：\n" + histBlock + "\n\n最新用户消息：\n" + user
@@ -1309,23 +1336,6 @@ func (e *Engine) PlainChat(ctx context.Context, id, user string, history []Messa
 
 // ---------------------------------------------------------------------------
 // helpers
-
-func compactHistory(history []Message) string {
-	if len(history) == 0 {
-		return "（无历史）"
-	}
-	var b strings.Builder
-	for _, m := range history {
-		b.WriteString(m.Role + ": ")
-		c := strings.TrimSpace(m.Content)
-		if len(c) > 400 {
-			c = c[:400] + "…"
-		}
-		b.WriteString(c)
-		b.WriteString("\n")
-	}
-	return b.String()
-}
 
 // skillTypeLabel renders a human-readable label for a skill's type column.
 func skillTypeLabel(t string) string {

@@ -48,8 +48,8 @@ func TestOCRClientHonorsConfiguredTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("超时上限 3s、服务要 1200ms，却失败了：%v", err)
 	}
-	if got != "手册正文" {
-		t.Fatalf("解析文本不对：%q", got)
+	if got.Text != "手册正文" {
+		t.Fatalf("解析文本不对：%q", got.Text)
 	}
 }
 

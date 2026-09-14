@@ -83,12 +83,18 @@ func (a *Admin) ReadSkillFile(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		text, xerr := a.extractDoc(rel, raw)
+		res, xerr := a.extractDoc(rel, raw)
 		if xerr != nil {
 			writeJSON(w, http.StatusOK, map[string]any{"previewable": true, "error": xerr.Error(), "text": ""})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"previewable": true, "text": text, "mime": f.Mime})
+		// warning/stats 一起回给前端：预览页是用户上传后第一眼看到的地方，
+		// 「这 PDF 只读出 1000 字符水印」必须在这里就露出来，而不是等训练完
+		// 发现技能和素材无关才回头怀疑。
+		writeJSON(w, http.StatusOK, map[string]any{
+			"previewable": true, "text": res.Text, "mime": f.Mime,
+			"warning": res.Warning, "stats": res.Stats,
+		})
 		return
 	}
 	f, err := a.store.ReadFile(slug, rel)
@@ -288,21 +294,37 @@ func (a *Admin) extractAndLand(slug, filename string, data []byte) {
 	if base == "" {
 		base = "extracted"
 	}
-	text, err := a.extractDoc(filename, data)
+	res, err := a.extractDoc(filename, data)
 	if err != nil {
 		log.Printf("[extract] %s/%s 解析失败: %v (%.1fs)", slug, filename, err, time.Since(start).Seconds())
 		return
 	}
 	land := "source/" + base + ".txt"
-	if err := a.store.WriteFile(slug, land, text); err != nil {
+	if err := a.store.WriteFile(slug, land, res.Text); err != nil {
 		log.Printf("[extract] %s/%s 落地文本失败: %v", slug, land, err)
 		return
 	}
-	log.Printf("[extract] %s/%s -> %s (%d chars, %.1fs)", slug, filename, land, len(text), time.Since(start).Seconds())
+	log.Printf("[extract] %s/%s -> %s (%d chars, stats=%v, %.1fs)", slug, filename, land, len([]rune(res.Text)), res.Stats, time.Since(start).Seconds())
+	// 解析「成功但可疑」必须留痕：这类情况字符数不为 0，只看 chars 是发现不了的。
+	if res.Warning != "" {
+		log.Printf("[extract] ⚠️ %s/%s 解析可能不完整: %s", slug, filename, res.Warning)
+	}
+}
+
+// docExtract ocrd /extract 的返回：文本 + 「素材可信度」诊断。
+//
+// 为什么诊断要跟着文本一起回来：混合型 PDF（前几页扫描 + 后几页可选）在旧版
+// ocrd 下只吐出 1000 多字符的水印，字符数非 0 ⇒ 上层以为素材没问题 ⇒ 预览页
+// 一片「正常」，用户看不出来自己的 PDF 其实没被读出来。
+type docExtract struct {
+	Text    string
+	Warning string
+	Stats   map[string]any
 }
 
 // extractDoc calls the ocrd microservice (POST /extract) and returns the text.
-func (a *Admin) extractDoc(filename string, data []byte) (string, error) {
+func (a *Admin) extractDoc(filename string, data []byte) (docExtract, error) {
+	var res docExtract
 	// 超时必须可配：写死 300s 而真实扫描件要 397.5s，只会让上传解析永远失败。
 	client := &http.Client{Timeout: a.ocrTimeoutOrDefault()}
 	var buf bytes.Buffer
@@ -313,36 +335,41 @@ func (a *Admin) extractDoc(filename string, data []byte) (string, error) {
 	}
 	fw, err := mw.CreateFormFile("file", name)
 	if err != nil {
-		return "", err
+		return res, err
 	}
 	if _, err := fw.Write(data); err != nil {
-		return "", err
+		return res, err
 	}
 	if err := mw.Close(); err != nil {
-		return "", err
+		return res, err
 	}
 	req, err := http.NewRequest(http.MethodPost, a.ocrURL+"/extract", &buf)
 	if err != nil {
-		return "", err
+		return res, err
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return res, err
 	}
 	defer resp.Body.Close()
 	var out struct {
-		OK   bool   `json:"ok"`
-		Text string `json:"text"`
-		Err  string `json:"error"`
+		OK      bool           `json:"ok"`
+		Text    string         `json:"text"`
+		Err     string         `json:"error"`
+		Warning string         `json:"warning"`
+		Stats   map[string]any `json:"stats"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
+		return res, err
 	}
 	if !out.OK {
-		return "", fmt.Errorf("解析服务: %s", out.Err)
+		return res, fmt.Errorf("解析服务: %s", out.Err)
 	}
-	return strings.TrimSpace(out.Text), nil
+	res.Text = strings.TrimSpace(out.Text)
+	res.Warning = strings.TrimSpace(out.Warning)
+	res.Stats = out.Stats
+	return res, nil
 }
 
 // RawSkillFile streams a managed file's raw bytes with the correct Content-Type,

@@ -209,7 +209,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// docgen skills produce an office file, not streamed text: drive the
 		// generator, cache the bytes, and hand the client a one-time download.
 		if sc.SkillType == model.SkillTypeDocGen {
-			doc, derr := h.eng.GenerateDoc(ctx, sc, args, req.Message, fullHist)
+			doc, derr := h.eng.GenerateDoc(ctx, req.SessionID, sc, args, req.Message, fullHist)
 			if derr != nil {
 				write(evError, jsonSafe(map[string]string{"error": "文档生成失败: " + derr.Error()}))
 				return
@@ -227,7 +227,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Persist this turn's spec into session history (as a marker in the
 			// assistant message) so a follow-up "再加一行 / 把单价改成 8000"
 			// continues from THIS document instead of inventing a new one.
-			h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: doc.Summary + docSummarySuffix(doc.Spec), SkillSlug: eval.SkillSlug, At: time.Now()})
+			h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: doc.Summary + docSummarySuffix(doc.Spec), SkillSlug: eval.SkillSlug, Kind: agent.KindArtifact, At: time.Now()})
 			write(evDone, jsonSafe(map[string]string{"skill": eval.SkillSlug}))
 			return
 		}
@@ -270,7 +270,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if action == "fill" && sc.Attachment != "" {
-			fres, ferr := h.eng.FillDoc(ctx, sc, req.Message, fullHist)
+			fres, ferr := h.eng.FillDoc(ctx, req.SessionID, sc, req.Message, fullHist)
 			if ferr != nil {
 				// fall back to the normal flow if the template can't be filled
 				fmt.Fprintf(os.Stderr, "[fill] fallback reason=%v\n", ferr)
@@ -302,6 +302,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					Role:      "assistant",
 					Content:   fres.Summary + fillSummarySuffix(fres.Vals),
 					SkillSlug: eval.SkillSlug,
+					Kind:      agent.KindArtifact,
 					At:        time.Now(),
 				})
 				write(evDone, jsonSafe(map[string]string{"skill": eval.SkillSlug}))
@@ -336,7 +337,9 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			write(evError, jsonSafe(map[string]string{"error": "生成失败: " + err.Error()}))
 			return
 		}
-		h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: full, SkillSlug: eval.SkillSlug, At: time.Now()})
+		// Kind=artifact：这是技能生成的正文，是用户下一轮「改成…/整理成…」的指代对象，
+		// 上下文注入时必须逐字保留（见 agent/compact.go 的产物层）。
+		h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: full, SkillSlug: eval.SkillSlug, Kind: agent.KindArtifact, At: time.Now()})
 		clock.Finish()
 		// typed flow skill with a declared template file → dispatch it for download
 		if sc.Attachment != "" {
@@ -357,7 +360,9 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		write(evError, jsonSafe(map[string]string{"error": err.Error()}))
 		return
 	}
-	h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: full, At: time.Now()})
+	// 无技能的普通对话产出也可能是「用户下一轮要指代的正文」（如「写篇新闻稿，
+	// 再整理成 word」而新闻稿没命中任何写作技能），够长的按产物保留原文。
+	h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: full, Kind: agent.ArtifactKind(full), At: time.Now()})
 	clock.Finish()
 	write(evDone, jsonSafe(map[string]string{"skill": ""}))
 }

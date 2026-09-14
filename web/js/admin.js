@@ -270,7 +270,18 @@
                   <div class="row" style="margin-top:10px">前台列表已可用，也可在「技能管理」里编辑。</div>`;
                 loadManageSkills();
                 break;
-              case 'error': logLine('✕', ev.data, 'err'); break;
+              case 'error':
+                // 素材门禁失败等硬错误必须「响亮」：以前只往日志里打一行红字，
+                // 用户滚一下就当警告忽略了，然后拿着上一次的成功结果以为训练过了。
+                logLine('✕', ev.data, 'err');
+                {
+                  const rd = $('tr-result');
+                  rd.style.display = 'block';
+                  rd.innerHTML = `<h4 style="color:#c0392b">✕ 训练已中止</h4>
+                    <div class="row">${esc(ev.data)}</div>
+                    <div class="row" style="margin-top:10px;color:#888">素材没读到内容时，本次不会生成技能——避免交付一份与素材无关的成品。</div>`;
+                }
+                break;
             }
           } catch (_) {}
         }
@@ -649,9 +660,19 @@
               if (!pj || !pj.previewable) { holder.innerHTML = '<p class="dim" style="padding:24px">该格式不支持内容提取，请使用下载按钮查看原文件。</p>'; return; }
               if (pj.error) { holder.innerHTML = '<p class="msg err">' + esc(pj.error) + '</p>'; return; }
               const t = pj.text || '';
+              // 逐页统计 + 警告条：混合型 PDF 只读出薄水印层时，旧版这里显示
+              // 「已提取文本 · 1129 字符」，看着一切正常，用户完全无从察觉。
+              const st = pj.stats || {};
+              const pageInfo = (typeof st.pages === 'number' && st.pages > 0)
+                ? (' · 共 ' + st.pages + ' 页（文本层 ' + (st.text_pages || 0) + ' / OCR ' + (st.ocr_pages || 0) + ' / 空白 ' + (st.empty_pages || 0) + '）')
+                : '';
+              const warnBar = pj.warning
+                ? '<div style="padding:10px 12px;font-size:12px;color:#e0a030;background:rgba(224,160,48,.08);border-bottom:1px solid var(--border)">⚠️ ' + esc(pj.warning) + '　如内容明显偏少，请检查是否为扫描件或尝试重新导出 PDF。</div>'
+                : '';
               holder.innerHTML =
+                warnBar +
                 '<div style="padding:8px 12px;font-size:12px;color:#888;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">' +
-                  '<span>已提取文本 · ' + esc(t.length) + ' 字符（文档内容自动解析）</span>' +
+                  '<span>已提取文本 · ' + esc(t.length) + ' 字符（文档内容自动解析）' + esc(pageInfo) + '</span>' +
                   '<span style="opacity:.7">原始排版请用「下载」查看</span>' +
                 '</div>' +
                 '<pre style="white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;padding:14px 16px;font-size:13px;line-height:1.7;margin:0">' + esc(t || '(无文本内容)') + '</pre>';

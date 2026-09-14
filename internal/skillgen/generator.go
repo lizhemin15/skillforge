@@ -123,7 +123,21 @@ func (g *Generator) Generate(ctx context.Context, in *Input, onStep func(string)
 	// 旧流程把上传字节直接当文本塞给 LLM：上传一本扫描版手册，模型看到的
 	// 是二进制乱码，「抽取写作特征」自然全军覆没。这一步把素材真正文本化，
 	// 也是后面手册结构抽取能成立的前提。
-	g.ingestFiles(ctx, in, steps)
+	rep := g.ingestFiles(ctx, in, steps)
+
+	// ---- Step 0.5: 素材门禁（硬失败，不放行静默降级） ----
+	// 事故背景：混合型 PDF（前几页扫描 + 后几页可选）只解析出 1000 多字符的水印，
+	// 字符数非 0 让全链路都以为「有素材」，于是流水线照跑，最后交付一份**和素材
+	// 毫无关系**的技能。用户看到的是一份看起来很完整、但跟他上传的东西不搭边的技能，
+	// 比直接报错坏得多——他没机会知道是自己的 PDF 没被读出来。
+	// 判据只覆盖「传了文档却拿不到内容」，纯文本需求训练不受影响。
+	if err := g.enforceMaterialGate(rep); err != nil {
+		steps("0.5/9 ❌ " + err.Error())
+		return nil, err
+	}
+	if len(rep.Warnings) > 0 {
+		steps(fmt.Sprintf("0.5/9 ⚠️ 素材质量提示（%d 条）：%s", len(rep.Warnings), strings.Join(rep.Warnings, "；")))
+	}
 
 	// ---- Step 1: ingest files → extract key attributes ----
 	steps("1/9 分析参考文件，提取写作特征…")

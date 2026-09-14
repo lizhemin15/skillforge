@@ -43,7 +43,16 @@ restore() {
   cp "$BAK/manifest.json" web/assets.manifest.json
   for h in "${HTMLS[@]}"; do cp "$BAK/$(basename $h)" "$h"; done
   cp "$BAK/style.css" web/css/style.css
-  for p in "${TOUCHED_PATHS[@]}"; do git checkout -- "$p" >/dev/null 2>&1 || true; done
+  # ⚠️ 这里**不能**再补一句 `git checkout -- $p`：它是按索引/HEAD 覆盖工作区，
+  # 会把「跑自证之前工作区里本来就有的未提交改动」一并抹掉，而这些改动跟本次注入
+  # 毫无关系。实测踩过：先在台上改了 js/site.js 之类未提交改动 + 重新生成 manifest，
+  # 再跑一次自证 → manifest 被 HEAD 版覆盖，守卫当场报 3 条红
+  # （HTML=20260914D manifest=20260913D、哈希漂移、git 比对），看起来像真故障，
+  # 其实是自证脚本吃掉了自己的工作成果 —— 又一次假红。
+  # BAK 快照 = 真正的「运行前状态」，恢复它就够了。
+  for p in "${TOUCHED_PATHS[@]}"; do
+    [ -f "$BAK/$(basename "$p")" ] && cp "$BAK/$(basename "$p")" "$p"
+  done
 }
 trap restore EXIT
 

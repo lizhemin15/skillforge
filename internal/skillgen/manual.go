@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -284,10 +285,23 @@ func humanDuration(d time.Duration) string {
 	return fmt.Sprintf("%d 分 %d 秒", sec/60, sec%60)
 }
 
+// ocrResult ocrd /extract 的解析结果。
+//
+// Warning/Stats 是「素材可信度」诊断，为什么必须一路传到上层：
+// 线上事故是混合型 PDF（前几页扫描 + 后几页可选）只解析出 1129 字符的水印，
+// 字符数非 0 ⇒ 全链路绿灯 ⇒ 生成了一份和素材毫无关系的技能。**字符数分辨不出
+// 「正文」和「水印」**，只有服务端的逐页统计能分辨，所以不能被丢在这一层。
+type ocrResult struct {
+	Text    string
+	Warning string         // 「有 N/M 页没识别出文字」这类可据以决策的提示
+	Stats   map[string]any // 逐页统计（pages/text_pages/ocr_pages/empty_pages），非 PDF 为空
+}
+
 // ocrExtract 调用 ocrd 的 /extract 接口把文档解析成纯文本。
 // 字段名与 api 层 extractDoc 保持一致（form 字段 "file"），避免两个调用方
 // 对同一个微服务用两套协议。
-func ocrExtract(ctx context.Context, ocrURL, filename string, data []byte, client *http.Client) (string, error) {
+func ocrExtract(ctx context.Context, ocrURL, filename string, data []byte, client *http.Client) (ocrResult, error) {
+	var res ocrResult
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	name := filepath.Base(filename)
@@ -296,42 +310,196 @@ func ocrExtract(ctx context.Context, ocrURL, filename string, data []byte, clien
 	}
 	fw, err := mw.CreateFormFile("file", name)
 	if err != nil {
-		return "", err
+		return res, err
 	}
 	if _, err := fw.Write(data); err != nil {
-		return "", err
+		return res, err
 	}
 	if err := mw.Close(); err != nil {
-		return "", err
+		return res, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(ocrURL, "/")+"/extract", &buf)
 	if err != nil {
-		return "", err
+		return res, err
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	// 超时由调用方注入（默认 30 分钟，见 DefaultOCRTimeout）。这里坚决不写死数值：
 	// 旧实现写死 300s，而真实扫描件要 397.5s，导致解析必然失败却只在流里留一行 ⚠️。
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return res, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 	if err != nil {
-		return "", err
+		return res, err
 	}
 	var out struct {
-		OK    bool   `json:"ok"`
-		Text  string `json:"text"`
-		Error string `json:"error"`
+		OK      bool           `json:"ok"`
+		Text    string         `json:"text"`
+		Error   string         `json:"error"`
+		Warning string         `json:"warning"`
+		Stats   map[string]any `json:"stats"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("解析服务返回无法识别: %w", err)
+		return res, fmt.Errorf("解析服务返回无法识别: %w", err)
 	}
 	if !out.OK {
-		return "", fmt.Errorf("解析服务: %s", out.Error)
+		return res, fmt.Errorf("解析服务: %s", out.Error)
 	}
-	return strings.TrimSpace(out.Text), nil
+	res.Text = strings.TrimSpace(out.Text)
+	res.Warning = strings.TrimSpace(out.Warning)
+	res.Stats = out.Stats
+	return res, nil
+}
+
+// statsLine 把逐页统计压成一行人能读的话，写进训练进度流。
+// 老版本不看统计，用户只能看到「解析完成：1129 字符」——一个数字，看不出那是水印。
+func statsLine(stats map[string]any) string {
+	if len(stats) == 0 {
+		return ""
+	}
+	num := func(k string) int { return statsInt(stats, k) }
+	pages := num("pages")
+	if pages == 0 {
+		return ""
+	}
+	s := fmt.Sprintf("共 %d 页（文本层直取 %d / OCR %d", pages, num("text_pages"), num("ocr_pages"))
+	if e := num("empty_pages"); e > 0 {
+		s += fmt.Sprintf(" / 空白 %d", e)
+	}
+	return s + "）"
+}
+
+// extractionJudgement 对一次解析结果的可信度判定（结构化，不靠关键字）。
+type extractionJudgement struct {
+	pages   int  // 该文档页数（非 PDF / 无统计时为 0）
+	suspect bool // 文本非空但等于没读到正文
+}
+
+// judgeExtraction 依据逐页统计判断「这份文档到底读出来没有」。
+//
+// 判据（任一成立即 suspect）：
+//   - 有统计且页数 > 0，但所有页都是空白页（empty_pages == pages）；
+//   - 平均每页字数低于 suspectAvgPageChars（页码 + 水印就是这种形态）。
+//
+// 没有 stats（docx/txt 等非分页格式）时不做可疑判定——拿不到事实就不要猜。
+func judgeExtraction(stats map[string]any, chars int) extractionJudgement {
+	pages := statsInt(stats, "pages")
+	if pages <= 0 {
+		return extractionJudgement{}
+	}
+	j := extractionJudgement{pages: pages}
+	if statsInt(stats, "empty_pages") >= pages {
+		j.suspect = true
+		return j
+	}
+	if chars/pages < suspectAvgPageChars {
+		j.suspect = true
+	}
+	return j
+}
+
+// statsInt 读 ocrd stats 里的整数字段（JSON 走 float64，这里做一次收口）。
+func statsInt(stats map[string]any, key string) int {
+	if len(stats) == 0 {
+		return 0
+	}
+	switch v := stats[key].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			return int(n)
+		}
+	}
+	return 0
+}
+
+// materialReport 汇总本轮素材的准备结果，作为「素材门禁」的判据。
+//
+// 为什么需要一个报告对象：老流程里每一步失败都只是 continue（打一行 ⚠️ 就往下走），
+// 整条流水线对「素材到底有没有拿到」一无所知。结果就是上传了一份解析不出来的 PDF，
+// 训练照跑，最后交付一份和素材毫无关系的技能——用户的原话是「生成的 skill 似乎和我
+// 给的内容完全没有关系」。**静默降级比报错危险得多**，所以把事实收集起来交给硬门。
+type materialReport struct {
+	DocFiles int      // 上传的二进制文档数（需要解析的那些）
+	OKFiles  int      // 成功文本化的文档数
+	Chars    int      // 可用素材总字符数（含纯文本素材）
+	Failures []string // 逐个失败原因：「文件名: 原因」
+	Warnings []string // 解析成功但可信度存疑（如平均每页字数过低）
+
+	// SuspectFiles 记录「解析返回了非空文本，但逐页统计显示等于没读到正文」的文档数
+	// （整本页页空白，或平均每页字数低于 suspectAvgPageChars）。
+	//
+	// 为什么单靠 OKFiles / Chars 抓不住：混合型 PDF 只读出「扫描全能王 / 第 N 页」水印时，
+	// 文本非空、字符数上千，两道判据全部放行，训练照跑，最后交付的技能与素材毫无关系。
+	// 所以判据必须落在「每页读到多少字」这种结构化事实上，而不是看字符串里有没有
+	// 「水印」二字——靠关键词猜形态必然漏（换一个扫描 App 水印文案就变了）。
+	SuspectFiles int
+
+	// TotalPages 所有文档的页数合计，用于把「共 50 页只读到 1129 字」说清楚。
+	TotalPages int
+}
+
+// minMaterialChars 素材可用性下限（字符）。低于此值等于没有素材，继续跑只会喂给
+// 模型一堆水印噪声。可用 SKILLFORGE_MIN_MATERIAL_CHARS 覆盖。
+func (g *Generator) minMaterialChars() int {
+	if v := strings.TrimSpace(os.Getenv("SKILLFORGE_MIN_MATERIAL_CHARS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return 200
+}
+
+// suspectAvgPageChars 「等于没读到正文」的每页字数水位。
+//
+// 取 50 而不是更小的值，是拿线上事故的真实数字校准过的：
+// 那份混合型 PDF 是 50 页 / 1129 字符 = 平均每页 22 字，全是「第 N 页 + 水印」。
+// 最初按 ocrd 侧的告警水位（20 字/页）抄过来，结果 22 > 20 —— 事故样本一次都拦不住，
+// 单测用真实数字直接把这个阈值照出来了。真正文页每页几百字，50 的余量足够大，
+// 不会误杀正常素材；而「50 页只凑出 2000 多字」本来也训不出任何东西。
+const suspectAvgPageChars = 50
+
+// enforceMaterialGate 素材硬门：上传了文档却一份都没解析出来（或素材总量少得可怜、
+// 或整本只读出页码水印）时直接失败，绝不退回通用流程。
+//
+// 判据只在 DocFiles > 0 时生效——没传文档、纯靠需求描述训练技能是正当用法，
+// 不能连带误杀。
+func (g *Generator) enforceMaterialGate(rep *materialReport) error {
+	if rep == nil || rep.DocFiles == 0 {
+		return nil
+	}
+	if rep.OKFiles == 0 {
+		return fmt.Errorf("上传的 %d 份文档全部无法解析，本次训练已中止（避免生成与素材无关的技能）: %s",
+			rep.DocFiles, strings.Join(rep.Failures, "；"))
+	}
+	// 解析成功但等于没读到正文：上传的每一份都是这种，就没有任何可用素材。
+	// 这一条才是用户那条反馈（「生成的 skill 似乎和我给的内容完全没有关系」）的正主：
+	// 前几页扫描 + 后几页可选的混合 PDF，正是这样一套「看着有字、其实全是水印」的素材。
+	if rep.SuspectFiles > 0 && rep.SuspectFiles == rep.DocFiles {
+		return fmt.Errorf("上传的 %d 份文档共 %d 页只解析出 %d 字符（平均每页 %.0f 字），"+
+			"内容疑似只有页码/水印而正文缺失，本次训练已中止（避免生成与素材无关的技能）：%s\n"+
+			"建议：确认文件是可搜索的文本 PDF，或重新导出/改为图片扫描件后重试",
+			rep.DocFiles, rep.TotalPages, rep.Chars, avgCharsPerPage(rep.Chars, rep.TotalPages),
+			strings.Join(rep.Warnings, "；"))
+	}
+	if rep.Chars < g.minMaterialChars() {
+		return fmt.Errorf("素材可用内容仅 %d 字符（低于 %d），本次训练已中止（避免生成与素材无关的技能）：%s",
+			rep.Chars, g.minMaterialChars(), strings.Join(rep.Warnings, "；"))
+	}
+	return nil
+}
+
+// avgCharsPerPage 只用于给人看的报错文案，页数为 0 时返回 0。
+func avgCharsPerPage(chars, pages int) float64 {
+	if pages <= 0 {
+		return 0
+	}
+	return float64(chars) / float64(pages)
 }
 
 // ingestFiles 把上传的参考文件规整成「文本化」的素材：二进制文档先过 ocrd，
@@ -339,10 +507,15 @@ func ocrExtract(ctx context.Context, ocrURL, filename string, data []byte, clien
 //
 // 幂等：Content 已是文本（管理员直接传 .txt/.md，或二次运行时）则原样跳过，
 // 不会重复消耗 OCR 算力。
-func (g *Generator) ingestFiles(ctx context.Context, in *Input, steps func(string)) {
+//
+// 返回素材报告（供 enforceMaterialGate 判定）；**不在这里报错**——失败原因要攒够
+// 一次性说清，而不是第一次失败就抛（用户上传 3 份文档，报 3 次错的信息量远不如一次说全）。
+func (g *Generator) ingestFiles(ctx context.Context, in *Input, steps func(string)) *materialReport {
+	rep := &materialReport{}
 	if in == nil || len(in.Files) == 0 {
-		return
+		return rep
 	}
+	rep.Chars = materialChars(in)
 	for _, uf := range in.Files {
 		if uf == nil {
 			continue
@@ -354,7 +527,9 @@ func (g *Generator) ingestFiles(ctx context.Context, in *Input, steps func(strin
 		if !looksBinary(uf.Content) {
 			continue // 已经是文本（或上次已抽过），无需再解析
 		}
+		rep.DocFiles++
 		if g.ocrURL == "" {
+			rep.Failures = append(rep.Failures, fn+": 未配置解析服务")
 			if steps != nil {
 				steps(fmt.Sprintf("⚠️ %s 是二进制文档，但未配置解析服务，无法作为参考素材", fn))
 			}
@@ -367,9 +542,10 @@ func (g *Generator) ingestFiles(ctx context.Context, in *Input, steps func(strin
 		raw := []byte(uf.Content)
 		// 扫描件解析要几分钟，中途必须回报进度——否则前端看起来就是卡死。
 		stopProgress := ocrProgress(steps, fn, start)
-		text, err := ocrExtract(ctx, g.ocrURL, fn, raw, g.ocrClient())
+		res, err := ocrExtract(ctx, g.ocrURL, fn, raw, g.ocrClient())
 		stopProgress()
 		if err != nil {
+			rep.Failures = append(rep.Failures, fmt.Sprintf("%s: %v", fn, err))
 			if steps != nil {
 				msg := fmt.Sprintf("⚠️ %s 解析失败：%v", fn, err)
 				if isTimeoutErr(err) {
@@ -383,7 +559,9 @@ func (g *Generator) ingestFiles(ctx context.Context, in *Input, steps func(strin
 			}
 			continue
 		}
+		text := res.Text
 		if strings.TrimSpace(text) == "" {
+			rep.Failures = append(rep.Failures, fn+": 解析结果为空")
 			if steps != nil {
 				steps(fmt.Sprintf("⚠️ %s 解析结果为空，已跳过", fn))
 			}
@@ -392,10 +570,52 @@ func (g *Generator) ingestFiles(ctx context.Context, in *Input, steps func(strin
 		uf.Raw = raw
 		uf.Content = text
 		uf.Extracted = true
+		rep.OKFiles++
+		// 「有文本」和「有正文」是两件事：把逐页事实记进报告，供素材门禁判定。
+		rec := judgeExtraction(res.Stats, len([]rune(text)))
+		rep.TotalPages += rec.pages
+		if rec.suspect {
+			rep.SuspectFiles++
+		}
 		if steps != nil {
-			steps(fmt.Sprintf("%s 解析完成：%d 字符（%.1fs）", fn, len([]rune(text)), time.Since(start).Seconds()))
+			steps(fmt.Sprintf("%s 解析完成：%d 字符（%.1fs）%s",
+				fn, len([]rune(text)), time.Since(start).Seconds(), statsLine(res.Stats)))
+			// 服务端用逐页统计判断出的「素材可能不完整」，必须原样透给用户看：
+			// 这是唯一能让用户在上传后、训练前就发现「PDF 只有水印被读出来」的信号。
+			if res.Warning != "" {
+				rep.Warnings = append(rep.Warnings, fn+": "+res.Warning)
+				steps(fmt.Sprintf("⚠️ %s 解析可能不完整：%s", fn, res.Warning))
+			}
+		} else if res.Warning != "" {
+			rep.Warnings = append(rep.Warnings, fn+": "+res.Warning)
 		}
 	}
+	rep.Chars = materialChars(in)
+	return rep
+}
+
+// materialChars 统计当前可用素材的总字符数（跳过隐藏文件与仍是二进制的文件）。
+// 与 manualSourceText 同口径，避免「门禁按 A 口径算、实际用料按 B 口径算」的错位。
+func materialChars(in *Input) int {
+	if in == nil {
+		return 0
+	}
+	n := 0
+	for _, f := range in.Files {
+		if f == nil {
+			continue
+		}
+		name := filepath.Base(strings.TrimSpace(f.Filename))
+		if name == "" || strings.HasPrefix(name, ".") {
+			continue
+		}
+		c := f.Content
+		if strings.TrimSpace(c) == "" || looksBinary(c) {
+			continue
+		}
+		n += len([]rune(c))
+	}
+	return n
 }
 
 // manualSourceText 把内存里的素材拼成一份原文，供锚点定位使用。

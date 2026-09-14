@@ -37,3 +37,7 @@ deploy.env
 
 # ocrd 构建产物（143M，只进离线包，不入库）
 /dist-bin/
+
+# Python 缓存（deploy/ocr 下的 __pycache__ 是本地跑脚本产生的垃圾）
+__pycache__/
+/dist-dl/

@@ -205,6 +205,11 @@ func packBlock(pack *WritePack, cat *WriteCategory) string {
 	if len(cat.Examples) > 0 {
 		b.WriteString("\n【本类真实范文（手册原文，供参照结构、语气、措辞）】\n")
 		b.WriteString("范文里与本篇主体无关的事实**不得搬用**——事实只能来自用户提供的素材。\n")
+		// 手册范文常带 {公司名称}/{日期} 这类占位符。模型的惯性是连占位符一起照抄：
+		// 用户明明给了「发布单位星河科技、发布日期 2026 年 9 月 14 日」，正文里还是
+		// {公司名称}/{日期}。这属于「用户给的信息没用上」，会被当成「没管我说的话」。
+		b.WriteString("范文中的占位符（如 {公司名称}、{日期}、{xx}）必须替换成本轮用户给出的真实信息；" +
+			"用户没给的，用中性表述绕开，**绝不允许把占位符原样写进正文**。\n")
 		for i, ex := range cat.Examples {
 			fmt.Fprintf(&b, "\n----- 范文 %d（%s）-----\n", i+1, ex.Path)
 			b.WriteString(strings.TrimSpace(ex.Content) + "\n")
@@ -215,8 +220,19 @@ func packBlock(pack *WritePack, cat *WriteCategory) string {
 }
 
 // GenerateWithPack 起草：在技能提示词之后注入本类的真实要求与范文。
-func (e *Engine) GenerateWithPack(ctx context.Context, sc *SkillContent, pack *WritePack, cat *WriteCategory, args map[string]string, onDelta func(string)) (string, error) {
-	return e.generateWithExtra(ctx, sc, args, packBlock(pack, cat), onDelta)
+// prior 是本会话前文（含上一轮产物的原文）。写作技能最容易犯「不管上一轮」的错：
+// 用户说「刚才那篇改成公文语气」「在上一篇基础上加一段」，如果起草时看不到上一篇
+// 的正文，模型只会重新写一篇看起来差不多的东西——用户的原话就是「通常没有管之前
+// 生成的内容」。所以这里把产物原文并进 extra（system 侧），而不是丢进 user 消息，
+// 免得被模型当成「本轮的新素材」混进正文。
+func (e *Engine) GenerateWithPack(ctx context.Context, sc *SkillContent, pack *WritePack, cat *WriteCategory, args map[string]string, prior string, onDelta func(string)) (string, error) {
+	extra := packBlock(pack, cat)
+	if strings.TrimSpace(prior) != "" && prior != "（无历史）" {
+		extra += "\n\n## 本会话前文（含用户已认可的产物原文）\n" +
+			"用户说「改成…/在上一篇基础上…/接着写」时，指的就是下面的产物；" +
+			"必须在它基础上修改，不要另起炉灶重写一遍。\n\n" + prior + "\n"
+	}
+	return e.generateWithExtra(ctx, sc, args, extra, onDelta)
 }
 
 // ReviewIssue 是审稿人挑出的一条问题。
