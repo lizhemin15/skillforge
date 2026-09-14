@@ -85,7 +85,17 @@ type Engine struct {
 	sessions map[string][]Message // in-memory trimmed history (maxHist)
 	full     map[string][]Message // full history as persisted to disk (untouched by maxHist)
 	dataDir  string               // sessions persisted under <dataDir>/sessions/*.json
-	maxHist  int                  // max assistant+user turns kept for in-memory context
+	// maxHist 内存里保留的消息条数上限。
+	//
+	// 原值 12（=6 轮）是「不截断、交给大模型压缩」那套设计落地前留下的：它比
+	// 压缩层还先动手，于是分层根本没机会生效——超过 6 轮的产物**轮不到被压缩，
+	// 直接整段消失**。用户实测的「多轮对话就忘了我之前问了什么」正是它：
+	// 18 条历史被砍到 12 条，最早贴进的那份写作要求连影子都没有。
+	//
+	// 定 40（=20 轮）：够让压缩层（compactKeepRecent=6 + watermark 触发阈值
+	// 4000 字）真正吃上长历史，而 40 条消息体量对现代模型的上下文窗口不值一提。
+	// 真正决定注入体积的是 ContextBlock 的分层预算，不是这个裁剪条数。
+	maxHist int // max assistant+user turns kept for in-memory context
 
 	// summaries 存「旧对话被模型压缩的结果」及其 watermark（见 compact.go）。
 	// 为什么不在每次请求里现场压：压缩是一次真实模型调用（秒级），每轮都压会
@@ -102,7 +112,7 @@ func New(l *llm.Client, s *store.SkillStore) *Engine {
 		store:     s,
 		sessions:  make(map[string][]Message),
 		full:      make(map[string][]Message),
-		maxHist:   12,
+		maxHist:   40,
 		summaries: make(map[string]*compaction),
 	}
 	// sessions are persisted to <dataDir>/sessions/<id>.json so a service
@@ -259,7 +269,25 @@ func (e *Engine) Session(id string) []Message {
 		e.full[id] = full
 	}
 	if len(full) > e.maxHist {
-		full = full[len(full)-e.maxHist:]
+		// 裁剪窗口，但把素材/产物消息钉住（见 isPinnedMsg）。
+		//
+		// 用户实测：「我多轮对话的时候，似乎就忘了我之前问了什么，以及你自己
+		// 回答了什么。」——素材层和产物层都要靠这些消息才能逐字注入，被纯时间窗
+		// 切走就等于用户贴的一万字要求和之前写好的长稿一起消失，而且是**连压缩
+		// 的机会都没有**（压缩只看近轮之外的对话）。maxHist 调大只能拖延，钉住
+		// 才是根治；窗口该收的是寒暄，不是证据。
+		keep := full[len(full)-e.maxHist:]
+		var pinned []Message
+		for _, m := range full[:len(full)-e.maxHist] {
+			if isPinnedMsg(m) {
+				pinned = append(pinned, m)
+			}
+		}
+		if len(pinned) > 0 {
+			full = append(pinned, keep...)
+		} else {
+			full = keep
+		}
 	}
 	e.sessions[id] = full
 	return full
@@ -337,7 +365,7 @@ func (e *Engine) EvalTurn(ctx context.Context, id, user string, history []Messag
 优先级：用户要求"填/起草/生成"某个明确表单或文档，且清单里有带专用模板的 template 技能精确匹配（如用户说"采购验收单"）时，必须优先选它且 action="fill"，绝不能退而选通用 docgen 技能。只有当没有专门 template 匹配时，才选通用 docgen/write 技能。
 
 需求要点：
-1. 若命中某个技能，返回它的 slug，并在 params 里提取用户已提及的关键参数（键名用技能参数名）。needs 的判定**必须严格**：只把技能参数中标记为 [必填]、且用户这次消息**确实没有提供**的参数列进 needs（name 用技能参数名，label 用中文提示）。[可选] 参数一律不追问——用户没给就自行推断合理占位或省略，直接进入生成。action="fill" 时绝不需要 params/needs（填充阶段会解析字段并让后续环节补全/编造值），needs 留空。docgen 类技能（含 fill）没有任何必填参数：用户给了详情就填进文档，用户只要模板/没给详情就编造合理示例数据填充或下发模板。
+1. 若命中某个技能，返回它的 slug，并在 params 里提取用户已提及的关键参数（键名用技能参数名）。needs 的判定**必须严格**：只把技能参数中标记为 [必填]、且用户这次消息**确实没有提供**的参数列进 needs（name 用技能参数名，label 用中文提示）。判定"有没有提供"时**必须把上下文块【用户提供的要求与素材】整段算进去**：那里写明的信息就是用户已经给过的，一律不得列进 needs，也不得在 reason/steps 里说"待用户补充"。只有素材层和最近对话里都找不到的参数，才算没提供。[可选] 参数一律不追问——用户没给就自行推断合理占位或省略，直接进入生成。action="fill" 时绝不需要 params/needs（填充阶段会解析字段并让后续环节补全/编造值），needs 留空。docgen 类技能（含 fill）没有任何必填参数：用户给了详情就填进文档，用户只要模板/没给详情就编造合理示例数据填充或下发模板。
 2. 用户可能在延续话题（如"再写一遍但改短点""把手机号改成139…"）——结合历史判断是否沿用之前的技能并继续 action（延续填充用 action="fill"）；延续时写 reason 说明。
 3. 无论什么情况，都在 steps 里输出 4 阶段拆解执行路径，让用户看到多智能体怎么处理：
    - {phase:"analyze", label:"① 意图分析", detail:"识别出的意图与 action：<intent>/<action>（如 docgen/fill、write/write、query/answer）", status:"done"}
@@ -1080,9 +1108,16 @@ func (e *Engine) FillDoc(ctx context.Context, id string, sc *SkillContent, userM
 		// instead of emitting a broken artifact. (纯结构编辑——只有 ops 没有 fields——
 		// 是合法的，比如"在第3行下面追加一行预算求和"，此时不应反问。)
 		if len(vals) == 0 && len(ops) == 0 {
-			return &FillResult{Clarify: &FillClarify{Questions: []string{
-				"您想往这张表/文档里填哪些内容？请告诉我具体的关键信息（比如品名、数量、金额、往来单位、日期等），我按您给的填。",
-			}}}, nil
+			q := "您想往这张表/文档里填哪些内容？请告诉我具体的关键信息（比如品名、数量、金额、往来单位、日期等），我按您给的填。"
+			if hasMaterial(history) {
+				// 用户已经贴过素材，还回头问「请告诉我品名/数量/金额」等于让他把
+				// 刚贴过的一万字再说一遍——这正是用户实测点名的「要的时候也不是
+				// 根据我目前提供的信息的基础上来进一步补充，而是直接通用的补充」。
+				// 有素材时改成指着他给的素材问，让他只需补一句对应关系。
+				q = "您提供的素材我已经看到，但没能从里面解析出可直接填入模板的字段。" +
+					"请指明素材里哪一段对应模板里的哪些项（例如「第 2 段的设备清单填到品目列」），我按您指的位置填。"
+			}
+			return &FillResult{Clarify: &FillClarify{Questions: []string{q}}}, nil
 		}
 	} else {
 		fmt.Fprintf(os.Stderr, "[filldoc] no json in reply: %q\n", out)
@@ -1333,6 +1368,9 @@ func TemplateFillSkillInHistory(history []Message, msg string) string {
 // The FULL history (untouched by maxHist) is also persisted to disk so a
 // restart / refresh does not wipe continuation context.
 func (e *Engine) Push(id string, m Message) {
+	// 素材打标：用户贴的长要求/范文在这里被标记成 KindMaterial，之后才会进
+	// ContextBlock 的素材层逐字保留。不打这一步，它就会被近轮层砍成 600 字。
+	m = markMaterial(m)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	h := e.sessions[id]
@@ -1362,6 +1400,7 @@ func (e *Engine) PlainChat(ctx context.Context, id, user string, history []Messa
 	sys := `你是 SkillForge 的智能写作助手。你的职责是帮助用户写作。
 当用户提出的写作需求与某个技能匹配时，你会自动调用对应技能；当前这条消息你判断不需要技能，所以请你用一般性写作助手的方式自然回应。
 可以帮用户：闲聊、回答一般问题、或者在用户还没明确用哪个技能时引导ta描述写作需求（文章主题/篇幅/语气等）。
+**引导前先看上下文**：如果【用户提供的要求与素材】或最近对话里已经写了主题/篇幅/语气/格式，那就是用户已经提供过的信息 —— 直接按它动手，不要再问一遍；需要补充时，只问那些**确实还没出现**的点，并且问题要建立在已有素材上（例如「我已按你给的《XX》要求写，其中第 3 条你希望按 A 还是 B 处理？」），而不是抛一份通用清单让用户从头再说一遍。
 如果用户问"有哪些技能/能做什么"，请根据下方"技能清单"如实列出当前可用的技能名称和用途；如果技能清单为空，就如实说明当前没有配置技能。
 回答保持简洁、专业、口语化，用中文。
 

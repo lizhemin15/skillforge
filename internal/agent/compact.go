@@ -28,12 +28,18 @@ import (
 //	   「改成…/整理成…/导出成…」的指代对象，必须逐字保留——压缩成摘要就等于
 //	   让模型拿着二手描述去重构原文，必然走形。这层的额度按「字符预算」控制，
 //	   超预算时**丢最旧的产物、保最新的**（用户几乎总是指代最近那几轮的结果）。
-//	B. 前情层（大模型压缩，一次压缩多轮复用）：较早的对话交给模型压成要点，
+//	B'. 素材层（原文，不压缩）：用户自己贴进来的写作要求/范文/示例/数据清单。
+//	   这一层是 2026-09 用户实测反馈补上的：他一次贴进「一万字写作要求 + 范文」
+//	   再提写作需求，模型却像没看见，还回头通用追问「请告诉我主题、篇幅、语气」。
+//	   原因是当时只有「助手产物层」逐字保留，**用户贴的素材**落进近轮层被砍到
+//	   600 字头尾（实测 11992 字 → 678 字，中间条款全丢）。素材是用户后续所有
+//	   要求的依据，必须和产物层同等对待：逐字保留、独立预算。
+//	C. 前情层（大模型压缩，一次压缩多轮复用）：较早的对话交给模型压成要点，
 //	   只留事实（目标/已确认的参数与数字/待办/偏好），丢掉寒暄与重复。
 //	   压过的不再压：靠 watermark 缓存，避免每轮多一次调用。
 //	        这里刻意**不压产物层**——摘要里的数字/名目一旦被模型改写（把 8000
 //	   写成「约八千」），填表时就会写进正式文档。
-//	C. 近轮层（原文+头尾截断）：最近几轮原样注入，只对超长单条做头尾截断，
+//	D. 近轮层（原文+头尾截断）：最近几轮原样注入，只对超长单条做头尾截断，
 //	   因为指代词（「上面那个」「照这个改」）都指向最近几轮。
 //
 // 压缩调用失败时退回「头尾截断」而不是报错：上下文退化也必须能继续对话，
@@ -44,6 +50,18 @@ const (
 	// 单独建字段而不是靠扫正文关键词，是因为关键词会随文案变化而漏——
 	// 判断依据必须是结构化事实（详见下方 isArtifactMsg 的历史兼容分支）。
 	KindArtifact = "artifact"
+
+	// KindMaterial 标记「这条消息是用户提供的要求/素材（写作要求、范文、示例、
+	// 数据清单）」。与产物层对称，理由同样是「用户下次指代的依据」：他贴了一万字
+	// 要求，下一句说「按这个写」，指的就是这份素材。
+	// 判据是**长度**（结构化事实），不是扫「要求/范文」这类关键词——关键词随文案
+	// 一变就漏，而一条用户消息长到千字量级，除了素材没有别的可能。
+	KindMaterial = "material"
+
+	// materialMinRunes 一条用户消息达到这个长度就按「素材」对待。
+	// 定在 1200：正常指令（「把第 2 段改短点」「按上面的要求写一份通知」）远短于此，
+	// 而要求/范文/数据清单都在这个量级以上。
+	materialMinRunes = 1200
 
 	// compactKeepRecent 最近 N 条对话逐字保留（指代词的落点都在这里）。
 	compactKeepRecent = 6
@@ -57,6 +75,11 @@ const (
 	// 定在 20000 是因为一份正式文档（公文/合同/长文）大概 3000~8000 字，
 	// 够容纳最近两三份产物原文。
 	compactArtifactRunes = 20000
+	// compactMaterialRunes 素材层总预算（字符）。比产物层还大一档，是因为用户
+	// 实测会一次贴进「一万字写作要求 + 范文」——预算不到一万字，那份素材就必然
+	// 被拦腰截断，症状正是「它像没看到我的信息」。换算下来中文 1 字 ≈ 1 rune，
+	// 24000 够完整装下一万字素材再留一倍余量。
+	compactMaterialRunes = 24000
 	// compactMsgRunes 单条消息在「近轮层」的额度（超过则头尾截断）。
 	compactMsgRunes = 600
 	// compactTimeout 压缩调用的超时。压不动就走截断兜底，绝不让用户等在这里。
@@ -103,6 +126,9 @@ func (e *Engine) ContextBlock(ctx context.Context, id string, history []Message)
 	}
 
 	artifacts, dialogue := splitArtifacts(history)
+	// 素材层先从对话里摘出来：不摘的话它既在素材层逐字保留，又在近轮层被截断一遍，
+	// 模型会看到同一份要求出现两次、其中一次还是残的，比不注入更糟。
+	materials, dialogue := splitMaterials(dialogue)
 
 	// 近轮层：对话尾部逐字保留；其余进「旧对话」，可能被压。
 	recentStart := len(dialogue) - compactKeepRecent
@@ -112,6 +138,16 @@ func (e *Engine) ContextBlock(ctx context.Context, id string, history []Message)
 	older, recent := dialogue[:recentStart], dialogue[recentStart:]
 
 	var b strings.Builder
+
+	// A0. 素材层（原文）
+	if block := renderMaterials(materials); block != "" {
+		b.WriteString("【用户提供的要求与素材（原文，逐字保留）】\n")
+		b.WriteString("下面是用户自己贴进来的写作要求/范文/示例/数据。用户说「按这个写」「照这个要求」时，")
+		b.WriteString("**指的就是这些内容**。这里已经写明的信息一律视为**用户已经提供**：\n")
+		b.WriteString("直接照它执行，不要再回头追问其中已有的内容，也不要凭记忆复述。\n\n")
+		b.WriteString(block)
+		b.WriteString("\n")
+	}
 
 	// A. 产物层（原文）
 	if block := renderArtifacts(artifacts); block != "" {
@@ -160,6 +196,120 @@ func splitArtifacts(history []Message) (artifacts, dialogue []Message) {
 		dialogue = append(dialogue, m)
 	}
 	return artifacts, dialogue
+}
+
+// markMaterial 在消息进入会话时就给「用户贴进来的长素材」打结构化标记。
+//
+// 放在 Push 这个唯一入口打标，而不是在各调用点判断：漏掉一处，就是一条素材被
+// 近轮层砍成 600 字头尾，而这类漏点在界面上完全看不出来——模型只是「忽然变得
+// 很健忘」，没有报错、没有异常日志。集中一处才能保证不漏。
+//
+// 只认 role=user：助手的长回复另有产物层（isArtifactMsg）负责，两者额度独立。
+func markMaterial(m Message) Message {
+	if m.Kind != "" {
+		return m
+	}
+	if !strings.EqualFold(strings.TrimSpace(m.Role), "user") {
+		return m
+	}
+	if len([]rune(strings.TrimSpace(m.Content))) >= materialMinRunes {
+		m.Kind = KindMaterial
+	}
+	return m
+}
+
+// splitMaterials 把用户素材从对话流里摘出来，保持原有先后顺序。
+func splitMaterials(dialogue []Message) (materials, rest []Message) {
+	for _, m := range dialogue {
+		if isMaterialMsg(m) {
+			materials = append(materials, m)
+			continue
+		}
+		rest = append(rest, m)
+	}
+	return materials, rest
+}
+
+// isMaterialMsg 判断一条消息是否为「用户提供的素材」。
+// 与 isArtifactMsg 一样分两路：结构化 Kind 优先，历史兼容看 role+长度
+// （从磁盘恢复的老会话没有 Kind 字段）。
+func isMaterialMsg(m Message) bool {
+	if m.Kind == KindMaterial {
+		return true
+	}
+	if m.Kind != "" {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(m.Role), "user") {
+		return false
+	}
+	return len([]rune(strings.TrimSpace(m.Content))) >= materialMinRunes
+}
+
+// renderMaterials 渲染素材层。策略与产物层一致：按预算**丢最旧的、保最新的**
+// （用户近期的要求优先级高于很早以前给的模板），但输出按时间正序，读起来是一份
+// 连贯的「用户要求」，而不是倒着堆。
+func renderMaterials(materials []Message) string {
+	if len(materials) == 0 {
+		return ""
+	}
+	total := 0
+	var kept []Message
+	for i := len(materials) - 1; i >= 0; i-- {
+		m := materials[i]
+		n := len([]rune(m.Content))
+		if total > 0 && total+n > compactMaterialRunes {
+			break
+		}
+		kept = append(kept, m)
+		total += n
+	}
+	// kept 是倒序收集的，翻回正序。
+	for i, j := 0, len(kept)-1; i < j; i, j = i+1, j-1 {
+		kept[i], kept[j] = kept[j], kept[i]
+	}
+	var b strings.Builder
+	for _, m := range kept {
+		b.WriteString(renderMaterial(m))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// renderMaterial 单条素材：不压缩、尽量不截断（预算已给到 24000）。
+// 万一单条就超预算（用户贴了十几万字），仍走头尾截断并**写明省略了多少字**——
+// 模型看到省略标注会主动确认，看到断头文本则会当作完整要求一路编下去。
+func renderMaterial(m Message) string {
+	body := strings.TrimSpace(m.Content)
+	if n := len([]rune(body)); n > compactMaterialRunes {
+		body = truncHeadTail(body, compactMaterialRunes)
+	}
+	return "---\n" + body
+}
+
+// hasMaterial 判断这段历史里有没有用户贴进来的素材（素材层是否非空）。
+//
+// 用途是让「信息不足」的追问区分两种完全不同的处境：
+//   - 用户真的什么都没给 → 问通用清单是合理的；
+//   - 用户已经贴了一大段，只是没被用上 → 再问通用清单就是让他从头重说一遍，
+//     用户实测把这句点名为「直接通用的补充」。
+func hasMaterial(history []Message) bool {
+	_, dialogue := splitArtifacts(history)
+	materials, _ := splitMaterials(dialogue)
+	return len(materials) > 0
+}
+
+// isPinnedMsg 判断一条消息在「会话窗口裁剪」时是否必须钉住。
+//
+// 素材与产物分别由素材层（B'）和产物层（B）逐字注入，是用户后续所有请求的前提。
+// 纯按时间窗切掉它们，就出现用户实测的两个现象：
+//   - 「像是没看到我的信息」——五分钟前贴的要求被窗口切走了（连压缩的机会都没有）；
+//   - 「忘了你自己回答了什么」——之前写好的长稿同样被切走了。
+//
+// 钉住不会无限膨胀：两层各自有预算（素材 24000 / 产物 20000 字），超出时按
+// 「丢最旧的、保最新的」收口，收口规则写在 renderMaterials / renderArtifacts 里。
+func isPinnedMsg(m Message) bool {
+	return isMaterialMsg(m) || isArtifactMsg(m)
 }
 
 // isArtifactMsg 判断一条消息是否为「上一轮的产物」。
