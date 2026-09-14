@@ -220,7 +220,7 @@ if [ "$QUICK" = 0 ]; then
   # 早就跟实现脱钩（categoryErrStatus 里 ErrNotManualSkill 被有意删掉），脚本每次
   # 都在打印「锚点失效 ✗」，但因为它既不在 CI 也没人手动跑，谁也没看见。
   # 「永远绿的自证脚本」比没有更糟：它让人以为这块有人看着。
-  step '7/7 断言自证（6 条）'
+  step '7/7 断言自证（7 条）'
   selfcheck() {   # $1=标签，其余=命令
     local label="$1"; shift
     local out rc
@@ -238,6 +238,7 @@ if [ "$QUICK" = 0 ]; then
   selfcheck '后端 / 推荐行自证'         bash internal/api/suggest_mutation_check.sh
   selfcheck '后端 / 分类结构管理自证'   python3 scripts/category_guard_inject.py
   selfcheck '后端 / 思考开关矩阵自证'   python3 scripts/fastjson_knob_inject.py
+  selfcheck '后端 / 提速与中间材料自证' python3 scripts/thinking_knob_inject.py
 fi
 
 printf '\n\033[1m========== preflight 汇总 ==========\033[0m\n'
