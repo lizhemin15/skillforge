@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""真浏览器终验：聊天流式过程中的**中间材料**是否真在滚（线上/本地同一套断言）。
+
+为什么要真浏览器：
+  node 测试（chat_trace.test.mjs）是**读源码 + 手搓 DOM 字符串**的断言。它能检查
+  「renderTrace 里写了 s.material 分支」，却检查不出运行时**有没有真的收到材料、
+  材料是不是在滚动、有没有挂错步骤**。用户原话：「现在速度过于慢了，中间可以流式
+  输出思考的一些中间材料，现在一直卡着计时，用户体验不佳」——只有跳秒不算进度。
+  所以必须发一条真消息，在真流式过程中采样真 DOM。
+
+判据（每条打 ok/FAIL，任何 FAIL 都算红、退出码 1；不是崩溃红）：
+    M1 材料出现在**首段正文之前**（用户等的这段时间屏幕上有真内容，而不是跳秒）
+    M2 材料**在滚**：≥3 个不同的尾部快照（一次性贴一块不算滚）
+    M3 材料被截尾（≤220 字），不会撑破面板
+    M4 材料只挂**进行中**那一步：`.ctk-step.done .ctk-mat` 全程为 0
+    M5 前提：整轮真收到 ≥200 字正文（否则「没材料」可能只是这轮太短，M1 是空跑）
+    M6 真流式过程中页面无 JS 异常（历史坑：RAF 丢接收者）
+
+负向自证（INJECT_NOMAT=1）：
+  用 page.route 在**网络层**把 chat.js 里材料渲染分支改掉（`(s.material` → `(false && s.material`），
+  浏览器拿到的就是一份「不渲染材料」的真代码 → M1 必须精确转红、退出码 1。
+  在测试里手改 DOM 造红是假的；这里改的是浏览器实际执行的脚本。
+
+用法：
+  python3 web/tests/chat_material_e2e.py                          # 打 127.0.0.1:8092
+  BASE=http://127.0.0.1:9999 python3 web/tests/chat_material_e2e.py
+  INJECT_NOMAT=1 python3 web/tests/chat_material_e2e.py           # 负向自证，必须红
+
+SKIP 规则：playwright 不可用 / 页面打不开 → 打 SKIP 并 exit 0。SKIP != PASS。
+"""
+import os
+import sys
+import time
+
+BASE = os.environ.get('BASE', 'http://127.0.0.1:8092')
+# 默认提示词要能逼出「执笔跳的思考链」——材料正是在这段静默里流出来的。
+# 太短的问答会走关思考链的路由跳，材料本来就不该出现，断言会变成空跑。
+PROMPT = os.environ.get('PROMPT', '写一份关于开展数据治理专项工作的通知，正文不少于 600 字，直接输出正文')
+MAXW = int(os.environ.get('MAXW', '240'))  # 单轮最长等多久（秒）
+# INJECT_NOMAT=1：网络层把材料渲染分支改掉，复刻「后端有材料、前端不显示」这个故障。
+INJECT_NOMAT = os.environ.get('INJECT_NOMAT') == '1'
+
+fails = []
+checks = 0
+
+
+def check(name, ok, extra=''):
+    global checks
+    checks += 1
+    if ok:
+        print(f'ok   {name}')
+    else:
+        print(f'FAIL {name} {extra}')
+        fails.append(name)
+    return bool(ok)
+
+
+def report():
+    print(f'--- {checks - len(fails)}/{checks} ok ---')
+    if fails:
+        print('FAILED: ' + '; '.join(fails))
+        return 1
+    return 0
+
+
+# 在页面里起一个采样器：每 200ms 记录「材料尾部 / 材料长度 / 正文长度 / 有无 active 步」。
+# 采样必须在页面内部跑（Python 侧轮询会漏帧，200ms 的滚动窗口只有真 setInterval 抓得住）。
+SAMPLER_JS = """() => {
+  window.__mt = {samples: [], t0: Date.now(), errs: []};
+  window.addEventListener('error', e => window.__mt.errs.push(String(e.message).slice(0,120)));
+  clearInterval(window.__iv);
+  window.__iv = setInterval(() => {
+    const act = document.querySelector('.ctk-step.active');
+    const m = act ? act.querySelector('.ctk-mat') : null;
+    const b = document.querySelector('.ch-msg.assistant .ch-bubble');
+    const txt = m ? (m.innerText || '') : '';
+    window.__mt.samples.push([
+      Date.now() - window.__mt.t0,
+      txt.length,
+      txt.slice(-40),
+      b ? (b.innerText || '').replace(/\\s+/g, '').length : 0,
+      !!act,
+      document.querySelectorAll('.ctk-step.done .ctk-mat').length,
+    ]);
+  }, 200);
+  return true;
+}"""
+
+READ_JS = """() => {
+  const s = window.__mt || {samples: [], errs: []};
+  const b = document.querySelector('.ch-msg.assistant .ch-bubble');
+  return {samples: s.samples, errs: s.errs,
+          bubble: b ? (b.innerText || '').replace(/\\s+/g, '').length : 0,
+          active: !!document.querySelector('.ctk-step.active'),
+          steps: document.querySelectorAll('.ctk-step').length};
+}"""
+
+
+def main():
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:  # pragma: no cover
+        print(f'SKIP playwright 不可用：{e}')
+        return 0
+
+    with sync_playwright() as p:
+        br = p.chromium.launch()
+        try:
+            pg = br.new_page(viewport={'width': 1280, 'height': 900})
+
+            # ---- 负向自证：在网络层改掉浏览器实际执行的 chat.js ----
+            if INJECT_NOMAT:
+                def _rewrite(route):
+                    try:
+                        r = route.fetch()
+                        body = r.text()
+                        n = body.count('(s.material')
+                        body = body.replace('(s.material', '(false && s.material')
+                        print(f'[inject] chat.js 里材料渲染分支命中 {n} 处，已改成恒不渲染')
+                        route.fulfill(status=r.status, body=body,
+                                      headers={k: v for k, v in r.headers.items()
+                                               if k.lower() not in ('content-length', 'content-encoding')})
+                    except Exception as e:
+                        print(f'[inject] 改写失败：{str(e)[:100]}')
+                        route.continue_()
+                pg.route('**/chat.js*', _rewrite)
+
+            try:
+                pg.goto(BASE, wait_until='domcontentloaded', timeout=15000)
+            except Exception as e:
+                print(f'SKIP 打不开 {BASE}（服务没起？）：{str(e)[:120]}')
+                return 0
+            pg.wait_for_selector('.ch-scroll', timeout=10000)
+            pg.wait_for_selector('textarea', timeout=10000)
+            return run_checks(pg)
+        finally:
+            br.close()
+
+
+def run_checks(pg):
+    pg.evaluate(SAMPLER_JS)
+    pg.fill('textarea', PROMPT)
+    pg.click('#chat-send')
+
+    # 轮询到「没有 active 步 且 正文连续 4 次采样不再增长」为止，或超时。
+    deadline = time.time() + MAXW
+    stable = 0
+    last_bubble = 0
+    last = {}
+    while time.time() < deadline:
+        time.sleep(1.0)
+        last = pg.evaluate(READ_JS)
+        if last['bubble'] > 0 and last['bubble'] == last_bubble and not last['active']:
+            stable += 1
+            if stable >= 4:
+                break
+        else:
+            stable = 0
+        last_bubble = last['bubble']
+    pg.evaluate('() => clearInterval(window.__iv)')
+    last = pg.evaluate(READ_JS)
+
+    samples = last['samples']
+    print(f"采样 {len(samples)} 帧 / steps={last['steps']} / 正文 {last['bubble']} 字 / errs={last['errs'][:2]}")
+    mats = [s for s in samples if s[1] > 0]
+    if mats:
+        print('材料首帧: ' + str(mats[0]))
+        print('材料末帧: ' + str(mats[-1]))
+        tails = []
+        for s in mats:
+            if not tails or tails[-1] != s[2]:
+                tails.append(s[2])
+        print(f'材料窗口 {len(mats)} 帧 / 不同尾部快照 {len(tails)} 个 / 峰值 {max(s[1] for s in mats)} 字')
+    else:
+        print('材料窗口: 整轮没有任何材料帧' + ('（INJECT_NOMAT=1，这是预期）' if INJECT_NOMAT else ''))
+
+    # M5 是前提，先断它：没有真正文的话「没材料」不能算通过，但也不能算材料失败。
+    ok_body = last['bubble'] >= 200
+    check('M5 前提：整轮真收到 ≥200 字正文（否则 M1 是空跑）', ok_body,
+          f"bubble={last['bubble']}")
+
+    if mats:
+        first = mats[0]
+        check('M1 材料出现在首段正文之前（等的时候屏幕上有真内容，不是跳秒）',
+              first[3] == 0, f"材料首帧时正文已 {first[3]} 字")
+        tails = []
+        for s in mats:
+            if not tails or tails[-1] != s[2]:
+                tails.append(s[2])
+        check('M2 材料在滚（≥3 个不同尾部快照，不是一次性贴一块）', len(tails) >= 3,
+              f'不同快照 {len(tails)} 个')
+        check('M3 材料被截尾 ≤220 字（不撑破面板）', max(s[1] for s in mats) <= 220,
+              f"峰值 {max(s[1] for s in mats)} 字")
+        check('M4 材料只挂进行中那一步（`.ctk-step.done .ctk-mat` 全程为 0）',
+              max(s[5] for s in samples) == 0, f"done 步里出现过 {max(s[5] for s in samples)} 个材料块")
+    else:
+        # 没材料：M1/M2/M3/M4 全红。这是 INJECT_NOMAT=1 时要看到的结果。
+        check('M1 材料出现在首段正文之前（等的时候屏幕上有真内容，不是跳秒）', False,
+              '整轮没有材料帧')
+        check('M2 材料在滚（≥3 个不同尾部快照，不是一次性贴一块）', False, '整轮没有材料帧')
+        check('M3 材料被截尾 ≤220 字（不撑破面板）', False, '整轮没有材料帧')
+        check('M4 材料只挂进行中那一步（`.ctk-step.done .ctk-mat` 全程为 0）',
+              max((s[5] for s in samples), default=0) == 0, '')
+
+    check('M6 真流式过程中页面无 JS 异常', not last['errs'], str(last['errs'][:2]))
+    return report()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

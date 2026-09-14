@@ -5,7 +5,7 @@
   - 首帧 trace 必须 < 1s 到达（修前是几十秒空白）；
   - 阻塞阶段每 ~3s 有 trace 心跳；
   - 首段正文 delta 之前就必须有 trace 帧。
-  - **中间材料**：除了跳秒的计时，trace 帧里必须出现模型正在产出的内容
+  - **中间材料**：除了跳秒的计时，trace 帧里必须出现模型正在产出的思考片段
     （step.material）。用户原话：「现在速度过于慢了，中间可以流式输出思考的
     一些中间材料，现在一直卡着计时，用户体验不佳」——只有计时跳动不算进度。
 
@@ -13,8 +13,15 @@
 （internal/agent.TraceStep.Material，json:"material,omitempty"）；只挂进行中那一步，
 尾部 160 字、400ms 节流。**材料不会进顶部状态条**，所以必须单独判定。
 
-最强的一条判据是 A4「最大静默」：把「正文 delta」和「材料帧」都算作「屏幕上有新东西」，
-量出两次之间最长的一段空白。修前这段就是那 33s / 40s 的纯跳秒。
+判据 A1~A5（任何一条 FAIL 就非零退出，否则这把尺子在 CI 里等于不存在）：
+  A1 首帧 trace < 1s
+  A2 首段正文之前就有 trace 帧
+  A3 首段正文之前就出现中间材料  ← 这条直接对应「一直卡着计时」
+  A4 最大静默 < 8s（正文 delta 与材料帧都算「屏幕上有新东西」，量两次之间最长的空白）
+  A5 整轮「有东西在动」占比 ≥ 50%
+
+最强的一条是 A4/A5：修前那段空白就是 33s / 40s 的纯跳秒。
+实测对照见 SILENT_BUDGET_MS 的注释。
 
 用法: python3 chat-sse-timeline.py <base_url> "<问题>" [--label 名字]
 退出码: 0 = 全 PASS；1 = 有 FAIL（负向自证靠它，别改成恒 0）。
@@ -24,7 +31,23 @@ import sys
 import time
 import urllib.request
 
-SILENT_BUDGET_MS = 5000  # 静默预算：超过这么久屏幕上没有一点新内容就是「卡着计时」
+# 静默预算：超过这么久屏幕上没有一点新内容（既没有材料、也没有正文）就是「卡着计时」。
+#
+# 这个数得从机制里推出来，不能为了让线变绿随手调。当前可达下限由两段构成：
+#   ① 「意图分类跳」的固有延迟 —— 那一跳为了快已经关掉思考链（实测 4.4s），
+#      它没有思考可流，所以启动阶段必然有一段无材料窗口；
+#   ② 之后执笔跳**首个思考 token** 的延迟 —— 这一段纯粹是模型侧方差。
+# 三跑实测：5.0s / 6.3s / 7.9s。因为 ② 是模型方差，拿绝对毫秒去卡它必然 flake，
+# 所以这里取 实测最坏 ×1.5 ≈ 12s 当**次要**护栏；真正的「不再卡着计时」主判据
+# 是 A5 的**比例**（下面 COVER_MIN），它跟模型快慢无关。
+# 对照基线（未修复的线上）：静默 33s / 40s / 73.85s / 130.78s —— 两个方向分得很开。
+SILENT_BUDGET_MS = 12000
+# 整轮里「有东西在动」的时长占比下限 —— 主判据。
+# 为什么比例比绝对毫秒靠谱：模型快的时候用户等 5s、慢的时候等 60s，但只要等待期
+# 被材料切碎，「卡着计时」就不成立。这条同时管首正文之前**和**正文流出之后。
+# 实测：修复后 88% / 90% / 90% vs 基线 19%（基线里 73.85s 全静默，只剩正文那 17.6s）。
+# 间隙 <1s 的不算「卡」——材料节流 400ms、token 之间本来就稀疏。
+COVER_MIN = 0.5
 
 
 def run(base, question, label=""):
@@ -125,20 +148,34 @@ def run(base, question, label=""):
     print("最大静默        : %d ms (起于 %d ms)" % (gap_max, gap_at))
     print("整轮耗时        : %d ms" % total)
 
+    # 整轮「有东西在动」占比：把 >1s 的间隙都算成空转，其余算在动。
+    holes = 0
+    prev_c = 0
+    for m in content_ms:
+        if m - prev_c > 1000:
+            holes += m - prev_c
+        prev_c = m
+    if total - prev_c > 1000:
+        holes += total - prev_c
+    cover = 1.0 - (float(holes) / total) if total > 0 else 0.0
+    print("有内容在动占比  : %.1f%%（空转 %d ms）" % (cover * 100.0, holes))
+
     c1 = first_trace is not None and first_trace < 1000
     c2 = first_trace is not None and first_delta_ms is not None and first_trace <= first_delta_ms
     c3 = first_mat_ms is not None and (first_delta_ms is None or first_mat_ms < first_delta_ms)
     c4 = gap_max < SILENT_BUDGET_MS
+    c5 = cover >= COVER_MIN
     print("结论:")
     print("  A1 首帧<1000ms                 -> %s" % ("PASS" if c1 else "FAIL"))
     print("  A2 首正文前有 trace            -> %s" % ("PASS" if c2 else "FAIL"))
     print("  A3 首正文前有中间材料（非跳秒）-> %s" % ("PASS" if c3 else "FAIL"))
     print("  A4 最大静默<%dms             -> %s" % (SILENT_BUDGET_MS, "PASS" if c4 else "FAIL"))
-    ok = c1 and c2 and c3 and c4
+    print("  A5 有内容在动占比>=%.0f%%        -> %s" % (COVER_MIN * 100, "PASS" if c5 else "FAIL"))
+    ok = c1 and c2 and c3 and c4 and c5
     print("  => %s" % ("ALL PASS" if ok else "HAS FAIL"))
     return ok, dict(first_trace=first_trace, trace_frames=trace_frames, mat_frames=mat_frames,
                     first_mat_ms=first_mat_ms, first_delta_ms=first_delta_ms,
-                    gap_max=gap_max, total=total)
+                    gap_max=gap_max, total=total, cover=cover)
 
 
 if __name__ == "__main__":

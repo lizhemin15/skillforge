@@ -115,11 +115,14 @@ jobs:
 
       # 断言自证：往出货文件里注入真实故障，要求对应断言变红。
       # 全绿的断言集不代表真能抓住故障，这几个脚本把「抓得住」本身也守上。
-      - name: 前端断言自证（分类结构管理 / 缓存版本号 / 输入区布局与贴底滚动）
+      - name: 前端断言自证（分类结构管理 / 缓存版本号 / 输入区布局与贴底滚动 / 思考材料的渲染）
         run: |
           bash web/tests/category_ui_mutation_check.sh
           bash web/tests/asset_version_mutation_check.sh
           python3 web/tests/chat_composer_mutation_check.py
+          # 材料的「后端发了、前端没渲染」形态只在 Go 侧看不出来（后端确实发了，
+          # 所以 go test 和 SSE 验收全绿），必须由前端这一层自证抓得住。
+          python3 web/tests/chat_trace_mutation_check.py
 
       # 推荐行（输入框上方那几颗小胶囊）的后端：/api/chat/suggest。
       # 它的失败形态全是「静默降级」——前端 fetch 挂在 .catch 里，404/500/超时
