@@ -105,10 +105,19 @@ def main():
                 page.fill('#lg-user', user)
                 page.fill('#lg-pass', pwd)
                 page.click('#login-form button[type=submit]')
+                # 训练表单住在「新建技能」弹窗（#skill-new）里，登录完成时它还没被打开。
+                # 早期版本在这里直接等 #train-form，等的是一个永远不会可见的元素，
+                # 于是每轮都以「登录后训练页没出现」这种**假红**收场 —— 页面本身是好的，
+                # 红的是脚本少点了一下。真终验不能留这种狼来了。
+                # 登录后落在「LLM 服务」tab，训练表单在 #tab-skills 里（隐藏）。
+                # 三步缺一不可：登录 → 切「技能管理」→ 开「新建技能」弹窗。
+                # 早期版本只做了第一步就去等 #train-form，等的是永远不可见的元素。
+                page.click('button[data-tab="skills"]')
+                page.click('button[onclick*="newSkillView"]')
                 page.wait_for_selector('#train-form', timeout=15000, state='visible')
-                ok('已用真凭据登录训练页（凭据走环境变量，未落盘、未打印）')
+                ok('已用真凭据登录 → 技能管理 → 新建技能，训练表单可见（凭据走环境变量，未落盘、未打印）')
             except Exception as e:  # noqa: BLE001
-                fail(f'登录后训练页没出现（{type(e).__name__}: {str(e)[:120]}）')
+                fail(f'登录后打不开训练表单（{type(e).__name__}: {str(e)[:120]}）')
                 browser.close()
                 return 1
 
