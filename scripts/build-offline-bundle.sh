@@ -85,7 +85,7 @@ case "$ARCH" in
 esac
 
 # 用文件内容判定架构，不靠文件名——文件名是 CI 里拼出来的，猜错会把 arm64 的包装成 amd64
-BIN_DESC="$(file -b "$BINARY" 2>/dev/null || true)"
+BIN_DESC="$(file -bL "$BINARY" 2>/dev/null || true)"
 case "$BIN_DESC" in
 	*ARM\ aarch64*) BIN_ARCH=arm64 ;;
 	*x86-64*)       BIN_ARCH=amd64 ;;
@@ -101,7 +101,7 @@ c_ok "二进制架构核对通过：$ARCH（$(du -h "$BINARY" | cut -f1)）"
 # 用户看到的是"扫描件抽不出文本"，而不是"包打错了"，极难往回追。
 if [ -n "$OCR_BIN" ]; then
 	[ -f "$OCR_BIN" ] || die "找不到 ocrd：$OCR_BIN"
-	OCR_DESC="$(file -b "$OCR_BIN" 2>/dev/null || true)"
+	OCR_DESC="$(file -bL "$OCR_BIN" 2>/dev/null || true)"
 	case "$OCR_DESC" in
 		*ARM\ aarch64*) OCR_ARCH=arm64 ;;
 		*x86-64*)       OCR_ARCH=amd64 ;;
@@ -160,7 +160,7 @@ if [ -n "$PY_RUNTIME" ]; then
 
 	# 架构核对：用文件内容判定，不靠文件名（跟主二进制、ocrd 同一套规矩）。
 	# 装错架构的运行时在目标机上表现为「代码执行沙箱失败」，用户根本看不出是包打错了。
-	PY_DESC="$(file -b "$PY_RT_BIN" 2>/dev/null || true)"
+	PY_DESC="$(file -bL "$PY_RT_BIN" 2>/dev/null || true)"
 	case "$PY_DESC" in
 		*ARM\ aarch64*) PY_RT_ARCH=arm64 ;;
 		*x86-64*)       PY_RT_ARCH=amd64 ;;

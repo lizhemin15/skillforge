@@ -231,7 +231,9 @@ jobs:
           # 装到目标机上却是「解释器能启动、一 import 就炸」，比完全起不来更难查。
           PY_BIN="$TMP/$ROOT/python/bin/python3"
           test -x "$PY_BIN" || { echo "::error::离线包里没有可执行的自带解释器 python/bin/python3"; exit 1; }
-          PY_DESC="$(file -b "$PY_BIN")"
+          # -L 不能去掉：bin/python3 是补出来的**软链**（真实 python 安装也是这个布局），
+          # 不跟链接 file 只会回一句 "symbolic link to python3.12" → 架构解析成空串。
+          PY_DESC="$(file -bL "$PY_BIN")"
           case "$PY_DESC" in
             *x86-64*)        PKG_ARCH=amd64 ;;
             *ARM\ aarch64*)  PKG_ARCH=arm64 ;;
