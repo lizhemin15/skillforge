@@ -150,7 +150,8 @@ def main():
             except Exception:  # noqa: BLE001
                 tick = ''
             if tick and tick != last_tick:
-                tick_snaps.append(tick)
+                # 带上到达时刻：光有文字没法回答「最长静默多久」（这是用户体感的核心指标）
+                tick_snaps.append((round(time.time() - t0, 1), tick))
                 last_tick = tick
             time.sleep(0.4)
 
@@ -171,16 +172,16 @@ def main():
 
         # ---- T3 计时器真的在动 ----
         if len(tick_snaps) >= 3:
-            ok(f'T3 计时器文字在动（{len(tick_snaps)} 个不同快照）：首次「{tick_snaps[0][:40]}」'
-               f' 末次「{tick_snaps[-1][:40]}」')
+            ok(f'T3 计时器文字在动（{len(tick_snaps)} 个不同快照）：首次「{tick_snaps[0][1][:40]}」'
+               f' 末次「{tick_snaps[-1][1][:40]}」')
         else:
             fail(f'T3 计时器只有 {len(tick_snaps)} 个快照（期望 ≥3）—— '
                  f'屏幕是静止的：{tick_snaps[:3]}')
 
         # ---- T3b 心跳文案真的说了「距上次进度」（这是长跑任务的活气声明）----
-        hb = [s for s in tick_snaps if '已' in s]
+        hb = [(t, s) for t, s in tick_snaps if '已' in s]
         if hb:
-            ok(f'T3b 心跳文案含已用时长：{hb[-1][:60]}')
+            ok(f'T3b 心跳文案含已用时长：{hb[-1][1][:60]}')
         else:
             fail('T3b 计时器里没有「已用时长」文案（心跳没在更新）')
 
@@ -209,6 +210,15 @@ def main():
         else:
             fail(f'T5b 实况块占 {mat_nodes} 个 DOM 节点（期望 1）—— '
                  f'一片一节点会随训练时长线性增长，二十分钟下来把页面拖死')
+
+        # 完整时间线落盘（算最长静默空档要用全量，不是前 6 行）
+        out = os.environ.get('LINES_OUT')
+        if out:
+            with open(out, 'w') as fh:
+                json.dump({'sample_seconds': SAMPLE_SECONDS, 'lines': line_seen,
+                           'ticks': tick_snaps, 'js_errors': errs,
+                           'ok': ok_cnt, 'fail': fail_cnt, 'skips': skips}, fh, ensure_ascii=False)
+            print(f'时间线已落盘 → {out}（{len(line_seen)} 行 / {len(tick_snaps)} 个计时快照）')
 
         print('\n--- 证据 ---')
         print(f'采样窗口 {SAMPLE_SECONDS:.0f}s / 日志行 {len(line_seen)} / 计时快照 {len(tick_snaps)}')
