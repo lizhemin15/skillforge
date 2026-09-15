@@ -125,6 +125,7 @@ func (e *Engine) RouteCategory(ctx context.Context, pack *WritePack, userMsg str
 		DisableThinking: true,
 		JSONMode:        true,
 		OnReasoning:     reasoningSink(ctx),
+		OnContent:       contentSink(ctx),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("分类判定失败: %w", err)
@@ -318,6 +319,7 @@ func (e *Engine) Review(ctx context.Context, pack *WritePack, cat *WriteCategory
 	out, err := e.llm.StreamChat(ctx, reviewSys, b.String(), llm.StreamOpts{
 		JSONMode:    true,
 		OnReasoning: reasoningSink(ctx),
+		OnContent:   contentSink(ctx),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("审稿失败: %w", err)

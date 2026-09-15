@@ -51,3 +51,29 @@ func reasoningSink(ctx context.Context) func(string) {
 	}
 	return func(s string) { sink(s) }
 }
+
+// contentSink 返回可直接当 llm 的 OnContent 用的闭包：把流式 JSON 正文里
+// **人话文字**抽出来当中间材料。
+//
+// 与 reasoningSink 的分工是踩过线上才划清的：reasoningSink 收模型的思考链，
+// 而 astron 上关思考链的开关是真管用的（实测 reasoning 片数 = 0），所以那些
+// 「关了思考链」的跳**一片材料都不可能产出**——材料挂接没错，是根本没料。
+// 同一跳的 content 却在按片段流（实测 440 片 / 2350 字节、首片 382ms），
+// 而这些 JSON 里装的就是用户最终要的那份文档的文字。docgen 那一跳实测裸跑
+// 16.8 秒（整轮 23.8s），这 16.8 秒里屏幕上只有计时在跳——contentSink 就是
+// 为这 16.8 秒存在的。
+//
+// 每调用一次生成一个独立的 jsonPreview：它是有状态的（容器栈 / 当前字段），
+// 跨 LLM 调用复用会把上一份 JSON 的字段归属带进下一份。
+func contentSink(ctx context.Context) func(string) {
+	sink := ProgressOf(ctx)
+	if sink == nil {
+		return nil
+	}
+	p := &jsonPreview{}
+	return func(s string) {
+		if text := p.Feed(s); text != "" {
+			sink(text)
+		}
+	}
+}

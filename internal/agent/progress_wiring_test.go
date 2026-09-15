@@ -134,6 +134,12 @@ func TestEvalTurnAsksProviderToDisableThinking(t *testing.T) {
 }
 
 // provider 忽略开关、照旧产思考链时，分类这一跳的材料也要能流出去（astron 就这样）。
+//
+// 这条路上材料有**两个来源**，缺哪个都会让用户在那一跳只看到跳秒的计时：
+//   - 思考链（只有 provider 忽略关思考链开关时才有，astron 上实测一片都没有）；
+//   - JSON 里的 reason 字段（contentSink 抽的，任何 provider 都有）。
+// 所以断言从「材料恰好等于思考链」改成「两个来源都在」——覆盖面比原来更宽，
+// 同时补上「不得混进 JSON 结构」这一条，那才是 contentSink 真正的风险面。
 func TestEvalTurnReportsMaterialEvenWhenKnobIgnored(t *testing.T) {
 	fp := &fakeProvider{
 		reasoning: "用户在延续上一轮的新闻稿，要把正文整理成 Word 文档。",
@@ -146,8 +152,50 @@ func TestEvalTurnReportsMaterialEvenWhenKnobIgnored(t *testing.T) {
 	if _, err := eng.EvalTurn(ctx, "s1", "把它整理成 word", nil); err != nil {
 		t.Fatalf("EvalTurn 失败: %v", err)
 	}
-	if joined := strings.Join(got, ""); joined != fp.reasoning {
-		t.Fatalf("分类阶段被忽略的思考链也要当材料流出去，实际 %q", joined)
+	joined := strings.Join(got, "")
+	if !strings.Contains(joined, fp.reasoning) {
+		t.Fatalf("被忽略的思考链没当材料流出去，实际 %q", joined)
+	}
+	if !strings.Contains(joined, "整理成文档") {
+		t.Fatalf("JSON 的 reason 没当材料流出去（provider 关掉思考链时这是唯一的材料来源），实际 %q", joined)
+	}
+	for _, noise := range []string{`{`, `}`, `"intent"`, `"params"`, `"skill_slug"`, `[`} {
+		if strings.Contains(joined, noise) {
+			t.Errorf("材料里混进了 JSON 结构 %q：%q", noise, joined)
+		}
+	}
+}
+
+// docgen 规格那一跳是整轮最长的静默：关掉思考链后线上实测裸跑 16.8 秒（整轮 23.8s），
+// 这期间屏幕上只有「正在生成…（已用 6s/9s/12s…）」在跳。
+//
+// astron 上关思考链的开关是真管用的（实测 reasoning 片数 = 0），所以这一跳的材料
+// **只能**来自 contentSink 从流式 JSON 里抽出来的正文。这条断言就是那 16.8 秒的尺子：
+// 关掉思考链的路径必须仍有内容在动，否则用户看到的还是一个空跳的计时。
+func TestGenerateDocStreamsDocumentTextAsMaterial(t *testing.T) {
+	fp := &fakeProvider{content: `{"format":"word","filename":"关于开展数据治理专项工作的通知.docx",` +
+		`"title":"关于开展数据治理专项工作的通知",` +
+		`"parags":["为深入贯彻公司数据治理工作部署，现将有关事项通知如下。","请各部门于每月底前报送工作进展。"]}`}
+	eng := newTestEngine(t, fp)
+
+	var got []string
+	ctx := WithProgress(context.Background(), func(s string) { got = append(got, s) })
+	// 生成失败的处置属于另一条线（模板/落盘），这里只看材料有没有流出去。
+	_, _ = eng.GenerateDoc(ctx, "s1", &SkillContent{Name: "办公文档管家", SystemPrompt: "按 DOCJSON 契约输出"}, nil, "写一份关于开展数据治理专项工作的通知", nil)
+
+	joined := strings.Join(got, "")
+	if joined == "" {
+		t.Fatal("docgen 这一跳一片材料都没有：关掉思考链后它是整轮里最长的一段静默，材料只能来自 contentSink 抽的正文")
+	}
+	for _, want := range []string{"关于开展数据治理专项工作的通知", "为深入贯彻公司数据治理工作部署", "请各部门于每月底前报送工作进展。"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("正文没流成材料，缺 %q：%q", want, joined)
+		}
+	}
+	for _, noise := range []string{".docx", "format", "filename", "parags"} {
+		if strings.Contains(joined, noise) {
+			t.Errorf("材料里混进了结构性字段 %q：%q", noise, joined)
+		}
 	}
 }
 

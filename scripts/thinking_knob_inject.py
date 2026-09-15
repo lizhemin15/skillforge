@@ -77,8 +77,8 @@ MUTATIONS = [
     ),
     (
         "M3 分类那一跳不再请求关思考链", "internal/agent/agent.go",
-        "\t\tDisableThinking: true,\n\t\tJSONMode:        true,\n\t\tOnReasoning:     reasoningSink(ctx),\n\t})\n\tif err != nil {\n\t\treturn nil, false\n\t}",
-        "\t\tDisableThinking: false,\n\t\tJSONMode:        true,\n\t\tOnReasoning:     reasoningSink(ctx),\n\t})\n\tif err != nil {\n\t\treturn nil, false\n\t}",
+        "\t\tDisableThinking: true,\n\t\tJSONMode:        true,\n\t\tOnReasoning:     reasoningSink(ctx),\n\t\tOnContent:       contentSink(ctx),\n\t})\n\tif err != nil {\n\t\treturn nil, false\n\t}",
+        "\t\tDisableThinking: false,\n\t\tJSONMode:        true,\n\t\tOnReasoning:     reasoningSink(ctx),\n\t\tOnContent:       contentSink(ctx),\n\t})\n\tif err != nil {\n\t\treturn nil, false\n\t}",
         [GO_MARK, "test", "-v", "./internal/agent/", "-run", "TestEvalTurn", "-count=1"],
         "TestEvalTurnAsksProviderToDisableThinking",
         "接线回归：分类那一跳又把思考链打开了 —— 单元/SSE 全绿，线上慢回 40s。",
@@ -98,6 +98,28 @@ MUTATIONS = [
         ["node", "tests/chat_trace.test.mjs"],
         "有材料时渲染 .ctk-mat",
         "后端发了、前端不渲染 —— 这轮最阴的形态：go test 和 SSE 验收全绿，只有屏幕退回跳秒。",
+    ),
+    (
+        "M6 docgen 规格那一跳不再把正文流成材料", "internal/agent/agent.go",
+        "out, err := e.llm.StreamChat(ctx, sys, argBlock.String(), llm.StreamOpts{\n"
+        "\t\tDisableThinking: true,\n\t\tJSONMode:        true,\n"
+        "\t\tOnReasoning:     reasoningSink(ctx),\n\t\tOnContent:       contentSink(ctx),\n\t})",
+        "out, err := e.llm.StreamChat(ctx, sys, argBlock.String(), llm.StreamOpts{\n"
+        "\t\tDisableThinking: true,\n\t\tJSONMode:        true,\n"
+        "\t\tOnReasoning:     reasoningSink(ctx),\n\t})",
+        [GO_MARK, "test", "-v", "./internal/agent/", "-run", "TestGenerateDocStreamsDocumentTextAsMaterial", "-count=1"],
+        "TestGenerateDocStreamsDocumentTextAsMaterial",
+        "这一跳关着思考链（astron 上思考片段恒为 0），掐了 contentSink 就等于掐掉了它唯一的"
+        "材料来源：整轮最长的 16.8 秒静默又回来了，而材料链路的其它断言全绿。",
+    ),
+    (
+        "M7 抽取器把容器归属算在压栈之后", "internal/agent/jsonpreview.go",
+        "\t\towner := p.attr()\n\t\tp.kind = append(p.kind, b)\n\t\tp.own = append(p.own, owner)",
+        "\t\tp.kind = append(p.kind, b)\n\t\tp.own = append(p.own, p.attr())",
+        [GO_MARK, "test", "-v", "./internal/agent/", "-run", "TestJsonPreviewChunkInvariant", "-count=1"],
+        "TestJsonPreviewChunkInvariant",
+        "真踩过的 bug 原样注回：attr() 看的是栈顶容器，压完再算就是在问「新容器归谁」，"
+        "答案永远是它自己 —— `\"rows\":[[\"a\",\"b\"]]` 一个值都露不出来，根级 `[` 还会越界 panic。",
     ),
 ]
 

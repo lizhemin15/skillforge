@@ -425,6 +425,7 @@ func (e *Engine) classify(ctx context.Context, id, sys string, history []Message
 		DisableThinking: true,
 		JSONMode:        true,
 		OnReasoning:     reasoningSink(ctx),
+		OnContent:       contentSink(ctx),
 	})
 	if err != nil {
 		return nil, false
@@ -742,6 +743,7 @@ func (e *Engine) GenerateDoc(ctx context.Context, id string, sc *SkillContent, a
 		DisableThinking: true,
 		JSONMode:        true,
 		OnReasoning:     reasoningSink(ctx),
+		OnContent:       contentSink(ctx),
 	})
 	if err != nil {
 		return nil, err
@@ -1071,6 +1073,7 @@ func (e *Engine) FillDoc(ctx context.Context, id string, sc *SkillContent, userM
 		DisableThinking: true,
 		JSONMode:        true,
 		OnReasoning:     reasoningSink(ctx),
+		OnContent:       contentSink(ctx),
 	})
 	if err != nil {
 		return nil, err
