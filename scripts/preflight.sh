@@ -234,7 +234,10 @@ if [ "$QUICK" = 0 ]; then
   }
   selfcheck '前端 / 分类结构管理自证'   bash web/tests/category_ui_mutation_check.sh
   selfcheck '前端 / 缓存版本号自证'     bash web/tests/asset_version_mutation_check.sh
+  selfcheck '前端 / 勾选层与点外关闭自证' python3 web/tests/chat_ui_mutation_check.py
   selfcheck '前端 / 输入区布局与贴底滚动自证' python3 web/tests/chat_composer_mutation_check.py
+  selfcheck '前端 / 思考材料渲染自证'   python3 web/tests/chat_trace_mutation_check.py
+  selfcheck '前端 / 线上验收 leg 接线自证' bash web/tests/live_e2e_roster_mutation_check.sh
   selfcheck '后端 / 推荐行自证'         bash internal/api/suggest_mutation_check.sh
   selfcheck '后端 / 分类结构管理自证'   python3 scripts/category_guard_inject.py
   selfcheck '后端 / 思考开关矩阵自证'   python3 scripts/fastjson_knob_inject.py

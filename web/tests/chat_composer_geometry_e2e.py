@@ -38,6 +38,9 @@ SKIP 规则：playwright 不可用 / 页面打不开 → 打 SKIP 并 exit 0。S
   为什么注入后是 81px 而不是历史 994px：无头 Chromium 帧间还能追上一些；真浏览器带
   重渲染时落后更狠。断言有牙齿即可 —— 0 → 81 且必须红，就够了。
 """
+# LIVE-LEGS: default
+# ↑ 线上验收 leg 声明（只有一条 leg，不需要额外 env）。枚举规则见
+#   scripts/acceptance-live.sh 与 web/tests/live_e2e_roster.test.mjs。
 import hashlib
 import os
 import sys

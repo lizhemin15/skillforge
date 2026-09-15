@@ -21,6 +21,9 @@
   python3 web/tests/chat_layer_e2e.py            # 默认打 http://127.0.0.1:8092
   BASE=http://127.0.0.1:9999 python3 web/tests/chat_layer_e2e.py
 """
+# LIVE-LEGS: default
+# ↑ 线上验收 leg 声明（只有一条 leg，不需要额外 env）。枚举规则见
+#   scripts/acceptance-live.sh 与 web/tests/live_e2e_roster.test.mjs。
 import os
 import sys
 
@@ -121,15 +124,46 @@ def run_checks(pg):
     check('触发器点亮显示"展开中"', 'is-on' in trigger_cls(), trigger_cls())
 
     rows_all = pg.eval_on_selector_all('.ch-skrow', 'els => els.length')
-    check('层里铺满了技能（全量，不是 4 颗）', rows_all >= 10, f'rows={rows_all}')
+    # 这条断言的原意是「层里铺的是**全量**，不是被截断的前几颗」。
+    # 旧版写死 `rows_all >= 10`：技能库瘦身后它必然红（实测库里只有 6 个技能时
+    # 报 rows=6）—— 那是**假红**，坏的是尺子不是货。要「全量」就必须拿服务端
+    # 自己的全量当尺子，而不是一个跟数据无关的魔数。
+    api_cnt = pg.evaluate(
+        """async () => {
+             const r = await fetch('/api/skills', { headers: { Accept: 'application/json' } });
+             if (!r.ok) return -1;
+             const d = await r.json();
+             if (Array.isArray(d)) return d.length;
+             return (typeof d.count === 'number') ? d.count : ((d.skills || []).length);
+           }"""
+    )
+    check('前提：技能库里至少 2 个技能（否则"全量"和"搜索过滤"都没意义）',
+          isinstance(api_cnt, int) and api_cnt >= 2, f'api={api_cnt}')
+    check('层里铺满了技能（= 服务端全量，不是截断的前几颗）',
+          rows_all == api_cnt, f'rows={rows_all} api={api_cnt}')
 
     # —— 3. 搜索真过滤 ——
-    pg.fill('#sk-q', '合同')
-    pg.wait_for_timeout(200)
+    # 搜索词也从数据里取：写死「合同」的版本会在那个技能被删/改名时变成假红。
+    # 取「名字不被任何其它技能名包含」的那一个 —— 搜全名必然只命中自己。
+    q = pg.evaluate(
+        """() => {
+             const names = [...document.querySelectorAll('.ch-skname')]
+               .map((e) => e.textContent.trim()).filter(Boolean);
+             const uniq = names.filter((n) => names.filter((x) => x.includes(n)).length === 1);
+             return uniq[uniq.length - 1] || '';
+           }"""
+    )
+    check('前提：存在一个不被其它技能名包含的名字（搜索词要它才唯一）',
+          isinstance(q, str) and q != '', f'q={q!r} rows={rows_all}')
+    pg.fill('#sk-q', q)
+    pg.wait_for_timeout(250)
     rows_q = pg.eval_on_selector_all('.ch-skrow', 'els => els.length')
-    check('搜索"合同"真的过滤（不是列全部）', 0 < rows_q < rows_all, f'{rows_q}/{rows_all}')
+    check('搜索真名真的过滤（不是列全部）', 0 < rows_q < rows_all, f'{rows_q}/{rows_all} q={q!r}')
     pg.fill('#sk-q', '')
     pg.wait_for_timeout(200)
+    rows_back = pg.eval_on_selector_all('.ch-skrow', 'els => els.length')
+    check('清空搜索框后恢复全量（不是一次过滤就再也回不来）', rows_back == rows_all,
+          f'{rows_back}/{rows_all}')
 
     # —— 4. 勾一个 → 关层 + 落盘 ——
     pg.click('.ch-skrow')

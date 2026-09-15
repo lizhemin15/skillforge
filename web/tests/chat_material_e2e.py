@@ -26,19 +26,45 @@
   BASE=http://127.0.0.1:9999 python3 web/tests/chat_material_e2e.py
   INJECT_NOMAT=1 python3 web/tests/chat_material_e2e.py           # 负向自证，必须红
 
+REQUIRE_FILE=1：docgen（生成 .docx）那条路径专用。
+  该路径的交付物是**文件卡片**，正文不进聊天气泡，所以不能用「气泡 ≥200 字」当前提。
+  这条更不能改用「材料 ≥200 字」当前提 —— 那等于拿 M1 自己给自己当前提（循环论证）。
+  独立前提只有文件卡片本身：出现「已生成文档」的 atx-link。
+
 SKIP 规则：playwright 不可用 / 页面打不开 → 打 SKIP 并 exit 0。SKIP != PASS。
 """
+# LIVE-LEGS: writing | docgen REQUIRE_FILE=1 PROMPT_KEY=docgen
+# ↑ 线上验收 leg 声明。scripts/acceptance-live.sh 只认这一行来枚举要跑几条 leg
+#   （不许在 runner 里写死文件名 —— 那是「漏加 = 这个 leg 不存在」的老洞）；
+#   web/tests/live_e2e_roster.test.mjs 守着它跟文件真身不许脱钩。
 import os
 import sys
 import time
 
 BASE = os.environ.get('BASE', 'http://127.0.0.1:8092')
-# 默认提示词要能逼出「执笔跳的思考链」——材料正是在这段静默里流出来的。
-# 太短的问答会走关思考链的路由跳，材料本来就不该出现，断言会变成空跑。
-PROMPT = os.environ.get('PROMPT', '写一份关于开展数据治理专项工作的通知，正文不少于 600 字，直接输出正文')
 MAXW = int(os.environ.get('MAXW', '240'))  # 单轮最长等多久（秒）
+
+# 提示词预设：**必须放在文件里**，不能让 runner 用命令行传。
+# 原因：runner 是 bash，leg 声明按空格切；把中文长提示词塞进 leg 的 env 赋值里，
+# 既会被空格切碎，也会让「提示词」这条最该被审查的东西藏进 scripts/ 里没人看。
+# 每条 leg 只带「无空格的键=值」。
+PROMPT_PRESETS = {
+    # 写作路径：材料来自「执笔跳」——材料正是在这段静默里流出来的。
+    # 太短的问答会走关思考链的路由跳，材料本来就不该出现，断言会变成空跑。
+    'writing': '写一份关于开展数据治理专项工作的通知，正文不少于 600 字，直接输出正文',
+    # docgen 路径：交付物是 .docx 文件卡片（正文不进气泡），且这一跳关掉思考链，
+    # 材料只能来自「流式 JSON 里的正文」。走这条路要用 REQUIRE_FILE=1 换前提。
+    'docgen': '帮我生成一份《关于开展数据治理专项行动的通知》的 Word 文档，直接生成文件',
+}
+PROMPT_KEY = os.environ.get('PROMPT_KEY', 'writing')
+if PROMPT_KEY not in PROMPT_PRESETS:
+    print(f'未知 PROMPT_KEY={PROMPT_KEY}，可选：{sorted(PROMPT_PRESETS)}')
+    sys.exit(2)
+PROMPT = os.environ.get('PROMPT', PROMPT_PRESETS[PROMPT_KEY])
 # INJECT_NOMAT=1：网络层把材料渲染分支改掉，复刻「后端有材料、前端不显示」这个故障。
 INJECT_NOMAT = os.environ.get('INJECT_NOMAT') == '1'
+# docgen 路径：前提改成「出现已生成文档卡片」（见文件头说明，不能用材料当前提）
+REQUIRE_FILE = os.environ.get('REQUIRE_FILE') == '1'
 
 fails = []
 checks = 0
@@ -91,6 +117,8 @@ READ_JS = """() => {
   const b = document.querySelector('.ch-msg.assistant .ch-bubble');
   return {samples: s.samples, errs: s.errs,
           bubble: b ? (b.innerText || '').replace(/\\s+/g, '').length : 0,
+          genfile: Array.from(document.querySelectorAll('a.atx-link .atx-hint'))
+                     .some(e => (e.innerText || '').includes('已生成文档')),
           active: !!document.querySelector('.ctk-step.active'),
           steps: document.querySelectorAll('.ctk-step').length};
 }"""
@@ -174,10 +202,15 @@ def run_checks(pg):
     else:
         print('材料窗口: 整轮没有任何材料帧' + ('（INJECT_NOMAT=1，这是预期）' if INJECT_NOMAT else ''))
 
-    # M5 是前提，先断它：没有真正文的话「没材料」不能算通过，但也不能算材料失败。
-    ok_body = last['bubble'] >= 200
-    check('M5 前提：整轮真收到 ≥200 字正文（否则 M1 是空跑）', ok_body,
-          f"bubble={last['bubble']}")
+    # M5 是前提，先断它：没有真交付物的话「没材料」不能算通过，但也不能算材料失败。
+    if REQUIRE_FILE:
+        ok_body = bool(last.get('genfile'))
+        check('M5 前提：出现「已生成文档」卡片（该路径交付物是文件，否则 M1 是空跑）', ok_body,
+              f"genfile={last.get('genfile')}")
+    else:
+        ok_body = last['bubble'] >= 200
+        check('M5 前提：整轮真收到 ≥200 字正文（否则 M1 是空跑）', ok_body,
+              f"bubble={last['bubble']}")
 
     if mats:
         first = mats[0]

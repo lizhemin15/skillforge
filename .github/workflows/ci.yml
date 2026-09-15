@@ -115,14 +115,23 @@ jobs:
 
       # 断言自证：往出货文件里注入真实故障，要求对应断言变红。
       # 全绿的断言集不代表真能抓住故障，这几个脚本把「抓得住」本身也守上。
-      - name: 前端断言自证（分类结构管理 / 缓存版本号 / 输入区布局与贴底滚动 / 思考材料的渲染）
+      - name: 前端断言自证（分类结构管理 / 缓存版本号 / 输入区布局与贴底滚动 / 思考材料的渲染 / 线上验收 leg 接线）
         run: |
           bash web/tests/category_ui_mutation_check.sh
           bash web/tests/asset_version_mutation_check.sh
+          # 这条 15 注入的自证此前**哪里都没调用**（不在 CI、不在 preflight），
+          # 只有人手动跑；它是 chat_modes.test.mjs 的唯一牙齿，被漏掉等于那套
+          # 断言（勾选层开关、点外关闭、推荐行抖动）没人守。
+          python3 web/tests/chat_ui_mutation_check.py
           python3 web/tests/chat_composer_mutation_check.py
           # 材料的「后端发了、前端没渲染」形态只在 Go 侧看不出来（后端确实发了，
           # 所以 go test 和 SSE 验收全绿），必须由前端这一层自证抓得住。
           python3 web/tests/chat_trace_mutation_check.py
+          # 线上验收（真浏览器 + 真服务 + 真模型）天然进不了 CI，于是天然会腐烂。
+          # 这条自证守的是「接线」：伪造 SKIP 必须判失败、声明里的两条 leg 必须真跑
+          # 两次、runner 退回写死清单必须被 roster 测试抓住。它不需要服务/模型，
+          # 所以能在 CI 里跑 —— 这正是它存在的理由。
+          bash web/tests/live_e2e_roster_mutation_check.sh
 
       # 推荐行（输入框上方那几颗小胶囊）的后端：/api/chat/suggest。
       # 它的失败形态全是「静默降级」——前端 fetch 挂在 .catch 里，404/500/超时
