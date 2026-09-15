@@ -218,13 +218,19 @@ func judgeSandbox(diag map[string]string, secretPaths []string, err error) selfC
 		return c
 	}
 	if diag["uid"] == "" {
-		// 真的发生过：almalinux:8 最小安装（默认不带 python3）上装完，自检报的是
-		// 「没有降权」，客户以为沙箱漏了、要开安全事故复盘，实际只是探针解释器不存在。
-		// 归因错了比不报还坏——它把「环境缺件」伪装成「安全缺陷」。
-		c.detail = append(c.detail, "沙箱探针没有报告 uid —— 这是「证据缺失」，不是「降权失败」："+
-			"探针的 python 解释器根本没跑起来，所以 uid 无从得知。"+
-			"最常见原因是目标机缺 python3（RHEL/AlmaLinux 最小安装默认不带它）。"+
-			"先装 python3 再重跑自检：dnf install -y python3（离线机挂 ISO 或配本地源）。"+
+		// 这一支现在几乎不可达——探针跑完却没有 uid 的两种情况都已被上游点名：
+		// ①解释器不存在：SandboxDiagnosticsFor 在跑探针之前就报（带 dnf/apt 提示）；
+		// ②systemd-run 拒收参数：probeFailureDetail 把原始报错塞进 error，走上面那支。
+		// 留着它当最后一道闸：**没有 uid 证据就绝不能判通过**，也不许替客户编一个原因。
+		//
+		// 历史教训（Bug O 的误诊版）：这里原来一口咬定「最常见原因是目标机缺 python3」。
+		// 真现场是 AlmaLinux 8（systemd 239）不认 systemd-run 的 --working-directory
+		// ——python3 好好地在包里躺着。客户照着那句话装了几遍 python3，怎么装都修不好。
+		c.detail = append(c.detail, "沙箱探针没有报告 uid —— 这是「证据缺失」，不是「降权失败」，"+
+			"也不能据此断定原因。请先看探针的原始回执（systemd-run 的 stdout/stderr）："+
+			"已知过的两类真因是 ①目标机没有可用的 python3 解释器（RHEL/AlmaLinux 最小安装默认不带）；"+
+			"②目标机 systemd 版本较老、不认我们下发的某个 systemd-run 选项"+
+			"（例：AlmaLinux 8 的 systemd 239 不认 --working-directory，只认属性 --property=WorkingDirectory=）。"+
 			"在拿到 uid 证据之前，既不能说沙箱安全，也不能把责任算在降权上。")
 		return c
 	}

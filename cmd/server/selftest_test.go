@@ -193,6 +193,11 @@ func TestJudgeSandbox(t *testing.T) {
 // 压根没有 uid 这一项 → 旧逻辑掉进「uid != 65534」分支，打印「没有降权：uid=」。
 // 客户看到的是「安全加固失效」，实际只是目标机缺个解释器。归因错了比不报还坏：
 // 它把「环境缺件」伪装成「安全缺陷」，会把人带去查错方向。
+//
+// 后来又逮到第二类真因（Bug Y2）：AlmaLinux 8 的 systemd 239 不认 systemd-run 的
+// --working-directory，探针一个字都不吐，而这句话当时一口咬定「缺 python3」——
+// 客户装了几遍 python3 都修不好。所以现在这条明细**不许给出单一结论**：
+// 只能说「证据缺失」，并把已知真因按可能性摊开。
 func TestJudgeSandboxEmptyUIDIsNotBlamedOnPrivilegeDrop(t *testing.T) {
 	got := judgeSandbox(map[string]string{
 		"network":    "断(OK)",
@@ -203,11 +208,28 @@ func TestJudgeSandboxEmptyUIDIsNotBlamedOnPrivilegeDrop(t *testing.T) {
 		t.Fatalf("没拿到 uid 证据却判 ok=true（假绿灯）：%v", got.detail)
 	}
 	joined := strings.Join(got.detail, "\n")
-	if !strings.Contains(joined, "python3") {
-		t.Fatalf("明细没点出真因 python3：%v", got.detail)
-	}
 	if strings.Contains(joined, "没有降权") {
 		t.Fatalf("把「证据缺失」误诊成「没有降权」——这条误诊必须绝迹：%v", got.detail)
+	}
+	if !strings.Contains(joined, "证据缺失") {
+		t.Fatalf("必须点明这是「证据缺失」：%v", got.detail)
+	}
+	// ⚠️ 断言必须锚在「区分性子句」上，不能锚在相邻句子里也有的词。
+	// 踩过的坑：原来这里只要求出现 "systemd" 和 "原始回执"，结果把文案改回
+	// 「一口咬定缺 python3」后测试**依然全绿**——因为紧挨着的上一句
+	// 「请先看探针的原始回执（systemd-run 的 stdout/stderr）」把这两个词都送上了。
+	// 子串断言会跨句泄漏：量到的不是被测属性，而是邻居的余光。
+	for _, want := range []string{"两类真因", "python3", "systemd 版本较老"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("明细没摊开已知真因 %q（只给单一结论会把客户带去错方向）：%v", want, got.detail)
+		}
+	}
+	if !strings.Contains(joined, "原始回执") {
+		t.Fatalf("没告诉客户去哪儿看原始证据：%v", got.detail)
+	}
+	// 历史上那句错误的单一结论必须绝迹——它就是客户「装几遍 python3 也修不好」的来源。
+	if strings.Contains(joined, "最常见原因是目标机缺 python3") {
+		t.Fatalf("出现历史误诊原句（把两类真因收窄成 python3 一个）：%v", got.detail)
 	}
 }
 
