@@ -226,7 +226,20 @@
     fd.append('requirement', $('tr-req').value || '');
     for (const f of selectedFiles) fd.append('files', f);
 
+    // 心跳：后端只在阶段边界发帧，阶段内部可能几十秒静默（一跑二十分钟）。
+    // 屏幕必须持续有「还在跑」的活气，否则用户看到的只是一个不动的框 —— 投诉原话
+    // 「一直卡着计时，用户体验不佳」就是这个。每秒刷新已用时长 + 距上次进度多久。
+    const tickFmt = (s) => (s >= 60 ? Math.floor(s / 60) + 'm' + String(s % 60).padStart(2, '0') + 's' : s + 's');
+    let lastEvAt = Date.now();
+    const t0 = Date.now();
+    const hb = setInterval(() => {
+      const now = Date.now();
+      txt.textContent = '训练中… 已 ' + tickFmt(Math.round((now - t0) / 1000)) +
+        '（距上次进度 ' + tickFmt(Math.round((now - lastEvAt) / 1000)) + '）';
+    }, 1000);
+
     const logLine = (stage, s, cls) => {
+      lastEvAt = Date.now();
       const div = document.createElement('div');
       div.className = 'ln ' + (cls || '');
       div.innerHTML = `<span class="t">${esc(stage)}</span><span class="s">${esc(s)}</span>`;
@@ -256,7 +269,14 @@
           try {
             const ev = JSON.parse(line0.slice(5).trim());
             switch (ev.type) {
-              case 'stage': logLine('→', ev.data, ''); break;
+              // ⚠️ 契约：后端 internal/api/admin.go 发的是 status / step / error / done。
+              // 这里以前只认 'stage'，于是「开始训练」和整场训练的阶段进度帧被静默丢弃 ——
+              // 界面上只剩一个空日志框 + 不动的「训练中…」，二十分钟看不出任何进展。
+              // 事件名对不上是静默故障（没有任何报错），所以下面配了契约测试守着。
+              case 'status': logLine('•', ev.data, ''); break;
+              case 'step':
+              case 'stage': // 旧名，向后兼容
+                logLine('→', ev.data, ''); break;
               case 'done':
                 const r = ev.data && typeof ev.data === 'object' ? ev.data : JSON.parse(ev.data);
                 // 降级交付必须显性说出来：技能落盘了，但裁判没验收通过（没跑完或没过线）。
@@ -298,6 +318,7 @@
     } catch (err) {
       logLine('!', '网络错误：' + err.message, 'err');
     } finally {
+      clearInterval(hb);
       go.disabled = false; spin.style.display = 'none'; txt.textContent = '开始训练';
       selectedFiles = []; renderTags();
     }
