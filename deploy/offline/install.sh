@@ -113,6 +113,8 @@ UNIT="/etc/systemd/system/$SERVICE_NAME.service"
 OCR_BIN="$PREFIX/bin/ocrd"
 OCR_UNIT="/etc/systemd/system/$SERVICE_NAME-ocr.service"
 BUNDLED_FONT=""
+# 包内自带 Python 拷到 $PREFIX 后的绝对路径（PY_BUNDLED=1 时才有值）。
+BUNDLED_PY=""
 
 printf '\033[1mSkillForge 离线安装\033[0m\n'
 c_info "安装前缀 : $PREFIX"
@@ -160,6 +162,27 @@ PY_FOUND=""
 # PY_FROM_PATH=1 表示命中的解释器不在候选名单里、只在 $PATH 上找到 —— 这种必须钉进
 # 配置文件，见下面「生成配置」那步。
 PY_FROM_PATH=0
+# PY_BUNDLED=1 表示用的是**包内自带**的那份（拷到 $PREFIX/python 后钉进配置）。
+PY_BUNDLED=0
+# 包内自带的解释器源路径（在 $HERE 下，稍后拷进 $PREFIX）。
+PY_BUNDLED_SRC=""
+
+# ---------- 包里自带的 Python（优先于目标机上的任何解释器）----------
+#
+# 为什么要自带：客户机器常是内网最小安装 —— 没有 python3，而且**装不了**
+# （没有源、没有 ISO 可挂）。旧版把「目标机得先有 python3」写进前置要求，等于把
+# 「一键安装」拆成「你先想办法弄个 python 去」，用户报的现场就是这个。
+# 现在离线包自带一份便携 CPython，安装时拷到 $PREFIX/python 并钉进配置，
+# 目标机完全不需要预装解释器。
+if [ -x "$HERE/python/bin/python3" ] \
+	&& "$HERE/python/bin/python3" -c pass >/dev/null 2>&1; then
+	PY_BUNDLED_SRC="$HERE/python/bin/python3"
+elif [ -e "$HERE/python" ]; then
+	# 目录在、解释器却跑不起来 = 包被截断或架构不符。必须说出来：否则用户拿到的是
+	# 「安装成功但 AI 不能跑代码」，而原因（包坏了）从任何输出里都看不出来。
+	# 注意 $HERE/python 不带 bin/python3 的老包不在此列 —— 那种走下面的候选/ PATH。
+	c_warn "包内自带解释器存在但跑不起来：$HERE/python/bin/python3（包可能损坏或架构不符）"
+fi
 if [ -n "${SKILLFORGE_PYTHON:-}" ]; then
 	# 显式指定就只认它：与 Go 侧同一条原则 —— 指了个用不了的路径时不去猜别的，
 	# 否则运维以为在用自己那份、实际在用系统的，是最难查的坑。
@@ -169,12 +192,20 @@ if [ -n "${SKILLFORGE_PYTHON:-}" ]; then
 		c_warn "SKILLFORGE_PYTHON=$SKILLFORGE_PYTHON 不可用：要存在、可执行、且能跑 \`-c pass\`"
 	fi
 else
-	for _cand in $PythonCandidates; do
-		if [ -x "$_cand" ] && "$_cand" -c pass >/dev/null 2>&1; then
-			PY_FOUND="$_cand"
-			break
-		fi
-	done
+	# 自带优先于目标机上的一切（含候选名单里那三个）：客户机器什么环境我们控制不了，
+	# 包里这份是唯一能保证「一定存在、行为一致」的解释器。
+	if [ -n "$PY_BUNDLED_SRC" ]; then
+		PY_FOUND="$PY_BUNDLED_SRC"
+		PY_BUNDLED=1
+	fi
+	if [ -z "$PY_FOUND" ]; then
+		for _cand in $PythonCandidates; do
+			if [ -x "$_cand" ] && "$_cand" -c pass >/dev/null 2>&1; then
+				PY_FOUND="$_cand"
+				break
+			fi
+		done
+	fi
 	# 候选全不命中时，再认一次 $PATH 里的 python3 —— 与 Go 侧 resolvePythonFrom 的
 	# 最后一步等价（自己编译 / conda 装到 /opt/xxx/bin 这类不在候选名单里的位置）。
 	#
@@ -199,15 +230,19 @@ fi
 # 不吭声——装完自检里那条会红，客户看到的是「代码执行沙箱 失败」，得让他一眼看懂
 # 是缺解释器，不是安全加固漏了。（真机上这就是 almalinux 最小安装的现场。）
 if [ -z "$PY_FOUND" ]; then
-	c_warn "这台机器没有找到可用的 python3 解释器（找过：$PythonCandidates 以及 \$PATH）"
+	c_warn "这台机器没有找到可用的 python3 解释器（找过：包内自带、$PythonCandidates 以及 \$PATH）"
 	c_warn "  影响：「代码执行沙箱」一项自检会失败，AI 无法跑代码/脚本校验；写作等主功能不受影响"
 	c_warn "  注意：这不是沙箱降权/加固失败，就是缺个解释器"
-	c_warn "  修复：dnf install -y python3（RHEL/AlmaLinux 最小安装默认不带；Debian/Ubuntu 用 apt install python3）"
+	c_warn "  本包本应自带一份便携解释器（<包目录>/python/bin/python3）—— 上面这句出现，"
+	c_warn "  通常是拿了旧版离线包（不带 python/），或包在解压时被截断。建议重新下载最新离线包。"
+	c_warn "  不想换包就自己装一个：dnf install -y python3（RHEL/AlmaLinux 最小安装默认不带；Debian/Ubuntu 用 apt install python3）"
 	c_warn "  离线机：挂发行版 ISO 或配本地源后按上面装，装完补跑一次自检：/opt/skillforge/skillforge -selftest"
 	c_warn "  解释器装在别处（自己编译/conda）：装完在 $PREFIX.env 里加一行 SKILLFORGE_PYTHON=/usr/local/bin/python3"
 	c_warn "  确实接受这一项不可用：加 --skip-selftest 跳过装后自检（自担风险，不推荐）"
 else
-	if [ "$PY_FOUND" = "/usr/bin/python3" ]; then
+	if [ "$PY_BUNDLED" = "1" ]; then
+		c_ok "python3 可用（代码执行沙箱的解释器）：包内自带（目标机无需预装）"
+	elif [ "$PY_FOUND" = "/usr/bin/python3" ]; then
 		c_ok "python3 可用（代码执行沙箱的解释器）：$PY_FOUND"
 	else
 		# 走到这里说明旧逻辑会误报「没有 python3」——把命中的路径打出来，方便回访。
@@ -503,6 +538,37 @@ if [ "$DO_OCR" -eq 1 ]; then
 	fi
 fi
 
+# ---------- 包内自带的 Python 运行时 ----------
+#
+# 为什么不直接用包目录里那份：客户装完常会把解压出来的目录（甚至 tar 包）清掉，
+# 而服务是 systemd 长期跑的 —— 指向包目录的解释器会在某次清理后突然消失，表现为
+# 「昨天还能跑代码，今天不能了」。所以拷进 $PREFIX，与二进制同生命周期。
+if [ "$PY_BUNDLED" = "1" ]; then
+	BUNDLED_PY="$PREFIX/python/bin/python3"
+	# 先拷到 .new 再换入：中途失败不会留下半份运行时被下次安装当成好的用。
+	# cp -a 保留可执行位与符号链接 —— 便携 Python 的 lib 下有大量 symlink，
+	# 丢了会把整套标准库连根拔掉（表现为 import 全失败）。
+	rm -rf "$PREFIX/python.new"
+	cp -a "$HERE/python" "$PREFIX/python.new"
+	# 沙箱是以降权用户跑的，必须让他读得到、执行得了：目录给 a+rx，普通文件给 a+r。
+	# 少这一步，装完自检「代码执行沙箱」会红，报的还是权限错误 —— 用户根本看不出
+	# 是自己这里少了个 chmod。
+	chmod -R a+rX "$PREFIX/python.new"
+	# 换入用「旧的先挪走」而不是先 rm：正在跑的服务（--no-start / 升级热替换）不至于
+	# 在这一瞬间找不到解释器。挪走的旧件最后统一删。
+	if [ -e "$PREFIX/python" ]; then
+		rm -rf "$PREFIX/python.old"
+		mv "$PREFIX/python" "$PREFIX/python.old"
+	fi
+	mv "$PREFIX/python.new" "$PREFIX/python"
+	rm -rf "$PREFIX/python.old"
+	# 拷完必须现场验一次：跨文件系统拷贝 / 权限位丢失 / 磁盘满，都会让这份运行时
+	# 变成「文件在、跑不起来」。装完才发现在客户那里 = 一次无效交付，所以当场 die。
+	"$BUNDLED_PY" -c pass >/dev/null 2>&1 \
+		|| die "自带解释器拷到 $BUNDLED_PY 后跑不起来（拷贝不完整 / 权限不对 / 磁盘满？）——安装中止，不留下「装成功但跑不了代码」的实例"
+	c_ok "自带 Python 运行时：$BUNDLED_PY（目标机无需预装解释器）"
+fi
+
 # 技能不随包带：程序启动时会自己 seed 内置技能（见 internal/store/seed.go），
 # 包里再塞一份目录只会造成「有目录没数据库记录」的孤儿状态。
 
@@ -537,6 +603,11 @@ umask 077
 	if [ -n "$OLD_PY" ]; then
 		printf '# ---- 解释器（沿用上一版配置）----\n'
 		printf 'SKILLFORGE_PYTHON=%s\n\n' "$OLD_PY"
+	elif [ "$PY_BUNDLED" = "1" ]; then
+		printf '# ---- 解释器（离线包自带，目标机无需预装 python3）----\n'
+		printf '# 必须钉住绝对路径：服务由 systemd 起，它的 PATH 跟你登录的 shell 不一样，\n'
+		printf '# 只靠「找 $PATH」会出现「安装时说没问题、装完自检红」。\n'
+		printf 'SKILLFORGE_PYTHON=%s\n\n' "$BUNDLED_PY"
 	elif [ "$PY_FROM_PATH" = "1" ]; then
 		printf '# ---- 解释器 ----\n'
 		printf '# 这个解释器不在标准位置（/usr/bin、/usr/local/bin、platform-python），\n'

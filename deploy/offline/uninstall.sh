@@ -189,6 +189,21 @@ if [ -d "$PREFIX/bin" ] && [ -z "$(ls -A "$PREFIX/bin" 2>/dev/null)" ]; then
 	rmdir "$PREFIX/bin"
 	c_ok "已删除空的 $PREFIX/bin"
 fi
+
+# 自带 Python 运行时（install.sh 从包里拷到 $PREFIX/python）：整整一个运行时，
+# 不删就永远留在客户机上（几百 MB）。它是程序文件、不是数据，所以 --purge 之外也要清。
+PY_DIR="$PREFIX/python"
+if [ -d "$PY_DIR" ]; then
+	# 目录串按整段锚定，别用子串：$PREFIX/python-old 这类名字不该被这里匹配到。
+	case "$PY_DIR" in
+		/*/python) ;;
+		*) c_warn "跳过非常规解释器目录（名字不以 /python 结尾）：$PY_DIR" ; PY_DIR="" ;;
+	esac
+fi
+if [ -n "${PY_DIR:-}" ] && [ -d "$PY_DIR" ]; then
+	rm -rf "$PY_DIR"
+	c_ok "已删除自带的 Python 运行时：$PY_DIR"
+fi
 [ "$removed" -eq 0 ] && c_info "前缀目录里本来就没有程序文件"
 
 # 把目录转成「整段路径」匹配用的正则：

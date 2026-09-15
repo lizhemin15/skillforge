@@ -120,15 +120,18 @@ case(
 case(
     "探测退回写死单一路径（原始故障复发）",
     INSTALL_SH,
-    '\tfor _cand in $PythonCandidates; do\n'
-    '\t\tif [ -x "$_cand" ] && "$_cand" -c pass >/dev/null 2>&1; then\n'
-    "\t\t\tPY_FOUND=\"$_cand\"\n"
-    "\t\t\tbreak\n"
-    "\t\tfi\n"
-    "\tdone\n",
-    '\tif [ ! -x /usr/bin/python3 ]; then\n'
-    '\t\tc_warn "写死单路径探测（注入的自证场景）"\n'
-    '\tfi\n',
+    # 缩进是 2 个 tab：这段候选循环现在包在 `if [ -z "$PY_FOUND" ]` 里
+    # （为「包内自带解释器优先」让路）。锚点必须跟着出货文件走 —— 命中 0 次时本脚本
+    # 会明确报「锚点失配」而不是静默跳过，这是故意的：静默跳过 = 这条自证失效了。
+    '\t\tfor _cand in $PythonCandidates; do\n'
+    '\t\t\tif [ -x "$_cand" ] && "$_cand" -c pass >/dev/null 2>&1; then\n'
+    "\t\t\t\tPY_FOUND=\"$_cand\"\n"
+    "\t\t\t\tbreak\n"
+    "\t\t\tfi\n"
+    "\t\tdone\n",
+    '\t\tif [ ! -x /usr/bin/python3 ]; then\n'
+    '\t\t\tc_warn "写死单路径探测（注入的自证场景）"\n'
+    '\t\tfi\n',
     "没有用 $PythonCandidates 做循环探测",
 )
 

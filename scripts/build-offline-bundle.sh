@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 #
-# build-offline-bundle.sh —— 把二进制 + 一键安装脚本 + 中文字体打成一个「拷走就能装」的 tar.gz
+# build-offline-bundle.sh —— 把二进制 + 一键安装脚本 + 中文字体 + 便携 Python 打成一个「拷走就能装」的 tar.gz
 #
-# 为什么需要它：客户机器常常是内网、没外网、也没装中文字体。分发包里必须自带
+# 为什么需要它：客户机器常常是内网、没外网、也没装中文字体、**连 python3 都没有**
+# （最小安装、无本地源，也装不上）。分发包里必须自带
 #   1) 编译好的二进制（不依赖客户装 Go）
 #   2) install.sh / uninstall.sh / systemd 模板（一条命令装完）
 #   3) 一个覆盖「中文 + 数字 + 拉丁」的 .ttf（否则 PDF 里的数字会静默变空白，见 Bug G）
+#   4) 一份便携 CPython（否则内网机器装完「代码执行沙箱」必红，AI 跑不了代码）
 #
 # 用法（本地手工打）：
-#   scripts/build-offline-bundle.sh --version v0.3.0 --arch amd64 --binary ./skillforge-linux-amd64
+#   scripts/build-offline-bundle.sh --version v0.3.0 --arch amd64 --binary ./skillforge-linux-amd64 \
+#     --ocr ./ocrd-linux-amd64 --python-runtime /path/to/cpython-<ver>-linux-x86_64-install_only_stripped.tar.gz
+# 取便携运行时：scripts/fetch-python-runtime.sh --arch amd64 --outdir /tmp
 # CI 里由 .github/workflows/release.yml 调用，逐架构产出并附到 Release。
 #
 # 输出：dist/skillforge-<version>-offline-linux-<arch>.tar.gz（含同名 .sha256）
@@ -16,7 +20,8 @@
 # 设计要点：
 #   - **确定性**：固定 mtime、固定属主、按名字排序打包、gzip -n，同样的输入产出同样的字节
 #     （这样 Release 里的 sha256 才有可比性，也便于验证「我下的包没被改过」）
-#   - **不联网**：字体从本机已装的包里拿，不做 apt install / 不下载
+#   - **不联网**：字体从本机已装的包里拿、Python 运行时由调用方先下好传进来（--python-runtime），
+#     打包脚本自己不做 apt install / 不下载
 #   - 缺字体时**直接失败**而不是打一个残包：残包在客户机上表现为「PDF 里数字全没了」，
 #     属于最难排查的那类故障（打开 PDF 看不出错，只是数据没了）
 
@@ -29,6 +34,8 @@ OUTDIR="dist"
 FONT_FILE=""
 OCR_BIN=""
 NO_OCR=""
+NO_PY_RUNTIME=""
+PY_RUNTIME=""
 SOURCE_DATE=""
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -45,7 +52,10 @@ c_warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
 die()    { c_fail "$*" >&2; exit 1; }
 
 usage() {
-	sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+	# 行号必须跟着头部注释走：注释是给人看的用法说明，sed 范围一旦落后，
+	# --help 就会把说明截断一半（或者把代码打出来）—— 加了 --python-runtime 说明后
+	# 注释从 26 行变成 27 行。
+	sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 	exit 0
 }
 
@@ -56,6 +66,8 @@ while [ $# -gt 0 ]; do
 		--binary)  BINARY="${2:?--binary 需要值，指向已编译的 linux 二进制}"; shift 2 ;;
 		--ocr)     OCR_BIN="${2:?--ocr 需要值，指向已编译好的 linux ocrd}"; shift 2 ;;
 		--no-ocr)  NO_OCR=1; shift ;;
+		--python-runtime) PY_RUNTIME="${2:?--python-runtime 需要值，指向便携 CPython 的 .tar.gz}"; shift 2 ;;
+		--no-python-runtime) NO_PY_RUNTIME=1; shift ;;
 		--outdir)  OUTDIR="${2:?}"; shift 2 ;;
 		--font)    FONT_FILE="${2:?}"; shift 2 ;;
 		--source-date) SOURCE_DATE="${2:?}"; shift 2 ;;
@@ -105,6 +117,76 @@ else
 	# 默认**必须**带：用户拿到的包如果只缺它，装完才发现 = 一次无效交付。
 	# 真要打不带 ocr 的包，显式加 --no-ocr。
 	die "没有 --ocr 指定 ocrd 二进制。离线包默认必须带文档解析服务；确实不要请显式加 --no-ocr"
+fi
+
+# ---------- 便携 Python 运行时（默认必带）----------
+#
+# 为什么必带：客户机器常是内网最小安装 —— 没有 python3，而且**装不了**（没有源、
+# 没有 ISO 可挂）。旧版把「目标机得先有 python3」写成前置要求，等于把「一键安装」
+# 拆成「你先想办法弄个 python 去」，用户报的现场就是这个。
+# 现在包里自带一份便携 CPython（python-build-standalone 的 install_only 包），
+# install.sh 装的时候拷到 $PREFIX/python 并钉进配置，目标机完全不用预装。
+if [ -z "$PY_RUNTIME" ]; then
+	if [ -n "$NO_PY_RUNTIME" ]; then
+		# 与 --no-ocr 同样处理：没被执行过的分支就是坏的分支 —— CI 里会显式跑一次
+		# 这个分支冒烟，省得它哪天把某个 job 打红。
+		c_warn "按 --no-python-runtime 打一个不带解释器的包（内网最小安装的机器装完 AI 跑不了代码）"
+	else
+		die "没有 --python-runtime 指定便携 Python 运行时。离线包默认必须自带解释器（否则内网最小安装的机器装完「代码执行沙箱」必红）；确实不要请显式加 --no-python-runtime"
+	fi
+fi
+
+PY_VERSION=""
+PY_RT_HOME=""
+if [ -n "$PY_RUNTIME" ]; then
+	[ -f "$PY_RUNTIME" ] || die "找不到便携 Python 运行时：$PY_RUNTIME"
+
+	# 解到临时目录再定位，不写死层数：上游 install_only 包目前是 python/ 一层，
+	# 但上游改布局时这里不该跟着改 —— 用「bin/python3 在哪」来定位。
+	PY_RT_TMP="$(mktemp -d "${TMPDIR:-/tmp}/pyrt.XXXXXX")"
+	trap 'rm -rf "$PY_RT_TMP"' EXIT
+	tar -xzf "$PY_RUNTIME" -C "$PY_RT_TMP"
+	# 找解释器：先认 bin/python3，退回版本化的 bin/python3.12。
+	# ⚠️ 这个坑踩过一次：python-build-standalone 的 install_only 包里**只有**
+	# python/bin/python3.12 这个真文件，bin/python3 常常压根不存在 —— 用
+	# `-type f -name python3` 找会命中 0 次，脚本报「不是 install_only 包」，
+	# 其实只是找法不对。同时排除 *-config（那是脚本，不是解释器）。
+	PY_RT_BIN="$({ cd "$PY_RT_TMP" && find . -maxdepth 4 \( -type f -o -type l \) \
+		\( -name 'python3' -o -name 'python3.[0-9]*' \) -path '*/bin/*' -print 2>/dev/null; } \
+		| grep -v -- '-config$' | sort | head -n 1 || true)"
+	[ -n "$PY_RT_BIN" ] || die "$PY_RUNTIME 里找不到 bin/python3* —— 这不是 python-build-standalone 的 install_only 包？"
+	PY_RT_BIN="$PY_RT_TMP/${PY_RT_BIN#./}"
+	PY_RT_HOME="$(cd "$(dirname "$PY_RT_BIN")/.." && pwd)"
+
+	# 架构核对：用文件内容判定，不靠文件名（跟主二进制、ocrd 同一套规矩）。
+	# 装错架构的运行时在目标机上表现为「代码执行沙箱失败」，用户根本看不出是包打错了。
+	PY_DESC="$(file -b "$PY_RT_BIN" 2>/dev/null || true)"
+	case "$PY_DESC" in
+		*ARM\ aarch64*) PY_RT_ARCH=arm64 ;;
+		*x86-64*)       PY_RT_ARCH=amd64 ;;
+		*)              PY_RT_ARCH="" ;;
+	esac
+	if [ -n "$PY_RT_ARCH" ] && [ "$PY_RT_ARCH" != "$ARCH" ]; then
+		die "自带 Python 架构与 --arch 不符：--arch=$ARCH，但运行时是 $PY_RT_ARCH（$PY_DESC）"
+	fi
+
+	# 版本：同架构时真跑一次 `-V` 取（最准），跨架构只能从目录名推（lib/python3.12）。
+	# 取不到不算错，但要留痕 —— VERSION 里 python=unknown 时能看出是这里没拿到。
+	case "$(uname -m)" in
+		aarch64|arm64) PY_HOST_ARCH=arm64 ;;
+		x86_64|amd64)  PY_HOST_ARCH=amd64 ;;
+		*)             PY_HOST_ARCH="" ;;
+	esac
+	if [ "$PY_HOST_ARCH" = "$ARCH" ]; then
+		PY_VERSION="$("$PY_RT_BIN" -V 2>&1 | awk '{print $2}')" || true
+		"$PY_RT_BIN" -c 'import json,ssl,sqlite3,hashlib' >/dev/null 2>&1 \
+			|| die "自带 Python 跑不起基础模块（json/ssl/sqlite3/hashlib）—— 这份运行时是残件，别打进包"
+	fi
+	if [ -z "$PY_VERSION" ]; then
+		PY_VERSION="$(cd "$PY_RT_HOME/lib" 2>/dev/null && ls -d python3.* 2>/dev/null | head -n 1 | sed 's/^python//')" || true
+		[ -n "$PY_VERSION" ] || PY_VERSION="unknown"
+	fi
+	c_ok "自带 Python 运行时核对通过：$PY_VERSION / $ARCH（$(du -sh "$PY_RT_HOME" | cut -f1)）"
 fi
 
 # 版本核对：install.sh 的装后自检会核对版本号是「构建期注入」还是 "dev"，用来证明
@@ -256,6 +338,25 @@ install -m 0644 "$REPO_ROOT/deploy/offline/skillforge-ocr.service.template" "$ST
 install -m 0644 "$REPO_ROOT/deploy/offline/skillforge.env.example" "$STAGE/skillforge.env.example"
 install -m 0644 "$REPO_ROOT/deploy/offline/README.md" "$STAGE/README.md"
 
+# 自带 Python 运行时：整个目录拷进包（cp -a 保留可执行位与符号链接 —— 便携 Python 的
+# lib 下有大量 symlink，丢了等于把标准库连根拔掉）。install.sh 装的时候会把它拷到
+# $PREFIX/python 并钉进配置，客户机器不需要预装任何解释器。
+if [ -n "$PY_RT_HOME" ]; then
+	cp -a "$PY_RT_HOME" "$STAGE/python"
+	# 包内必须有一个叫 bin/python3 的解释器：install.sh 只认这个名字（约定少一个是一个）。
+	# python-build-standalone 只给了版本化的 bin/python3.12，这里补一个**相对** symlink ——
+	# 相对链接才能随包换目录（绝对链接一搬路径就断，而「拷到别的机器」正是本包的用法）。
+	if [ ! -e "$STAGE/python/bin/python3" ]; then
+		PY_RT_REAL="$(cd "$STAGE/python/bin" && ls python3.[0-9]* 2>/dev/null | grep -v -- '-config$' | head -n 1 || true)"
+		[ -n "$PY_RT_REAL" ] || die "自带 Python 的 bin/ 下既没有 python3 也没有 python3.<版本> —— 包里没有可用的解释器"
+		ln -s "$PY_RT_REAL" "$STAGE/python/bin/python3"
+		c_info "已补 bin/python3 → $PY_RT_REAL（相对链接）"
+	fi
+	[ -x "$STAGE/python/bin/python3" ] \
+		|| die "包内 python/bin/python3 不可执行 —— 装到目标机会「AI 跑不了代码」，别发这个包"
+	c_ok "自带 Python 运行时已放进包：python/（$PY_VERSION）"
+fi
+
 # 字体许可证：文鼎字体走 Arphic Public License，允许原样再分发，但**必须随附许可证文本**。
 # 漏了这一条就等于违约分发，所以是硬性步骤而不是「有就带上」。
 font_base="$(basename "$font_pick")"
@@ -299,6 +400,7 @@ arch=$ARCH
 built=$BUILD_STAMP
 font=$(basename "$font_pick")
 ocr=$([ -n "$OCR_BIN" ] && echo yes || echo no)
+python=$([ -n "$PY_RT_HOME" ] && echo "${PY_VERSION:-unknown}" || echo no)
 EOF
 
 cat > "$STAGE/INSTALL.txt" <<'EOF'
@@ -315,6 +417,19 @@ SkillForge 离线安装包
 
 目标机要求（装之前请先确认）：
   - systemd（含 systemd-run）—— 代码执行沙箱靠它隔离；没有就直接拒绝安装
+EOF
+
+# 「目标机要不要自己装 python3」这句必须与包内实际内容一致：带了就写「不用装」，
+# 没带（--no-python-runtime）就如实说清怎么补。说明书与产物不一致时，用户是照说明书
+# 装的，别的检查全绿也没用 —— 跟下面 ocr 那条断言同一个道理。
+if [ -n "$PY_RT_HOME" ]; then
+	cat >> "$STAGE/INSTALL.txt" <<'EOF'
+  - 不需要预装 python3 —— 这个包自带一份便携 CPython（见下面的 python/ 目录）。
+      安装时会把它拷到安装前缀下（<前缀>/python）并写进配置，目标机无需任何解释器：
+      内网、无本地源、RHEL/AlmaLinux 最小安装都直接可用。
+EOF
+else
+	cat >> "$STAGE/INSTALL.txt" <<'EOF'
   - python3 解释器之一 —— 代码执行沙箱的探针与「执行代码」工具的解释器
       按顺序找这三个位置（任一个能跑 `-c pass` 即可）：
         /usr/bin/python3          发行版包管理器装的（Debian/Ubuntu/AlmaLinux 默认自带）
@@ -327,6 +442,7 @@ SkillForge 离线安装包
       缺了它安装仍会继续（写作功能不受影响），但自检里「代码执行沙箱」一项会失败，
       AI 也就无法跑代码/脚本校验。注意那**不是**沙箱降权/加固失败，就是缺个解释器。
 EOF
+fi
 
 # 包内容清单必须与包内实际文件一致。
 # 旧版把「包里带了两个程序（含 bin/ocrd）」写死在这个单引号 heredoc 里，而 arm64 离线包
@@ -350,6 +466,16 @@ else
 影响：扫描件 PDF / Word / Excel / PPT 的文本抽取不可用；写作、技能库、代码执行等
 其余功能不受影响。要补齐解析能力，请换用自带 ocrd 的那份离线包（amd64）。
 安装时会先扫描端口：默认主服务 8092、文档解析 8093。端口被占时会提示你指定新端口。
+EOF
+fi
+
+if [ -n "$PY_RT_HOME" ]; then
+	cat >> "$STAGE/INSTALL.txt" <<EOF
+
+包里还带了一个运行时：
+  python/         便携 CPython $PY_VERSION（含标准库），装的时候拷到 <前缀>/python，
+                  并把绝对路径写进 skillforge.env 的 SKILLFORGE_PYTHON。
+                  「执行代码」工具与沙箱探针用它 —— 所以目标机**不需要**预装 python3。
 EOF
 fi
 
@@ -382,6 +508,26 @@ else
 		|| die "说明与产物不一致：包里没有 ocrd，INSTALL.txt 却没如实告诉用户"
 fi
 
+# 出包前自检：INSTALL.txt 对「要不要目标机自备 python3」的说法必须与包内实际内容一致。
+# 同上：说明书与产物不一致时，用户是照说明书装的 —— 别的检查全绿也救不回来。
+# 这里同样按形态锚定（'不需要预装 python3' 整句），不用裸 'python3'：
+# 不带运行时的说明里也会出现 python3 字样（教用户怎么装），裸子串必然假绿。
+PY_CLAIM='不需要预装 python3'
+if [ -n "$PY_RT_HOME" ]; then
+	grep -q "$PY_CLAIM" "$STAGE/INSTALL.txt" \
+		|| die "说明与产物不一致：包里有自带 Python 运行时，INSTALL.txt 却还在要求目标机自备 python3"
+	grep -q 'SKILLFORGE_PYTHON' "$STAGE/INSTALL.txt" \
+		|| die "说明与产物不一致：包里有自带 Python，INSTALL.txt 却没告诉用户它会被写进配置"
+	[ -x "$STAGE/python/bin/python3" ] \
+		|| die "包内 python/bin/python3 不存在或不可执行 —— 这种包装到目标机上就是「AI 跑不了代码」"
+else
+	if grep -q "$PY_CLAIM" "$STAGE/INSTALL.txt"; then
+		die "说明与产物不一致：这次打了 --no-python-runtime，INSTALL.txt 却声称不需要预装 python3"
+	fi
+	grep -q 'dnf install -y python3' "$STAGE/INSTALL.txt" \
+		|| die "说明与产物不一致：包里没有自带解释器，INSTALL.txt 却没告诉用户怎么补上"
+fi
+
 # ---------- 3. 确定性打包 ----------
 # 固定时间戳 + 固定属主 + 名字排序：同样的输入产出逐字节相同的 tar.gz。
 # 不这么做的话，每次 CI 跑出来的 sha256 都不一样，Release 里的校验和就没意义了。
@@ -403,4 +549,12 @@ c_ok "离线包：$TARBALL（$(du -h "$TARBALL" | cut -f1)）"
 c_ok "校验和：$(cut -d' ' -f1 "$TARBALL.sha256")"
 c_info "解压后目录：$STAGE_NAME/"
 printf '\n'
-( cd "$STAGE" && find . -type f | sort | sed 's|^\./|  |' )
+# python/ 里有几千个标准库文件：逐条列会把 CI 日志刷爆、也淹掉真正该看的文件。
+# 汇总成一行（文件数 + 体积），要查明细看包内 VERSION 里的 python= 字段。
+( cd "$STAGE" && find . -type f -not -path './python/*' | sort | sed 's|^\./|  |' )
+if [ -n "$PY_RT_HOME" ]; then
+	printf '  python/  （自带解释器 %s：%s 个文件，%s）\n' \
+		"$PY_VERSION" \
+		"$(find "$STAGE/python" -type f | wc -l)" \
+		"$(du -sh "$STAGE/python" | cut -f1)"
+fi

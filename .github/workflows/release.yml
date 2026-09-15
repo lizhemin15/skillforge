@@ -135,12 +135,24 @@ jobs:
           scripts/build-ocr.sh --arch amd64 --selfcheck --out dist-bin/ocrd-amd64
           sha256sum dist-bin/ocrd-amd64 | tee dist-bin/ocrd-amd64.sha256
 
-      - name: 打离线包（自动挑字体 + 带许可证 + 确定性 tar）
+      # 便携 Python 运行时（离线包要自带解释器用）：在 CI 里现下、传路径给打包脚本。
+      # 为什么不让打包脚本自己下：它守着「构建期不联网」这条原则（字体也是从本机已装的
+      # 包里拿的）。取料与打包分开，打包脚本保持纯粹、可离线复跑。
+      # 为什么资产名不写死在 workflow 里：见 scripts/fetch-python-runtime.sh 头部注释
+      # （形如「版本+8位日期」的字面量在本地会被掩码改写，落盘即错 → curl 404）。
+      - name: 取便携 Python 运行时（linux/${{ matrix.goarch }}）
+        run: |
+          chmod +x scripts/fetch-python-runtime.sh
+          PKG="$(scripts/fetch-python-runtime.sh --arch "${{ matrix.goarch }}" --outdir /tmp/pyrt)"
+          echo "PY_RUNTIME_PKG=$PKG" >> "$GITHUB_ENV"
+
+      - name: 打离线包（自动挑字体 + 带许可证 + 自带解释器 + 确定性 tar）
         run: |
           chmod +x scripts/build-offline-bundle.sh
           ARGS=(--version "${{ steps.vars.outputs.version }}"
                 --arch "${{ matrix.goarch }}"
-                --binary "/tmp/skillforge-linux-${{ matrix.goarch }}")
+                --binary "/tmp/skillforge-linux-${{ matrix.goarch }}"
+                --python-runtime "$PY_RUNTIME_PKG")
           if [ "${{ matrix.goarch }}" = "amd64" ]; then
             ARGS+=(--ocr dist-bin/ocrd-amd64)
           else
@@ -155,7 +167,9 @@ jobs:
       # → 整个 GitHub Release 被 skip（v0.3.21 / v0.3.22 / v0.3.23 全是这个死法）。
       # 一句话：没被执行过的分支就是坏的分支。用 amd64 的二进制多打一个不带 ocr 的包，
       # 成本几秒，换这条路径每次 push 都被踩一遍。
-      - name: 冒烟 · 无 OCR 分支必须能走通（--no-ocr）
+      # 顺带把 --no-python-runtime 也踩通：它是「客户自有解释器、不要包里这份」的逃生门，
+      # 正常 CI 路径永远走不到 —— 同样属于没人踩过的分支。
+      - name: 冒烟 · 异常分支必须能走通（--no-ocr / --no-python-runtime）
         if: matrix.goarch == 'amd64'
         run: |
           chmod +x scripts/build-offline-bundle.sh
@@ -164,8 +178,18 @@ jobs:
             --arch amd64 \
             --binary /tmp/skillforge-linux-amd64 \
             --no-ocr \
+            --no-python-runtime \
             --outdir /tmp/smoke-no-ocr
           ls -l /tmp/smoke-no-ocr/
+          # 不带解释器的包：说明书必须如实告诉用户怎么补、VERSION 必须如实标 no。
+          # 这两条是「说明与产物一致」断言的反面 —— 少了它，那个分支只会生成一个
+          # 自称「不需要预装 python3」却根本没带解释器的包。
+          SMOKE_DIR="$(ls -d /tmp/smoke-no-ocr/*/ )"
+          grep -q 'dnf install -y python3' "$SMOKE_DIR/INSTALL.txt" \
+            || { echo "::error::--no-python-runtime 的包没告诉用户怎么补解释器"; exit 1; }
+          grep -q '^python=no$' "$SMOKE_DIR/VERSION" \
+            || { echo "::error::--no-python-runtime 的包 VERSION 里 python= 不是 no"; exit 1; }
+          echo "异常分支冒烟通过"
 
       # 出厂前验货：包里的东西必须能一步步装起来，缺一样就挡在这里，别让用户发现。
       - name: 验货（内容 / 脚本语法 / 校验和 / 许可证）
@@ -201,6 +225,34 @@ jobs:
           test -x "$TMP/$ROOT/bin/skillforge"
           test -s "$TMP/$ROOT/fonts/$(ls "$TMP/$ROOT/fonts" | head -1)"
           test -s "$TMP/$ROOT/licenses/ARPHICPL.txt"
+
+          # 4.1) 自带解释器：必须在包里、架构必须对、同架构时还必须真跑起来。
+          # 「包里有个 python/ 目录」不算数 —— 标准库缺件或架构不符时目录一样在，
+          # 装到目标机上却是「解释器能启动、一 import 就炸」，比完全起不来更难查。
+          PY_BIN="$TMP/$ROOT/python/bin/python3"
+          test -x "$PY_BIN" || { echo "::error::离线包里没有可执行的自带解释器 python/bin/python3"; exit 1; }
+          PY_DESC="$(file -b "$PY_BIN")"
+          case "$PY_DESC" in
+            *x86-64*)        PKG_ARCH=amd64 ;;
+            *ARM\ aarch64*)  PKG_ARCH=arm64 ;;
+            *)               PKG_ARCH="" ;;
+          esac
+          [ "$PKG_ARCH" = "${{ matrix.goarch }}" ] \
+            || { echo "::error::包内解释器架构($PKG_ARCH)与目标架构(${{ matrix.goarch }})不符：$PY_DESC"; exit 1; }
+          HOST_ARCH="$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')"
+          if [ "$PKG_ARCH" = "$HOST_ARCH" ]; then
+            "$PY_BIN" -c 'import json, ssl, sqlite3, hashlib' \
+              || { echo "::error::包内解释器起不来或标准库缺件"; exit 1; }
+            echo "包内自带解释器可运行：$("$PY_BIN" -V 2>&1)"
+          else
+            # 跨架构（x86 runner 验 arm64 包）跑不了：如实说「未执行验证」，
+            # 不能假装验过 —— 未经执行的检查等于没有检查。
+            echo "跨架构包（$PKG_ARCH 在 $HOST_ARCH 上）→ 只验文件与架构，未执行解释器"
+          fi
+          grep -q '^python=[0-9]' "$TMP/$ROOT/VERSION" \
+            || { echo "::error::VERSION 里 python= 不是版本号（包没带上解释器？）"; exit 1; }
+          grep -q '不需要预装 python3' "$TMP/$ROOT/INSTALL.txt" \
+            || { echo "::error::包里有自带解释器，INSTALL.txt 却没写「不需要预装 python3」——说明书与产物不一致"; exit 1; }
 
           # 5) 字体覆盖率复验：包里那份字体必须含 0-9（Bug G 的防线，从脚本到产物都要过一遍）
           python3 - "$TMP/$ROOT/fonts" <<'PY'

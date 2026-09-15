@@ -67,6 +67,7 @@ c_info(){ printf 'INFO %s\\n' "$*" >&2; }
 HARNESS_SUFFIX = """
 printf 'PY_FOUND=%s\\n' "${PY_FOUND:-}"
 printf 'PY_FROM_PATH=%s\\n' "${PY_FROM_PATH:-}"
+printf 'PY_BUNDLED=%s\\n' "${PY_BUNDLED:-}"
 """
 
 
@@ -83,14 +84,22 @@ def fake_python(dirpath: Path, ok: bool) -> Path:
     return p
 
 
-def run_probe(script_path: Path, env_path: str, hide_candidates: bool) -> dict[str, str]:
-    """在 mount namespace 里跑探测段，把 PY_FOUND / PY_FROM_PATH 读回来。"""
+def run_probe(script_path: Path, env_path: str, hide_candidates: bool,
+              here: str | None = None) -> dict[str, str]:
+    """在 mount namespace 里跑探测段，把 PY_FOUND / PY_FROM_PATH / PY_BUNDLED 读回来。
+
+    here：模拟「离线包解压出来的目录」。探测段里自带解释器看的就是 $HERE/python/bin/python3，
+    传了它才能测「包内自带」那条路径；不传时 $HERE 为空（探测段在 set -e 下展开成空串，
+    不会炸），等价于「这包没带解释器」的老现场。
+    """
     hides = "\n".join(
         f'[ -e "{c}" ] && mount --bind /dev/null "{c}"' for c in CANDIDATES
     ) if hide_candidates else ":"
+    here_line = f'export HERE={shlex.quote(here)}' if here else ':'
     inner = f"""
 set -e
 {hides}
+{here_line}
 export PATH={env_path}
 bash {script_path}
 """
@@ -270,6 +279,58 @@ def main() -> int:
               "SKILLFORGE_PYTHON=/custom/py3" in v, True)
         check("沿用旧配置时不把本次探测到的值也写进去",
               str(good) in v, False)
+
+        # ⑦⑧⑨ 包内自带的解释器（离线包自带一份便携 CPython，目标机不需要预装）。
+        #   为什么单独测这三组：这是「一键安装」唯一的硬保证 —— 客户机器上有没有
+        #   python3、能不能装 python3，我们控制不了；包里这份才是可控的那个变量。
+        bundle_ok = tmp / "bundle-ok"
+        (bundle_ok / "python" / "bin").mkdir(parents=True)
+        bundle_py = fake_python(bundle_ok / "python" / "bin", ok=True)
+
+        print("\n⑦ 包内自带解释器可用（= 目标机连 python3 都没有的那类机器）")
+        r = run_probe(harness, f"{empty_dir}:/usr/bin:/bin",
+                      hide_candidates=True, here=str(bundle_ok))
+        check("自带解释器被选中", r.get("PY_FOUND"), str(bundle_py))
+        check("标记为「包内自带」（要钉进配置文件）", r.get("PY_BUNDLED"), "1")
+
+        print("\n⑧ 自带优先于目标机上的候选（候选可用也不动摇）")
+        r = run_probe(harness, f"{empty_dir}:/usr/bin:/bin",
+                      hide_candidates=False, here=str(bundle_ok))
+        check("候选可用时仍用包里那份", r.get("PY_FOUND"), str(bundle_py))
+        check("仍标记自带", r.get("PY_BUNDLED"), "1")
+        check("不标记 from $PATH", r.get("PY_FROM_PATH"), "0")
+
+        # ⑨ 负向自证：包里的解释器是残件（包被截断 / 架构不符 / 标准库缺件）。
+        #    这时绝不能当成「有解释器」—— 那会得到「装完 AI 跑不了代码，而安装日志
+        #    说一切正常」，是最难查的一类现场。必须报空，且必须提示包坏了。
+        bundle_bad = tmp / "bundle-bad"
+        (bundle_bad / "python" / "bin").mkdir(parents=True)
+        fake_python(bundle_bad / "python" / "bin", ok=False)
+        print("\n⑨ 负向自证：包内自带解释器是残件")
+        r = run_probe(harness, f"{empty_dir}:/usr/bin:/bin",
+                      hide_candidates=True, here=str(bundle_bad))
+        check("残件不许被当成自带可用", r.get("PY_BUNDLED"), "0")
+        check("也不能因此报「找到了」", r.get("PY_FOUND"), "")
+        check("要提示「包可能损坏或架构不符」（否则用户只会以为是自己机器的问题）",
+              "架构" in r.get("_stderr", ""), True)
+
+        print("\n⑩ 落盘：自带解释器必须钉进配置文件")
+        # systemd 起的服务 PATH 与登录 shell 不同：不钉住就会出现「安装时认了、装完找不到」。
+        v = run_env_gen(tmp, "bundled",
+                        PY_FROM_PATH="0", PY_FOUND="/opt/skillforge/python/bin/python3",
+                        PY_BUNDLED="1", BUNDLED_PY="/opt/skillforge/python/bin/python3",
+                        OLD_PY="")
+        check("自带解释器被钉进配置文件",
+              "SKILLFORGE_PYTHON=/opt/skillforge/python/bin/python3" in v, True)
+
+        v = run_env_gen(tmp, "bundled-oldpy",
+                        PY_FROM_PATH="0", PY_FOUND="/opt/skillforge/python/bin/python3",
+                        PY_BUNDLED="1", BUNDLED_PY="/opt/skillforge/python/bin/python3",
+                        OLD_PY="/custom/py3")
+        check("有上一版配置时仍沿用客户那份（升级不该悄悄换掉客户指定的解释器）",
+              "SKILLFORGE_PYTHON=/custom/py3" in v, True)
+        check("沿用旧配置时不自作主张写自带路径",
+              "/opt/skillforge/python/bin/python3" in v, False)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -284,7 +345,7 @@ def main() -> int:
 
 
 def mutation_selfcheck() -> int:
-    """负向自证：把 install.sh 的 $PATH 兜底去掉，本脚本必须**精确**变红。
+    """负向自证：逐条注入真故障，本脚本必须**精确**变红。
 
     没有这一步，本脚本只是「一堆 ok」——它凭什么值得信？这跟 Go 测试的注入自证
     是同一条原则：断言必须能被真故障打红，且红的必须是预期那条。
@@ -294,41 +355,82 @@ def mutation_selfcheck() -> int:
       ② 注入后本脚本非零退出
       ③ 输出里出现的是预期那条 FAIL（不是崩溃、不是别的红）
       ④ 还原后回绿
+
+    为什么要多条：一条只能证明「某一段代码是被保护的」。新增了「包内自带解释器优先」
+    之后，如果只留原来那条 $PATH 注入，这段新代码就是「写了但没尺子量」——哪天被重构
+    掉也没人知道。
     """
+    cases = [
+        (
+            "把 install.sh 的 $PATH 兜底去掉（= 用户报的那个故障形状）",
+            '\t\t_via_path="$(command -v python3 2>/dev/null || true)"',
+            '\t\t_via_path=""',
+            "$PATH 上的解释器被认出来",
+        ),
+        (
+            "把「包内自带解释器优先」整段删掉（重构时最容易悄悄丢的那段）",
+            '\tif [ -n "$PY_BUNDLED_SRC" ]; then\n'
+            '\t\tPY_FOUND="$PY_BUNDLED_SRC"\n'
+            "\t\tPY_BUNDLED=1\n"
+            "\tfi\n",
+            '\t: # 注入：自带优先被删\n',
+            "自带解释器被选中",
+        ),
+        (
+            # 注意：这段 `if` 在 install.sh 里是**顶层、0 缩进**（第 177 行），续行的
+            # `&&` 才是 1 个 tab。锚点必须按真实缩写，否则命中 0 次。
+            # 替换的是**两行**（含续行反斜杠）：只删 `&& ...` 那半句会留下悬空的 `\`，
+            # bash 直接语法错误 —— 那是「崩溃红」，判据③（红的必须是预期那条）不成立。
+            "自带解释器探测不探活（只看文件存在就算可用）",
+            'if [ -x "$HERE/python/bin/python3" ] \\\n'
+            '\t&& "$HERE/python/bin/python3" -c pass >/dev/null 2>&1; then\n',
+            'if [ -x "$HERE/python/bin/python3" ]; then\n',
+            "残件不许被当成自带可用",
+        ),
+    ]
+
     orig = INSTALL_SH.read_text(encoding="utf-8")
-    needle = '\t\t_via_path="$(command -v python3 2>/dev/null || true)"'
-    if needle not in orig:
-        print("自证失败：注入点不存在（install.sh 结构改了）——本脚本的自证已失效，先修它")
-        return 1
-    injected = orig.replace(needle, '\t\t_via_path=""', 1)
-    if injected == orig:
-        print("自证失败：注入没生效")
-        return 1
+    bad = False
+    for desc, needle, repl, expect in cases:
+        if needle not in orig:
+            print(f"自证失败：注入点不存在（install.sh 结构改了）——「{desc}」这条自证已失效，先修它")
+            bad = True
+            continue
+        injected = orig.replace(needle, repl, 1)
+        if injected == orig:
+            print(f"自证失败：「{desc}」注入没生效")
+            bad = True
+            continue
 
-    expect = "$PATH 上的解释器被认出来"
-    print("-- 注入：把 install.sh 的 $PATH 兜底去掉（= 用户报的那个故障形状）")
-    try:
-        INSTALL_SH.write_text(injected, encoding="utf-8")
-        p = subprocess.run([sys.executable, __file__], capture_output=True, text=True)
-        if p.returncode == 0:
-            print("自证失败：去掉 $PATH 兜底后本脚本仍然全绿 —— 这些 ok 是假的")
-            return 1
-        if expect not in p.stdout:
-            print(f"自证失败：本脚本红了，但红的不是预期那条（期望输出含「{expect}」）")
-            for line in p.stdout.splitlines():
-                if "FAIL" in line:
-                    print("      " + line)
-            return 1
-        print(f"-- 注入后精确变红（rc={p.returncode}，红的是「{expect}」）✓")
-    finally:
-        INSTALL_SH.write_text(orig, encoding="utf-8")
+        print(f"-- 注入：{desc}")
+        try:
+            INSTALL_SH.write_text(injected, encoding="utf-8")
+            p = subprocess.run([sys.executable, __file__], capture_output=True, text=True)
+            if p.returncode == 0:
+                print(f"自证失败：注入后本脚本仍然全绿 —— 这些 ok 是假的（期望「{expect}」变红）")
+                bad = True
+                continue
+            if expect not in p.stdout:
+                print(f"自证失败：本脚本红了，但红的不是预期那条（期望输出含「{expect}」）")
+                for line in p.stdout.splitlines():
+                    if "FAIL" in line:
+                        print("      " + line)
+                bad = True
+                continue
+            print(f"-- 注入后精确变红（rc={p.returncode}，红的是「{expect}」）✓")
+        finally:
+            INSTALL_SH.write_text(orig, encoding="utf-8")
 
+    # 还原后必须回绿：自证不能把工作区改坏，否则下一次运行全是假红。
     p = subprocess.run([sys.executable, __file__], capture_output=True, text=True)
     if p.returncode != 0:
         print("自证失败：还原后没有回绿 —— 自证把工作区改坏了")
+        print(p.stdout[-2000:])
         return 1
     print("-- 还原后回绿 ✓")
-    print("\n本脚本的负向自证通过：它抓得住「文案说找过 $PATH、实际没找」这个故障 ✓")
+    if bad:
+        return 1
+    print(f"\n本脚本的负向自证通过：{len(cases)} 条真故障各自精确打红对应断言 ✓")
     return 0
 
 
