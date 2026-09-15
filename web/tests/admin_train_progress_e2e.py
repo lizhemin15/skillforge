@@ -25,6 +25,15 @@ web/tests/sse_event_contract.test.mjs 在 CI 里守的），而是**真页面上
   BASE=http://127.0.0.1:8080 python3 web/tests/admin_train_progress_e2e.py
   MIN_LINES=3 ...              # 提高日志行数门槛
 
+前置断言（血泪教训，别删）：
+  「点了开始训练」之后**必须先证明请求真的发出去了**，再去判屏幕有没有动。
+  2026-09-16 首次跑就栽在这：`#tr-desc`（一句话描述）带 `required`，脚本只填了
+  名称和要求 —— 浏览器原生表单校验直接拦下提交，**没有 JS 异常、没有网络请求、
+  按钮文案不变**，于是 T1~T5 全红、报告写的是「页面坏了」。页面是好的，
+  红的是脚本少填了一个必填项。凡是「脚本动作没生效」都不许报成「被测系统坏了」。
+  现在脚本会：先做 checkValidity 自查（把不合法的字段 id 直接点出来），
+  再监听 /api/admin/train 请求，请求没发出就以**脚本原因**收场。
+
 代价与副作用（必须显性说出来）：
   训练是二十分钟的长跑。本脚本只采样开头的 SAMPLE_SECONDS 秒，够拿到
   「屏幕在动」的证据就断开（浏览器关掉 = SSE 断开）。断开会让它白跑一轮，
@@ -45,6 +54,10 @@ TRAIN_NAME = os.environ.get('TRAIN_NAME', '线上训练进度验收160916')
 
 # 素材用一段真需求（不给文件也能训练）。提示词写在这里而不是 runner 的 env 里：
 # 这是最该被审查的东西，藏进 scripts/ 没人看得见（roster 测试的注释专门讲过这点）。
+# 一句话描述是表单必填项（#tr-desc 带 required）。不填它，浏览器原生校验会
+# 静默拦下提交 —— 脚本看起来「点了」，其实什么都没发出去。
+DESC = os.environ.get('TRAIN_DESC', '依据上级通知训练数据治理专项工作公文体例')
+
 REQUIREMENT = (
     '根据以下材料训练出技能：单位收到上级关于开展数据治理专项工作的通知后，'
     '成立专项工作组，明确数据责任人，按季度完成数据资产盘点与质量核查，'
@@ -90,6 +103,10 @@ def main():
         page = browser.new_page(viewport={'width': 1440, 'height': 900})
         errs = []
         page.on('pageerror', lambda e: errs.append(str(e)))
+        # 记下发往 /api/admin/train 的请求：这是「点击真的到了后端」的硬证据，
+        # 光看屏幕动没动分不清「前端吞帧」和「压根没发请求」。
+        train_reqs = []
+        page.on('request', lambda r: train_reqs.append(r.url) if '/api/admin/train' in r.url else None)
         try:
             page.goto(BASE + '/admin', wait_until='domcontentloaded', timeout=20000)
         except Exception as e:  # noqa: BLE001
@@ -127,10 +144,35 @@ def main():
             browser.close()
             return 0
 
-        # 开跑
+        # 开跑（三个必填/入参都得给：少一个就可能被原生校验静默拦下）
         page.fill('#tr-name', TRAIN_NAME)
+        page.fill('#tr-desc', DESC)
         page.fill('#tr-req', REQUIREMENT)
+
+        # 前置自查：表单本身合不合法？不合法就点名是哪个字段，别让「脚本没填够」
+        # 伪装成「页面坏了」。
+        bad = page.evaluate(
+            "() => Array.from(document.querySelectorAll('#train-form [required]'))"
+            ".filter(e => !e.checkValidity()).map(e => e.id || e.name || e.tagName)")
+        if bad:
+            fail(f'PROBE 训练表单原生校验未通过，提交会被浏览器静默拦下 —— '
+                 f'这是**脚本原因**（少填了必填项），不是页面故障。不合法字段：{bad}')
+            browser.close()
+            return 1
+
         page.click('#tr-go')
+
+        # 前置断言：点击必须在 15s 内产出真的训练请求
+        deadline = time.time() + 15
+        while time.time() < deadline and not train_reqs:
+            time.sleep(0.3)
+        if not train_reqs:
+            fail('PROBE 点了开始训练，但 15s 内没有发出 /api/admin/train 请求 —— '
+                 '这是**脚本动作没生效**（点击目标/表单状态），不是页面故障；'
+                 '此时报告里的屏幕静止标记为不可用，不当作界面缺陷')
+            browser.close()
+            return 1
+        ok(f'PROBE 点击已触发训练请求（{train_reqs[0][:60]}）—— 屏幕断言的前提成立')
 
         t0 = time.time()
         line_seen = []          # (t, 行文本)
