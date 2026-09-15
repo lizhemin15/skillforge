@@ -146,19 +146,52 @@ command -v systemctl >/dev/null 2>&1 || die "找不到 systemctl（systemd 在�
 command -v systemd-run >/dev/null 2>&1 || die "找不到 systemd-run（systemd 太旧或安装不完整）。沙箱不可用，拒绝安装。"
 c_ok "systemd / systemd-run 可用"
 
-# python3：代码执行沙箱（自检探针 + 「执行代码」工具）的解释器，路径写死在
-# /usr/bin/python3，所以这里就查这个路径。
+# python3：代码执行沙箱（自检探针 + 「执行代码」工具）的解释器。
+#
+# 不再只查写死的 /usr/bin/python3 —— 装没装 ≠ 在不在这一个路径上。源码编译/
+# conda 装在 /usr/local/bin/python3、RHEL 8 系只有 /usr/libexec/platform-python
+# 的机器，都会被旧逻辑误报成「目标机没有 python3」，用户照着提示去装一个已经
+# 装好的东西，怎么装都「修不好」。
+#
+# ⚠️ PythonCandidates 必须与 internal/tools/exec.go 的 pythonCandidates 逐字一致：
+# internal/tools/python_resolve_test.go 会解析这两份源码比对名单，脱钩即红。
+PythonCandidates="/usr/bin/python3 /usr/local/bin/python3 /usr/libexec/platform-python"
+PY_FOUND=""
+if [ -n "${SKILLFORGE_PYTHON:-}" ]; then
+	# 显式指定就只认它：与 Go 侧同一条原则 —— 指了个用不了的路径时不去猜别的，
+	# 否则运维以为在用自己那份、实际在用系统的，是最难查的坑。
+	if [ -x "$SKILLFORGE_PYTHON" ] && "$SKILLFORGE_PYTHON" -c pass >/dev/null 2>&1; then
+		PY_FOUND="$SKILLFORGE_PYTHON"
+	else
+		c_warn "SKILLFORGE_PYTHON=$SKILLFORGE_PYTHON 不可用：要存在、可执行、且能跑 \`-c pass\`"
+	fi
+else
+	for _cand in $PythonCandidates; do
+		if [ -x "$_cand" ] && "$_cand" -c pass >/dev/null 2>&1; then
+			PY_FOUND="$_cand"
+			break
+		fi
+	done
+fi
+
 # 为什么只警告不拦：写作主功能不依赖它，硬拦会把本来能用的客户挡在门外；但也不能
 # 不吭声——装完自检里那条会红，客户看到的是「代码执行沙箱 失败」，得让他一眼看懂
 # 是缺解释器，不是安全加固漏了。（真机上这就是 almalinux 最小安装的现场。）
-if [ ! -x /usr/bin/python3 ]; then
-	c_warn "这台机器没有 /usr/bin/python3 —— 代码执行沙箱（探针与「执行代码」工具）需要它"
-	c_warn "  影响：装完自检的「代码执行沙箱」一项会失败，AI 无法跑代码/脚本校验"
+if [ -z "$PY_FOUND" ]; then
+	c_warn "这台机器没有找到可用的 python3 解释器（找过：$PythonCandidates 以及 \$PATH）"
+	c_warn "  影响：「代码执行沙箱」一项自检会失败，AI 无法跑代码/脚本校验；写作等主功能不受影响"
+	c_warn "  注意：这不是沙箱降权/加固失败，就是缺个解释器"
 	c_warn "  修复：dnf install -y python3（RHEL/AlmaLinux 最小安装默认不带；Debian/Ubuntu 用 apt install python3）"
 	c_warn "  离线机：挂发行版 ISO 或配本地源后按上面装，装完补跑一次自检：/opt/skillforge/skillforge -selftest"
+	c_warn "  解释器装在别处（自己编译/conda）：装完在 $PREFIX.env 里加一行 SKILLFORGE_PYTHON=/usr/local/bin/python3"
 	c_warn "  确实接受这一项不可用：加 --skip-selftest 跳过装后自检（自担风险，不推荐）"
 else
-	c_ok "python3 可用（代码执行沙箱的解释器）"
+	if [ "$PY_FOUND" = "/usr/bin/python3" ]; then
+		c_ok "python3 可用（代码执行沙箱的解释器）：$PY_FOUND"
+	else
+		# 走到这里说明旧逻辑会误报「没有 python3」——把命中的路径打出来，方便回访。
+		c_ok "python3 可用（代码执行沙箱的解释器）：$PY_FOUND（非默认路径，已自动识别）"
+	fi
 fi
 
 # ---------- 0.5 服务单元占用检查（Bug M）----------

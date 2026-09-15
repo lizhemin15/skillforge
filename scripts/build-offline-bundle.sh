@@ -315,11 +315,17 @@ SkillForge 离线安装包
 
 目标机要求（装之前请先确认）：
   - systemd（含 systemd-run）—— 代码执行沙箱靠它隔离；没有就直接拒绝安装
-  - /usr/bin/python3 —— 代码执行沙箱的探针与「执行代码」工具的解释器
-      Debian / Ubuntu 默认自带；RHEL / AlmaLinux / CentOS 最小安装默认不带，
-      补：dnf install -y python3（离线机挂发行版 ISO 或配本地源）
+  - python3 解释器之一 —— 代码执行沙箱的探针与「执行代码」工具的解释器
+      按顺序找这三个位置（任一个能跑 `-c pass` 即可）：
+        /usr/bin/python3          发行版包管理器装的（Debian/Ubuntu/AlmaLinux 默认自带）
+        /usr/local/bin/python3    自己编译 / conda / pipx 装的
+        /usr/libexec/platform-python   RHEL / CentOS / AlmaLinux 8 自带（没有 python3 这个名字）
+      再找不到才退到 $PATH 上的 python3。RHEL / AlmaLinux / CentOS 最小安装默认不带，
+      补：dnf install -y python3（离线机挂发行版 ISO 或配本地源）。
+      解释器在别处（自定义前缀）：装完在 skillforge.env 里加一行
+        SKILLFORGE_PYTHON=/opt/python/bin/python3
       缺了它安装仍会继续（写作功能不受影响），但自检里「代码执行沙箱」一项会失败，
-      AI 也就无法跑代码/脚本校验。
+      AI 也就无法跑代码/脚本校验。注意那**不是**沙箱降权/加固失败，就是缺个解释器。
 EOF
 
 # 包内容清单必须与包内实际文件一致。

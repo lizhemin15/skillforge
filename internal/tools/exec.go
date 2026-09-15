@@ -34,11 +34,120 @@ type ExecConfig struct {
 	MaxOutput int // 回给模型的输出上限（字节）
 }
 
+// EnvPythonOverride 是解释器路径的显式覆盖。
+//
+// 给「机器上有一份自己的解释器（conda / 自编译 / 便携包）」的现场用：
+// 例如 SKILLFORGE_PYTHON=/opt/python/bin/python3。
+const EnvPythonOverride = "SKILLFORGE_PYTHON"
+
+// pythonCandidates 是解释器候选绝对路径，按优先级排列。
+//
+// 为什么不再是写死的单个 /usr/bin/python3（用户报的现场：「安装时提示目标机
+// 没有 python3」）：装没装 ≠ 在不在这一个路径上。见过的真实形态——
+//
+//	· 发行版包管理器装的 → /usr/bin/python3（绝大多数）
+//	· 源码编译 / pipx / conda 前缀 → /usr/local/bin/python3
+//	· RHEL / CentOS / AlmaLinux 8 的系统解释器 → /usr/libexec/platform-python
+//	  （它没有 python3 这个名字，但 `platform-python -c ...` 照样跑）
+//
+// 写死单一路径时，后两种会被一律误报成「目标机没有 python3」——用户照着提示
+// 去装一个**已经装好**的东西，怎么装都「修不好」。所以：先按候选找，再退到
+// $PATH 里的 python3。
+//
+// ⚠️ 改这里必须同步 deploy/offline/install.sh 的 PythonCandidates —— 安装脚本
+// 要在解包前先探一次，它不能调这个二进制。两份名单脱钩时会变成「安装说没问题、
+// 装完自检红」，所以有守卫盯着：internal/tools/python_resolve_test.go 解析两边
+// 源码逐项比对（顺序即优先级），并由 web/tests/python_resolve_mutation_check.py
+// 注入自证「这条守卫真能红」。
+var pythonCandidates = []string{
+	"/usr/bin/python3",
+	"/usr/local/bin/python3",
+	"/usr/libexec/platform-python",
+}
+
+// pythonUsablePath 判断一个路径是否真能当解释器用，能用则返回它的**绝对**路径。
+//
+// 光看文件存在（-x）不算数：见过 selinux 拦执行、见过同名目录、见过 0 字节的
+// 残缺文件 —— 那些情况下探针跑不起来，用户看到的还是「沙箱失败」，等于白改。
+//
+// 为什么返回绝对路径而不是原样回：沙箱是 root 起的 systemd 进程，cwd 与调用方
+// 无关。放一个相对路径进去，systemd-run 会去它自己的 cwd 找解释器 ——
+// 「配置看着对、行为随机」的那类问题。
+func pythonUsablePath(p string) (string, bool) {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return "", false
+	}
+	abs := p
+	if !filepath.IsAbs(abs) {
+		lp, err := exec.LookPath(abs)
+		if err != nil {
+			return "", false
+		}
+		abs = lp
+	} else if _, err := exec.LookPath(abs); err != nil {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if exec.CommandContext(ctx, abs, "-c", "pass").Run() != nil {
+		return "", false
+	}
+	return abs, true
+}
+
+// resolvePythonFrom 是 ResolvePython 的内核：override 与候选名单都从参数进来。
+//
+// 抽出来的唯一理由是可测：真机上造不出「候选全不可用」这种场景（/usr/bin/python3
+// 就在那儿），而造不出来的场景 = 那条断言永远跑不到 = 等于没有断言。
+func resolvePythonFrom(override string, candidates []string) string {
+	if strings.TrimSpace(override) != "" {
+		abs, ok := pythonUsablePath(override)
+		if !ok {
+			// 显式指定却不可用 → 不猜别的，交给自检报错。
+			return ""
+		}
+		return abs
+	}
+	for _, c := range candidates {
+		if abs, ok := pythonUsablePath(c); ok {
+			return abs
+		}
+	}
+	if abs, ok := pythonUsablePath("python3"); ok {
+		return abs
+	}
+	return ""
+}
+
+// ResolvePython 挑一个能用的解释器，返回绝对路径；找不到返回 ""。
+//
+// 顺序：$SKILLFORGE_PYTHON → pythonCandidates → $PATH 里的 python3。
+//
+// override 设了却不可用时**直接返回 ""，不去猜别的** —— 与「沙箱不可用就拒绝
+// 执行，绝不静默降级」同一条原则：运维以为在用自己那份解释器、实际在用系统的
+// 那份，是最难查的坑。宁可让自检红着告诉他路径写错了。
+func ResolvePython() string {
+	return resolvePythonFrom(os.Getenv(EnvPythonOverride), pythonCandidates)
+}
+
+// pythonLabel 把解析结果转成「给诊断用的路径」：解析不到时退回候选名单第一项。
+//
+// 退回的是**标签**不是解释器：有了它，缺解释器的现场才能拿到
+// 「目标机没有可用的 python3 解释器（探针解释器 /usr/bin/python3）」这句真话；
+// 留空的话用户看到的是一句谁也看不懂的 systemd 报错。
+func pythonLabel(py string) string {
+	if py == "" {
+		return pythonCandidates[0]
+	}
+	return py
+}
+
 // DefaultExecConfig 返回经过实测验证的默认配置。
 func DefaultExecConfig() ExecConfig {
 	return ExecConfig{
 		WorkRoot:    "/var/lib/skillforge/work",
-		Python:      "/usr/bin/python3",
+		Python:      pythonLabel(ResolvePython()),
 		Timeout:     30 * time.Second,
 		MemoryMax:   "256M",
 		CPUQuota:    "50%",
@@ -448,11 +557,23 @@ func SandboxDiagnosticsFor(ctx context.Context, secretPaths []string) map[string
 		// 「Failed to find executable …」写进 display，不算 error，上层拿到的是
 		// 一份没有 uid 的「正常」输出，于是把「环境缺 python3」误诊成「沙箱没降权」。
 		// 与其让上层去猜，不如在跑探针之前就查一次，报一句真话。
+		// 只在「所有候选 + $PATH 都找不到」时才报这句。ResolvePython 已经跑过一轮
+		// 真实探测（含 -c pass），所以走到这里基本就是真没装解释器；如果运维用
+		// SKILLFORGE_PYTHON 显式指了一个用不了的解释器，也走这里 —— 那时下面这句
+		// 会把 override 点名，免得他去系统里找一个根本不该找的东西。
 		if _, err := exec.LookPath(py); err != nil {
+			hint := "修复：Debian/Ubuntu 用 apt install python3；" +
+				"RHEL/AlmaLinux 最小安装用 dnf install -y python3（离线机挂 ISO 或配本地源）"
+			if v := strings.TrimSpace(os.Getenv(EnvPythonOverride)); v != "" {
+				hint = fmt.Sprintf("注意：%s=%s 是你显式指定的解释器，它不存在或跑不起来（%s 要能接受 `-c pass`）。"+
+					"要么改正这个路径，要么 unset %s 让程序按候选名单自己找",
+					EnvPythonOverride, v, v, EnvPythonOverride)
+			}
 			out["error"] = fmt.Sprintf(
-				"目标机没有 python3（探针解释器 %s 不存在）：代码沙箱的探针与「执行代码」工具都依赖它，"+
-					"这不是沙箱降权失败。修复：Debian/Ubuntu 用 apt install python3；"+
-					"RHEL/AlmaLinux 最小安装用 dnf install -y python3（离线机挂 ISO 或配本地源）", py)
+				"目标机没有可用的 python3 解释器（找过 %s 和 $PATH 里的 python3，探针解释器停在 %s）："+
+					"代码沙箱的探针与「执行代码」工具都依赖它，**这不是沙箱降权失败**，写作等主功能不受影响。"+
+					"解释器装在别处时可以直接指定：SKILLFORGE_PYTHON=/usr/local/bin/python3（写进 %s 最省事）。%s",
+				strings.Join(pythonCandidates, " / "), py, "/opt/skillforge/skillforge.env", hint)
 			return out
 		}
 	}
