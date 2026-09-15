@@ -179,7 +179,7 @@ func TestRelayBuffersFastFragmentsThenFlushesTail(t *testing.T) {
 func TestRelayFlushesWhenBufferHitsMax(t *testing.T) {
 	var got []string
 	r := NewMaterialRelay(time.Hour, 10, func(k, s string) { got = append(got, s) })
-	r.Push(MaterialText, "aaaaa") // 首片立刻
+	r.Push(MaterialText, "aaaaa")        // 首片立刻
 	r.Push(MaterialText, "bbbbbbbbbbbb") // 12 >= 10 立即吐
 	if len(got) != 2 || got[1] != "bbbbbbbbbbbb" {
 		t.Fatalf("超过 max 没吐出: %#v", got)
