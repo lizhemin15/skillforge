@@ -14,6 +14,7 @@ $PATH 兜底」——它是文本断言，证明不了这段代码真能把 /opt
 """
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -116,6 +117,54 @@ def check(desc: str, got, want) -> None:
         print(f"  FAIL {desc}\n       期望 {want!r} / 实际 {got!r}")
 
 
+def env_gen_script() -> str:
+    """抠出 install.sh 里「写配置文件」那一段（真跑，不是读文本）。
+
+    为什么必须真跑：上面几组证明的是「探测段会给 PY_FROM_PATH 打标」，而
+    `python_resolve_test.go` 证明的是「生成配置段里写着按 PY_FROM_PATH 分支写
+    SKILLFORGE_PYTHON」—— 全是**静态**的。文档说要写、代码里也写着要写，
+    两句话都真，合起来仍然可能是假的（分支条件写反、变量名写错、写入被挪到
+    别的块外面）。这一组把真段落跑一遍，直接看落盘的 env 文件里有没有那一行。
+
+    三种现场：命中的解释器来自 $PATH（要钉）、命中标准位置（不许钉，钉死会在
+    系统升级换路径时僵住）、上一版配置里已有值（一律沿用，不许被覆盖）。
+    """
+    sh = INSTALL_SH.read_text(encoding="utf-8")
+    start = sh.index(': > "$ENV_FILE"')
+    start = sh.rindex("\n", 0, start) + 1
+    end = sh.index('chmod 600 "$ENV_FILE"', start)
+    end = sh.index("\n", end) + 1
+    return sh[start:end]
+
+
+def run_env_gen(tmp: Path, name: str, **vars) -> str:
+    """在桩环境里真跑生成配置段，返回落盘的 env 文件内容。"""
+    env_file = tmp / f"env-{name}"
+    harness = [
+        "set -e",
+        f'ENV_FILE={shlex.quote(str(env_file))}',
+        "c_ok() { :; }", "c_warn() { :; }", "c_info() { :; }", "c_fail() { :; }",
+        "SERVICE_NAME=skillforge",
+        "PORT=8092",
+        f'DATA_DIR={shlex.quote(str(tmp))}',
+        "PUBLIC_URL=http://127.0.0.1:8092",
+        "ADMIN_USER=admin",
+        "FINAL_PW=pw", "SF_JWT=jwt",
+        f'BUNDLED_FONT={shlex.quote(str(tmp))}/font.ttf',
+        'OLD_FONT=""',
+        'OLD_LLM_PROV="openai"', 'OLD_LLM_URL="http://x"',
+        'OLD_LLM_MODEL="m"', 'OLD_LLM_KEY=""',
+        "DO_OCR=0", "OCR_PORT=9999",
+    ]
+    for k, v in vars.items():
+        harness.append(f'{k}="{v}"')
+    harness.append(env_gen_script())
+    r = subprocess.run(["bash", "-c", "\n".join(harness)], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"生成配置段真跑失败 rc={r.returncode}: {r.stderr[:400]}")
+    return env_file.read_text(encoding="utf-8")
+
+
 def main() -> int:
     def skip(why: str) -> int:
         # SKIP ≠ PASS：默认判失败，只有显式 ALLOW_SKIP=1（CI runner 这类构造不出
@@ -198,6 +247,29 @@ def main() -> int:
         r = run_probe(harness, f"{bad_dir}:/usr/bin:/bin", hide_candidates=True)
         check("跑不起来的残件不许被判成可用", r.get("PY_FOUND"), "")
         check("不标记 from $PATH", r.get("PY_FROM_PATH"), "0")
+
+        # ⑥ 落盘：真跑「写配置文件」那一段，看 env 文件里到底有没有那一行。
+        #    前面五组 + python_resolve_test.go 全是静态的：一个证明「会给
+        #    PY_FROM_PATH 打标」，一个证明「代码里写着按标记写 SKILLFORGE_PYTHON」。
+        #    两句话都真，合起来仍然可能是假的 —— 分支写反、变量名写错、写入被挪到
+        #    别的块外，静态断言全看不见。这一组直接看落盘结果。
+        print("\n⑥ 落盘：真跑生成配置段，看 env 文件里到底写了什么")
+        v = run_env_gen(tmp, "frompath",
+                        PY_FROM_PATH="1", PY_FOUND=str(good), OLD_PY="")
+        check("来自 $PATH 的解释器被钉进配置文件",
+              f"SKILLFORGE_PYTHON={good}" in v, True)
+
+        v = run_env_gen(tmp, "std",
+                        PY_FROM_PATH="0", PY_FOUND=CANDIDATES[0], OLD_PY="")
+        check("标准位置不钉（钉死会在系统升级换路径时僵住）",
+              "SKILLFORGE_PYTHON" in v, False)
+
+        v = run_env_gen(tmp, "oldpy",
+                        PY_FROM_PATH="1", PY_FOUND=str(good), OLD_PY="/custom/py3")
+        check("升级时沿用客户手写的配置，不被自动探测覆盖",
+              "SKILLFORGE_PYTHON=/custom/py3" in v, True)
+        check("沿用旧配置时不把本次探测到的值也写进去",
+              str(good) in v, False)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
