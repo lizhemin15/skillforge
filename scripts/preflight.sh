@@ -242,6 +242,10 @@ if [ "$QUICK" = 0 ]; then
   selfcheck '前端 / 停用技能列表自证'   python3 web/tests/skill_disabled_admin_ui_mutation_check.py
   # Bug O「误报目标机没有 python3」的自证：候选名单漂移 / 写死单路径 / 不探活。
   selfcheck '前端 / 解释器探测自证'     python3 web/tests/python_resolve_mutation_check.py
+  # 上面那条是文本断言；这条真跑：遮蔽候选路径后看探测段认不认 $PATH 上的解释器
+  # （用户报的现场就是「python3 在 PATH 上、却被说没有」）。带自证。
+  selfcheck '安装脚本 / 解释器探测真跑' python3 web/tests/install_python_probe_live_check.py
+  selfcheck '安装脚本 / 解释器探测真跑自证' python3 web/tests/install_python_probe_live_check.py --mutation-selfcheck
   selfcheck '后端 / 推荐行自证'         bash internal/api/suggest_mutation_check.sh
   selfcheck '后端 / 分类结构管理自证'   python3 scripts/category_guard_inject.py
   selfcheck '后端 / 思考开关矩阵自证'   python3 scripts/fastjson_knob_inject.py

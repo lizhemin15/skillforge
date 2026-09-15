@@ -157,6 +157,9 @@ c_ok "systemd / systemd-run 可用"
 # internal/tools/python_resolve_test.go 会解析这两份源码比对名单，脱钩即红。
 PythonCandidates="/usr/bin/python3 /usr/local/bin/python3 /usr/libexec/platform-python"
 PY_FOUND=""
+# PY_FROM_PATH=1 表示命中的解释器不在候选名单里、只在 $PATH 上找到 —— 这种必须钉进
+# 配置文件，见下面「生成配置」那步。
+PY_FROM_PATH=0
 if [ -n "${SKILLFORGE_PYTHON:-}" ]; then
 	# 显式指定就只认它：与 Go 侧同一条原则 —— 指了个用不了的路径时不去猜别的，
 	# 否则运维以为在用自己那份、实际在用系统的，是最难查的坑。
@@ -172,6 +175,24 @@ else
 			break
 		fi
 	done
+	# 候选全不命中时，再认一次 $PATH 里的 python3 —— 与 Go 侧 resolvePythonFrom 的
+	# 最后一步等价（自己编译 / conda 装到 /opt/xxx/bin 这类不在候选名单里的位置）。
+	#
+	# 少了这一步，下面那句「找过：… 以及 $PATH」就是**假话**：用户去查 PATH 明明有
+	# python3，还是被告知「没有 python3」，怎么修都修不好 —— 跟这轮修的误报同一个形状。
+	if [ -z "$PY_FOUND" ]; then
+		_via_path="$(command -v python3 2>/dev/null || true)"
+		case "$_via_path" in
+			/*) ;;
+			# 相对路径没有意义：命中它的是安装时的 cwd，而服务由 systemd 起，
+			# cwd 是 /。写进配置只会变成「看着对、行为随机」。
+			*) _via_path="" ;;
+		esac
+		if [ -n "$_via_path" ] && "$_via_path" -c pass >/dev/null 2>&1; then
+			PY_FOUND="$_via_path"
+			PY_FROM_PATH=1
+		fi
+	fi
 fi
 
 # 为什么只警告不拦：写作主功能不依赖它，硬拦会把本来能用的客户挡在门外；但也不能
@@ -406,6 +427,7 @@ OLD_LLM_URL="$(env_get SKILLFORGE_LLM_BASE_URL)"
 OLD_LLM_MODEL="$(env_get SKILLFORGE_LLM_MODEL)"
 OLD_LLM_PROV="$(env_get SKILLFORGE_LLM_PROVIDER)"
 OLD_FONT="$(env_get SKILLFORGE_PDF_FONT_FILE)"
+OLD_PY="$(env_get SKILLFORGE_PYTHON)"
 
 if [ -n "$OLD_SF_JWT" ]; then
 	SF_JWT="$OLD_SF_JWT"
@@ -506,6 +528,22 @@ umask 077
 	printf '%s=%s\n\n' SKILLFORGE_JWT_SECRET "$SF_JWT"
 	printf '# ---- PDF 字体（离线包自带；显式指定可避免运行时猜字体）----\n'
 	printf 'SKILLFORGE_PDF_FONT_FILE=%s\n\n' "$BUNDLED_FONT"
+	# 解释器只在我们「从 $PATH 里认出来」时才钉住：
+	#   - 服务由 systemd 起，它的 PATH 与你登录时的 shell **不同**。安装时认到
+	#     /opt/xxx/bin/python3、服务起来却找不到 → 「安装说没问题、装完自检红」，
+	#     用户两头都查不出所以然。钉住路径是唯一能保证两边看到同一个解释器的做法。
+	#   - 命中候选名单里那三个位置的不钉：那是标准位置，钉死反而在系统升级换路径时僵住。
+	#   - 上一版配置里已有的 SKILLFORGE_PYTHON 一律沿用（升级不改客户的手写配置）。
+	if [ -n "$OLD_PY" ]; then
+		printf '# ---- 解释器（沿用上一版配置）----\n'
+		printf 'SKILLFORGE_PYTHON=%s\n\n' "$OLD_PY"
+	elif [ "$PY_FROM_PATH" = "1" ]; then
+		printf '# ---- 解释器 ----\n'
+		printf '# 这个解释器不在标准位置（/usr/bin、/usr/local/bin、platform-python），\n'
+		printf '# 只在安装时的 $PATH 上找到。systemd 起的服务 PATH 和你登录的 shell 不同，\n'
+		printf '# 不钉住就会出现「安装时认了、装完自检红」。换解释器时改这一行并重启服务。\n'
+		printf 'SKILLFORGE_PYTHON=%s\n\n' "$PY_FOUND"
+	fi
 	if [ "$DO_OCR" -eq 1 ]; then
 		printf '# ---- 文档解析服务（ocrd，本机回环，不对外）----\n'
 		printf '# 只监听 127.0.0.1，主服务用它把 PDF/Word/Excel/扫描件抽成文本。\n'

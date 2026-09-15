@@ -135,6 +135,18 @@ jobs:
           # 「解释器探测」那条：候选名单两边脱钩 / 探测写死单一路径 / 只看存在不探活
           # ——三种退化看着都像对的，靠注入自证它们会被抓住（Bug O）。
           python3 web/tests/python_resolve_mutation_check.py
+          # 上面那条是**文本**断言：只能证明 install.sh 里写着 $PATH 兜底，
+          # 证明不了它真能把 /opt/xxx/bin/python3 认出来。这条才是真跑：从
+          # install.sh 里抠出探测段，在 mount namespace 里把候选路径遮蔽掉
+          # （bind /dev/null，本机 /usr/bin/python3 不受影响），再真跑一遍看它
+          # 认不认 $PATH 上那个。前缀是 sudo：遮蔽需要 CAP_SYS_ADMIN。
+          # runner 用不了 mount namespace 时**明说未验证**，不假装绿。
+          if sudo unshare -m true 2>/dev/null; then
+            sudo -E python3 web/tests/install_python_probe_live_check.py
+            sudo -E python3 web/tests/install_python_probe_live_check.py --mutation-selfcheck
+          else
+            echo "::warning::本 runner 用不了 mount namespace，「\$PATH 兜底真跑」这一条在 CI 里**未验证**（部署机 preflight 里真跑）"
+          fi
           # 「业务技能停用一次就从界面蒸发」那条（Bug N）。这条自证跨三层：
           # 前端契约（管理端打哪个接口）、后端契约（路由/ListAll 有没有被改回去）、
           # 后端行为（go test 真停用一个技能再看全量列表）。它内部会跑 go test，

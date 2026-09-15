@@ -210,4 +210,75 @@ func TestPythonCandidates_MatchInstaller(t *testing.T) {
 	if strings.Contains(shStr, "[ ! -x /usr/bin/python3 ]") {
 		t.Fatal("install.sh 里又出现了写死的单路径探测 `[ ! -x /usr/bin/python3 ]`")
 	}
+
+	// ---- 候选名单之后的 $PATH 兜底 ----
+	//
+	// 上面两条只保证「名单一致 + 循环探测」。名单里只有三个绝对路径，而 Go 侧
+	// resolvePythonFrom 的最后一步是 `pythonUsablePath("python3")` —— 走 $PATH。
+	// 少了这一步，两边行为**不等价**：install.sh 会说「没找到 python3（找过 … 以及
+	// $PATH）」而用户一查 $PATH 明明有（自己编译 / conda 装到 /opt/xxx/bin）——
+	// 「找过 $PATH」是假话，用户怎么修都修不好。这就是本轮报的那个形状。
+	warnAt := strings.Index(shStr, "# 为什么只警告不拦")
+	if warnAt < 0 {
+		t.Fatal("install.sh 里找不到「# 为什么只警告不拦」这段（文件结构改了，请同步本测试）")
+	}
+	pathBlock := shStr[loopAt+loopTail : warnAt]
+	if !strings.Contains(pathBlock, "command -v python3") {
+		t.Fatal("install.sh 的候选名单循环之后没有 $PATH 兜底（缺 `command -v python3`）：" +
+			"Go 侧会认 $PATH 上的解释器、install.sh 不认，两边行为不等价；" +
+			"而且下面那句「找过 … 以及 $PATH」会变成假话，用户查 PATH 明明有、还是被告知没有")
+	}
+	// 顺序即优先级：$PATH 兜底必须在候选名单**之后**。
+	// 放到前面会让 /usr/bin/python3 之类标准位置被一个偏门的同名 python3 抢走，
+	// 与 Go 侧顺序（override → 候选 → $PATH）不一致。
+	if !strings.Contains(pathBlock, `-c pass`) {
+		t.Fatal("install.sh 的 $PATH 兜底没有探活（缺 `-c pass`）：只看 command -v 命中会把" +
+			"「文件在但跑不起来」判成可用，装完自检才红")
+	}
+	// 写进配置文件的路径必须是绝对的：命中相对路径只能说明安装时的 cwd，而服务由
+	// systemd 起（cwd=/），钉进配置就是「看着对、行为随机」。
+	if !strings.Contains(pathBlock, "/*)") {
+		t.Fatal("install.sh 的 $PATH 兜底没有拒绝相对路径（缺 `case` 的 `/*)` 分支）：" +
+			"相对路径写进配置文件后，systemd 起的服务会按 / 去找解释器，随机失败")
+	}
+
+	// ---- 命中「只在 $PATH 上」的解释器时必须钉进配置文件 ----
+	//
+	// 这是第二个不等价：install.sh 用**安装时 shell 的** $PATH 认了解释器，
+	// 服务由 systemd 起，PATH 是另一份（/usr/local/sbin:/usr/local/bin:/usr/sbin:…）。
+	// 不钉住 → 安装期绿、装完自检红，用户两头都查不出所以然。
+	// 锚点用 `step "4/7" "生成配置"` 整个标记，不用裸「生成配置」四个字：
+	// 后者在文件里更早的地方也出现过，抠出来的段会把 OLD_PY= 赋值行一起圈进来，
+	// 于是「不沿用上一版配置」这种注入照样绿（写注入⑬时当场抓出来的第二个假断言）。
+	envAt := strings.Index(shStr, `step "4/7" "生成配置"`)
+	chmodAt := strings.Index(shStr, `chmod 600 "$ENV_FILE"`)
+	if envAt < 0 || chmodAt < envAt {
+		t.Fatal("install.sh 里定位不到「生成配置」到 `chmod 600 \"$ENV_FILE\"` 这一段" +
+			"（文件结构改了，请同步本测试）")
+	}
+	envBlock := shStr[envAt:chmodAt]
+	// 只看 envBlock 里有没有 "SKILLFORGE_PYTHON=" 是个**假断言**：OLD_PY 分支里也有一行，
+	// 把 PY_FROM_PATH 那条写入删掉照样绿（写这条注入时当场抓出来的）。
+	// 所以要抠出 PY_FROM_PATH 那个分支整段看它真的写了什么。
+	pfAt := strings.Index(envBlock, `elif [ "$PY_FROM_PATH" = "1" ]; then`)
+	if pfAt < 0 {
+		t.Fatal("生成配置那步没有受 PY_FROM_PATH 门控的分支：候选名单里的标准位置也会被" +
+			"钉死，将来系统升级换路径反而僵住")
+	}
+	pfBlock := envBlock[pfAt:]
+	if pfEnd := strings.Index(pfBlock, "\n	fi"); pfEnd > 0 {
+		pfBlock = pfBlock[:pfEnd]
+	}
+	if !strings.Contains(pfBlock, "SKILLFORGE_PYTHON=") || !strings.Contains(pfBlock, "PY_FOUND") {
+		t.Fatal("PY_FROM_PATH 分支里没有真正把命中的解释器写进配置文件（缺" +
+			"`SKILLFORGE_PYTHON=` 写入或 `$PY_FOUND` 取值）：门控在、写入没了，" +
+			"安装期认了、服务期照样找不到")
+	}
+	// 升级安装时不许覆盖客户手写的配置。
+	// 断言锚在「OLD_PY 被用来门控」，不是「这一段里出现过 OLD_PY」——后者会被
+	// OLD_PY= 赋值行蒙过（同上，注入⑬抓出来的）。
+	if !strings.Contains(envBlock, `[ -n "$OLD_PY" ]`) {
+		t.Fatal("生成配置那步没有沿用上一版配置里已有的 SKILLFORGE_PYTHON（缺 `[ -n \"$OLD_PY\" ]` " +
+			"门控）：升级会把客户手写的解释器路径改掉")
+	}
 }

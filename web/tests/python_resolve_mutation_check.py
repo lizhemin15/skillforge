@@ -202,6 +202,67 @@ case(
     "第 1 项不可执行时应继续用第 2 项",
 )
 
+# ⑧ 「找过 $PATH」的兜底被删掉 —— 文案还在说找过 $PATH，实际没找。
+#    现场：python3 只在 /opt/xxx/bin（自己编译/conda），用户查 PATH 明明有，
+#    还是被告知「没有 python3」，怎么修都修不好。
+case(
+    "$PATH 兜底被删（文案说找过 $PATH、实际没找）",
+    INSTALL_SH,
+    '\t\t_via_path="$(command -v python3 2>/dev/null || true)"\n',
+    '\t\t_via_path=""\n',
+    "没有 $PATH 兜底",
+)
+
+# ⑨ 兜底只看 command -v 命中、不真跑解释器
+case(
+    "$PATH 兜底不探活（命中就跑不起来的也算可用）",
+    INSTALL_SH,
+    '\t\tif [ -n "$_via_path" ] && "$_via_path" -c pass >/dev/null 2>&1; then\n',
+    '\t\tif [ -n "$_via_path" ]; then\n',
+    "$PATH 兜底没有探活",
+)
+
+# ⑩ 兜底不拒绝相对路径 —— systemd 起的服务按 / 找解释器，随机失败
+case(
+    "$PATH 兜底接受相对路径",
+    INSTALL_SH,
+    '\t\tcase "$_via_path" in\n'
+    "\t\t\t/*) ;;\n"
+    "\t\t\t# 相对路径没有意义：命中它的是安装时的 cwd，而服务由 systemd 起，\n"
+    "\t\t\t# cwd 是 /。写进配置只会变成「看着对、行为随机」。\n"
+    '\t\t\t*) _via_path="" ;;\n'
+    "\t\tesac\n",
+    "",
+    "没有拒绝相对路径",
+)
+
+# ⑪ 门控消失：候选名单里的标准位置也被钉死（系统升级换路径时僵住）
+case(
+    "写入解释器不受 PY_FROM_PATH 门控",
+    INSTALL_SH,
+    '\telif [ "$PY_FROM_PATH" = "1" ]; then\n',
+    '\telif [ "$PY_FROM_PATH" != "不可能相等" ]; then\n',
+    "没有受 PY_FROM_PATH 门控的分支",
+)
+
+# ⑫ 门控在、写入没了 —— 安装期认了、服务期照样找不到（假断言就是这样被抓住的）
+case(
+    "PY_FROM_PATH 分支里不真写 SKILLFORGE_PYTHON",
+    INSTALL_SH,
+    "\t\tprintf 'SKILLFORGE_PYTHON=%s\\n\\n' \"$PY_FOUND\"\n",
+    "\t\tprintf '# 注入：此处不写解释器\\n'\n",
+    "没有真正把命中的解释器写进配置文件",
+)
+
+# ⑬ 升级安装覆盖客户手写的配置
+case(
+    "生成配置不沿用上一版的 SKILLFORGE_PYTHON",
+    INSTALL_SH,
+    '\tif [ -n "$OLD_PY" ]; then\n',
+    "\tif false; then\n",
+    "没有沿用上一版配置里已有的 SKILLFORGE_PYTHON",
+)
+
 print()
 rc, out = run(GO_TEST)
 if rc != 0:
