@@ -183,6 +183,11 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/admin/skills/core", h.Auth.Middleware(h.Admin.SetSkillCore))
 	mux.HandleFunc("DELETE /api/admin/skills/{slug}", h.Auth.Middleware(h.Admin.DeleteSkill))
 
+	// ---- skill list (admin, 全量含停用) ----
+	// 管理端「技能管理」必须用这条：公开 List 会过滤掉停用技能，拿它渲染管理
+	// 列表会让停用变成不可逆操作（见 skills.go 的 ListAll 注释 / Bug N）。
+	mux.HandleFunc("GET /api/admin/skills", h.Auth.Middleware(h.Skills.ListAll))
+
 	// ---- knowledge-base style skill file management ----
 	mux.HandleFunc("GET /api/admin/skills/{slug}/files", h.Auth.Middleware(h.Admin.ListSkillFiles))
 	mux.HandleFunc("GET /api/admin/skills/{slug}/file", h.Auth.Middleware(h.Admin.ReadSkillFile))

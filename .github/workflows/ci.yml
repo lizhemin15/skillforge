@@ -132,6 +132,11 @@ jobs:
           # 两次、runner 退回写死清单必须被 roster 测试抓住。它不需要服务/模型，
           # 所以能在 CI 里跑 —— 这正是它存在的理由。
           bash web/tests/live_e2e_roster_mutation_check.sh
+          # 「业务技能停用一次就从界面蒸发」那条（Bug N）。这条自证跨三层：
+          # 前端契约（管理端打哪个接口）、后端契约（路由/ListAll 有没有被改回去）、
+          # 后端行为（go test 真停用一个技能再看全量列表）。它内部会跑 go test，
+          # 所以必须排在本 step 之后的 Go 环境里 —— setup-go 在上面，照跑。
+          python3 web/tests/skill_disabled_admin_ui_mutation_check.py
 
       # 推荐行（输入框上方那几颗小胶囊）的后端：/api/chat/suggest。
       # 它的失败形态全是「静默降级」——前端 fetch 挂在 .catch 里，404/500/超时

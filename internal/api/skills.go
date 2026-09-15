@@ -21,6 +21,13 @@ func NewSkills(s *store.SkillStore) *Skills {
 }
 
 // List returns all enabled skills (public).
+//
+// 这是**公开**口径（对话页技能勾选层、首页卡片）：停用技能不出现在这里。
+// 注意 `!s.Enabled && !s.IsCore` —— 核心技能即使停用也仍会列出来，于是点它会
+// 拿到 Generate 的 403「该技能当前不可用」。这条历史行为本轮**没动**（不在
+// 抱怨范围内，改动面越小越好），但它是个「看着能用、点了报错」的坑。
+//
+// ⚠️ 管理端别拿这个接口渲染管理列表 —— 见 ListAll。
 func (h *Skills) List(w http.ResponseWriter, r *http.Request) {
 	skills, err := h.store.List()
 	if err != nil {
@@ -36,6 +43,34 @@ func (h *Skills) List(w http.ResponseWriter, r *http.Request) {
 	}
 	// Add core skill-generator to the listing tail
 	writeJSON(w, http.StatusOK, map[string]any{"skills": out, "count": len(out)})
+}
+
+// ListAll returns every skill, **disabled ones included**. 管理端专用（挂鉴权）。
+//
+// 为什么必须有这个接口（Bug N，用户报「业务技能停用了就消失了」）：
+// 管理端「技能管理」原先打的是上面的公开 List，而它自己却渲染了
+// `<span class="pill-off">已停用</span>` 和「启用」按钮 —— 渲染代码永远
+// 收不到停用技能，于是**停用一次技能就从界面上蒸发**，想再启用只能直接改
+// sqlite，停用变成了不可逆操作。管理列表要的是全量，公开列表要的是可用，
+// 两者口径不同，就不能共用一个 handler。
+func (h *Skills) ListAll(w http.ResponseWriter, r *http.Request) {
+	skills, err := h.store.List()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if skills == nil {
+		skills = []model.Skill{}
+	}
+	disabled := 0
+	for _, s := range skills {
+		if !s.Enabled {
+			disabled++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"skills": skills, "count": len(skills), "disabled_count": disabled,
+	})
 }
 
 // Get returns one skill's detail.

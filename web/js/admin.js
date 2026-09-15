@@ -304,9 +304,13 @@
   });
 
   // ---------- skill management ----------
+  // ⚠️ 管理列表打的是 **/api/admin/skills（全量）**，不是公开的 /api/skills。
+  // 公开列表按设计过滤掉停用技能，用它渲染管理列表的话：停用一次技能，这一行
+  // 就从界面上消失 —— 下面渲染的「启用」按钮和「已停用」药丸永远没人能点到，
+  // 想恢复只能手改 sqlite（Bug N：用户报「业务技能停用了就消失了」）。
   async function loadManageSkills() {
     try {
-      const r = await fetch('/api/skills');
+      const r = await fetch('/api/admin/skills', { headers: authHdr() });
       const j = await r.json();
       const list = (j.skills || []);
       const box = $('skill-manage-list');
@@ -1075,8 +1079,11 @@
       <div class="field"><label>名称</label><input type="text" id="kb-meta-name" required></div>
       <div class="field"><label>分类</label><input type="text" id="kb-meta-cat"></div>
       <div class="field"><label>描述</label><input type="text" id="kb-meta-desc"></div>`;
-    // prefill with current skill name/desc from public list
-    fetch('/api/skills').then(r => r.json()).then(j => {
+    // prefill with current skill name/desc from the **admin** list.
+    // 别改成公开的 /api/skills：它过滤掉停用技能，于是编辑一个已停用技能的
+    // 「名称/分类/描述」时表单是空的，`if (!sk) return;` 静默跳过 —— 用户看到
+    // 空白输入框，一保存就把名称/描述清空了（同一个 Bug N 的第二个症状）。
+    fetch('/api/admin/skills', { headers: authHdr() }).then(r => r.json()).then(j => {
       const sk = (j.skills || []).find(x => x.slug === curSkillSlug);
       if (!sk) return;
       $('kb-meta-name').value = sk.name || '';
