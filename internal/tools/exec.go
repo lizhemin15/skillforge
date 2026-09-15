@@ -327,7 +327,13 @@ func (t *RunPythonTool) systemdArgs(dir, unit string) []string {
 		// +2s 缓冲：正常路径由 Go 侧 ctx 先超时并显式 kill unit，这里只是最后一道保险
 		"--property=RuntimeMaxSec=" + fmt.Sprint(int(t.cfg.Timeout.Seconds())+2),
 		"--property=ReadWritePaths=" + dir,
-		"--working-directory=" + dir,
+		// 工作目录必须走 --property=WorkingDirectory=，**不能用 --working-directory=**：
+		// 后者是 systemd-run 在 systemd v243 才加的 CLI 选项，而 RHEL/CentOS/AlmaLinux 8
+		// 带的是 systemd 239 —— 在那些机器上 systemd-run 直接
+		// `unrecognized option '--working-directory=...'` 退出，一次代码都执行不了。
+		// 「执行代码」工具会全部失败，装后自检也只报「探针没有报告 uid」（真现场）。
+		// 属性名 WorkingDirectory 从 systemd v203 就有，239 上实测可用（uid=65534 拿到）。
+		"--property=WorkingDirectory=" + dir,
 		"--setenv=PYTHONIOENCODING=utf-8",
 		"--setenv=PYTHONDONTWRITEBYTECODE=1",
 		"--setenv=LANG=C.UTF-8",
@@ -583,7 +589,20 @@ func SandboxDiagnosticsFor(ctx context.Context, secretPaths []string) map[string
 		out["error"] = err.Error()
 		return out
 	}
-	for k, v := range parseProbeOutput(res.Content) {
+	parsed := parseProbeOutput(res.Content)
+	// 探针没吐 uid 时，**必须把 systemd-run 的原始输出带上去**。
+	// 真现场（Bug Y2，AlmaLinux 8 / systemd 239）：systemd-run 报
+	// `unrecognized option '--working-directory=...'` 退出，探针一个字都没打，
+	// 上层只看到「没有 uid」，于是判成「目标机缺 python3」——客户拿着一个
+	// 明明自带的解释器去 dnf install python3，怎么装都修不好。
+	// 归因错比不报还坏：把「我们的参数与目标机 systemd 不兼容」伪装成「环境缺件」。
+	if parsed["uid"] == "" {
+		if d := probeFailureDetail(res.Content); d != "" {
+			out["error"] = d
+			return out
+		}
+	}
+	for k, v := range parsed {
 		if strings.HasPrefix(k, "read:") {
 			v = classifyReadEvidence(v)
 		}
@@ -591,6 +610,48 @@ func SandboxDiagnosticsFor(ctx context.Context, secretPaths []string) map[string
 	}
 	out["display"] = res.Display
 	return out
+}
+
+// probeFailureDetail 从探针回执里抠出「到底哪一步失败了」。
+//
+// 规则刻意保守：先找 systemd-run / systemd 自己的报错行（这类信息一眼能定位）；
+// 找不到也绝不返回空 —— 只要探针一个字都没吐 uid，就把原始回执原样交上去。
+// 宁可让用户看一段生硬的 systemd 输出，也不要给他一句编好的、指向错误方向的
+// 「你没装 python3」。纯函数，单测直接打它。
+func probeFailureDetail(content string) string {
+	const maxLen = 400
+	c := strings.TrimSpace(content)
+	if c == "" {
+		return "沙箱探针没有任何输出（systemd-run 连探针都没跑起来，且未给出原因）"
+	}
+	markers := []string{
+		"unrecognized option",
+		"Failed to ",
+		"Failed at step",
+		"not found",
+		"Permission denied",
+		"Operation not permitted",
+	}
+	for _, line := range strings.Split(c, "\n") {
+		l := strings.TrimSpace(line)
+		if l == "" {
+			continue
+		}
+		for _, m := range markers {
+			if strings.Contains(l, m) {
+				d := "沙箱探针未返回证据，systemd-run 原始报错：" + l
+				if len(d) > maxLen {
+					d = d[:maxLen] + "…"
+				}
+				return d
+			}
+		}
+	}
+	d := "沙箱探针未返回证据，原始回执：" + strings.Join(strings.Fields(c), " ")
+	if len(d) > maxLen {
+		d = d[:maxLen] + "…"
+	}
+	return d
 }
 
 // parseProbeOutput 解析探针输出的 `k=v|k=v` 行。
