@@ -55,7 +55,11 @@ for s in items:
     sid = s.get('id') or s.get('slug')
     # 判据必须收紧到「我们自己的验收产物名」，不能用「名字含 验收/测试」这种宽匹配 ——
     # 线上真有一个用户的正式技能叫「采购验收单」，宽匹配会把真数据当垃圾删掉。
-    flag = ' [垃圾候选]' if any(k in n for k in ('线上训练进度验收', '线上混合素材验收', '实测废件')) else ''
+    # ⚠️ 必须同时看 id/slug 和 name：验收技能是**训练**出来的，它的 name 是模型起的标题
+    # （如「数据治理专项公文起草」），标识垃圾只体现在 id/slug 上。上一版只看 name，
+    # 结果「线上训练进度验收160916」被判成「没有要删的」——漏判比误删更隐蔽。
+    hay = (str(sid or '') + '\x00' + str(n or ''))
+    flag = ' [垃圾候选]' if any(k in hay for k in ('线上训练进度验收', '线上混合素材验收', '实测废件')) else ''
     if flag:
         junk.append((sid, n))
     print(f'  - {sid} | {n} | enabled={s.get("enabled")}{flag}')

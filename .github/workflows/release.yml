@@ -97,8 +97,11 @@ jobs:
       - name: 安装中文字体（离线包要自带，缺了就挑不到字体）
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq fonts-arphic-gbsn00lp fonts-arphic-gkai00mp
+          # poppler-utils 是运行时防线脚本的前置工具：它用 pdftotext 断言「测试料确实没有
+          # 文字层」——没有这道前置断言，「必须走 OCR」的前提就是假的，防线会假绿。
+          sudo apt-get install -y -qq fonts-arphic-gbsn00lp fonts-arphic-gkai00mp poppler-utils
           ls -l /usr/share/fonts/truetype/arphic-gbsn00lp/
+          pdftotext -v 2>&1 | head -1
 
       - name: 注入版本信息
         id: vars

@@ -34,6 +34,12 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 BUILD="$ROOT/testdata/mixed/build_mixed_pdf.py"
+# 固定料：3 页纯扫描件（325KB，文字层 0 字符）。为什么要有它 ——
+# 原实现只会「现造」，走宿主 python 的 pymupdf；GitHub runner 上没这个包，
+# 于是 release.yml 的 amd64 离线包 job 红在「造扫描件失败」→ needs 不满足 →
+# 整个 GitHub Release 被 skip（产物拿不到）。构建期现造这条路，只能在装了
+# pymupdf 的机器上走；固定料让 CI 与开发机走同一条、可复现的路。
+FIXTURE_REPO="$ROOT/testdata/ocr/scan3-rtloss.pdf"
 
 BIN="${OCRD_BIN:-/opt/skillforge/bin/ocrd}"
 PORT="${OCRD_PORT:-18093}"
@@ -48,7 +54,19 @@ while [ $# -gt 0 ]; do
 done
 
 [ -x "$BIN" ] || { echo "SKIP/FAIL: 冻结二进制不存在或不可执行：$BIN"; echo "（本事故只存在于 PyInstaller 冻结件；请用 OCRD_BIN=dist-bin/ocrd-amd64 指定）"; exit 2; }
-[ -f "$BUILD" ] || { echo "FAIL: 缺 $BUILD，无法生成扫描件测试料"; exit 1; }
+
+# 测试料来源：显式 FIXTURE_PDF > 仓库固定料 > 现造（需宿主 pymupdf）。
+FIXTURE_SRC=""
+if [ -n "${FIXTURE_PDF:-}" ] && [ -f "${FIXTURE_PDF:-}" ]; then
+  FIXTURE_SRC="$FIXTURE_PDF"
+elif [ -f "$FIXTURE_REPO" ]; then
+  FIXTURE_SRC="$FIXTURE_REPO"
+fi
+if [ -z "$FIXTURE_SRC" ]; then
+  command -v python3 >/dev/null 2>&1 && python3 -c 'import pymupdf' 2>/dev/null \
+    || { echo "SKIP/FAIL: 没有可用测试料：固定料 $FIXTURE_REPO 不存在，且宿主 python3 无 pymupdf（现造不可行）"; echo "（SKIP ≠ PASS：没有料就没测这条防线，别当绿）"; exit 2; }
+  [ -f "$BUILD" ] || { echo "FAIL: 缺 $BUILD，无法生成扫描件测试料"; exit 1; }
+fi
 
 WORK="$(mktemp -d /tmp/verify_rtloss.XXXXXX)"
 RT="$WORK/ocr-tmp"                       # 专用临时目录：模拟修 A 之后 systemd 给的 TMPDIR
@@ -104,8 +122,26 @@ wait_health() { # $1=超时秒数 $2=阶段名
 jget() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2]))' "$1" "$2" 2>/dev/null; }
 
 echo "=== 0) 测试料：3 页纯扫描件（必须走 OCR 才有正文）==="
-python3 "$BUILD" "$WORK/scan3.pdf" --scan 3 --text 0 --tag RTLOSS >/dev/null || { echo "FAIL: 造扫描件失败"; exit 1; }
-ok "scan3.pdf 就绪（$(stat -c%s "$WORK/scan3.pdf")B）"
+if [ -n "$FIXTURE_SRC" ]; then
+  cp "$FIXTURE_SRC" "$WORK/scan3.pdf" || { echo "FAIL: 拷贝测试料失败：$FIXTURE_SRC"; exit 1; }
+  ok "scan3.pdf 就绪（固定料 $(basename "$FIXTURE_SRC")，$(stat -c%s "$WORK/scan3.pdf")B）"
+else
+  python3 "$BUILD" "$WORK/scan3.pdf" --scan 3 --text 0 --tag RTLOSS >/dev/null || { echo "FAIL: 造扫描件失败"; exit 1; }
+  ok "scan3.pdf 就绪（现造，$(stat -c%s "$WORK/scan3.pdf")B）"
+fi
+
+# 前置断言：料必须真是纯扫描（无文字层）。否则「必须走 OCR 才有正文」这个前提是假的，
+# 后面所有「OCR 结果正确」的断言都在骗自己。有 pdftotext 就查，没有就明说跳过（不静默通过）。
+if command -v pdftotext >/dev/null 2>&1; then
+  CH="$(pdftotext "$WORK/scan3.pdf" - 2>/dev/null | tr -d ' \t\r\n\f' | wc -c | tr -d ' ')"
+  if [ "${CH:-0}" -ge 10 ]; then
+    fail "测试料自带文字层（pdftotext 读出 ${CH} 字符）→ 「必须走 OCR 才有正文」不成立，本次结果无效"
+    exit 1
+  fi
+  ok "测试料确无文字层（pdftotext 读出 ${CH} 字符）→ OCR 前提成立"
+else
+  echo "  · 跳过「无文字层」前置断言：本机无 pdftotext（不当成通过）"
+fi
 
 echo "=== 1) 起服务（TMPDIR=$RT，冻结二进制=$BIN，break=$BREAK）==="
 wait_health 120 "启动" || { echo "FAIL: 服务起不来，这是环境问题不是防线问题"; exit 1; }
