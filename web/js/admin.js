@@ -244,6 +244,9 @@
       div.className = 'ln ' + (cls || '');
       div.innerHTML = `<span class="t">${esc(stage)}</span><span class="s">${esc(s)}</span>`;
       $('tr-log').appendChild(div);
+      // 实况材料块始终贴在最下面：新阶段日志插在它前面，材料块跟着往下走。
+      const live = $('tr-material');
+      if (live) $('tr-log').appendChild(live);
       $('tr-log').scrollTop = $('tr-log').scrollHeight;
     };
 
@@ -268,11 +271,45 @@
           if (!line0.startsWith('data:')) continue;
           try {
             const ev = JSON.parse(line0.slice(5).trim());
+            // 终帧到了，实况块收掉：留着会让人以为还在跑。
+            if (ev.type === 'done' || ev.type === 'error') {
+              const live = $('tr-material');
+              if (live) live.remove();
+            }
             switch (ev.type) {
               // ⚠️ 契约：后端 internal/api/admin.go 发的是 status / step / error / done。
               // 这里以前只认 'stage'，于是「开始训练」和整场训练的阶段进度帧被静默丢弃 ——
               // 界面上只剩一个空日志框 + 不动的「训练中…」，二十分钟看不出任何进展。
               // 事件名对不上是静默故障（没有任何报错），所以下面配了契约测试守着。
+              // 中间材料：模型流式吐出的思考链/正文片段（后端已攒批：~400ms 或 240 字节一帧）。
+              // 必须**就地更新**同一个实况块，不能一片一个 DOM 节点 —— 二十分钟下来那是
+              // 几万个节点，页面直接被拖死。这里只保留尾部若干字符，像终端在跑。
+              case 'delta': {
+                let d = ev.data;
+                if (typeof d !== 'object') {
+                  try { d = JSON.parse(d); } catch (_) { d = { kind: 'note', text: String(ev.data) }; }
+                }
+                const label = d.kind === 'think' ? '思考' : (d.kind === 'note' ? '提示' : '正文');
+                let mp = $('tr-material');
+                if (!mp) {
+                  mp = document.createElement('div');
+                  mp.id = 'tr-material';
+                  mp.className = 'ln material';
+                  mp.style.cssText = 'color:#6b7280;white-space:pre-wrap;word-break:break-all;border-left:2px solid #d1d5db;padding-left:8px;margin:6px 0;';
+                  $('tr-log').appendChild(mp);
+                }
+                // 换类别时补一个分隔，否则「思考」和「正文」会连成一句读。
+                // 注意：分隔符必须拼进下面那次赋值里。先 += 再整体覆盖「看着等价」，
+                // 实际会把刚加的分隔符冲掉（本条行为测试抓到的就是这个）。
+                const sep = (mp.dataset.kind && mp.dataset.kind !== d.kind) ? '\n' : '';
+                mp.dataset.kind = d.kind;
+                mp.textContent = sep + '… ' + label + '：' + String(d.text || '').replace(/\s+/g, ' ');
+                // 尾部截断：DOM 里只留最近这一段，历史材料没有回看需求（阶段边界会打点）。
+                if (mp.textContent.length > 700) mp.textContent = '… ' + mp.textContent.slice(-697);
+                lastEvAt = Date.now();
+                $('tr-log').scrollTop = $('tr-log').scrollHeight;
+                break;
+              }
               case 'status': logLine('•', ev.data, ''); break;
               case 'step':
               case 'stage': // 旧名，向后兼容

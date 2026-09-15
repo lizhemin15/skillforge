@@ -97,8 +97,24 @@ def main():
             browser.close()
             return 0
 
+        # 训练页在登录墙后面：凭据从环境变量走，**不进脚本、不进日志**。
+        # 没给凭据就 SKIP（而不是伪造一个 token 绕过去 —— 那样验的不是用户走的路）。
+        user, pwd = os.environ.get('ADMIN_USER'), os.environ.get('ADMIN_PASS')
+        if user and pwd:
+            try:
+                page.fill('#lg-user', user)
+                page.fill('#lg-pass', pwd)
+                page.click('#login-form button[type=submit]')
+                page.wait_for_selector('#train-form', timeout=15000, state='visible')
+                ok('已用真凭据登录训练页（凭据走环境变量，未落盘、未打印）')
+            except Exception as e:  # noqa: BLE001
+                fail(f'登录后训练页没出现（{type(e).__name__}: {str(e)[:120]}）')
+                browser.close()
+                return 1
+
         if not page.locator('#train-form').count():
-            skip('页面上没有 #train-form（未登录 / 不是训练页）—— SKIP 不等于 PASS')
+            skip('页面上没有 #train-form（未登录 / 不是训练页）—— SKIP 不等于 PASS；'
+                 '要真跑请给 ADMIN_USER/ADMIN_PASS')
             browser.close()
             return 0
 

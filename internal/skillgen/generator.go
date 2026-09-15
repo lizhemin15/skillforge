@@ -27,6 +27,46 @@ type chatClient interface {
 	Chat(ctx context.Context, sys, user string, jsonMode ...bool) (string, error)
 }
 
+// streamChatClient 是「能流式对话」这层可选能力。单独一个接口而不是并进 chatClient：
+// 测试里大量替身只实现了 Chat，把它并进去会逼所有替身跟着改（改动面与收益不成比例）；
+// 类型断言拿不到流式能力时优雅退回阻塞调用，语义不变。
+type streamChatClient interface {
+	StreamChat(ctx context.Context, sys, user string, o llm.StreamOpts) (string, error)
+}
+
+// chatWithMaterial 是 Chat 的「带中间材料」版本：ctx 上挂了接收器就走真流式，
+// 边生成边把思考链与正文片段吐出去；没挂就还是原来的阻塞调用。
+//
+// 事故背景：训练一跑二十分钟，而流水线只在**阶段边界**发一条进度，阶段内部是
+// 一个几十分钟级别的静默模型调用。用户在界面上看到的只有一个计时器在跳，
+// 分不清「在慢慢想」和「卡死了」——投诉原话「一直卡着计时，用户体验不佳」。
+// 而 llm 客户端本来就支持流式（StreamOpts 的注释就写着「收思考链片段（中间材料）」），
+// 是训练链路没接。这里把线接上，并且只在训练这条链路接：其他路径不进流式，
+// 不多花一次请求、不引入 provider 兼容性风险。
+func (g *Generator) chatWithMaterial(ctx context.Context, sys, user string, jsonMode ...bool) (string, error) {
+	sink := deltaOf(ctx)
+	if sink == nil {
+		return g.llm.Chat(ctx, sys, user, jsonMode...)
+	}
+	sc, ok := g.llm.(streamChatClient)
+	if !ok {
+		return g.llm.Chat(ctx, sys, user, jsonMode...)
+	}
+	jm := len(jsonMode) > 0 && jsonMode[0]
+	out, err := sc.StreamChat(ctx, sys, user, llm.StreamOpts{
+		JSONMode:    jm,
+		OnReasoning: func(s string) { sink(MaterialThink, s) },
+		OnContent:   func(s string) { sink(MaterialText, s) },
+	})
+	if err != nil {
+		// 流式失败不能把这一阶段整个干掉：退回阻塞调用重来一次，并把原因当材料吐出来。
+		// 不给旁白的话，用户看到的是「材料忽然没了」，比从来没流过还费解。
+		sink(MaterialNote, "（流式中断，回退阻塞调用："+err.Error()+"）")
+		return g.llm.Chat(ctx, sys, user, jsonMode...)
+	}
+	return out, nil
+}
+
 // Generator is the "skill-generator" (女娲) pipeline: it ingests reference
 // files + a requirement, and produces a complete, validated writing skill.
 type Generator struct {
@@ -458,7 +498,7 @@ func (g *Generator) extractAttributes(ctx context.Context, in *Input) (string, e
 	//   `invalid character 'ä' after object key:value pair`
 	// —— 'ä' 是 Go 把中文首字节 0xE4 按 latin1 打印出来的，真因是 JSON 语法在中文
 	// 字符处崩了，而报错本身看不出模型写坏了哪里。
-	out, err := g.llm.Chat(ctx, sys, user, true)
+	out, err := g.chatWithMaterial(ctx, sys, user, true)
 	if err != nil {
 		return "", err
 	}
@@ -499,7 +539,7 @@ func (g *Generator) detectType(ctx context.Context, in *Input) (*typeOut, error)
 - type=query：参考文件是"办事流程、业务步骤、审批环节、操作指导、政策问答"，目标是用户问什么时候，助手直接给出流程/步骤/答案，不写长篇大论。
 - type=template：同 query，但参考文件里还包含"需要用户填写/签字的表单模板或 Word 文档"，用户命中时除了给流程，还要把该文件作为附件下发。
 注意：若参考文件里明确有 .docx/.xlsx/.xls/.doc/.pdf 这类文件，多半是 template 型要下发的附件。`
-	out, err := g.llm.Chat(ctx, sys, corpus, true)
+	out, err := g.chatWithMaterial(ctx, sys, corpus, true)
 	if err != nil {
 		return nil, err
 	}
@@ -615,7 +655,7 @@ func (g *Generator) Review(ctx context.Context, slug, instruction, currentPrompt
 优化指令：{INSTRUCTION}`
 	sys = strings.ReplaceAll(sys, "{INSTRUCTION}", instruction)
 	user := "== 风格画像（不可变） ==\n" + anchor + "\n\n== 现有 system_prompt.md ==\n" + cur + tplPart + exBlock.String()
-	out, err := g.llm.Chat(ctx, sys, user)
+	out, err := g.chatWithMaterial(ctx, sys, user)
 	if err != nil {
 		return "", err
 	}
@@ -660,7 +700,7 @@ func (g *Generator) synthesizeMetadata(ctx context.Context, in *Input, attrs str
 }
 input_params 通常3-6项。只输出JSON。`
 	user := "需求:\n" + in.Requirement + "\n\n分析:\n" + attrs
-	out, err := g.llm.Chat(ctx, sys, user, true)
+	out, err := g.chatWithMaterial(ctx, sys, user, true)
 	if err != nil {
 		return nil, err
 	}
@@ -706,7 +746,7 @@ func (g *Generator) buildSystemPrompt(ctx context.Context, in *Input, attrs stri
 - "事实与占位符":素材里已有的具体事实必须原样用上,只有确无依据的单个字段才用占位符【待补:字段名】,不得整篇改用占位符。
 直接输出正文,不要用代码块包裹,不要输出解释。` + extra
 	user := "需求:\n" + in.Requirement + "\n\n特征分析:\n" + attrs + "\n\n母模板:\n" + tpl
-	out, err := g.llm.Chat(ctx, sys, user)
+	out, err := g.chatWithMaterial(ctx, sys, user)
 	if err != nil {
 		return "", err
 	}
@@ -756,7 +796,7 @@ func (g *Generator) reviseSystemPrompt(ctx context.Context, in *Input, attrs, ty
 			fmt.Fprintf(&b, "- %s 丢分 %d/%d：%s\n", d.Label, d.Score, d.Weight, strings.TrimSpace(d.Reason))
 		}
 	}
-	out, err := g.llm.Chat(ctx, sys, b.String())
+	out, err := g.chatWithMaterial(ctx, sys, b.String())
 	if err != nil {
 		return "", err
 	}
@@ -800,7 +840,7 @@ func (g *Generator) buildTemplate(ctx context.Context, in *Input, attrs string, 
 用Markdown标题组织,保持通用,不要写死具体办事内容。直接输出正文,不要代码块。`
 	}
 	user := "需求:\n" + in.Requirement + "\n\n特征:\n" + attrs
-	out, err := g.llm.Chat(ctx, sys, user)
+	out, err := g.chatWithMaterial(ctx, sys, user)
 	if err != nil {
 		return "", err
 	}
@@ -834,7 +874,7 @@ func (g *Generator) buildExamples(ctx context.Context, in *Input, attrs string, 
 	}
 	// Otherwise forge one demonstration snippet to anchor style.
 	user := "需求:\n" + in.Requirement + "\n\n特征:\n" + attrs
-	out, err := g.llm.Chat(ctx, sys, user)
+	out, err := g.chatWithMaterial(ctx, sys, user)
 	if err != nil {
 		return nil, err
 	}

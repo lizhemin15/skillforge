@@ -194,11 +194,25 @@ func (a *Admin) Train(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
+	// 中间材料：把模型流式吐出的思考链/正文片段攒批后转成 delta 帧。
+	// 训练一跑二十分钟，流水线只在阶段边界发一条进度，阶段内部是几分钟级的静默
+	// 模型调用——屏幕上只有一个计时器在动，用户分不清「在慢慢想」和「卡死了」。
+	// 攒批参数（400ms / 240 字节）与前端「就地更新一个实况块」配套：不攒批的话
+	// 一帧一片，每秒几百帧会把浏览器拖垮。
+	relay := skillgen.NewMaterialRelay(400*time.Millisecond, 240, func(kind, text string) {
+		b, _ := json.Marshal(map[string]string{"kind": kind, "text": text})
+		send("delta", string(b))
+	})
+	tctx = skillgen.WithDelta(tctx, relay.Push)
+
 	send("status", fmt.Sprintf("开始训练技能：%s", name))
 	trainStart := time.Now()
 	res, err := a.gen.Generate(tctx, in, func(step string) {
+		// 阶段边界先把积压材料吐干净：不然尾巴会串到下一个阶段的材料里。
+		relay.Flush()
 		send("step", step)
 	})
+	relay.Flush()
 	// 结论同时落 SSE 与 stderr：SSE 给当下还盯着的浏览器，stderr 给「人已经走了」的场景。
 	// 结论同时落 SSE 与 stderr：SSE 给当下还盯着的浏览器，stderr 给「人已经走了」的场景。
 	logTrainOutcome(name, in.Slug, time.Since(trainStart), res, err)
