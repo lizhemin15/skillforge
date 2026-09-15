@@ -190,6 +190,26 @@ def main():
         else:
             fail(f'T4 有 {len(errs)} 个 JS 异常：{errs[:3]}')
 
+        # ---- T5 中间材料真的流到屏幕上（「卡着计时」这次的核心）----
+        # T1~T4 守的都是「帧有没有到屏幕」；阶段内部静默那两分钟，屏幕上有进度行、
+        # 计时器也在动，T1~T4 全绿而用户照样在盯空计时器。所以必须单独守材料。
+        mat_rows = [(t, r) for t, r in line_seen if '思考：' in r or '正文：' in r or '提示：' in r]
+        try:
+            mat_nodes = page.eval_on_selector_all('#tr-log .material', 'els => els.length')
+        except Exception:  # noqa: BLE001
+            mat_nodes = -1
+        if mat_rows:
+            ok(f'T5a {SAMPLE_SECONDS:.0f}s 内出现流式中间材料 {len(mat_rows)} 次，'
+               f'首片在 {mat_rows[0][0]:.1f}s：{mat_rows[0][1][:70]}')
+        else:
+            fail(f'T5a {SAMPLE_SECONDS:.0f}s 内没有任何中间材料行 —— 阶段内部仍是静默，'
+                 f'用户还是只能盯着一个空计时器（改动没生效，或帧被前端吞了）')
+        if mat_nodes == 1:
+            ok('T5b 实况块只占 1 个 DOM 节点（就地更新，不是一片一节点）')
+        else:
+            fail(f'T5b 实况块占 {mat_nodes} 个 DOM 节点（期望 1）—— '
+                 f'一片一节点会随训练时长线性增长，二十分钟下来把页面拖死')
+
         print('\n--- 证据 ---')
         print(f'采样窗口 {SAMPLE_SECONDS:.0f}s / 日志行 {len(line_seen)} / 计时快照 {len(tick_snaps)}')
         for t, r in line_seen[:6]:
