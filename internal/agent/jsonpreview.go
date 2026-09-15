@@ -55,12 +55,12 @@ type jsonPreview struct {
 	esc   bool // 上一字节是反斜杠
 	isKey bool // 当前这个字符串是 key
 
-	cap bool              // 当前字符串是否放行
-	buf strings.Builder   // 当前 key 的原文（value 不缓冲，省内存）
-	cur string            // 当前对象里最近完成的 key
-	kind []byte           // 容器栈：'{' / '['
-	own  []string         // 每个容器「由哪个字段引入」，与 kind 同长
-	prev byte             // 最近一个非空白、且不在字符串内的字节
+	cap  bool            // 当前字符串是否放行
+	buf  strings.Builder // 当前 key 的原文（value 不缓冲，省内存）
+	cur  string          // 当前对象里最近完成的 key
+	kind []byte          // 容器栈：'{' / '['
+	own  []string        // 每个容器「由哪个字段引入」，与 kind 同长
+	prev byte            // 最近一个非空白、且不在字符串内的字节
 
 	uCnt int  // \u 转义还剩几个十六进制位
 	uVal rune // \u 已累积的值

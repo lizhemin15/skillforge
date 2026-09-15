@@ -138,6 +138,7 @@ func TestEvalTurnAsksProviderToDisableThinking(t *testing.T) {
 // 这条路上材料有**两个来源**，缺哪个都会让用户在那一跳只看到跳秒的计时：
 //   - 思考链（只有 provider 忽略关思考链开关时才有，astron 上实测一片都没有）；
 //   - JSON 里的 reason 字段（contentSink 抽的，任何 provider 都有）。
+//
 // 所以断言从「材料恰好等于思考链」改成「两个来源都在」——覆盖面比原来更宽，
 // 同时补上「不得混进 JSON 结构」这一条，那才是 contentSink 真正的风险面。
 func TestEvalTurnReportsMaterialEvenWhenKnobIgnored(t *testing.T) {

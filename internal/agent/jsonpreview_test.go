@@ -94,11 +94,11 @@ func TestJsonPreviewAllowlist(t *testing.T) {
 // 残缺/畸形输入不能崩、也不能把后续正文一起吞掉 —— 输入是网络流，断在半路是常态。
 func TestJsonPreviewMalformed(t *testing.T) {
 	cases := []string{
-		`{"title":"没写完的标`,       // 字符串断在半路
-		`{"title":"结尾是反斜杠\`,    // 转义断在半路
-		`{"title":"坏转义\u12`,     // \u 位数不够
-		`{"title":"坏转义\uZZZZ后面还有正文"}`, // \u 跟的不是十六进制
-		`{"title":"落单高位代理\ud83d后面继续"}`, // 高位代理后面不是低位
+		`{"title":"没写完的标`,                        // 字符串断在半路
+		`{"title":"结尾是反斜杠\`,                      // 转义断在半路
+		`{"title":"坏转义\u12`,                      // \u 位数不够
+		`{"title":"坏转义\uZZZZ后面还有正文"}`,            // \u 跟的不是十六进制
+		`{"title":"落单高位代理\ud83d后面继续"}`,           // 高位代理后面不是低位
 		`{"title":"` + strings.Repeat("长", 5000), // 超长未收口
 		`{"title":"孤零零的引号\"没转义","parags":["正文"]}`,
 		`{`, `[]`, `"`, `\`, ``,
