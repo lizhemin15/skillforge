@@ -119,3 +119,23 @@ case "$ARCH:$DESC" in
 esac
 c_ok "产物：$OUT（$(du -h "$OUT" | cut -f1)，$DESC）"
 c_ok "sha256：$(sha256sum "$OUT" | cut -d' ' -f1)"
+
+# ---------- 5. 运行时事故防线：解包目录被 tmpfiles 清掉时要能自己发现、说人话、重启自愈 ----------
+# 这道防线**必须**对冻结二进制跑：非冻结运行没有 $TMPDIR/_MEI* 解包目录，没有这个事故形态。
+# 本机架构与产物架构一致时真跑（正绿 + --break 转红）；不一致时明确跳过，不假绿。
+HOST_M="$(uname -m)"
+VERIFY="$REPO_ROOT/deploy/ocr/verify_runtime_loss.sh"
+case "$ARCH:$HOST_M" in
+	amd64:x86_64|arm64:aarch64)
+		[ -f "$VERIFY" ] || die "缺 $VERIFY（运行时事故防线脚本）"
+		echo "== 运行时防线：正绿 =="
+		OCRD_BIN="$OUT" OCRD_PORT="${OCRD_PORT:-18094}" bash "$VERIFY" \
+			|| die "运行时防线未通过：$VERIFY（产物 $OUT）"
+		echo "== 运行时防线：--break 自证（关掉守卫必须变红）=="
+		OCRD_BIN="$OUT" OCRD_PORT="${OCRD_PORT:-18094}" bash "$VERIFY" --break \
+			|| die "--break 自证未通过：去掉守卫后防线竟然还是绿的 → 这道尺子是假的"
+		;;
+	*)
+		echo "  · 跳过运行时防线（产物 $ARCH，本机 $HOST_M，跑不了）：$VERIFY"
+		;;
+esac

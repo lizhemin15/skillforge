@@ -675,6 +675,7 @@ if [ "$DO_OCR" -eq 1 ]; then
 		sed -e "s|__OCR_BIN__|$OCR_BIN|g" \
 		    -e "s|__OCR_PORT__|$OCR_PORT|g" \
 		    -e "s|__SERVICE_NAME__|$SERVICE_NAME|g" \
+		    -e "s|__PREFIX__|$PREFIX|g" \
 		    "$HERE/skillforge-ocr.service.template" > "$OCR_UNIT"
 	else
 		cat > "$OCR_UNIT" <<EOF
@@ -684,6 +685,12 @@ After=network.target
 
 [Service]
 Type=simple
+# TMPDIR 不能是 /tmp：systemd-tmpfiles 的 \`D /tmp\` 规则无保留期，会把运行中 ocrd 的
+# PyInstaller 解包目录（\$TMPDIR/_MEIxxxx）删掉 → 引擎重建失败 → 扫描件解析永久坏掉。
+# 详见 deploy/offline/skillforge-ocr.service.template 里的完整说明。
+Environment=TMPDIR=$PREFIX/run/ocr-tmp
+ExecStartPre=/bin/mkdir -p $PREFIX/run/ocr-tmp
+ExecStartPre=/bin/chmod 700 $PREFIX/run/ocr-tmp
 ExecStart=$OCR_BIN --port $OCR_PORT
 Restart=on-failure
 RestartSec=3

@@ -64,7 +64,78 @@ GARBLED_DETAIL_MAX = 20
 # 事故教训：换二进制后只靠 `systemctl restart` + 进程活着，看不出新逻辑有没有生效；
 # 一旦 /health 能把「逐页择优 + 阈值」报出来，部署验收就有可 curl 的证据，
 # 不用去猜「是不是没重启成功」。
-VERSION = "ocrd-v5-quality"
+VERSION = "ocrd-v5-runtime-guard"
+
+# ---------- 运行时目录守卫（2026-09-16 线上事故）----------
+# PyInstaller onefile 会把权重/配置解包到 $TMPDIR/_MEIxxxx/。默认 TMPDIR=/tmp，而线上
+# /usr/lib/tmpfiles.d/tmp.conf 的规则是 `D /tmp 1777 root root -`（**没有保留期**），
+# 每日 04:05 的 systemd-tmpfiles-clean 会把 /tmp 清空 —— 运行中的 ocrd 解包目录就这样没了。
+#
+# 为什么这个故障极难发现：
+#   * 已载入内存的模型照常推理 → 小件、已缓存件全部正常，只有需要「重新读盘」才会炸；
+#   * 第一个炸点是引擎回收重建（RECYCLE_EVERY 页）时要重读 rapidocr 的 config.yaml：
+#     [Errno 2] No such file or directory: '/tmp/_MEIxxx/rapidocr_onnxruntime/config.yaml'
+#   * 而引擎一旦重建失败就**永久坏掉**（self.engine 仍为 None，后续每个请求都秒失败），
+#     直到有人重启进程 —— 用户侧看到的是「扫描件/Office 解析全废，抽出来的东西跟素材无关」。
+#
+# 两道防线：
+#   ① 部署层把 TMPDIR 指到 tmpfiles 不碰的地方（见 deploy/offline/skillforge-ocr.service.template）；
+#   ② 这一层兜底：发现运行时目录没了就明说 + 非零退出，让 systemd 立刻重启出一个完好实例
+#      （Restart=on-failure + RestartSec=3，几秒自愈，用户重试即可）。
+#      「明说」很重要：原样抛 Errno 2 会被上层误读成「这份文件解析不了」，而真因是服务本身。
+RUNTIME_LOST_MSG = ("解析服务运行时目录已被系统清理（TMPDIR 下的解包目录丢失）："
+                    "正在自动重启解析服务，请稍后重试本次上传")
+# OCRD_RUNTIME_GUARD=off 只给自证脚本注入故障用（deploy/ocr/verify_runtime_loss.sh），
+# 生产环境不要设 —— 设了等于自废这条防线（自证脚本会断言「关掉守卫必须变红」）。
+_RUNTIME_GUARD_OFF = os.environ.get("OCRD_RUNTIME_GUARD", "").strip().lower() == "off"
+
+
+def runtime_dir() -> str:
+    """PyInstaller onefile 的解包目录；源码直跑（非冻结）时为空串。"""
+    return getattr(sys, "_MEIPASS", "") or ""
+
+
+def runtime_ok() -> bool:
+    """运行时解包目录还在不在。非冻结运行恒为 True（没有解包目录，也就无所谓丢失）。"""
+    if _RUNTIME_GUARD_OFF:
+        return True
+    d = runtime_dir()
+    return True if not d else os.path.isdir(d)
+
+
+def private_tmpdir() -> bool:
+    """TMPDIR 是不是「我们自己的专用目录」（而不是 /tmp 这种人人共用的）。
+
+    判据用权限位而不是路径名：非 other-writable 就认为归我们独占。凡共用目录一律不碰里面的
+    _MEI*，否则我们就是在删别人的运行时目录 —— 那正是本文件要修的事故。
+    """
+    if not runtime_dir():
+        return False
+    parent = os.path.dirname(runtime_dir())
+    try:
+        return not (os.stat(parent).st_mode & 0o002)
+    except OSError:
+        return False
+
+
+def tmpdir_is_shared() -> bool:
+    """解包目录落在共用临时目录里 → 随时可能被系统清理，启动时要显式警告。"""
+    return bool(runtime_dir()) and not private_tmpdir()
+
+
+def exit_for_restart(delay: float = 0.4):
+    """回完响应后非零退出，交给 systemd 重启（Restart=on-failure）。
+
+    为什么退出而不是内部重建：解包目录里的权重/配置已经没了，进程内无法凭空恢复，
+    重启一次 PyInstaller bootloader 会重新解包出一份完好的运行时。延迟是留给
+    HTTP 响应 flush 的时间窗 —— 不给的话调用方只会看到连接被重置。
+    """
+    def _bye():
+        time.sleep(delay)
+        print(f"FATAL: {RUNTIME_LOST_MSG}（退出 75 交给 systemd 重启）", flush=True)
+        os._exit(75)
+
+    threading.Thread(target=_bye, daemon=False).start()
 
 # ---------- OOXML 命名空间 ----------
 NS = {
@@ -305,7 +376,16 @@ class OcrEngine:
         if self.engine is None:
             with self._init_lock:
                 if self.engine is None:
-                    self.engine = RapidOCR()
+                    if not runtime_ok():
+                        # 解包目录没了：别等 RapidOCR 抛一句 Errno 2 让上层误判成「文件坏」，
+                        # 直接说清真因（见 RUNTIME_LOST_MSG 处的事故说明）。
+                        raise RuntimeError(RUNTIME_LOST_MSG)
+                    try:
+                        self.engine = RapidOCR()
+                    except Exception as e:
+                        raise RuntimeError(
+                            "解析引擎重建失败：%s（若提示 config.yaml / 模型文件缺失，"
+                            "说明运行时解包目录被系统清理，服务需重启）" % e)
         return self.engine
 
     def _recycle(self):
@@ -509,13 +589,25 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.rstrip("/") == "/health":
             # version / min_page_chars 一起报出来：部署验收可以直接 curl 出「跑的是哪一版、
             # 逐页择优的阈值是多少」，不用先进机器翻二进制（见 VERSION 处的注释）。
-            self._send_json(200, {"ok": True, "service": "ocrd", "version": VERSION,
+            # runtime_ok：本进程的 PyInstaller 解包目录是否还在。它是「服务是否还能干活」的
+            # 诚实指标 —— 已加载进内存的模型会让服务看起来一切正常，直到需要重新读盘才炸。
+            # ok 跟着 runtime_ok 走：任何只看 ok 的老监控/脚本也能因此发现异常。
+            rok = runtime_ok()
+            self._send_json(200, {"ok": rok, "service": "ocrd", "version": VERSION,
+                                  "runtime_ok": rok, "runtime_dir": runtime_dir(),
                                   "min_page_chars": MIN_PAGE_CHARS,
                                   "quality_rule": QUALITY_RULE,
                                   "formats": "pdf|docx|xlsx|pptx|txt|md|csv|html", "rapidocr": True})
         else:
             self._send_json(404, {"ok": False, "error": "not_found"})
     def _handle_upload(self, path):
+        # 运行时目录已丢 → 这份文件不是「解析不了」，是服务本身坏了：说清 + 自愈（重启）。
+        # 放在读 body 之前，是为了不让调用方白等一次上传（大件上传 + 秒错的体感最差）。
+        if not runtime_ok():
+            self._send_json(200, {"ok": False, "error": RUNTIME_LOST_MSG,
+                                  "runtime_ok": False, "self_healing": True})
+            exit_for_restart()
+            return
         if self.headers.get("Expect", "").lower() == "100-continue":
             self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
             self.wfile.flush()
@@ -549,7 +641,14 @@ class Handler(BaseHTTPRequestHandler):
                 "pages": [{"page": 1, "src": fmt, "ms": ms, "text": text}] if fmt == "pdf" else [],
             })
         except Exception as e:
-            self._send_json(200, {"ok": False, "error": str(e)})  # 200 + ok:false (与 v1 兼容)
+            msg = str(e)
+            # 引擎重建时才发现运行时目录没了 → 同样「说清 + 自愈」，而不是回一句 Errno 2。
+            if (not runtime_ok()) or msg == RUNTIME_LOST_MSG or RUNTIME_LOST_MSG in msg:
+                self._send_json(200, {"ok": False, "error": RUNTIME_LOST_MSG,
+                                      "runtime_ok": False, "self_healing": True})
+                exit_for_restart()
+                return
+            self._send_json(200, {"ok": False, "error": msg})  # 200 + ok:false (与 v1 兼容)
     def do_POST(self):
         p = self.path.rstrip("/")
         if p in ("/extract", "/convert"):
@@ -557,14 +656,29 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"ok": False, "error": "not_found"})
 
 def sweep_stale_tmp():
-    """清掉崩溃残留的 /tmp/ocrd_*（进程被 OOM kill -9 时 finally 里的 rmdir 不会执行）。"""
+    """清掉崩溃残留的 /tmp/ocrd_*（进程被 OOM kill -9 时 finally 里的 rmdir 不会执行），
+    以及本进程 TMPDIR 里上次被 kill -9 留下的 _MEI* 解包目录（正常退出 PyInstaller 自查自清，
+    被 kill -9 就留下；不清会一直堆在磁盘上）。
+
+    只清「超过 STALE_TMP_HOURS 没动过」的：本进程自己的解包目录 mtime 是启动时刻，
+    2 小时内不可能被这里误删 —— 误删了就是自己把自己搞死（正是本文件要修的那类事故）。
+    """
     now, n = time.time(), 0
-    for d in glob.glob(os.path.join(tempfile.gettempdir(), "ocrd_*")):
-        try:
-            if now - os.path.getmtime(d) > STALE_TMP_HOURS * 3600:
-                shutil.rmtree(d, ignore_errors=True); n += 1
-        except OSError:
-            pass
+    patterns = [os.path.join(tempfile.gettempdir(), "ocrd_*")]
+    if runtime_dir() and private_tmpdir():
+        # 只在「TMPDIR 是我们自己的专用目录」时才清 _MEI*。反过来（TMPDIR=/tmp 这种人人
+        # 共用的目录）绝不清 —— 别的 PyInstaller 应用也把它的运行时放在 /tmp/_MEI*，
+        # 我们一删，就是在别人身上复现本文件要修的事故。
+        patterns.append(os.path.join(os.path.dirname(runtime_dir()), "_MEI*"))
+    for pat in patterns:
+        for d in glob.glob(pat):
+            if runtime_dir() and os.path.abspath(d) == os.path.abspath(runtime_dir()):
+                continue  # 自己正在用的，绝不碰
+            try:
+                if now - os.path.getmtime(d) > STALE_TMP_HOURS * 3600:
+                    shutil.rmtree(d, ignore_errors=True); n += 1
+            except OSError:
+                pass
     return n
 
 def main():
@@ -575,6 +689,16 @@ def main():
     a = ap.parse_args()
     n = sweep_stale_tmp()
     print(f"启动清理残留临时目录: {n} 个", flush=True)
+    # 把「解包目录落在哪」打出来：一旦它落在 /tmp，就会在 systemd-tmpfiles 的下一次清理里
+    # 消失（见 RUNTIME_LOST_MSG 处的事故说明）。开机日志里有这一行，故障就不必靠猜。
+    rd = runtime_dir() or "(非冻结运行，无解包目录)"
+    print(f"runtime_dir={rd} TMPDIR={tempfile.gettempdir()}", flush=True)
+    if tmpdir_is_shared():
+        # 不报错只警告：能跑，但下一次 systemd-tmpfiles-clean 就会把我们的运行时删掉，
+        # 表现为「跑着跑着扫描件解析全废」。想改对就设 Environment=TMPDIR=<专用目录>
+        # （见 deploy/offline/skillforge-ocr.service.template）。
+        print("WARN: 解包目录落在共用临时目录（other-writable）里 —— "
+              "随时可能被 systemd-tmpfiles 清理掉，请给服务设 TMPDIR 指向专用目录", flush=True)
     global ENGINE
     ENGINE = OcrEngine(a.dpi, a.max_cache)
     try: ENGINE._ensure()

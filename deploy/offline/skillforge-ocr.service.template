@@ -5,6 +5,21 @@ After=network.target
 
 [Service]
 Type=simple
+# TMPDIR 必须指向**我们自己的专用目录**，不能是 /tmp。
+#
+# 为什么（2026-09-16 线上事故）：ocrd 是 PyInstaller onefile，启动时把权重/配置解包到
+# $TMPDIR/_MEIxxxx/。默认 TMPDIR=/tmp，而 /usr/lib/tmpfiles.d/tmp.conf 的规则是
+# `D /tmp 1777 root root -`（没有保留期）—— systemd-tmpfiles-clean.timer 每天清一次，
+# 运行中的 ocrd 解包目录就这样被删了。已加载进内存的模型照常推理，所以「小件正常」；
+# 等到引擎回收重建（满 RECYCLE_EVERY 页）要重读 config.yaml 时才炸：
+#   [Errno 2] No such file or directory: '/tmp/_MEIxxx/rapidocr_onnxruntime/config.yaml'
+# 且引擎一旦重建失败就永久坏掉，此后每个需要 OCR 的请求都秒失败，直到重启进程。
+# 用户可见后果：扫描件/混合 PDF 解析全废 → 训练素材为空 → 生成出与素材无关的技能。
+# 放到 __PREFIX__/run/：tmpfiles 不管这里，且和 bin/、data/ 同前缀，不会跨盘。
+# 最后一层兜底在 ocrd 代码里（运行时目录守卫：发现丢失就明确报错 + 非零退出让 systemd 重启）。
+Environment=TMPDIR=__PREFIX__/run/ocr-tmp
+ExecStartPre=/bin/mkdir -p __PREFIX__/run/ocr-tmp
+ExecStartPre=/bin/chmod 700 __PREFIX__/run/ocr-tmp
 ExecStart=__OCR_BIN__ --port __OCR_PORT__
 Restart=on-failure
 RestartSec=3
