@@ -56,6 +56,22 @@ case "$ARCH" in
 esac
 printf '\033[1m构建 ocrd · %s（基线 %s）\033[0m\n' "$PLATFORM" "$MANYLINUX"
 
+# ---------- 0. 守卫语义单测（不依赖二进制，几秒级，先跑省得白等容器构建）----------
+# 背景：verify_runtime_loss.sh 的 S4 在本轮真二进制上抓到「守卫固定 sleep 0.4s 就 os._exit，
+# 而调用方还在传 body → 对端拿到连接中断（curl rc=55）」。并发时序靠造故障难稳定复现，
+# 这里从出货文件抠真函数（打桩可选依赖，CI runner 无需 pymupdf/rapidocr）把语义钉死。
+GUARD_TEST="$REPO_ROOT/deploy/ocr/test_guard_wait.py"
+if [ -f "$GUARD_TEST" ]; then
+	[ -n "$(command -v python3 || true)" ] || die "缺 python3，跑不了守卫语义单测：$GUARD_TEST"
+	echo "== 守卫语义单测：正跑 =="
+	python3 "$GUARD_TEST" || die "守卫语义单测未通过：$GUARD_TEST"
+	echo "== 守卫语义单测：--break 自证（换回旧实现必须转红）=="
+	python3 "$GUARD_TEST" --break \
+		|| die "--break 自证未通过：换回旧实现后单测竟然还是绿的 → 这道尺子是假的"
+else
+	die "缺 $GUARD_TEST（守卫退出语义的确定性单测）"
+fi
+
 # ---------- 1. 干净镜像里跑真 OCR（构建的 verify 阶段就是这道门）----------
 c_info "在 almalinux:8（glibc 2.28 基线、无 GUI 库）里验证自包含性 + OCR 真能出字…"
 set +e

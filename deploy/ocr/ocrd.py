@@ -123,19 +123,57 @@ def tmpdir_is_shared() -> bool:
     return bool(runtime_dir()) and not private_tmpdir()
 
 
-def exit_for_restart(delay: float = 0.4):
+def exit_for_restart(delay: float = 0.4, timeout: float = 10.0):
     """回完响应后非零退出，交给 systemd 重启（Restart=on-failure）。
 
     为什么退出而不是内部重建：解包目录里的权重/配置已经没了，进程内无法凭空恢复，
-    重启一次 PyInstaller bootloader 会重新解包出一份完好的运行时。延迟是留给
-    HTTP 响应 flush 的时间窗 —— 不给的话调用方只会看到连接被重置。
+    重启一次 PyInstaller bootloader 会重新解包出一份完好的运行时。
+
+    ⚠️ 这里必须等「在飞的请求」走完，不能只 sleep 一个固定值：
+    实测（verify_runtime_loss.sh 的 S4）固定 0.4s 会在调用方**还在上传 body** 时把进程
+    干掉 → 客户端拿到连接被重置（curl rc=55），而不是我们回的那句人话。排空 body
+    只解决了「本次请求」，并发时的另一条上传请求仍会被掐。所以改成等计数归零。
     """
     def _bye():
         time.sleep(delay)
+        drained = inflight_wait(timeout)
+        if not drained:
+            print(f"WARN: 仍有 {inflight_count()} 条请求在飞，超时 {timeout}s 先退出"
+                  f"（这些调用方会看到连接中断）", flush=True)
         print(f"FATAL: {RUNTIME_LOST_MSG}（退出 75 交给 systemd 重启）", flush=True)
         os._exit(75)
 
     threading.Thread(target=_bye, daemon=False).start()
+
+
+# ---------- 在飞请求计数：退出前要等它们走完（见 exit_for_restart 的注释）----------
+_INFLIGHT = 0
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def inflight_delta(n: int):
+    global _INFLIGHT
+    with _INFLIGHT_LOCK:
+        _INFLIGHT += n
+
+
+def inflight_count() -> int:
+    with _INFLIGHT_LOCK:
+        return _INFLIGHT
+
+
+def inflight_wait(timeout: float) -> bool:
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if inflight_count() <= 0:
+            return True
+        time.sleep(0.05)
+    return inflight_count() <= 0
+
+
+# 排空 body 的上限：超限就不再无脑读（避免被超大上传拖住线程），改由 close 收场。
+DRAIN_CAP = 8 << 20
+DRAIN_TIMEOUT = 5.0
 
 # ---------- OOXML 命名空间 ----------
 NS = {
@@ -586,6 +624,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
     def do_GET(self):
+        inflight_delta(1)
+        try:
+            return self._route_get()
+        finally:
+            inflight_delta(-1)
+    def _route_get(self):
         if self.path.rstrip("/") == "/health":
             # version / min_page_chars 一起报出来：部署验收可以直接 curl 出「跑的是哪一版、
             # 逐页择优的阈值是多少」，不用先进机器翻二进制（见 VERSION 处的注释）。
@@ -600,19 +644,53 @@ class Handler(BaseHTTPRequestHandler):
                                   "formats": "pdf|docx|xlsx|pptx|txt|md|csv|html", "rapidocr": True})
         else:
             self._send_json(404, {"ok": False, "error": "not_found"})
+    def _drain_body(self):
+        """把本次请求的 body 读完再回响应。
+
+        为什么必须排空：调用方是「边上传边等响应」的（Go 侧 http.Post 传整个 PDF）。
+        我们没读完就回包、甚至直接退出，对端只会看到连接被重置（实测 curl rc=55），
+        拿不到我们辛苦写的那句人话。排空 325KB 是本机内存拷贝，不构成「白等上传」。
+        """
+        length = int(self.headers.get("Content-Length") or 0)
+        left = min(length, DRAIN_CAP)
+        t0 = time.time()
+        while left > 0 and time.time() - t0 < DRAIN_TIMEOUT:
+            chunk = self.rfile.read(min(65536, left))
+            if not chunk:
+                return False
+            left -= len(chunk)
+        if length > DRAIN_CAP:
+            self.close_connection = True   # 超大上传不做无底洞排空，改用 close 收场
+            return False
+        return True
+
+    def _reply_then_restart(self, obj):
+        """回包 → flush → 交给 exit_for_restart（它会等所有在飞请求走完才退出）。"""
+        self._send_json(200, obj)
+        try:
+            self.wfile.flush()
+        except OSError:
+            pass
+        # 这条连接之后必然被进程退出打断，显式声明 close：让对端以「响应完整结束」收场，
+        # 而不是读到一半撞上 RST。
+        self.close_connection = True
+        exit_for_restart()
+
     def _handle_upload(self, path):
         # 运行时目录已丢 → 这份文件不是「解析不了」，是服务本身坏了：说清 + 自愈（重启）。
-        # 放在读 body 之前，是为了不让调用方白等一次上传（大件上传 + 秒错的体感最差）。
+        # 仍然不回退到「读 body 前就回错」：那样调用方看到的是连接中断而不是这句话。
+        # 排空 body 只花一次内存拷贝，换来的是「一定能读到人话」。
         if not runtime_ok():
-            self._send_json(200, {"ok": False, "error": RUNTIME_LOST_MSG,
-                                  "runtime_ok": False, "self_healing": True})
-            exit_for_restart()
+            self._drain_body()
+            self._reply_then_restart({"ok": False, "error": RUNTIME_LOST_MSG,
+                                      "runtime_ok": False, "self_healing": True})
             return
         if self.headers.get("Expect", "").lower() == "100-continue":
             self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
             self.wfile.flush()
         length = int(self.headers.get("Content-Length") or 0)
         if length > BUF:
+            self._drain_body()   # 同上：不回退到让调用方看到连接中断
             return self._send_json(413, {"ok": False, "error": "too_large"})
         body = self.rfile.read(length) if length else b""
         if not body:
@@ -644,12 +722,19 @@ class Handler(BaseHTTPRequestHandler):
             msg = str(e)
             # 引擎重建时才发现运行时目录没了 → 同样「说清 + 自愈」，而不是回一句 Errno 2。
             if (not runtime_ok()) or msg == RUNTIME_LOST_MSG or RUNTIME_LOST_MSG in msg:
-                self._send_json(200, {"ok": False, "error": RUNTIME_LOST_MSG,
-                                      "runtime_ok": False, "self_healing": True})
-                exit_for_restart()
+                # body 此时已读完，不存在「对端还在上传」的问题；仍走同一条路径，
+                # 让「回包 → 等其它在飞请求 → 退出」只有一处实现。
+                self._reply_then_restart({"ok": False, "error": RUNTIME_LOST_MSG,
+                                          "runtime_ok": False, "self_healing": True})
                 return
             self._send_json(200, {"ok": False, "error": msg})  # 200 + ok:false (与 v1 兼容)
     def do_POST(self):
+        inflight_delta(1)
+        try:
+            return self._route_post()
+        finally:
+            inflight_delta(-1)
+    def _route_post(self):
         p = self.path.rstrip("/")
         if p in ("/extract", "/convert"):
             return self._handle_upload(p)
