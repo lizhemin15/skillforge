@@ -24,7 +24,21 @@ import types
 import unittest
 from unittest import mock
 
-import pymupdf
+# 依赖缺失时报「怎么修」，不是甩一个 traceback。
+# 这个文件的 pymupdf 是**无条件顶层 import**（造料要现造 PDF，不能打桩），所以它必须在
+# CI 与本地都真的装上。2026-09-16 就是这么红的：本机有、runner 没有，`ModuleNotFoundError`
+# 退出 1，看起来像「判据坏了」。这里把话说清楚 —— 仍然是**真红**（exit 1，不是 SKIP），
+# 但指向的是安装动作，不会再被误读成判据故障。
+try:
+    import pymupdf
+except ModuleNotFoundError:  # pragma: no cover - 环境相关
+    sys.stderr.write(
+        "缺第三方依赖 pymupdf：这是环境问题，不是判据问题。\n"
+        "  本机：python3 -m pip install --user -r deploy/ocr/test-requirements.txt\n"
+        "  CI  ：ci.yml 的「OCR 解析服务单测」那一步会 pip install -r 同一份清单；\n"
+        "        若它没装，说明有人把那行删了（web/tests/preflight_parity.test.mjs 会因此判红）。\n"
+    )
+    raise SystemExit(1)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 

@@ -267,3 +267,105 @@ test('离线包装后探测自证：正向与两路注入都必须在 CI / prefl
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// deploy/ocr 单测的**第三方依赖**：声明 / 安装 / 与真 import 双向对账。
+//
+// 为什么单独立一条（2026-09-16 的 CI 红，一整批）：两条 OCR 单测被接进 CI 时只写了
+// 「跑脚本」，没写「装依赖」。本机早装好 pymupdf（开发机上还有别的脚本用），
+// 所以 preflight 一路绿；runner 上没有这个包，那一步 `ModuleNotFoundError` 退出 1。
+// 后果比"红一次"更坏：main 变成红的，而红的原因跟被测的「可选中页直取 / 乱码页回落 OCR」
+// 判据毫无关系 —— 环境红冒充断言红，下一个人会去查判据，查半天发现是缺包。
+//
+// 这类分叉的形状值得单独记：**闸门本身有依赖**，而依赖的安装既不在 CI 也不在本地闸门里，
+// 靠的是「开发机恰好装过」。凡是靠运气的环节，早晚在别人的机器上炸。
+//
+// 这里钉三件事：
+//   ① 每个被 test_*.py import 的第三方模块，都必须在 test-requirements.txt 里声明；
+//      没声明的要么补声明，要么写进下面 OPTIONAL_OCR_TEST_IMPORTS 白名单（附理由）。
+//   ② 清单里**不许有僵尸条目**：声明了却没人 import 的包，会让 CI 白装、也会掩盖真需求。
+//   ③ ci.yml 里那一步必须真的 `pip install -r` 这份清单，且不许吞错。
+const OCR_REQS = 'deploy/ocr/test-requirements.txt';
+
+// 允许「可能缺席」的模块：它们只在测试内部用来给被测件打桩，
+// 不吃推理结果（断言不落在 ONNX 上），所以 CI 不装也照样能验判据。
+const OPTIONAL_OCR_TEST_IMPORTS = new Map([
+  ['rapidocr_onnxruntime', '测试给 ocrd 注入的空壳模块（全程打桩 _ocr_page，不需要真推理引擎）'],
+]);
+
+// Python 标准库（本文件只用来排除，不做完整性校验；漏了某个 stdlib 名字的代价是被要求
+// 显式声明一次，属于「失败朝安全侧」）。
+const PY_STDLIB = new Set([
+  'os', 'sys', 're', 'json', 'types', 'pathlib', 'unittest', 'subprocess', 'threading', 'time',
+  'importlib', 'hashlib', 'tempfile', 'shutil', 'io', 'math', 'datetime', 'collections', 'textwrap',
+  'urllib', 'http', 'base64', 'zipfile', 'struct', 'functools', 'itertools', 'argparse', 'random',
+  'csv', 'glob', 'socket', 'warnings', 'traceback', 'statistics', 'string', 'copy', 'uuid',
+  'dataclasses', 'typing', 'logging', 'sqlite3', 'signal', 'contextlib', 'decimal', 'queue',
+  'secrets', 'platform', 'errno', 'codecs', 'xml', '__future__',
+]);
+
+test('deploy/ocr 单测的第三方依赖：清单与真 import 双向对账，且 CI 真的装', () => {
+  assert.ok(
+    existsSync(new URL(OCR_REQS, REPO)),
+    `${OCR_REQS} 不存在 —— 「尺子的依赖声明在哪」这件事又没了真值来源，` +
+      `CI 那步的 pip install 会变成一个没人对账的魔法字符串。`,
+  );
+  const declared = read(OCR_REQS)
+    .split('\n')
+    .map((l) => l.replace(/#.*$/, '').trim())
+    .filter(Boolean)
+    .map((l) => l.split(/[<>=!~[]/)[0].trim())
+    .filter(Boolean);
+
+  // ① 真 import 的第三方模块必须被声明（否则 CI 上就是 ModuleNotFoundError 那种环境红）
+  const ocrTests = readdirSync(new URL('deploy/ocr/', REPO)).filter((f) => /^test_.*\.py$/.test(f));
+  assert.ok(ocrTests.length > 0, 'deploy/ocr 下一个 test_*.py 都没枚举到 —— 这条对账尺子会退化成空转。');
+
+  const importedAnywhere = new Set();
+  for (const f of ocrTests) {
+    const mods = new Set();
+    for (const m of read(`deploy/ocr/${f}`).matchAll(/^\s*(?:import|from)\s+([A-Za-z_]\w*)/gm)) {
+      const mod = m[1];
+      importedAnywhere.add(mod);
+      // 本地同目录模块（ocrd）与 stdlib 不算第三方依赖
+      if (PY_STDLIB.has(mod) || mod === 'ocrd') continue;
+      mods.add(mod);
+    }
+    for (const mod of mods) {
+      if (OPTIONAL_OCR_TEST_IMPORTS.has(mod)) continue;
+      assert.ok(
+        declared.includes(mod),
+        `deploy/ocr/${f} import 了 ${mod}，但 ${OCR_REQS} 里没声明 —— ` +
+          `本机装过所以 preflight 绿，CI runner 上就是 ModuleNotFoundError 退出 1，` +
+          `而报错位置跟被测判据毫无关系（2026-09-16 的 main 红就是这么来的）。` +
+          `要么把 ${mod} 写进清单，要么在 OPTIONAL_OCR_TEST_IMPORTS 里说明它为什么可以缺席。`,
+      );
+    }
+  }
+
+  // ② 清单不许有僵尸条目
+  for (const d of declared) {
+    assert.ok(
+      importedAnywhere.has(d),
+      `${OCR_REQS} 声明了 ${d}，但 deploy/ocr 的 test_*.py 没有一个 import 它 —— ` +
+        `僵尸条目会让 CI 白装一个包，也会让人以为「依赖已经齐了」。`,
+    );
+  }
+
+  // ③ CI 必须真装这份清单，且不许吞错
+  const re = new RegExp(
+    `pip install[^\\n]*-r\\s+${OCR_REQS.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^\\n]*)`,
+  );
+  const m = CI.match(re);
+  assert.ok(
+    m,
+    `ci.yml 里没有 \`pip install -r ${OCR_REQS}\` —— 依赖靠「开发机恰好装过」，` +
+      `CI 会以环境红的形式炸，而且看起来像判据坏了。`,
+  );
+  assert.ok(
+    !/\|\|\s*true|continue-on-error/.test(m[1] || ''),
+    `ci.yml 里那句 pip install 带了吞错写法（${(m[1] || '').trim()}）—— ` +
+      `装不上就必须红：装不上却继续跑，脚本会在「依赖缺失」分支里退出，` +
+      `那时红的是环境、归因却会落到判据上（比直接炸更难查）。`,
+  );
+});

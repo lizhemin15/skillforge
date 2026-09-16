@@ -258,8 +258,15 @@ jobs:
       # 同目录的 verify_*.sh 要靠 PyInstaller 冻结二进制，本机没有时是 SKIP/FAIL
       # exit 2（见 verify_runtime_loss.sh:56），所以它们不在这条路上，
       # 由 deploy/ocr/Dockerfile:97 与 scripts/deploy_ocrd.sh 在发版时挡住。
+      # 依赖必须由**声明的清单**装进来，不能靠「本机恰好有」。
+      # 2026-09-16 的教训：这一步第一次接上时直接跑脚本，本机早装好 pymupdf 所以全绿，
+      # runner 上没有 → `ModuleNotFoundError` 退出 1，main 直接红，而红的原因跟
+      # 「可选中页该不该走 OCR」这条判据一点关系都没有（环境红冒充断言红，会把人带偏）。
+      # 用 --user：runner 的 ubuntu-24.04 默认 Python 是 externally-managed，
+      # 不带 --user 会被 PEP 668 拒掉。清单本身由 preflight_parity 与真 import 对账。
       - name: OCR 解析服务单测（质量判据 / 退出等待）
         run: |
+          python3 -m pip install --quiet --user -r deploy/ocr/test-requirements.txt
           python3 deploy/ocr/test_ocrd_quality.py
           python3 deploy/ocr/test_guard_wait.py
 

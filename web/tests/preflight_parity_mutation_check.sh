@@ -16,6 +16,13 @@
 #        没人接线 → 必须红并点名这个新文件。这条是「按目录收」这个设计的
 #        核心主张的行为证据：往那儿放尺子的人不需要记得改守卫文件，
 #        但守卫必须能看见他。纯读文本证明不了这一点。
+#     D 类（闸门自身的依赖）—— 拿掉清单里的一条声明 / 塞一条僵尸条目 /
+#        拿掉 ci.yml 里那句 pip install / 给它挂 `|| true` → 四种都必须红。
+#        2026-09-17 补：这类的共同性质是「只有换台机器才现形」——
+#        test_ocrd_quality.py 顶层 import pymupdf，本机早装过所以本地闸门一路绿，
+#        runner 上没有 → ModuleNotFoundError 退出 1，于是 main 红了，
+#        而红的理由跟被测判据毫无关系（环境红冒充断言红，把人带去查判据）。
+#        本地跑一万次都看不见这种故障，只能靠注入造出来，所以它必须在这一类里有一席之地。
 #
 # 四重判据（缺一不可，与仓库里其它自证脚本同规矩）：
 #   1. 注入点必须存在（锚点找不到 = 注入无效 = 等于没测，直接不合格）
@@ -33,15 +40,18 @@ cd "$ROOT"
 GUARD='web/tests/preflight_parity.test.mjs'
 CI_FILE='.github/workflows/ci.yml'
 PF_FILE='scripts/preflight.sh'
+REQ_FILE='deploy/ocr/test-requirements.txt'
 NEWLEDGER='deploy/offline/tests/selftest_parse_live_check.py'
 
 TMP="$(mktemp -d)"
 CI_BAK="$TMP/ci.yml.bak"
 PF_BAK="$TMP/preflight.sh.bak"
 GUARD_BAK="$TMP/preflight_parity.test.mjs.bak"
+REQ_BAK="$TMP/test-requirements.txt.bak"
 cp "$CI_FILE" "$CI_BAK"
 cp "$PF_FILE" "$PF_BAK"
 cp "$GUARD" "$GUARD_BAK"
+cp "$REQ_FILE" "$REQ_BAK"
 STRAY="$ROOT/deploy/offline/tests/zzz_stray_probe_check.py"
 
 cleanup() {
@@ -50,6 +60,7 @@ cleanup() {
   cp "$CI_BAK" "$CI_FILE" 2>/dev/null || true
   cp "$PF_BAK" "$PF_FILE" 2>/dev/null || true
   cp "$GUARD_BAK" "$GUARD" 2>/dev/null || true
+  cp "$REQ_BAK" "$REQ_FILE" 2>/dev/null || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -191,6 +202,56 @@ fi
 rm -f "$STRAY_OCR"
 
 echo
+echo "==== D 类：闸门自身的依赖（声明 / 装 / 对账，三处都能各自变红）===="
+
+# D 类打的是 2026-09-16 那次 main 红的形状：两条 OCR 单测接进 CI 时只写了「跑脚本」，
+# 没写「装依赖」。本机早装好 pymupdf，所以 preflight 绿；runner 上 ModuleNotFound → 退出 1，
+# 而红的理由跟被测判据毫无关系（环境红冒充断言红，会把下一个人带去查判据）。
+# 这类故障的特征是「只有换台机器才现形」，本地跑一万次都看不见 —— 所以必须靠注入造出来。
+
+# D1 清单里少声明一个真 import 的包 → 必须红在「没声明」那条，且点名模块名
+if inject "$REQ_FILE" "pymupdf>=1.24,<2" "# mutation：临时拿掉声明"; then
+  guard_run
+  expect_red "D1 清单漏声明真 import 的包" "但 deploy/ocr/test-requirements.txt 里没声明"
+  cp "$REQ_BAK" "$REQ_FILE"
+else
+  say_inject_fail "D1" "test-requirements.txt 里没有 pymupdf>=1.24,<2 这一行"
+fi
+
+# D2 清单里多一条没人 import 的僵尸条目 → 必须红（否则清单会烂成「装了也不知道为啥」）
+if inject "$REQ_FILE" "pymupdf>=1.24,<2" "pymupdf>=1.24,<2
+numpy>=1.0"; then
+  guard_run
+  expect_red "D2 清单出现僵尸条目（声明了没人 import）" "声明了 numpy"
+  cp "$REQ_BAK" "$REQ_FILE"
+else
+  say_inject_fail "D2" "test-requirements.txt 里没有 pymupdf>=1.24,<2 这一行"
+fi
+
+# D3 ci.yml 没装清单 → 必须红。注意这条红的是「CI 少一步」，
+#    和 D1 的「清单少一条」是两件事：漏装清单时清单自己是对的，全靠这条抓。
+if inject "$CI_FILE" "          python3 -m pip install --quiet --user -r $REQ_FILE
+" ""; then
+  guard_run
+  expect_red "D3 ci.yml 没装依赖清单" "没有 \`pip install -r $REQ_FILE\`"
+  cp "$CI_BAK" "$CI_FILE"
+else
+  say_inject_fail "D3" "ci.yml 里没有单独一行 pip install -r $REQ_FILE"
+fi
+
+# D4 给装依赖那行挂 || true → 必须红在「吞错写法」。
+#    为什么这条必须有：装不上却继续跑，脚本会走到「依赖缺失」那个分支退出，
+#    那时**红的是环境、归因却会落到判据上** —— 比直接炸更难查（正是 2026-09-16 那一批的坑）。
+if inject "$CI_FILE" "          python3 -m pip install --quiet --user -r $REQ_FILE" \
+                    "          python3 -m pip install --quiet --user -r $REQ_FILE || true"; then
+  guard_run
+  expect_red "D4 装依赖那行挂 || true" "吞错写法"
+  cp "$CI_BAK" "$CI_FILE"
+else
+  say_inject_fail "D4" "ci.yml 里没有那行 pip install -r $REQ_FILE"
+fi
+
+echo
 echo "==== 收尾：全部还原后必须回绿 ===="
 guard_run
 if [ "$GUARD_RC" -eq 0 ]; then ok "收尾 preflight_parity 回绿（注入无残留）"; else
@@ -219,4 +280,4 @@ if [ "$fails" -gt 0 ]; then
   echo "FAILED: 有 $fails 条自证不合格"
   exit 1
 fi
-echo "自证通过：接线注入 2 条 + 按组枚举守卫 1 条 + 注入模式 2 条 + 枚举活性 2 条 + 收尾 2 条，红的都是预期那条，还原后全绿。"
+echo "自证通过：基线 1 条 + 接线注入 3 条 + 注入模式 2 条 + 枚举活性 2 条 + 闸门依赖 4 条 + 收尾 2 条，红的都是预期那条，还原后全绿。"

@@ -1,0 +1,18 @@
+# deploy/ocr 下「可跑单测」的第三方依赖（由 CI 与本地 preflight 真跑）。
+#
+# 为什么要有这个文件：2026-09-16 的 CI 红过一整批 —— test_ocrd_quality.py 顶层
+# `import pymupdf`，本机（开发机早装好了）能跑，GitHub runner 上没有这个包，
+# 于是那一步以 `ModuleNotFoundError` 退出 1。症状是「本机全绿、CI 红」，
+# 而红的原因跟被测代码毫无关系 —— 属于「环境红冒充断言红」，会把人带去查错地方。
+#
+# 分工（别把这两件事混起来）：
+#   · 这里 = 声明「这些尺子需要什么」，是唯一真值来源；
+#   · ci.yml 的 OCR 单测那一步 = `pip install -r` 这个文件（用 --user，
+#     runner 的 ubuntu-24.04 默认 Python 是 externally-managed，不写 --user 会被 PEP 668 拦）；
+#   · web/tests/preflight_parity.test.mjs 的「deploy/ocr 单测第三方依赖」那条尺子 =
+#     把「真 import 的模块」与「本文件」双向对账（多写、少写都红），并钉住 ci.yml 真的装了。
+#
+# 只在**无条件顶层 import**（行首无缩进）里出现的模块才算数：测试里为了让 ocrd 在
+# 没装推理引擎时也能被导入，是用 try 里注入空壳模块（缩进 import）绕开的，
+# 那种可选依赖不该写进这里，否则等于给 CI 白装一堆包。
+pymupdf>=1.24,<2
