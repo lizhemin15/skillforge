@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# 双向自证：对「漏接流式」守卫做变异注入 —— 注入必须变红（且是预期那条），还原必须回绿。
+#
+# 三处变异覆盖三种失效形态：
+#   M1 结构面·形态二：把 g.streamingChat() 换回裸 g.llm（线上 353.3 秒零帧的原始写法）
+#   M2 结构面·形态一：把裸调 g.llm.Chat( 塞回训练链路
+#   M3 行为面：streamingChat 偷偷返回裸客户端（结构面看着合规，实际材料丢了）
+#   M4 守卫自身退化：匹配串改回 g.llm.Chat( → 下限断言必须 Fatalf（防空跑绿）
+set -uo pipefail
+cd /root/skillforge/internal/skillgen || exit 2
+
+restore() {
+  git -C /root/skillforge checkout -- internal/skillgen/manual.go internal/skillgen/generator.go internal/skillgen/stage_streaming_test.go 2>/dev/null
+}
+trap restore EXIT
+
+run() { go test . -run "$1" -count=1 2>&1; }
+
+RC=0
+expect_red_of() { # $1=用例 $2=预期的 FAIL 特征串 $3=变异说明
+  out=$(run "$1")
+  if [[ "$out" == *"$2"* ]]; then
+    echo "OK   注入→红：$3（命中：$2）"
+  else
+    echo "BAD  注入未变红或红错了地方：$3（期望含「$2」）"
+    printf '%s\n' "$out" | tail -20
+    RC=1
+  fi
+}
+
+# ---- M1：自由函数调用点退回裸客户端（原发地）----
+restore
+sed -i 's/ExtractStructure(ctx, g\.streamingChat(), src)/ExtractStructure(ctx, g.llm, src)/' manual.go
+grep -q 'ExtractStructure(ctx, g.llm, src)' manual.go || { echo "BAD M1 注入点没打上"; RC=1; }
+expect_red_of TestNoSilentModelCallOutsideChatWithMaterial 'manual.go:' "M1 裸客户端递给自由函数"
+
+# ---- M2：训练链路里直接阻塞调用（往真实阶段函数里塞一行）----
+restore
+python3 - <<'PY'
+import re
+p = "manual.go"
+s = open(p, encoding="utf-8").read()
+# 在 buildManual 函数体开头插入一次裸阻塞调用（形态一）
+i = s.index("func (g *Generator) buildManual(")
+j = s.index("\n", i) + 1
+s = s[:j] + '\t_, _ = g.llm.Chat(ctx, "sys", "user")\n' + s[j:]
+open(p, "w", encoding="utf-8").write(s)
+PY
+grep -q 'g.llm.Chat(ctx, "sys", "user")' manual.go || { echo "BAD M2 注入点没打上"; RC=1; }
+expect_red_of TestNoSilentModelCallOutsideChatWithMaterial 'manual.go:' "M2 链路里直接 g.llm.Chat("
+
+# ---- M2b：分类器被削弱（两种漏接形态只认一种）----
+restore
+sed -i 's|func(l string) bool { return strings.Contains(l, "g.llm == nil") }, // 未配置模型的守卫|func(l string) bool { return false }, // 未配置模型的守卫|' stage_streaming_test.go
+out=$(run TestGllmUseClassifierPinsBothLeakShapes)
+if [[ "$out" == *"分类器判错"* ]]; then
+  echo "OK   注入→红：M2b 分类器削弱被钉住（分类器判错）"
+else
+  echo "BAD  M2b 分类器削弱后仍全绿 —— 守卫的守卫空跑"
+  printf '%s\n' "$out" | tail -20
+  RC=1
+fi
+
+# ---- M3：包装器偷换回裸客户端（结构面合规、行为面漏材料的绕道）----
+restore
+sed -i 's|func (g \*Generator) streamingChat() chatClient { return chatFunc(g.chatWithMaterial) }|func (g *Generator) streamingChat() chatClient { return g.llm }|' generator.go
+grep -q 'return g.llm }' generator.go || { echo "BAD M3 注入点没打上"; RC=1; }
+out=$(run TestBuildManualStreamsMaterial)
+if [[ "$out" == *"必须走流式"* ]]; then
+  echo "OK   注入→红：M3 streamingChat 偷换裸客户端（行为面抓住：必须走流式）"
+else
+  echo "BAD  M3 未变红：行为面没抓住偷换"
+  printf '%s\n' "$out" | tail -20
+  RC=1
+fi
+
+# ---- M4：守卫自身退化（把启发式改回只看 g.llm.Chat(）----
+restore
+sed -i 's/if !strings.Contains(line, "g.llm") {/if !strings.Contains(line, "g.llm.Chat(") {/' stage_streaming_test.go
+out=$(run TestNoSilentModelCallOutsideChatWithMaterial)
+if [[ "$out" == *"守卫自身失效"* ]]; then
+  echo "OK   注入→红：M4 启发式退化被下限断言抓住（防空跑绿）"
+else
+  echo "BAD  M4 守卫退化后仍然全绿 —— 这把尺子会空跑"
+  printf '%s\n' "$out" | tail -20
+  RC=1
+fi
+
+# ---- 还原 → 必须回绿 ----
+restore
+if go test . -run 'TestNoSilentModelCallOutsideChatWithMaterial|TestBuildManualStreamsMaterial|TestGllmUseClassifierPinsBothLeakShapes' -count=1 >/tmp/guard_restored.log 2>&1; then
+  echo "OK   还原→绿"
+else
+  echo "BAD  还原后没回绿"
+  tail -20 /tmp/guard_restored.log
+  RC=1
+fi
+
+echo "----"
+if [[ $RC -eq 0 ]]; then echo "双向自证通过：5 处注入全红、还原全绿"; else echo "双向自证失败（RC=1）"; fi
+exit $RC

@@ -138,8 +138,12 @@ def main():
                 browser.close()
                 return 1
 
-        if not page.locator('#train-form').count():
-            skip('页面上没有 #train-form（未登录 / 不是训练页）—— SKIP 不等于 PASS；'
+        # 判「前提在不在」必须看**可见性**，不能看 count()：#train-form 一直在 DOM 里
+        # （住在新技能弹窗里），未登录时只是隐藏。拿 count() 当门槛会漏过这一层，
+        # 下一行 fill 立刻抛 "element is not visible" —— 尺子前提没满足却崩成 Traceback
+        # （RC=1），把「我没给凭据」演成「被测系统坏了」。SKIP 要 SKIP 干净。
+        if not page.locator('#train-form').is_visible():
+            skip('训练表单不可见（未登录 / 不是训练页）—— SKIP 不等于 PASS；'
                  '要真跑请给 ADMIN_USER/ADMIN_PASS')
             browser.close()
             return 0

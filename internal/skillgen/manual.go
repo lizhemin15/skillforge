@@ -825,7 +825,7 @@ func (g *Generator) buildManual(ctx context.Context, in *Input) (*manualPack, er
 	// 探不到（手册没有「第X章」这种结构）时两条路各自放弃，不影响主流程。
 	spans := pickChapterSpans(src)
 
-	st, stErr := ExtractStructure(ctx, g.llm, src)
+	st, stErr := ExtractStructure(ctx, g.streamingChat(), src)
 	var packErr error
 	if stErr == nil && st != nil && len(st.Categories) >= manualMinCategories {
 		// 路径一：全文一次抽取。能用就用——一次调用最省时间，成功率也不低
@@ -843,7 +843,7 @@ func (g *Generator) buildManual(ctx context.Context, in *Input) (*manualPack, er
 	// 路径二：按章小 prompt 抽取（治本，见 manual_repair.go 顶部注释）。
 	// 只有路径一不可靠时才走，所以「十几次调用」这个代价只在失败路径上付。
 	if len(spans) >= manualMinCategories {
-		st2, warns2, err2 := extractStructureByChapters(ctx, g.llm, spans)
+		st2, warns2, err2 := extractStructureByChapters(ctx, g.streamingChat(), spans)
 		if err2 == nil && st2 != nil && len(st2.Categories) >= manualMinCategories {
 			notes := append([]string{chapterStructureNote}, warns2...)
 			if mp, err := g.packFromStructure(src, st2, spans, notes); err == nil {

@@ -3,6 +3,7 @@ package skillgen
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -33,6 +34,29 @@ type chatClient interface {
 type streamChatClient interface {
 	StreamChat(ctx context.Context, sys, user string, o llm.StreamOpts) (string, error)
 }
+
+// chatFunc 把「一个对话函数」适配成 chatClient，让自由函数（ExtractStructure 等）
+// 也能接到带材料转发的调用上，且不必改它们的形参类型（它们要的就是「一次对话」）。
+//
+// 为什么需要这层适配：自由函数的形参原本是 chatClient，调用点只能把 `g.llm`
+// 整个递进去。裸客户端没有转发能力——它内部直达 `Chat`，绕过了 chatWithMaterial。
+// 线上实测这一绕就是 **353.3 秒零帧**（Step 5 手册结构抽取），正是用户说的
+// 「一直卡着计时」。把「取用模型能力」收成一条路（Generator.streamingChat），
+// 自由函数就再也不可能拿到绕过转发的裸客户端。
+type chatFunc func(ctx context.Context, sys, user string, jsonMode ...bool) (string, error)
+
+func (f chatFunc) Chat(ctx context.Context, sys, user string, jsonMode ...bool) (string, error) {
+	if f == nil {
+		return "", errors.New("chatFunc: 对话函数为空")
+	}
+	return f(ctx, sys, user, jsonMode...)
+}
+
+// streamingChat 是自由函数唯一该拿到的对话入口：内部就是 chatWithMaterial，
+// 挂了接收器就真流式、没挂就原样阻塞调用（语义与非训练链路一字不差）。
+//
+// 别把 g.llm 直接传出去——stage_streaming_test.go 的源码守卫会把那种写法判红。
+func (g *Generator) streamingChat() chatClient { return chatFunc(g.chatWithMaterial) }
 
 // chatWithMaterial 是 Chat 的「带中间材料」版本：ctx 上挂了接收器就走真流式，
 // 边生成边把思考链与正文片段吐出去；没挂就还是原来的阻塞调用。
