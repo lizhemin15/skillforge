@@ -149,9 +149,9 @@ func gllmUseIsHarmless(line string) bool {
 // 被判「有害」。这是守卫的守卫 —— 分类器一松，源码守卫就退化成空跑。
 func TestGllmUseClassifierPinsBothLeakShapes(t *testing.T) {
 	cases := []struct {
-		line      string
-		harmless  bool
-		why       string
+		line     string
+		harmless bool
+		why      string
 	}{
 		{`return g.llm.Chat(ctx, sys, user, jsonMode...)`, false, "形态一：直接阻塞调用"},
 		{`st, stErr := ExtractStructure(ctx, g.llm, src)`, false, "形态二：裸客户端递给自由函数"},
@@ -269,4 +269,3 @@ func TestBuildManualStreamsMaterial(t *testing.T) {
 		t.Errorf("结构抽取的推理链没转发到接收器，实收=%q", jt)
 	}
 }
-

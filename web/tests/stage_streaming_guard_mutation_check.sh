@@ -14,6 +14,16 @@ restore() {
 }
 trap restore EXIT
 
+# 前置条件：工作区必须干净。
+# 为什么必须挡：restore 用 git checkout 还原，它会把**未提交的改动一起抹掉**——
+# 实测踩过一次：改好 gofmt 还没提交就跑本脚本，还原把格式修复覆盖回旧版，
+# 接着被 commit 进去，CI 的 gofmt 门禁红。不干净就直接不跑，别让尺子吃掉人的劳动。
+if [[ -n "$(git -C /root/skillforge status --porcelain internal/skillgen)" ]]; then
+  echo "拒绝运行：internal/skillgen 有未提交改动，restore 会把它抹掉。先提交或 stash。"
+  git -C /root/skillforge status --short internal/skillgen
+  exit 2
+fi
+
 run() { go test . -run "$1" -count=1 2>&1; }
 
 RC=0
@@ -96,6 +106,17 @@ else
   RC=1
 fi
 
+# ---- 收尾：本脚本用 sed 改过 Go 源码，格式化必须仍然是干净的 ----
+# 为什么放在这个脚本里：本地只跑 go test 时看不出 gofmt 漂移，CI 的 vet/gofmt 门禁
+# 会红（实测 b18dfc4 就这么被拦下来一次）。尺子长在会动源码的地方才拦得住。
+if [[ -z "$(gofmt -l .)" ]]; then
+  echo "OK   gofmt 干净（本地不再漏过 CI 的格式化门禁）"
+else
+  echo "BAD  以下文件未格式化，CI 会红："
+  gofmt -l .
+  RC=1
+fi
+
 echo "----"
-if [[ $RC -eq 0 ]]; then echo "双向自证通过：5 处注入全红、还原全绿"; else echo "双向自证失败（RC=1）"; fi
+if [[ $RC -eq 0 ]]; then echo "双向自证通过：5 处注入全红、还原全绿、gofmt 干净"; else echo "双向自证失败（RC=1）"; fi
 exit $RC
