@@ -78,9 +78,16 @@ func (g *Generator) chatWithMaterial(ctx context.Context, sys, user string, json
 	}
 	jm := len(jsonMode) > 0 && jsonMode[0]
 	out, err := sc.StreamChat(ctx, sys, user, llm.StreamOpts{
-		JSONMode:    jm,
-		OnReasoning: func(s string) { sink(MaterialThink, s) },
-		OnContent:   func(s string) { sink(MaterialText, s) },
+		JSONMode: jm,
+		// 思考链开关跟着 ctx 走：调用点要么用 withoutThinking(ctx) 包一层（结构化/
+		// 机械阶段），要么登记在 keepThinkingSites 里说明为什么这处必须留（产出是
+		// 给人读的成品文字）。**这一行是整条链路的最后一跳**——上游标注做得再整齐，
+		// 少了它，provider 那边照样把思考链打开，速度一点没变，而所有源码侧守卫
+		// 仍然全绿。盯这一跳的是 thinking_test.go 的
+		// TestChatWithMaterialCarriesThinkingFlagToProvider（行为尺子）。
+		DisableThinking: thinkingOff(ctx),
+		OnReasoning:     func(s string) { sink(MaterialThink, s) },
+		OnContent:       func(s string) { sink(MaterialText, s) },
 	})
 	if err != nil {
 		// 流式失败不能把这一阶段整个干掉：退回阻塞调用重来一次，并把原因当材料吐出来。
@@ -522,7 +529,7 @@ func (g *Generator) extractAttributes(ctx context.Context, in *Input) (string, e
 	//   `invalid character 'ä' after object key:value pair`
 	// —— 'ä' 是 Go 把中文首字节 0xE4 按 latin1 打印出来的，真因是 JSON 语法在中文
 	// 字符处崩了，而报错本身看不出模型写坏了哪里。
-	out, err := g.chatWithMaterial(ctx, sys, user, true)
+	out, err := g.chatWithMaterial(withoutThinking(ctx), sys, user, true)
 	if err != nil {
 		return "", err
 	}
@@ -563,7 +570,7 @@ func (g *Generator) detectType(ctx context.Context, in *Input) (*typeOut, error)
 - type=query：参考文件是"办事流程、业务步骤、审批环节、操作指导、政策问答"，目标是用户问什么时候，助手直接给出流程/步骤/答案，不写长篇大论。
 - type=template：同 query，但参考文件里还包含"需要用户填写/签字的表单模板或 Word 文档"，用户命中时除了给流程，还要把该文件作为附件下发。
 注意：若参考文件里明确有 .docx/.xlsx/.xls/.doc/.pdf 这类文件，多半是 template 型要下发的附件。`
-	out, err := g.chatWithMaterial(ctx, sys, corpus, true)
+	out, err := g.chatWithMaterial(withoutThinking(ctx), sys, corpus, true)
 	if err != nil {
 		return nil, err
 	}
@@ -724,7 +731,7 @@ func (g *Generator) synthesizeMetadata(ctx context.Context, in *Input, attrs str
 }
 input_params 通常3-6项。只输出JSON。`
 	user := "需求:\n" + in.Requirement + "\n\n分析:\n" + attrs
-	out, err := g.chatWithMaterial(ctx, sys, user, true)
+	out, err := g.chatWithMaterial(withoutThinking(ctx), sys, user, true)
 	if err != nil {
 		return nil, err
 	}
@@ -864,7 +871,7 @@ func (g *Generator) buildTemplate(ctx context.Context, in *Input, attrs string, 
 用Markdown标题组织,保持通用,不要写死具体办事内容。直接输出正文,不要代码块。`
 	}
 	user := "需求:\n" + in.Requirement + "\n\n特征:\n" + attrs
-	out, err := g.chatWithMaterial(ctx, sys, user)
+	out, err := g.chatWithMaterial(withoutThinking(ctx), sys, user)
 	if err != nil {
 		return "", err
 	}

@@ -22,20 +22,26 @@ if [[ -x /usr/local/go/bin/go && "$(command -v go)" != "/usr/local/go/bin/go" ]]
 fi
 cd "$ROOT/internal/skillgen" || exit 2
 
-restore() {
-  git -C "$ROOT" checkout -- internal/skillgen/manual.go internal/skillgen/generator.go internal/skillgen/stage_streaming_test.go 2>/dev/null
-}
-trap restore EXIT
-
 # 前置条件：工作区必须干净。
 # 为什么必须挡：restore 用 git checkout 还原，它会把**未提交的改动一起抹掉**——
 # 实测踩过一次：改好 gofmt 还没提交就跑本脚本，还原把格式修复覆盖回旧版，
 # 接着被 commit 进去，CI 的 gofmt 门禁红。不干净就直接不跑，别让尺子吃掉人的劳动。
+#
+# ⚠️ 顺序陷阱（2026-09-17 又踩一次，比上面那次更狠）：trap 必须挂在**这道检查之后**。
+# 原来 trap 挂在前面，于是「拒绝运行」这条路径也会触发 EXIT trap → restore 照样
+# git checkout → 它刚刚声明要保护的那份未提交改动，被它自己吃掉（实测连 wipe 掉
+# generator.go/manual.go 里 7 处 withoutThinking，一次跑飞白干一轮）。
+# 现在没过这道门时 trap 还没挂，exit 2 直接走人，工作区原样。
 if [[ -n "$(git -C "$ROOT" status --porcelain internal/skillgen)" ]]; then
   echo "拒绝运行：internal/skillgen 有未提交改动，restore 会把它抹掉。先提交或 stash。"
   git -C "$ROOT" status --short internal/skillgen
   exit 2
 fi
+
+restore() {
+  git -C "$ROOT" checkout -- internal/skillgen/manual.go internal/skillgen/generator.go internal/skillgen/stage_streaming_test.go 2>/dev/null
+}
+trap restore EXIT
 
 run() { go test . -run "$1" -count=1 2>&1; }
 
