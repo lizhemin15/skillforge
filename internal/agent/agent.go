@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -358,6 +359,7 @@ func (e *Engine) EvalTurn(ctx context.Context, id, user string, history []Messag
 - 用户只要**空白模板/空表**、要求下发模板文件本身（"发我个模板 / 空白表 / 下载模板 / 给我模板文件"）→ intent="docgen"，action="template_only"。
 - 用户要**生成一份新的办公文档**（并给出内容，不是填既有模板）→ intent="docgen"，action="gen"。
 - 用户要写文章/稿子/介绍/邮件/文案/报道等自由文本 → intent="write"，action="write"。
+- **用户明说只要正文/不要文件**（"直接输出正文""直接给我文字""不要生成文件""不用做 Word""只要文字就行"）→ intent="write"，action="write"。即使题材像公文（通知/通报/报告/函），只要用户明说只要正文，就不许判成 docgen：**明说的交付形态压过题材判断**。
 - 用户要办理事务/查询流程规则，或闲聊问答 → intent="query"/"chat"，action="answer"。
 
 技能匹配（在意图判断之后进行，作为工具候选清单）：
@@ -475,6 +477,59 @@ func HasDocJSONContract(prompt string) bool {
 	hasBody := strings.Contains(p, `"parags"`) || strings.Contains(p, `"rows"`) ||
 		strings.Contains(p, `"cols"`)
 	return hasSpec && hasBody
+}
+
+// ExplicitTextOnly 判断用户这一轮**明说**只要正文、不要文件。
+//
+// 为什么需要这么一把确定性闸门（2026-09-17 线上实测，真浏览器，非推断）：
+// 用户输入「写一份关于开展数据治理专项工作的通知。背景与核心素材：…。正文不少于
+// 600 字，直接输出正文」——分类器按题材把 intent 判成 docgen（标题像公文），
+// 于是 chat.go 的出文件纠偏闸门当场把这一轮抢去生成 .docx：屏幕上只有一个文件卡片，
+// 正文是「已为您生成《…docx》，点击下方文件即可下载」94 字。
+// **用户明说了「直接输出正文」，交付物却是个文件** —— 这是真故障，不是审美问题；
+// 用户那句「它总是不能很好地理解」有一类就是这么来的。
+//
+// 为什么不直接信分类器：这类误判来自题材词（通知/报告/函），靠调提示词只能降低概率，
+// 压不到零；而「明说的交付形态」是用户亲手写下的判据，不该由模型投票决定。
+// 分类器提示词那侧也补了同一条规则（双保险），这里是**确定性兜底**。
+//
+// 判据刻意收窄：只认显式祈使式要求（直接输出正文 / 不要生成文件 / 只要文字…），
+// 绝不认「通知」「报告」这类题材词 —— 题材词正是误判根源，拿它当判据等于把闸门
+// 整个关掉，要 Word 的用户又拿不到文件（反向故障）。
+// 【续】否定式「不要文件」用正则而不是固定短语表：线上真语料就有「不用做 Word」，
+// 只列「不用word / 不要word / 不要生成文件」会漏掉中间夹动词的写法（本文件的表测
+// 第一次就是被它咬红的 —— 漏判方向是**真故障方向**：闸门照样把这一轮抢去出文件）。
+// 允许否定词与交付形态之间夹 0~3 个字（做/生成/出/给/再…），但停在句读处，
+// 免得跨小句把「不要改标题，生成一份 Word」判成只看正文。
+var textOnlyNegated = regexp.MustCompile(
+	`(?:不要|不用|别|无需|不需要|别给我)[^。；;，,、！!？?]{0,3}` +
+		`(?:文件|文档|附件|下载|word|docx|pdf|excel|ppt|xlsx)`,
+)
+
+// textOnlyPhrases 是「只要正文」这一族（肯定式）。
+// 刻意不认题材词（通知/报告/函）—— 题材词正是分类器误判的根源，
+// 把它当判据等于把闸门整个关掉，要 Word 的用户又拿不到文件（反向故障）。
+var textOnlyPhrases = []string{
+	"直接输出正文", "直接给我正文", "直接输出文字", "直接给我文字",
+	"只输出正文", "只要正文", "仅要正文", "只要文字", "仅要文字",
+	"输出正文即可", "正文即可", "文字就行", "文字即可",
+	"nofile",
+}
+
+func ExplicitTextOnly(msg string) bool {
+	// 去空白 + 小写：容忍「直接 输出 正文」「不用做 Word」这种断词，
+	// 英文按整词缩写匹配（"no file" → "nofile"）。
+	m := strings.ToLower(msg)
+	m = strings.NewReplacer(" ", "", "	", "", "\n", "", "　", "").Replace(m)
+	if textOnlyNegated.MatchString(m) {
+		return true
+	}
+	for _, k := range textOnlyPhrases {
+		if strings.Contains(m, k) {
+			return true
+		}
+	}
+	return false
 }
 
 // PickDocGenSkill 挑一个能出文件的技能（skill_type=docgen 且提示词带 DOCJSON 契约）。

@@ -197,7 +197,14 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// 	取证：线上验收的 docgen 腿（intent=docgen + 命中 write 型技能 → 无 file 帧）。
 		// 	纠偏只在「这一轮真出不了文件」时发生：命中 template 技能且带附件时，
 		// 	fill / template_only 照样能交付文件，不许被抢。
-		if strings.EqualFold(strings.TrimSpace(eval.Intent), "docgen") && sc.SkillType != model.SkillTypeDocGen {
+		//
+		// 2026-09-17 补一道**用户明说只看正文**的让路（真浏览器实测踩到）：
+		// 	同一个闸门反向也咬人 —— 「写一份…通知…直接输出正文」会被分类器按题材判成
+		// 	intent=docgen，于是用户明说了要正文，却只拿到一个 .docx 文件卡片（正文 94 字）。
+		// 	明说的交付形态是用户亲手写的判据，不该由模型投票决定，所以这里用确定性
+		// 	agent.ExplicitTextOnly 兜底让路；分类器提示词那侧也补了同一条规则（双保险）。
+		if strings.EqualFold(strings.TrimSpace(eval.Intent), "docgen") &&
+			sc.SkillType != model.SkillTypeDocGen && !agent.ExplicitTextOnly(req.Message) {
 			act := strings.ToLower(strings.TrimSpace(eval.Action))
 			deliversOwnFile := sc.Attachment != "" && (act == "fill" || act == "template_only")
 			if !deliversOwnFile {

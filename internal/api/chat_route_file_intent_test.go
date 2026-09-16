@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -110,6 +111,79 @@ func TestRouteWriteIntentNotCoercedToDocGen(t *testing.T) {
 	if d := findFrameData(routeFrames(sse), evFile); d != "" {
 		t.Fatalf("write 意图不该产出文件交付帧：%s", d)
 	}
+}
+
+// 反向的第三个方向：用户**明说**只要正文，却被塞一个文件下载。
+//
+// 这不是假想：2026-09-17 真浏览器实测线上，「写一份关于开展数据治理专项工作的通知…
+// 正文不少于 600 字，直接输出正文」被分类器按题材判成 intent=docgen，纠偏闸门当场
+// 把这一轮抢去生成 .docx —— 用户明说了要正文，屏幕上只有一个文件卡片，正文 94 字。
+// 所以闸门不能只看 intent，得给「明说的交付形态」让路（agent.ExplicitTextOnly）。
+//
+// 这条断言同时也守反向故障：把闸门整个删掉能过这条，但 TestRouteFileIntentCoerces…
+// 会红 —— 两条合起来才是完整的闸门契约。
+func TestRouteExplicitTextOnlyNotCoerced(t *testing.T) {
+	// 正文契约写在变量里：既喂给假模型，又当断言锚 —— 避免「两边各写一份、改一边就假绿」。
+	want := "各部门：\n为规范数据治理专项工作，现就有关事项通知如下：一、建立统一台账。"
+	f := newFakeLLM(t, func(system, user string) string {
+		switch {
+		case strings.Contains(system, "多智能体管线的调度器"):
+			// 分类器按题材误判：标题像公文 → 判成本轮要出文件。
+			return `{"intent":"docgen","action":"gen","skill_slug":"技能工厂",` +
+				`"reason":"题材像公文，本轮出文件","needs_tools":false}`
+		}
+		return want
+	})
+	// gen 必须给：闸门若失效会走发文路径，末尾要往交付缓存塞字节（chat.go genCache.put），
+	// nil map 写会直接 panic —— 注入自证时那就成了「红在崩溃上」，不算断言有效。
+	h := &chatHandler{eng: newManualEngine(t, t.TempDir(), f), maxRound: 1, gen: newGenCache()}
+
+	msg := `写一份关于开展数据治理专项工作的通知。背景与核心素材：已建成数据中台，覆盖 12 个业务域。` +
+		`正文不少于 600 字，直接输出正文。`
+	sse := runRouteChat(t, h, `{"session_id":"s-textonly","message":"`+msg+`","mode":"auto"}`)
+	frames := routeFrames(sse)
+
+	// 前提：真走到了生成（有一次非分类请求发出）。不成立就不许判绿。
+	if !anyRequestNotSystem(f, "多智能体管线的调度器") {
+		t.Fatalf("本轮没走到生成，这条尺子的前提不成立（不许空跑判绿）。\n---- 实际 SSE ----\n%s", sse)
+	}
+	// A1：明说了只看正文，就不许产出文件交付帧。
+	if d := findFrameData(routeFrames(sse), evFile); d != "" {
+		t.Fatalf("用户明说了「直接输出正文」，却拿到文件下载卡片（文件=%s）—— "+
+			"交付形态是用户亲手写的判据，不该被题材判断盖掉", d)
+	}
+	// A2：也不许打「已改用」的换技能说明 —— 明说了要正文时换技能本身就是误解。
+	if strings.Contains(sse, "已改用") {
+		t.Fatalf("这一轮不该纠偏（用户只要正文），却打了换技能说明。\n---- 实际 SSE ----\n%s", sse)
+	}
+	// A3：正文真的写出来了。少了这条，「整轮什么都没发生」也会被判绿。
+	//
+	// ⚠️ 必须拿**拼回来的正文**断言，不能拿原始 SSE 直接 Contains：流式正文是按增量切帧发的
+	// （实测一轮里「…现」和「就有关事项通知如下…」分在两帧），跨帧断句会让这条假红 ——
+	// 那是尺子自己坏，不是交付坏了（本条断言第一次跑就是这么红的）。
+	body := deltaText(frames)
+	if !strings.Contains(body, want) {
+		t.Fatalf("没有 file 帧 ≠ 走对了路：拼回来的正文里没有交付文字，这一轮等于什么都没交付。\n"+
+			"---- 拼回的正文（%d 字）----\n%s\n---- 实际 SSE ----\n%s", len([]rune(body)), body, sse)
+	}
+}
+
+// deltaText 把整轮的 delta 帧拼回正文（客户端就是这么拼的）。
+// 流式正文按增量切帧，跨帧断句让「拿原始 SSE 搜连续串」变成假红，故统一走这里。
+func deltaText(frames []routeFrame) string {
+	var b strings.Builder
+	for _, fr := range frames {
+		if fr.event != evDelta {
+			continue
+		}
+		var d struct {
+			T string `json:"t"`
+		}
+		if json.Unmarshal([]byte(fr.data), &d) == nil {
+			b.WriteString(d.T)
+		}
+	}
+	return b.String()
 }
 
 // containsAny 命中任一即可 —— 用来断言「讲清了因果」，而不是断言某个具体措辞。

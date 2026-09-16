@@ -42,7 +42,7 @@ trap cleanup EXIT
 
 fails=0
 run_test() {
-  go test ./internal/api/ -run 'TestRouteFileIntent|TestRouteWriteIntent' -count=1 2>&1
+  go test ./internal/api/ -run 'TestRoute' -count=1 2>&1
 }
 
 # ---------- 基线：不注入时必须全绿 ----------
@@ -105,9 +105,12 @@ inject_case '契约锚点退回认字面词（真实的文档技能没有这个�
   '要 Word 却只拿到文字'
 
 # 注入 3 = 方向开错：不看来意图，凡是命中非 docgen 技能就纠偏。
+# 锚点只取条件表达式的前半行（`…"docgen") &&`）：真源码这里已经因为「明说只看正文让路」
+# 折成了两行，拿整行当锚点会命中 0 次 —— 自证脚本锚不上就成哑炮（而且报的是「注入失败」，
+# 不是「断言没抓住」，两者都要当红看）。
 inject_case '不看意图就纠偏（用户要写文章，却被塞一份文件下载）' \
-  "$CHAT" 'if strings.EqualFold(strings.TrimSpace(eval.Intent), "docgen") && sc.SkillType != model.SkillTypeDocGen {' \
-  'if sc.SkillType != model.SkillTypeDocGen {' \
+  "$CHAT" 'if strings.EqualFold(strings.TrimSpace(eval.Intent), "docgen") &&' \
+  'if (strings.EqualFold(strings.TrimSpace(eval.Intent), "docgen") || true) &&' \
   'FAIL: TestRouteWriteIntentNotCoercedToDocGen'
 
 # 注入 4 = 换了技能但不讲为什么换（用户要的是「为什么」，不是「skill_type=docgen」）。
@@ -115,6 +118,18 @@ inject_case '换技能不讲原因（用户看不懂自己锁的技能为什么�
   "$CHAT" '型技能，产出正文而不是文件；" +' '型技能，" +' \
   '换技能没讲清为什么换'
 
+# 注入 5 = 反向咬人（2026-09-17 真浏览器实测踩到的形态）：删掉「用户明说只看正文」的让路，
+# 分类器按题材判 docgen 时闸门照样把这一轮抢去出文件 —— 用户明说只要正文，拿到的是文件卡片。
+# 这条注入必须让**反向那条新断言**红，而不是别的断言红。
+inject_case '明说只要正文也被抢去出文件（用户说了「直接输出正文」，拿到 .docx）' \
+  "$CHAT" 'sc.SkillType != model.SkillTypeDocGen && !agent.ExplicitTextOnly(req.Message) {' \
+  'sc.SkillType != model.SkillTypeDocGen {' \
+  'FAIL: TestRouteExplicitTextOnlyNotCoerced'
+
+# 说明（如实标注，不给假自证）：分类器提示词里那条「用户明说只要正文 → intent=write」
+# 改不了假模型的行为（假模型回的是罐头 JSON，不看提示词），所以**没有任何单元断言能抓住它被删**。
+# 它的守卫在直播链路上：web/tests/chat_material_e2e.py 的 writing 腿用的是同一句需求原文，
+# 提示词那条规则若被删，真模型会按题材判 docgen，writing 腿就会因为没有正文而变红。
 echo
 if ! out="$(run_test)"; then
   echo "✗ 还原后测试还是红的 —— 注入没被干净还原，出货文件可能已被改坏"
