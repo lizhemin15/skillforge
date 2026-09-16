@@ -454,6 +454,85 @@ type SkillContent struct {
 	Template     string
 }
 
+// HasDocJSONContract 判断一份技能提示词是否带文档生成契约（能让 parseDocJSON 解析成功的
+// 那段 JSON 规格说明）。
+//
+// 出文件这条路**只能**由带契约的技能走：GenerateDoc 最后要 parseDocJSON，拿写作技能的
+// 提示词去发文只会解析失败 —— 所以纠偏时不能把任意技能凑上去。
+//
+// ⚠️ 锚点用**结构**，不许认某个词：初版写的是 Contains(prompt, "DOCJSON")，而真实的
+// 内置「办公文档管家」提示词里从来没有 "DOCJSON" 这个字面量（它只出现在 seed.go 的
+// 注释里）。于是本函数对唯一的 docgen 技能恒返回 false，PickDocGenSkill 恒返回 nil ——
+// 闸门在生产里**永远不开**，纠偏形同虚设（写这把尺子时被当场逮到：红线打印的是
+// 「技能库里没有可用的文档生成技能」，而不是「没纠偏」）。
+// 认字段结构既贴合真实契约（【输出契约】里就是 format/filename/cols/rows/parags），
+// 也不会因为换个说法（"文档规格 JSON" 之类）就失效。
+func HasDocJSONContract(prompt string) bool {
+	p := strings.ToLower(prompt)
+	// 老词保留：技能工厂产出的技能可能自己带 DOCJSON 这名字。
+	hasSpec := strings.Contains(p, "docjson") ||
+		(strings.Contains(p, `"format"`) && strings.Contains(p, `"filename"`))
+	hasBody := strings.Contains(p, `"parags"`) || strings.Contains(p, `"rows"`) ||
+		strings.Contains(p, `"cols"`)
+	return hasSpec && hasBody
+}
+
+// PickDocGenSkill 挑一个能出文件的技能（skill_type=docgen 且提示词带 DOCJSON 契约）。
+// 用途：分类器给出「intent=docgen（要出文件）却命中非 docgen 型技能」这种自相矛盾的
+// 组合时，由调用方纠偏到这里，而不是静默降级成写正文。
+//
+// hint 是本轮用户原话（可为空）：多个 docgen 技能时按名称/描述的二字片段重合度排序，
+// 让「合同生成器」去接合同请求、「通知生成器」去接通知请求。分数相同按 slug 稳定排序，
+// 保证同一输入每次选同一个（不然路由会飘，排障时对不上账）。
+func (e *Engine) PickDocGenSkill(hint string) *SkillContent {
+	skills, err := e.store.List()
+	if err != nil {
+		return nil
+	}
+	best, bestScore := "", -1
+	for _, sk := range skills {
+		if !sk.Enabled || sk.SkillType != model.SkillTypeDocGen {
+			continue
+		}
+		sc, lerr := e.LoadSkill(sk.Slug)
+		if lerr != nil || sc == nil || !HasDocJSONContract(sc.SystemPrompt) {
+			continue // 没契约的发文技能等于不能用，宁可继续找下一个
+		}
+		score := shingleOverlap(sk.Name+" "+sk.Description, hint)
+		if score > bestScore || (score == bestScore && (best == "" || sk.Slug < best)) {
+			best, bestScore = sk.Slug, score
+		}
+	}
+	if best == "" {
+		return nil
+	}
+	sc, err := e.LoadSkill(best)
+	if err != nil {
+		return nil
+	}
+	return sc
+}
+
+// shingleOverlap 数 a 的相邻二字片段有多少出现在 b 里。此处只用来给候选技能排序，
+// 不追求语义精度：能区分「合同」和「通知」就够了，分不出来时全部同分、退回稳定排序。
+func shingleOverlap(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	if len(ra) < 2 || len(rb) < 2 {
+		return 0
+	}
+	bset := make(map[string]bool, len(rb))
+	for i := 0; i+1 < len(rb); i++ {
+		bset[string(rb[i:i+2])] = true
+	}
+	n := 0
+	for i := 0; i+1 < len(ra); i++ {
+		if bset[string(ra[i:i+2])] {
+			n++
+		}
+	}
+	return n
+}
+
 // LoadSkill fetches a skill's anchor files (system_prompt + template) plus its
 // type/attachment so the caller can route generation and file delivery.
 func (e *Engine) LoadSkill(slug string) (*SkillContent, error) {

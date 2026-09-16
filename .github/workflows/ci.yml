@@ -214,6 +214,16 @@ jobs:
           go test ./internal/api/ -run Suggest -count=1
           bash internal/api/suggest_mutation_check.sh
 
+      # 「intent=docgen 却命中写作技能」这条路的失败形态是静默降级：
+      # 用户点「生成 Word」拿到一段正文，页面上不报错、日志里也没异常。
+      # 纠偏闸门（PickDocGenSkill）必须同时挂单测和注入自证 ——
+      # 只装闸门不挂尺子，闸门恒不开也没人知道（本闸门初版就是这样：
+      # 契约锚点认了一个真实提示词里不存在的字面量，生产里永远不开）。
+      - name: 后端回归（文件意图纠偏 + 断言自证）
+        run: |
+          go test ./internal/api/ -run 'TestRouteFileIntent|TestRouteWriteIntent' -count=1
+          bash internal/api/chat_route_file_intent_mutation_check.sh
+
       # 这两条 .py 自证脚本此前**没有任何地方调用**：CI 里没有 step、本地也没跑。
       # 后果是可预测的 —— category_guard_inject.py 的一条锚点早就跟实现脱钩
       # （categoryErrStatus 里 ErrNotManualSkill 被有意删掉），脚本自己在那行

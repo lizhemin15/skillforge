@@ -265,6 +265,9 @@ if [ "$QUICK" = 0 ]; then
   selfcheck '安装脚本 / 解释器探测真跑' python3 web/tests/install_python_probe_live_check.py
   selfcheck '安装脚本 / 解释器探测真跑自证' python3 web/tests/install_python_probe_live_check.py --mutation-selfcheck
   selfcheck '后端 / 推荐行自证'         bash internal/api/suggest_mutation_check.sh
+  # 「要文件却被路由到写作技能」的纠偏闸门：失败形态是**静默降级成写正文** ——
+  # 用户点「生成 Word」拿到一段文字，页面上没有任何报错。
+  selfcheck '后端 / 文件意图纠偏自证'   bash internal/api/chat_route_file_intent_mutation_check.sh
   selfcheck '后端 / 分类结构管理自证'   python3 scripts/category_guard_inject.py
   selfcheck '后端 / 思考开关矩阵自证'   python3 scripts/fastjson_knob_inject.py
   selfcheck '后端 / 提速与中间材料自证' python3 scripts/thinking_knob_inject.py

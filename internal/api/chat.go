@@ -187,6 +187,48 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// keep the history on this skill so the fill logic can recover past values
 			}
 		}
+		// 2a-pre. 出文件意图的纠偏闸门。
+		// 	分类器会给出「intent=docgen（要出文件）却命中文章写作型技能」这种自相矛盾的
+		// 	组合：技能名里带「公文/通知」字样的写作技能最容易被挑走，尽管清单里每个技能
+		// 	都标着类型。而下面的发文分支只在**命中技能自己就是 docgen 型**时才会进 ——
+		// 	于是这种组合会**静默降级成写正文**：用户要 Word，拿到一屏文字，没有文件、
+		// 	没有报错、也没有一句说明。用户那句「生成的 skill 和我给的内容完全没关系」
+		// 	有一部分就是这么来的。
+		// 	取证：线上验收的 docgen 腿（intent=docgen + 命中 write 型技能 → 无 file 帧）。
+		// 	纠偏只在「这一轮真出不了文件」时发生：命中 template 技能且带附件时，
+		// 	fill / template_only 照样能交付文件，不许被抢。
+		if strings.EqualFold(strings.TrimSpace(eval.Intent), "docgen") && sc.SkillType != model.SkillTypeDocGen {
+			act := strings.ToLower(strings.TrimSpace(eval.Action))
+			deliversOwnFile := sc.Attachment != "" && (act == "fill" || act == "template_only")
+			if !deliversOwnFile {
+				if dsc := h.eng.PickDocGenSkill(req.Message); dsc != nil {
+					fmt.Fprintf(os.Stderr, "[route] intent=docgen action=%q 命中 %s(%s) 出不了文件 → 纠偏到文档生成技能 %s\n",
+						act, sc.Slug, sc.SkillType, dsc.Slug)
+					// needs 是照另一个技能的参数名算出来的，跟着换技能就失效了；
+					// docgen 类技能本身没有必填参数（见 EvalTurn 契约），清掉免得
+					// 用户被追问一堆跟这份文档无关的字段。
+					eval.Needs = nil
+					oldName, oldType := sc.Name, sc.SkillType
+					sc = dsc
+					eval.SkillSlug = dsc.Slug
+					// 换技能必须让用户看见，否则就是闷声改路由：
+					// 走 meta.note（前端已有「降级说明」渲染通道，出现在回复开头）。
+					write(evMeta, jsonSafe(map[string]string{
+						"reason": eval.Reason, "skill": dsc.Slug, "intent": eval.Intent,
+						"mode": mode,
+						"note": "「" + oldName + "」是「" + skillTypeLabel(oldType) + "」型技能，产出正文而不是文件；" +
+							"本轮要交付文件，已改用「" + dsc.Name + "」生成。",
+					}))
+				} else {
+					// 一个能出文件的技能都没有：把话说明白，别把「要文件」当「要正文」。
+					fmt.Fprintf(os.Stderr, "[route] intent=docgen 但技能库里没有可用的文档生成技能（命中 %s）\n", sc.Slug)
+					write(evDelta, jsonSafe(map[string]string{
+						"t": "当前技能库里没有可用的「文档生成」技能，无法产出 Word/Excel 文件；下面改用「" + sc.Name + "」输出正文。\n\n",
+					}))
+				}
+			}
+		}
+
 		write(evSkill, jsonSafe(map[string]string{
 			"slug": eval.SkillSlug, "name": sc.Name, "reason": eval.Reason,
 			"type": sc.SkillType, "file": sc.Attachment,
@@ -439,6 +481,26 @@ func needsMessage(needs []model.Param) string {
 		return "好的，我需要你补充一些信息才能开始写作，请告诉我。"
 	}
 	return "要开始写作，我需要你补充以下信息：" + strings.Join(labels, "、") + "。你可以直接告诉我。"
+}
+
+// skillTypeLabel 把技能类型翻成给用户看的说法。
+// 用途：路由纠偏时那句「X 是『文章写作』型技能，产出正文而不是文件」必须说人话 ——
+// 用户看到的是「为什么换了个技能」，不是「skill_type=write」。
+func skillTypeLabel(t string) string {
+	switch t {
+	case model.SkillTypeDocGen:
+		return "文档生成"
+	case model.SkillTypeTemplate:
+		return "模板填充"
+	case model.SkillTypeWrite:
+		return "文章写作"
+	case model.SkillTypeQuery:
+		return "查询问答"
+	}
+	if strings.TrimSpace(t) == "" {
+		return "未标注类型"
+	}
+	return t
 }
 
 // needsShort returns a compact comma list of missing-param labels, for trace detail.
