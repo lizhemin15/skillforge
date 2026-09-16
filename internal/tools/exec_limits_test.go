@@ -1,6 +1,10 @@
 package tools
 
 import (
+	"context"
+	"os"
+	"os/user"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -268,5 +272,68 @@ func TestOOMGateHasNoFalsePositives(t *testing.T) {
 	// numpy 的类名带 MemoryError 子串，但它不是解释器的 MemoryError。
 	if looksLikePythonMemoryError("numpy.core._exceptions._ArrayMemoryError: Unable to allocate 512 MiB") {
 		t.Error("numpy 的 _ArrayMemoryError 被误判成 python MemoryError（需要词边界）")
+	}
+}
+
+// TestRunReportsSandboxOOMToModel 走**真实 Run() 路径**，钉住「模型最终读到的那几个字」。
+//
+// 为什么必须走 Run() 而不是再测一遍 classifySandboxFailure：
+// 诊断函数自己是对的，但**模型读到的是调用点拼出来的那段话**。有人把调用点换成
+// 一句 `fmt.Sprintf("退出码 %d", exitCode)`（这正是改造前的历史写法）时，单测诊断函数
+// 依然全绿——而客户界面上又回到「一动不动跳秒 + 模型瞎猜重试」。
+// 这条负向自证（exec_limits_mutation_check.py 第 3 例）就是这么抓出来的：
+// 它把调用点改回历史写法，旧尺子没红，于是补了这条端到端断言。
+//
+// 用一个假 systemd-run 顶替真沙箱：Run() 只通过 PATH 找它，且判据只看它打印的日志串，
+// 所以钉住「日志里有 OOM 证据 → 模型拿到 OOM 诊断 + 改哪个变量」不需要真起 cgroup。
+func TestRunReportsSandboxOOMToModel(t *testing.T) {
+	for _, k := range []string{EnvExecTimeout, EnvExecMemory, EnvExecCPU, EnvExecTasks} {
+		t.Setenv(k, "")
+	}
+	// 客户按装机文档调大了内存：诊断里必须体现**生效值**，不能还是写死的 256M。
+	t.Setenv(EnvExecMemory, "1G")
+
+	bin := t.TempDir()
+	fake := filepath.Join(bin, "systemd-run")
+	// 内核 OOM 现场的真串。刻意不含 Timeout/timeout：Run() 用这两个子串判超时，
+	// 混进去会把 OOM 现场误判成超时。
+	logLine := "Memory cgroup out of memory: Killed process 4711 (python3) total-vm:2000000kB, anon-rss:1500000kB\n"
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nprintf '%s' '"+logLine+"' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("写假 systemd-run 失败：%v", err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	me, err := user.Current()
+	if err != nil {
+		t.Fatalf("取当前用户失败：%v", err)
+	}
+	cfg := DefaultExecConfig()
+	cfg.WorkRoot = t.TempDir()
+	// 降权到「当前用户」：测试里没有沙箱用户也照样能建工作区（chown 到自己总是允许），
+	// 于是这条断言不依赖运行测试的人是不是 root，也就不会在 CI 里被跳过。
+	cfg.SandboxUser = me.Username
+
+	res, err := NewRunPythonTool(cfg).Run(context.Background(), map[string]any{"code": "print(1)"})
+	if err != nil {
+		t.Fatalf("Run 返回错误（说明沙箱前置检查挡住或工作区没建起来）：%v", err)
+	}
+
+	for _, want := range []string{
+		"被内存上限杀掉",      // ① 类别说清了
+		"MemoryMax=1G", // ② 用的是生效值，不是写死的 256M
+		EnvExecMemory,  // ③ 告诉人改哪个变量
+	} {
+		if !strings.Contains(res.Content, want) {
+			t.Errorf("模型读到的诊断里缺 %q：\n%s", want, res.Content)
+		}
+	}
+	// 反面：不许退回历史那句没有信息量的组合（模型只能原样重试）。
+	for _, bad := range []string{"退出码 1", "请根据上面的 stderr 修正后重试"} {
+		if strings.Contains(res.Content, bad) {
+			t.Errorf("诊断退回历史写法（%q）——模型会瞎猜重试：\n%s", bad, res.Content)
+		}
+	}
+	if res.Display == "" {
+		t.Error("Display 为空：工具链在 UI 上看不见这次失败")
 	}
 }

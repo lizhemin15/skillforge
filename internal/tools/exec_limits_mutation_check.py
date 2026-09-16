@@ -107,13 +107,18 @@ CASES = [
         EXEC_GO,
         "status, hint := classifySandboxFailure(exitCode, out, timedOut, t.cfg)",
         "status, hint := fmt.Sprintf(\"退出码 %d\", exitCode), \"\"\n\tif timedOut {\n\t\tstatus = fmt.Sprintf(\"超时被杀（上限 %s）\", t.cfg.Timeout)\n\t}",
-        "TestSandboxFailureSaysWhy",
+        # 期望的尺子是**端到端**那条：诊断函数自己没被改，改的是调用点，
+        # 所以只有走 Run() 的断言才可能红（测诊断函数的用例在这种情况下依然全绿）。
+        "TestRunReportsSandboxOOMToModel",
     ),
     (
         "把 OOM 判据放宽成 Contains(out, \"memory\")（普通内存字样全被误诊）",
         EXEC_GO,
         'if strings.Contains(out, n) {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\n// looksLikePythonMemoryError',
-        'if strings.Contains(strings.ToLower(out), "memory") {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\n// looksLikePythonMemoryError',
+        # 注入串必须**能编译**：第一版写成 `Contains(strings.ToLower(out), "memory")`
+        # 把循环变量 n 弄成了未使用 → 编译错 → 输出里没有 `--- FAIL:` 行。
+        # 那种 rc!=0 是崩溃红、不是断言红，自证脚本会（正确地）判它「不算数」。
+        'if strings.Contains(strings.ToLower(out), strings.ToLower(n)) || strings.Contains(strings.ToLower(out), "memory") {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n\n// looksLikePythonMemoryError',
         "TestOOMGateHasNoFalsePositives",
     ),
     (
