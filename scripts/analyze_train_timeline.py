@@ -12,8 +12,18 @@ d = json.load(open(path))
 lines = d.get('lines', [])
 ticks = d.get('ticks', [])
 win = d.get('sample_seconds', 0)
+stop_reason = d.get('stop_reason', 'timeout')
+ended_at = d.get('ended_at')
+# 窗口右端怎么取：跑完了就用「后端说训练完成的那一刻」，还在跑才用采样窗口。
+# 训练结束后的那截空窗不是「屏幕卡住」，算进去会把体感指标污染成噪声
+# （2026-09-17 那次 213.7s 跑完、窗口 660s，照旧算法能算出 446s「静默」）。
+right = ended_at if (stop_reason == 'terminal' and ended_at) else win
+tail_note = (f'训练 {ended_at:.1f}s 结束（后端终态信号），尾部 '
+             f'{win - ended_at:.1f}s 不计入体感指标') if stop_reason == 'terminal' \
+    else f'采样窗口内未收到训练终态信号，{win:.0f}s 时仍在跑（尾部空档按「还在跑」计）'
 
-print(f"采样窗口 {win}s / 日志行 {len(lines)} / 计时快照 {len(ticks)}")
+print(f"采样窗口 {win}s（收工 {stop_reason}@{ended_at}s） / 日志行 {len(lines)} / 计时快照 {len(ticks)}")
+print(f"  {tail_note}")
 
 mat = [(t, r) for t, r in lines if '思考：' in r or '正文：' in r or '提示：' in r]
 prog = [(t, r) for t, r in lines if '思考：' not in r and '正文：' not in r and '提示：' not in r]
@@ -33,13 +43,13 @@ if prog:
 
 # 最长静默空档：屏幕上「没有任何新行 + 计时器文字没变」的最长时段
 marks = sorted([t for t, _ in lines] + [t for t, _ in ticks])
-if marks and win:
+if marks and right:
     spans = []
     prev = 0.0
     for t in marks:
         spans.append((t - prev, prev, t))
         prev = t
-    spans.append((win - prev, prev, win))
+    spans.append((right - prev, prev, right))
     gap, a, b = max(spans)
     print(f"\n最长静默空档 {gap:.1f}s（{a:.1f}s → {b:.1f}s）")
     top = sorted(spans, reverse=True)[:5]

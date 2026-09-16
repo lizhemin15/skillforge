@@ -108,5 +108,40 @@ check('阶段边界先 Flush 再发 step（材料尾巴不串到下个阶段）'
 check('训练结束再 Flush 一次（最后一阶段尾巴不丢）',
   /\}\)\s*\n\s*relay\.Flush\(\)/.test(adminGo));
 
+// ---- ④ 尺子自己也要被守：节点数必须「边跑边采」 ----
+// 训练终帧（done）一到，前端按设计把 #tr-material 收掉（admin.js「留着会让人以为还在跑」），
+// 所以**窗口结束后再数节点必然得 0**。2026-09-17 线上踩过这个弯路：整条腿「--- 8/9 ok ---」，
+// 红的那条其实就是尺子量错了时刻，跟被测系统无关。这条断言就守这个时刻。
+const leg = read('web/tests/admin_train_progress_e2e.py');
+// 用 Python 式缩进分块真解析出 while 循环体（**不能拿注释当边界**：紧贴循环末尾、
+// 缩进掉回 8 空格的语句语义上在循环外，用注释切会让它落进「循环内」——
+// 2026-09-17 注入 2 就是这么当的哑炮）。
+const legLines = leg.split('\n');
+const indOf = (l) => (l.match(/^ */) || [''])[0].length;
+const wAt = legLines.findIndex((l) => l.includes('while time.time() - t0 < SAMPLE_SECONDS'));
+let loopEnd = legLines.length;
+if (wAt >= 0) {
+  const wInd = indOf(legLines[wAt]);
+  for (let i = wAt + 1; i < legLines.length; i++) {
+    const l = legLines[i];
+    if (l.trim() === '' || l.trim().startsWith('#')) continue;  // 空行/注释不结束块
+    if (indOf(l) <= wInd) { loopEnd = i; break; }
+  }
+}
+const loopBody = wAt >= 0 ? legLines.slice(wAt, loopEnd).join('\n') : '';
+check('尺子边跑边采实况块节点数（循环体内有 mat_node_snaps.append）',
+  /mat_node_snaps\.append\(/.test(loopBody));
+const SEL = "eval_on_selector_all('#tr-log .material'";
+const allSel = leg.split(SEL).length - 1;
+const inLoopSel = loopBody.split(SEL).length - 1;
+check('实况块节点只在循环内采（循环外一次都不数，终帧收块时数必得 0 = 假红）',
+  inLoopSel >= 1 && allSel === inLoopSel, `文件内 ${allSel} 处，循环内 ${inLoopSel} 处`);
+check('尺子用后端终态信号收工（不把「训练已跑完」算成屏幕静默）',
+  /stop_reason, ended_at = 'terminal'/.test(leg));
+check('时间线落盘带收工原因+时刻（分析脚本才不用瞎猜窗口右端）',
+  /'stop_reason': stop_reason/.test(leg) && /'ended_at': ended_at/.test(leg));
+const an = read('scripts/analyze_train_timeline.py');
+check('分析脚本用真终态当窗口右端（否则尾部空窗会算成静默）', /right = ended_at if/.test(an));
+
 if (failures) { console.log(`\n${failures} 项失败`); process.exit(1); }
 console.log('\n全部通过');

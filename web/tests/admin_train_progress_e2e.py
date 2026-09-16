@@ -182,6 +182,9 @@ def main():
         line_seen = []          # (t, 行文本)
         tick_snaps = []         # 计时器文字的不同快照
         last_tick = None
+        # 实况块节点数：**只能边跑边采**（原因见 T5b）。采到的是 (t, 节点数)。
+        mat_node_snaps = []
+        stop_reason, ended_at = 'timeout', None   # 收工原因：terminal=后端说训练结束了
         while time.time() - t0 < SAMPLE_SECONDS:
             try:
                 rows = page.eval_on_selector_all(
@@ -199,6 +202,21 @@ def main():
                 # 带上到达时刻：光有文字没法回答「最长静默多久」（这是用户体感的核心指标）
                 tick_snaps.append((round(time.time() - t0, 1), tick))
                 last_tick = tick
+            # 边跑边数实况块节点。**不能在窗口结束后数一次**：训练终帧（done）一到，
+            # 前端会按设计把 #tr-material 收掉（admin.js「留着会让人以为还在跑」），
+            # 那时数必然是 0 —— 2026-09-17 就是这么做出的假红（8/9 ok，红的是尺子）。
+            try:
+                mn = page.eval_on_selector_all('#tr-log .material', 'els => els.length')
+            except Exception:  # noqa: BLE001
+                mn = -1
+            mat_node_snaps.append((round(time.time() - t0, 1), mn))
+            # 真终态信号：后端自己说「训练完成/失败」。用它收工，窗口尾部才不会留一段
+            # 假的「静默」（那是训练跑完了，不是屏幕卡住了）——否则「最长空档」会算成
+            # 好几分钟，把体感指标污染成噪声。
+            hit = next((r for r in rows if re.search(r'训练完成|训练失败|训练出错', r)), None)
+            if hit:
+                stop_reason, ended_at = 'terminal', round(time.time() - t0, 1)
+                break
             time.sleep(0.4)
 
         # ---- T1 日志框里有真行 ----
@@ -241,21 +259,29 @@ def main():
         # T1~T4 守的都是「帧有没有到屏幕」；阶段内部静默那两分钟，屏幕上有进度行、
         # 计时器也在动，T1~T4 全绿而用户照样在盯空计时器。所以必须单独守材料。
         mat_rows = [(t, r) for t, r in line_seen if '思考：' in r or '正文：' in r or '提示：' in r]
-        try:
-            mat_nodes = page.eval_on_selector_all('#tr-log .material', 'els => els.length')
-        except Exception:  # noqa: BLE001
-            mat_nodes = -1
+        # 前提断言：窗口内必须真采到过实况块，否则 T5b 是无意义的（0 节点 ≠ 一片一节点）
+        mat_nodes_max = max((n for _, n in mat_node_snaps), default=-1)
+        mat_node_seen = sum(1 for _, n in mat_node_snaps if n >= 1)
+        if mat_nodes_max >= 1:
+            ok(f'T5b0 前提成立：窗口内采到实况块 {mat_node_seen}/{len(mat_node_snaps)} 次，'
+               f'峰值 {mat_nodes_max} 个节点')
+        else:
+            fail(f'T5b0 前提不成立：全程没采到 #tr-log .material 节点'
+                 f'（{len(mat_node_snaps)} 次采样）—— T5b 无从判定，先查块到底有没有出现')
         if mat_rows:
             ok(f'T5a {SAMPLE_SECONDS:.0f}s 内出现流式中间材料 {len(mat_rows)} 次，'
                f'首片在 {mat_rows[0][0]:.1f}s：{mat_rows[0][1][:70]}')
         else:
             fail(f'T5a {SAMPLE_SECONDS:.0f}s 内没有任何中间材料行 —— 阶段内部仍是静默，'
                  f'用户还是只能盯着一个空计时器（改动没生效，或帧被前端吞了）')
-        if mat_nodes == 1:
-            ok('T5b 实况块只占 1 个 DOM 节点（就地更新，不是一片一节点）')
-        else:
-            fail(f'T5b 实况块占 {mat_nodes} 个 DOM 节点（期望 1）—— '
+        if mat_nodes_max == 1:
+            ok(f'T5b 实况块峰值只占 1 个 DOM 节点（就地更新）—— '
+               f'{len(mat_rows)} 片材料进屏，DOM 里始终只有 1 个节点')
+        elif mat_nodes_max > 1:
+            fail(f'T5b 实况块峰值占 {mat_nodes_max} 个 DOM 节点（期望 1）—— '
                  f'一片一节点会随训练时长线性增长，二十分钟下来把页面拖死')
+        else:
+            fail('T5b 无从判定：前提见 T5b0（没采到实况块）')
 
         # 完整时间线落盘（算最长静默空档要用全量，不是前 6 行）
         out = os.environ.get('LINES_OUT')
@@ -263,17 +289,24 @@ def main():
             with open(out, 'w') as fh:
                 json.dump({'sample_seconds': SAMPLE_SECONDS, 'lines': line_seen,
                            'ticks': tick_snaps, 'js_errors': errs,
+                           'mat_nodes': mat_node_snaps,
+                           # 收工原因与时刻：算「最长静默空档」必须用它当窗口右端，
+                           # 否则训练已结束的那段空窗会被算成屏幕卡住。
+                           'stop_reason': stop_reason, 'ended_at': ended_at,
                            'ok': ok_cnt, 'fail': fail_cnt, 'skips': skips}, fh, ensure_ascii=False)
-            print(f'时间线已落盘 → {out}（{len(line_seen)} 行 / {len(tick_snaps)} 个计时快照）')
+            print(f'时间线已落盘 → {out}（{len(line_seen)} 行 / {len(tick_snaps)} 个计时快照 / '
+                  f'收工 {stop_reason}@{ended_at}s）')
 
         print('\n--- 证据 ---')
-        print(f'采样窗口 {SAMPLE_SECONDS:.0f}s / 日志行 {len(line_seen)} / 计时快照 {len(tick_snaps)}')
+        print(f'采样窗口 {SAMPLE_SECONDS:.0f}s（收工 {stop_reason}@{ended_at}s）'
+              f' / 日志行 {len(line_seen)} / 计时快照 {len(tick_snaps)}'
+              f' / 实况块峰值节点 {mat_nodes_max}')
         for t, r in line_seen[:6]:
             print(f'  [{t:>6.1f}s] {r[:110]}')
         print('--- 清理提示（不装看不见）---')
         print(f'本轮训练是采样后主动断开的，后端可能仍在跑并最终生成技能「{TRAIN_NAME}」。')
         print(f'验收完请删掉它，别留在线上：')
-        print(f"  curl -X DELETE -H 'Authorization: Bearer <admin-token>' \\")
+        print(f"  curl -X DELETE -H 'Authorization: Bearer *** \\")
         print(f"    '{BASE}/api/admin/skills/{TRAIN_NAME}'")
         browser.close()
 
