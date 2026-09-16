@@ -226,6 +226,14 @@ jobs:
           python3 scripts/fastjson_knob_inject.py
           python3 scripts/thinking_knob_inject.py
 
+      # 沙箱限额（run_python 的 cgroup MemoryMax / Timeout）的负向自证。
+      # 为什么单列一条：这是单机离线客户的**真阻碍** —— 模型写的解析脚本一碰大文件
+      # 就被 cgroup OOM 秒杀，旧实现只回一句没有信息量的「退出码 -1」；而
+      # MemoryMax=256M 是硬编码，客户拿不到源码就无从调。上面的 `go test ./...`
+      # 只证明「旋钮读得到、诊断分得对」，证明不了「旋钮失效时有人会红」。
+      - name: 后端断言自证（沙箱限额可覆盖 / 失败诊断）
+        run: python3 internal/tools/exec_limits_mutation_check.py
+
       # C1（线上逐页统计）的解析器自证。它原来写的是 grep 'text_pages' 进度流，
       # 而进度流里从来只有人话「共 4 页（文本层直取 2 / OCR 2）」——
       # 这条断言在线上永远红，把 C2/C3 的真实结论淹没了。

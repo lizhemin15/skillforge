@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -144,17 +146,109 @@ func pythonLabel(py string) string {
 }
 
 // DefaultExecConfig 返回经过实测验证的默认配置。
+//
+// 三个限额可用环境变量覆盖（SKILLFORGE_EXEC_TIMEOUT / _MEMORY / _CPU），
+// 为什么必须可覆盖：单机离线部署的客户拿它跑自己的料，一份 17MB 的 PDF
+// 让模型写脚本解析，256M 内存上限会在几秒内把它 cgroup OOM 掉，而回给模型的
+// 是一句「退出码 -1」——模型不知道发生了什么事，只能反复重试，用户看到的就是
+// 「卡着计时」。限额是**兜底**不是**业务规则**，业务规则得由客户按自己机器定。
+//
+// 非法值一律忽略并退回默认（不静默接受半懂的值——写错就按默认跑，
+// 体检脚本会把生效值打印出来，运维能一眼看到自己写的那行没吃上）。
 func DefaultExecConfig() ExecConfig {
 	return ExecConfig{
 		WorkRoot:    "/var/lib/skillforge/work",
 		Python:      pythonLabel(ResolvePython()),
-		Timeout:     30 * time.Second,
-		MemoryMax:   "256M",
-		CPUQuota:    "50%",
-		TasksMax:    32,
+		Timeout:     envDuration(EnvExecTimeout, 30*time.Second),
+		MemoryMax:   envSize(EnvExecMemory, "256M"),
+		CPUQuota:    envCPUQuota(EnvExecCPU, "50%"),
+		TasksMax:    envInt(EnvExecTasks, 32),
 		SandboxUser: "nobody",
 		MaxOutput:   65536,
 	}
+}
+
+// 限额覆盖用的环境变量名。写进常量是为了体检/文档能引用同一份字面量。
+const (
+	EnvExecTimeout = "SKILLFORGE_EXEC_TIMEOUT"
+	EnvExecMemory  = "SKILLFORGE_EXEC_MEMORY"
+	EnvExecCPU     = "SKILLFORGE_EXEC_CPU"
+	EnvExecTasks   = "SKILLFORGE_EXEC_TASKS"
+)
+
+// envDuration 读时长覆盖：接受 "90s" / "5m" / 裸数字（按秒算）。
+// 下限 5s（再短连解释器都没起来），上限 30m（单机部署不该有一条工具调用
+// 占住半小时——那已经该走后台任务而不是同步工具）。
+func envDuration(name string, def time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def
+	}
+	var d time.Duration
+	if n, err := strconv.Atoi(raw); err == nil {
+		d = time.Duration(n) * time.Second
+	} else if parsed, err := time.ParseDuration(raw); err == nil {
+		d = parsed
+	} else {
+		return def
+	}
+	if d < 5*time.Second || d > 30*time.Minute {
+		return def
+	}
+	return d
+}
+
+// envSize 读 systemd 内存限额：形如 256M / 1G / 2G。
+// 认得出才用，认不出退回默认；下限 64M（小于它连 python 都起不来）。
+func envSize(name, def string) string {
+	raw := strings.ToUpper(strings.TrimSpace(os.Getenv(name)))
+	if raw == "" {
+		return def
+	}
+	m := sizeFormat.FindStringSubmatch(raw)
+	if m == nil {
+		return def
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n <= 0 {
+		return def
+	}
+	mult := map[string]int{"K": 1, "M": 1 << 10, "G": 1 << 20, "T": 1 << 30, "": 1}[m[2]]
+	if n*mult < 64*1024 { // < 64M：连解释器都起不来
+		return def
+	}
+	return raw
+}
+
+// sizeFormat 只认「数字 + 可选单位」这一种形态。systemd 还接受 50% / infinity，
+// 但给内存设百分数或无限在「沙箱兜底」语义下没意义，直接不收。
+var sizeFormat = regexp.MustCompile(`^([0-9]+)(K|M|G|T)?$`)
+
+// envCPUQuota 读 CPU 配额：形如 "50%" / "200%"。
+func envCPUQuota(name, def string) string {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def
+	}
+	if !cpuQuotaFormat.MatchString(raw) {
+		return def
+	}
+	return raw
+}
+
+var cpuQuotaFormat = regexp.MustCompile(`^[0-9]+%$`)
+
+// envInt 读正整数覆盖（TasksMax）。
+func envInt(name string, def int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
 }
 
 // RunPythonTool 让模型现场写 Python 处理数据。这是「工具组合」的粘合剂。
@@ -203,9 +297,25 @@ func NewRunPythonTool(cfg ExecConfig) *RunPythonTool {
 func (t *RunPythonTool) Name() string { return "run_python" }
 
 func (t *RunPythonTool) Description() string {
-	return "在沙箱里执行一段 Python 代码来处理数据、做计算、生成文件。沙箱限制：无网络、文件系统只读（当前工作目录可写）、30 秒超时、256MB 内存、最多 32 进程。" +
+	// 限额要**按生效值**写出来，不能钉死成「30 秒 / 256MB」：
+	// 客户调大 SKILLFORGE_EXEC_MEMORY 之后，如果模型看到的仍是 256MB，
+	// 它会继续拒绝写「整份读进来算」的脚本 —— 旋钮调了等于没调。
+	return fmt.Sprintf("在沙箱里执行一段 Python 代码来处理数据、做计算、生成文件。沙箱限制：无网络、文件系统只读（当前工作目录可写）、%s超时、%s 内存、最多 %d 进程。",
+		humanDuration(t.cfg.Timeout), t.cfg.MemoryMax, t.cfg.TasksMax) +
 		"用 print() 输出结果（会被截断到 64KB）；需要交文件给用户就用 open('结果.xlsx','wb') 写到当前目录，运行结束后会自动作为附件交付。" +
 		"因为是离线沙箱，不要写需要联网的代码（如 requests）；需要联网请改用 http_request 工具。可用标准库：csv/json/math/statistics/datetime/re 等；第三方库不保证存在。"
+}
+
+// humanDuration 把限额时长写成人话（模型读的是这段描述，别给它 "30s" 这种半截值）。
+func humanDuration(d time.Duration) string {
+	switch {
+	case d%(time.Minute) == 0 && d >= time.Minute:
+		return fmt.Sprintf("%d 分钟", int(d/time.Minute))
+	case d%(time.Second) == 0:
+		return fmt.Sprintf("%d 秒", int(d/time.Second))
+	default:
+		return d.Truncate(time.Second).String()
+	}
 }
 
 func (t *RunPythonTool) Schema() map[string]any {
@@ -284,12 +394,12 @@ func (t *RunPythonTool) Run(ctx context.Context, args map[string]any) (Result, e
 	if body == "" {
 		body = "(无输出)"
 	}
-	status := fmt.Sprintf("退出码 %d", exitCode)
-	if timedOut {
-		status = fmt.Sprintf("超时被杀（上限 %s）", t.cfg.Timeout)
-	}
+	status, hint := classifySandboxFailure(exitCode, out, timedOut, t.cfg)
 
 	content := fmt.Sprintf("沙箱执行结果（%s）：\n%s", status, body)
+	if hint != "" {
+		content += "\n" + hint
+	}
 	if len(files) > 0 {
 		names := make([]string, 0, len(files))
 		for _, f := range files {
@@ -297,7 +407,7 @@ func (t *RunPythonTool) Run(ctx context.Context, args map[string]any) (Result, e
 		}
 		content += fmt.Sprintf("\n产出文件已交付给用户: %s", strings.Join(names, ", "))
 	}
-	if runErr != nil && exitCode != 0 && !timedOut {
+	if runErr != nil && exitCode != 0 && !timedOut && hint == "" {
 		content += "\n（代码有报错，请根据上面的 stderr 修正后重试）"
 	}
 
@@ -306,6 +416,84 @@ func (t *RunPythonTool) Run(ctx context.Context, args map[string]any) (Result, e
 		Files:   files,
 		Display: status,
 	}, nil
+}
+
+// classifySandboxFailure 把沙箱的失败形态翻译成「模型能照着改、人也能照着改」的一句话。
+//
+// 为什么值得单独一个函数：改造前所有非超时的失败都挤成一句「退出码 -1」。
+// 单机离线部署的真实场景是——模型写了段解析 17MB PDF 的脚本，被 cgroup OOM 秒杀，
+// 拿回一句「退出码 -1」，它只能猜（「代码有报错，请修正后重试」）然后原样重试，
+// 用户界面上看到的是一动不动跳秒的计时器。给不出原因，就会变成死循环烧时间。
+//
+// 判据只用**日志里真出现的字符串**（systemd 的 OOM 记录 / 内核的 Killed），
+// 不靠调用方传"我猜是内存问题"——猜错的话等于把另一种故障引到错的修法上。
+func classifySandboxFailure(exitCode int, out string, timedOut bool, cfg ExecConfig) (status, hint string) {
+	if timedOut {
+		return fmt.Sprintf("超时被杀（上限 %s）", cfg.Timeout),
+			fmt.Sprintf("（脚本跑太久了。上限可用 %s 调大；更稳的做法是分页/分块处理，"+
+				"不要一次把整份文件读进内存。）", EnvExecTimeout)
+	}
+
+	oom := looksLikeOOM(out)
+	pyMem := !oom && looksLikePythonMemoryError(out)
+	switch {
+	case oom:
+		// 137 = 128+9（SIGKILL），是 cgroup OOM 与 systemd RuntimeMaxSec 的共用码，
+		// 所以判 OOM 优先看日志串，退出码只作为旁证。
+		return fmt.Sprintf("被内存上限杀掉（MemoryMax=%s）", cfg.MemoryMax),
+			fmt.Sprintf("（脚本吃内存超过了 %s。调大：在 %s 里设 %s=1G（或更大）后重启服务；"+
+				"同时建议改成流式/分块解析，别一次读整份文件。）",
+				cfg.MemoryMax, "/opt/skillforge/skillforge.env", EnvExecMemory)
+	case pyMem:
+		// 与上面区分开：进程**没被**上限杀，是自己申请不到内存抛的异常。
+		// 两种现场的修法不一样，混成一句「被上限杀掉」会把人引到调限额上，
+		// 而真正该做的是不要一次性把整份文件读进内存。
+		return "脚本内存不足（自己抛的 MemoryError，不是被沙箱上限杀掉）",
+			"（多半是一次性读了整份文件。改成流式/分页读取，或先抽样再全量；" +
+				"确实需要大内存时可让运维调大 " + EnvExecMemory + "。）"
+	case exitCode == -1:
+		// 走到这里说明不是超时、日志里也没有 OOM 记录：多半是沙箱没能启动
+		// （systemd-run 缺失、unit 名冲突、SandboxUser 不存在）。这类故障
+		// 模型自己改代码永远修不好，必须明说「不是你的代码问题」。
+		return "沙箱未正常结束（不是脚本语法问题）",
+			"（进程没有正常退出，且没有超时/内存记录：通常是沙箱自身没起来" +
+				"（systemd-run 缺失、降权用户不存在、unit 冲突）。请让运维跑 " +
+				"`skillforge -selftest` 看沙箱一节，不要靠改代码重试。）"
+	default:
+		return fmt.Sprintf("退出码 %d", exitCode), ""
+	}
+}
+
+// looksLikeOOM 判断输出里有没有「被内存上限杀掉」的实证。
+//
+// 只认内核/systemd 层面的证据。python 自己抛的异常不算——那是另一类现场
+// （见 looksLikePythonMemoryError），修法不同，不能混。
+func looksLikeOOM(out string) bool {
+	needles := []string{
+		"oom-kill",               // 内核：Memory cgroup out of memory: Killed process
+		"Out of memory",          // systemd：unit ... failed with result 'oom-kill'
+		"Memory cgroup out of",   // 内核行首
+		"cannot allocate memory", // 系统调用层（
+	}
+	for _, n := range needles {
+		if strings.Contains(out, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// looksLikePythonMemoryError 认 python 层的内存不足异常。
+//
+// ⚠️ 必须带词边界：`numpy.core._exceptions._ArrayMemoryError` 里含 "MemoryError"
+// 子串，用 Contains 会把它当普通 MemoryError 抓住——但 numpy 的分配失败与
+// 解释器抛 MemoryError 是两种现场。这条边界是单测逼出来的（第一版就是 Contains，
+// 被自己的反例测试抓住）。`\b` 在 `_ArrayMemoryError` 这种前面紧跟字母的写法上
+// 不成立，正好把 numpy 的类名排除在外。
+var pyMemoryError = regexp.MustCompile(`\bMemoryError\b`)
+
+func looksLikePythonMemoryError(out string) bool {
+	return pyMemoryError.MatchString(out)
 }
 
 // systemdArgs 组装沙箱命令行。属性组合已在本机实测验证（见 docs/agent-tools-plan.md）。
@@ -609,6 +797,14 @@ func SandboxDiagnosticsFor(ctx context.Context, secretPaths []string) map[string
 		out[k] = v
 	}
 	out["display"] = res.Display
+	// 生效限额必须出现在体检报告里。
+	// 为什么：客户按文档调了 SKILLFORGE_EXEC_MEMORY=1G，但 env 文件没被服务读到、
+	// 或者值写错被退回默认，现场从输出上完全看不出来。把生效值打出来，
+	// 「我明明调大了」和「实际还是 256M」就能一眼对上，不用去翻 /proc/<pid>/environ。
+	cfg := DefaultExecConfig()
+	out["limits"] = fmt.Sprintf("超时=%s 内存=%s CPU=%s 任务数=%d（可用 %s / %s / %s / %s 覆盖）",
+		cfg.Timeout, cfg.MemoryMax, cfg.CPUQuota, cfg.TasksMax,
+		EnvExecTimeout, EnvExecMemory, EnvExecCPU, EnvExecTasks)
 	return out
 }
 

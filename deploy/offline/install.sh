@@ -793,6 +793,17 @@ umask 077
 	fi
 	printf '# ---- 离线自检用来证明「沙箱确实读不到机密」的证据文件 ----\n'
 	printf 'SKILLFORGE_ENV_FILE=%s\n\n' "$ENV_FILE"
+	printf '# ---- agents 脚本沙箱限额（一般不用动）----\n'
+	printf '# 训练时模型会自己写 python 小脚本去解析素材，脚本跑在一个受限沙箱里，\n'
+	printf '# 默认每次最多用 256M 内存 / 30 秒 / 半个 CPU / 32 个进程。\n'
+	printf '# 素材很大时（几十 MB 的 PDF、上千行的 Excel），脚本可能吃不到 256M 被杀，\n'
+	printf '# 训练日志里会说清「内存不足」并给出这句调法 —— 那时，把下面两行的注释去掉、\n'
+	printf '# 按需放大即可（内存写 M/G，时间写 s/m；写错值会退回默认，不会把服务搞坏）。\n'
+	printf '#SKILLFORGE_EXEC_MEMORY=1G\n'
+	printf '#SKILLFORGE_EXEC_TIMEOUT=5m\n'
+	printf '# 另两个更少用：CPU 配额与进程数上限（默认 50%% / 64）。\n'
+	printf '#SKILLFORGE_EXEC_CPU=80%%\n'
+	printf '#SKILLFORGE_EXEC_TASKS=128\n\n'
 	printf '# ---- LLM（也可装好后登录管理端在网页上配，网页配置优先）----\n'
 	printf 'SKILLFORGE_LLM_PROVIDER=%s\n' "$OLD_LLM_PROV"
 	printf 'SKILLFORGE_LLM_BASE_URL=%s\n' "$OLD_LLM_URL"

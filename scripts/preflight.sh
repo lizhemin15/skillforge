@@ -250,6 +250,12 @@ if [ "$QUICK" = 0 ]; then
   selfcheck '后端 / 分类结构管理自证'   python3 scripts/category_guard_inject.py
   selfcheck '后端 / 思考开关矩阵自证'   python3 scripts/fastjson_knob_inject.py
   selfcheck '后端 / 提速与中间材料自证' python3 scripts/thinking_knob_inject.py
+  # 后端 / 沙箱限额：客户现场真阻碍（agents 写个解析脚本一碰大文件就被 cgroup OOM 秒杀，
+  # 报成没有信息量的「退出码 -1」；而 MemoryMax=256M 硬编码，单机离线客户无从调）。
+  # 正向（四旋钮可覆盖 / 非法值退回默认 / -1 分类成人话）由上面 `go test ./...` 覆盖；
+  # 这条补**负向**：注入真故障必须红在预期那条测试、还原后回绿 —— 否则「可覆盖」
+  # 三个字可能只是一段没人验过的注释。
+  selfcheck '后端 / 沙箱限额自证'        python3 internal/tools/exec_limits_mutation_check.py
   # 离线包 install.sh 的装后服务探测（三段：正向场景 / 两路注入自证）。
   # 注入模式的退出码是反的 —— rc=0 表示「确实按预期转红了」，所以这里不能吞错：
   # selfcheck 把非 0 当失败，正好是我们要的语义。
