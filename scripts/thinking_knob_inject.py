@@ -121,6 +121,55 @@ MUTATIONS = [
         "真踩过的 bug 原样注回：attr() 看的是栈顶容器，压完再算就是在问「新容器归谁」，"
         "答案永远是它自己 —— `\"rows\":[[\"a\",\"b\"]]` 一个值都露不出来，根级 `[` 还会越界 panic。",
     ),
+    (
+        "M8 结构化阶段又把思考链打开了", "internal/skillgen/generator.go",
+        # 锚点故意用「调用行 + 紧随其后的 return \"\", err」而不是上面那几行注释：
+        # 注释是给人看的，随时会被补一句（本轮就补过），锚点跟着碎掉 → 脚本报
+        # 「注入点没找到」＝ 这条自证悄悄失效，而它看上去只是「跳过了一项」。
+        # 带返回值的上下文既唯一，也不怕注释被改。
+        # 注入体必须是锚点的「只改被测行为」的严格变异：同样 4 行，只把
+        # withoutThinking(ctx) 拿掉。曾经这里只换了锚点、没换注入体，
+        # 结果注入把 if err 块整段删掉 → build failed（环境红）——
+        # 环境红不是断言红，等于这条自证白跑一轮。
+        "out, err := g.chatWithMaterial(withoutThinking(ctx), sys, user, true)\n"
+        "\tif err != nil {\n"
+        "\t\treturn \"\", err\n"
+        "\t}",
+        "out, err := g.chatWithMaterial(ctx, sys, user, true)\n"
+        "\tif err != nil {\n"
+        "\t\treturn \"\", err\n"
+        "\t}",
+        [GO_MARK, "test", "-v", "./internal/skillgen/", "-run",
+         "TestModelCallSitesDeclareThinkingMode", "-count=1"],
+        "TestModelCallSitesDeclareThinkingMode",
+        "用户投诉的「慢」就是这个形态：1/9 提取写作特征那一步 94.8 秒里 5026 字思考链 / 286 字正文，"
+        "产出只是一段特征 JSON。摘掉开关后耗时立刻回到 94.8s 量级，而**所有别的单测、界面、验收全绿** —— "
+        "只有源码守卫看得出「这个调用点没表态」。",
+    ),
+    (
+        "M9 顺手把「撰写系统提示词」也关成一刀切", "internal/skillgen/generator.go",
+        "\tuser := \"需求:\\n\" + in.Requirement + \"\\n\\n特征分析:\\n\" + attrs + \"\\n\\n母模板:\\n\" + tpl\n"
+        "\tout, err := g.chatWithMaterial(ctx, sys, user)",
+        "\tuser := \"需求:\\n\" + in.Requirement + \"\\n\\n特征分析:\\n\" + attrs + \"\\n\\n母模板:\\n\" + tpl\n"
+        "\tout, err := g.chatWithMaterial(withoutThinking(ctx), sys, user)",
+        [GO_MARK, "test", "-v", "./internal/skillgen/", "-run",
+         "TestKeepThinkingAllowlistHasNoDrift", "-count=1"],
+        "TestKeepThinkingAllowlistHasNoDrift",
+        "反方向的坏：4/9 撰写系统提示词产出的是要给人读的提示词正文，思考链直接影响质量。"
+        "关掉它整轮更快、单测全绿、界面照常，唯一的变化是技能变差 —— 「提速」漂成「降级」时"
+        "没有任何东西会响。这条守卫专门盯这种无声降级。",
+    ),
+    (
+        "M10 开关读了却没接到 provider 上", "internal/skillgen/generator.go",
+        "\t\tDisableThinking: thinkingOff(ctx),",
+        "\t\tDisableThinking: false,",
+        [GO_MARK, "test", "-v", "./internal/skillgen/", "-run",
+         "TestChatWithMaterialCarriesThinkingFlagToProvider", "-count=1"],
+        "TestChatWithMaterialCarriesThinkingFlagToProvider",
+        "最隐蔽的一种：调用点老老实实标了 withoutThinking、源码守卫全绿、扫描器也认，"
+        "但开关在最后一跳被写死成 false —— 9 处标注全是摆设，860.5s 原样回来。"
+        "行为用例是唯一能看见这一跳的尺子。",
+    ),
 ]
 
 

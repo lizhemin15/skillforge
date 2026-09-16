@@ -364,7 +364,7 @@ func (g *Generator) judgeDraft(ctx context.Context, mp *manualPack, cat Category
 	// jsonMode=true：裁判输出必须结构化使用（逐维扣分要进 fidelity.md、
 	// findings 要喂回炉），裸奔靠运气会在中文理由里随机炸 json。
 	// 同上：裁判评分要逐维推理，也是分钟级静默调用，接流式把思考链吐给用户。
-	out, err := g.chatWithMaterial(ctx, judgeSystemPrompt, user, true)
+	out, err := g.chatWithMaterial(withoutThinking(ctx), judgeSystemPrompt, user, true)
 	if err != nil {
 		return nil, fmt.Errorf("judgeDraft: 裁判调用失败: %w", err)
 	}
