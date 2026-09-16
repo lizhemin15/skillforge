@@ -97,7 +97,8 @@ func (g *Generator) enforcePromptHygiene(ctx context.Context, prompt string, ste
 2. 不得新增任何要求,不得改写其他句子,不要重排结构。
 3. 若输入里没有这类要求,原样输出。
 4. 直接输出修订后的完整提示词正文,不要解释、不要代码块包裹。`
-		if out, err := g.llm.Chat(ctx, sys, prompt); err == nil {
+		// 修订整份提示词属分钟级调用，同样接流式（与裁判段同理）。
+		if out, err := g.chatWithMaterial(ctx, sys, prompt); err == nil {
 			rev := cleanCodeFence(out)
 			if strings.TrimSpace(rev) != "" && len(promptHygieneViolations(rev)) < len(bad) {
 				prompt = rev

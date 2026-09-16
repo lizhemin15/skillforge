@@ -336,7 +336,9 @@ func (g *Generator) trialDraft(ctx context.Context, sysPrompt string, mp *manual
 	if blk := trialPackBlock(mp, cat); blk != "" {
 		sys = strings.TrimRight(sys, "\n") + "\n\n" + blk
 	}
-	out, err := g.llm.Chat(ctx, sys, buildTrialInput(cat, material))
+	// 走流式：试用写稿是全流程最长的一次调用（整篇成稿），静默跑几分钟在界面上
+	// 就是一个跳秒的计时器 —— 用户投诉「一直卡着计时，用户体验不佳」指的就是这里。
+	out, err := g.chatWithMaterial(ctx, sys, buildTrialInput(cat, material))
 	if err != nil {
 		return "", fmt.Errorf("trialDraft: 试用写稿失败: %w", err)
 	}
@@ -361,7 +363,8 @@ func (g *Generator) judgeDraft(ctx context.Context, mp *manualPack, cat Category
 	user := buildJudgeUserPrompt(cat, mp, material, draft)
 	// jsonMode=true：裁判输出必须结构化使用（逐维扣分要进 fidelity.md、
 	// findings 要喂回炉），裸奔靠运气会在中文理由里随机炸 json。
-	out, err := g.llm.Chat(ctx, judgeSystemPrompt, user, true)
+	// 同上：裁判评分要逐维推理，也是分钟级静默调用，接流式把思考链吐给用户。
+	out, err := g.chatWithMaterial(ctx, judgeSystemPrompt, user, true)
 	if err != nil {
 		return nil, fmt.Errorf("judgeDraft: 裁判调用失败: %w", err)
 	}

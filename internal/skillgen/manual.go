@@ -1156,7 +1156,8 @@ func (g *Generator) buildReviewer(ctx context.Context, st *Structure) (string, e
 5. 只输出 Markdown 正文，不要任何解释性开场白与结尾。`
 	user := "手册原文：\n\n" + src.String()
 
-	out, err := g.llm.Chat(ctx, sys, user)
+	// 审稿清单要通读手册原文再逐条提炼，属分钟级调用；接流式免得这一段也是纯计时。
+	out, err := g.chatWithMaterial(ctx, sys, user)
 	if err != nil {
 		return "", err
 	}
