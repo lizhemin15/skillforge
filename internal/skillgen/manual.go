@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -622,6 +623,9 @@ func (g *Generator) ingestFiles(ctx context.Context, in *Input, steps func(strin
 			if ocrsvc.Unreachable(err) {
 				reason := "文档解析服务没有在运行（" + ocrsvc.Endpoint(g.ocrURL) + " 连不上）"
 				rep.Failures = append(rep.Failures, fn+": "+reason)
+				// 界面上只给用户人话（可执行、不含底层噪音），但服务端日志要留真话：
+				// 排障时要能分清 refused / DNS / 路由。「用户看不到」不等于「可以不留证据」。
+				log.Printf("[ocr] %s 解析失败（依赖不可用）：%v", fn, err)
 				if rep.EnvHint == "" {
 					rep.EnvHint = "文档解析环境异常：" + ocrsvc.Explain(err, g.ocrURL).Error()
 				}

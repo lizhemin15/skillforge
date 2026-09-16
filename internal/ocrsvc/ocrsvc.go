@@ -148,9 +148,13 @@ type Health struct {
 func (h Health) Detail() string {
 	switch {
 	case !h.Running:
+		// 排查入口必须和 Explain 一样给全（status / journalctl）：线上取证时发现
+		// 只给一条 restart 命令，用户遇到「restart 也不行」（比如 unit not found、
+		// 起来又挂）就没下一步了。
 		return fmt.Sprintf("⚠️ 文档解析服务没有在运行（%s 连不上）：在目标机执行 `systemctl restart %s` 即可修复；"+
-			"若提示 unit not found，说明安装时未启用解析服务，需重装并启用（去掉 --no-ocr）。",
-			Endpoint(h.URL), UnitName())
+			"若提示 unit not found，说明安装时未启用解析服务，需重装并启用（去掉 --no-ocr）。"+
+			"排查：`systemctl status %s` / `journalctl -u %s -n 50`。",
+			Endpoint(h.URL), UnitName(), UnitName(), UnitName())
 	case !h.RuntimeOK:
 		return fmt.Sprintf("⚠️ 文档解析服务在运行但运行时已损坏（%s）：它正在自动重启，约 10 秒后重试即可；"+
 			"若持续如此，执行 `systemctl restart %s` 并在目标机看 `journalctl -u %s -n 50`。",
