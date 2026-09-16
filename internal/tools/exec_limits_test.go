@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -335,5 +336,43 @@ func TestRunReportsSandboxOOMToModel(t *testing.T) {
 	}
 	if res.Display == "" {
 		t.Error("Display 为空：工具链在 UI 上看不见这次失败")
+	}
+}
+
+// TestInstallDocMatchesExecDefaults 钉住「装机文档上写的数字 = 代码里的生效默认值」。
+//
+// 为什么值得一条测试：这个偏差在同一个下午出现了两次（进程数上限写了 64，实际默认 32）。
+// 客户照着文档判断「我这机器够不够」，写错他就按错的容量做规划；而且这种偏差
+// 单测、编译、CI 全都不会吭声——只有真去读这段文案的人才会发现。
+// 期望值全部由 DefaultExecConfig() 推导，所以以后改默认值会自动带着文案一起红。
+func TestInstallDocMatchesExecDefaults(t *testing.T) {
+	for _, k := range []string{EnvExecTimeout, EnvExecMemory, EnvExecCPU, EnvExecTasks} {
+		t.Setenv(k, "")
+	}
+	cfg := DefaultExecConfig()
+
+	// install.sh 是 printf 写的，文本里的 %% 是转义后的字面量。
+	wants := []string{
+		cfg.MemoryMax,                       // 内存
+		humanDuration(cfg.Timeout),          // 超时
+		fmt.Sprintf("%d 个进程", cfg.TasksMax), // 进程数
+		fmt.Sprintf("%s / %d", strings.ReplaceAll(cfg.CPUQuota, "%", "%%"), cfg.TasksMax), // CPU 配额 + 进程数
+	}
+
+	const doc = "../../deploy/offline/install.sh"
+	raw, err := os.ReadFile(doc)
+	if err != nil {
+		// 只跳过「文件不在这个检出版本里」的情形（例如只拷了 internal/ 出去跑单测）；
+		// 其它错误照常算失败。
+		if os.IsNotExist(err) {
+			t.Skipf("没有 %s，跳过（这条只在完整仓库里有意义）", doc)
+		}
+		t.Fatalf("读 %s 失败：%v", doc, err)
+	}
+	text := string(raw)
+	for _, w := range wants {
+		if !strings.Contains(text, w) {
+			t.Errorf("装机文档里没有生效默认值 %q —— 客户会按错的容量做规划：%s", w, doc)
+		}
 	}
 }

@@ -801,7 +801,7 @@ umask 077
 	printf '# 按需放大即可（内存写 M/G，时间写 s/m；写错值会退回默认，不会把服务搞坏）。\n'
 	printf '#SKILLFORGE_EXEC_MEMORY=1G\n'
 	printf '#SKILLFORGE_EXEC_TIMEOUT=5m\n'
-	printf '# 另两个更少用：CPU 配额与进程数上限（默认 50%% / 64）。\n'
+	printf '# 另两个更少用：CPU 配额与进程数上限（默认 50%% / 32）。\n'
 	printf '#SKILLFORGE_EXEC_CPU=80%%\n'
 	printf '#SKILLFORGE_EXEC_TASKS=128\n\n'
 	printf '# ---- LLM（也可装好后登录管理端在网页上配，网页配置优先）----\n'
