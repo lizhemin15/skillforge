@@ -59,8 +59,16 @@ expect_red_of() { # $1=用例 $2=预期的 FAIL 特征串 $3=变异说明
 
 # ---- M1：自由函数调用点退回裸客户端（原发地）----
 restore
-sed -i 's/ExtractStructure(ctx, g\.streamingChat(), src)/ExtractStructure(ctx, g.llm, src)/' manual.go
-grep -q 'ExtractStructure(ctx, g.llm, src)' manual.go || { echo "BAD M1 注入点没打上"; RC=1; }
+# 锚点必须容忍 ctx 被包一层（withoutThinking(ctx) / 任何 ctx 包装），不能写死具体形态。
+# 2026-09-17 踩过：提速那批给这处调用点加了 withoutThinking(ctx) 包装，sed 锚点原样是
+# `ExtractStructure(ctx, g.streamingChat(), src)` → **注入打不上** → 「BAD M1 注入点没打上」
+# → 这条腿自己红了。看起来像「漏接流式」的守卫坏了，其实是尺子的锚点过时了 —— 而真要被
+# 盯住的漏接形态那一刻根本没人看（最坏的组合：噪音红 + 真覆盖静默消失）。
+# 所以这里吸掉可选包装：`(ctx)` 或 `(xxx(ctx))` 都命中，注入后仍保留原包装。
+sed -i -E 's/ExtractStructure\(([A-Za-z_][A-Za-z0-9_]*\(ctx\)|ctx), g\.streamingChat\(\), src\)/ExtractStructure(\1, g.llm, src)/' manual.go
+# 注入成功的判据：出现「裸 g.llm 直接递给自由函数」这一形态（ctx 包装保留与否都算命中）
+grep -qE 'ExtractStructure\(([A-Za-z_][A-Za-z0-9_]*\(ctx\)|ctx), g\.llm, src\)' manual.go \
+  || { echo "BAD M1 注入点没打上"; RC=1; }
 expect_red_of TestNoSilentModelCallOutsideChatWithMaterial 'manual.go:' "M1 裸客户端递给自由函数"
 
 # ---- M2：训练链路里直接阻塞调用（往真实阶段函数里塞一行）----
