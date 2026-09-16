@@ -381,6 +381,25 @@ func judgeParseService(ev parseEvidence) selfCheck {
 		c.detail = append(c.detail,
 			fmt.Sprintf("%s 正常，版本 %s", ocrsvc.Endpoint(ev.URL), ver))
 
+	case ev.Health.Running:
+		// 「端口在听」必须**先于**「本机没有 unit」判定 —— 顺序反了会出事：
+		// 在没装 skillforge-ocr.service 的机器（容器 / 手工起进程 / CI）上，僵尸服务与
+		// 冒名服务会先命中「没有 unit」那一支、被吞成「跳过」，而那支明细还写着「也连不上」
+		// ——连探测结论都没看就下断言的假话。
+		// 2026-09-16 CI 红抓到的就是这个：本地装了 unit 走的是这一支（判失败，绿），
+		// CI 上被上一支吞掉（判跳过，红），**同一份代码两个结论**。本地绿是环境把 bug 遮住了。
+		c.detail = append(c.detail,
+			fmt.Sprintf("%s 端口在听，但服务自报运行时已损坏（版本 %s）", ocrsvc.Endpoint(ev.URL), ev.Health.Version),
+			"端口在听 ≠ 能干活：这种状态下每次解析都会失败，用户看到的是「上传的素材抽不出文字」。",
+			fmt.Sprintf("修复：`systemctl restart %s`（运行时守卫也会自己退出让 systemd 拉起），约 10 秒后重试。", ev.UnitName),
+			fmt.Sprintf("排查：`journalctl -u %s -n 50`。", ev.UnitName))
+		if ev.UnitPath == "" {
+			// 按证据报「来源」：上两条 systemd 命令在这台机器上用不上，明说，别让客户敲了没用。
+			c.detail = append(c.detail,
+				fmt.Sprintf("注意：本机没有 %s.service，上两条 systemd 命令只适用于 systemd 安装；"+
+					"容器 / 手工起进程的部署请重启解析服务进程本身。", ev.UnitName))
+		}
+
 	case !ev.Loopback:
 		c.detail = append(c.detail,
 			fmt.Sprintf("连不上远端解析服务 %s：地址写错了，或对端机器/服务挂了。", ocrsvc.Endpoint(ev.URL)),

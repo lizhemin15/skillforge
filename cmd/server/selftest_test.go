@@ -369,6 +369,21 @@ func TestJudgeParseService(t *testing.T) {
 			wantHits: []string{"端口在听", "systemctl restart", "journalctl"},
 		},
 		{
+			// 2026-09-16 CI 红补的用例：同样的僵尸服务，跑在**没装 unit** 的机器上
+			// （容器 / 手工起进程 / CI —— CI 就是这一台）。
+			// 旧判定顺序在此判「跳过」，于是同一份代码在装了 unit 的机器上判失败、在没装的机器上判跳过，
+			// 而「跳过」那支的明细还写着「也连不上」——探测都没连上怎么知道连不上。
+			// 本地绿也是靠这个盲区：本机恰好装了 unit。测试固件只写了「有 unit」那一维，缺了这一维。
+			name: "端口在听但运行时已损坏（僵尸）+ 本机没装 unit",
+			ev: parseEvidence{RawEnv: "http://127.0.0.1:19094", URL: "http://127.0.0.1:19094",
+				Loopback: true, UnitName: "skillforge-ocr", UnitPath: "", Health: zombie},
+			wantOK:   false,
+			wantSkip: false,
+			wantHits: []string{"端口在听", "systemctl restart", "本机没有 skillforge-ocr.service"},
+			// 「不算失败」是「没有 unit 且真连不上」那支的措辞；端口在听时用它 = 把事故说成预期行为。
+			wantAvoid: []string{"不算失败", "也连不上"},
+		},
+		{
 			name: "单元在但服务没在跑",
 			ev: parseEvidence{RawEnv: "http://127.0.0.1:8093", URL: "http://127.0.0.1:8093",
 				Loopback: true, UnitName: "skillforge-ocr", UnitPath: "/etc/systemd/system/skillforge-ocr.service", Health: refused},
