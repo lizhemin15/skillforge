@@ -238,6 +238,11 @@ if [ "$QUICK" = 0 ]; then
   selfcheck '前端 / 输入区布局与贴底滚动自证' python3 web/tests/chat_composer_mutation_check.py
   selfcheck '前端 / 思考材料渲染自证'   python3 web/tests/chat_trace_mutation_check.py
   selfcheck '前端 / 线上验收 leg 接线自证' bash web/tests/live_e2e_roster_mutation_check.sh
+  # 大模型输出 JSON 的「手抖容忍层」自证。线上真故障（2026-09-17）：模型把
+  # input_params.options 写成对象数组 [{"label":"启用","value":"on"}]，Go 严格解 []string
+  # 当场报错 → 整轮训练在第 2 步 18 秒中断（用户看到「训练失败」，且这正是
+  # 「生成的技能跟我给的东西没关系」的一个隐性来源）。
+  selfcheck '后端 / 模型输出手抖容忍自证' bash internal/model/param_flex_mutation_check.sh
   # 「模型链路偷偷不走流式」的守卫自证（线上 353 秒零帧的原发现场）。
   # 它此前是一把**游离尺子**：仓库里有、本机能跑，但没人调用；而且仓库根写死成
   # /root/skillforge，CI 里想接也接不上（已改成从脚本自身位置推导）。
