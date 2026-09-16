@@ -31,8 +31,17 @@
      所以 A5 有三态，缺一不可：
        · 出现且有材料 → PASS
        · 出现却零材料 → FAIL（这才是真正的漏接流式）
-       · 没出现       → 只有当日志里同时出现「5/9 未按手册处理」（=本轮确实走了通用
-                        路径）才算 N/A；否则 FAIL（没在手边的解释）。
+       · 没出现       → 只有当**日志自己写了**一条已登记的不适用理由（见 COND_STAGES）
+                        才算 N/A；否则 FAIL（没在手边的解释）。理由不许由尺子推断。
+
+     COND_STAGES 登记两条理由，对应 generator.go 里那两级前置条件：
+       · 「5/9 未按手册处理」——写作类技能，但手册抽取失败（设计好的退路）
+       · 「3/9 技能类型: <非 write>」——非写作类技能，手册识别这一步整段不跑
+     2026-09-17 线上 train_stream 腿（素材被识别为 query）走的是第二条：旧尺子只认
+     第一条，于是把「按设计不适用」判成 FAIL（假红）；但如果为了消红就放宽成「有
+     类型行就算数」，写作类技能把 5/9 与 8.5/9 两段一起删掉也能换个 N/A 绿（假绿）。
+     所以第二条理由**必须排除 write**，两个方向都要有用例钉住（见
+     judge_stats_three_state_check.py 的 S5/S6）。
      没有第三条前置条件，「把 8.5/9 整段删掉」或「手册识别永远失败」都会让尺子
      一路绿 —— 那是空跑绿，不是通过。
   A6 抽取层活证据：解析帧必须写明「文本层直取 N / OCR M」且 M < N+M
@@ -58,11 +67,25 @@ MAX_SILENCE = float(os.environ.get("MAX_SILENCE", "120"))
 # （但只有手册模式才跑它 —— 见下面 COND_STAGES 的三态判定。）
 EXPECT_STAGES = [s for s in os.environ.get(
     "EXPECT_STAGES", "8.5/9").split("|") if s]
-# 「本轮没跑这个阶段」的**唯一**可接受理由：日志里出现了这个标记，说明流程真的走了
-# 通用路径（8.5/9 的开关是 mp!=nil && 手册分类>0，见 generator.go:312）。
-# 没这条前置，把 8.5/9 整段删掉也能绿 —— N/A 必须是**被证明过的**不适用。
-COND_STAGES = {"8.5/9": "5/9 未按手册处理",
-               "裁判": "5/9 未按手册处理"}
+# 「本轮没跑这个阶段」的可接受理由（三态里的「中态」）——**必须是日志自己写的**，
+# 尺子不许替流程推断。8.5/9 的开关是 `mp != nil && len(mp.Structure.Categories) > 0`
+# （generator.go:318），而 mp 只在 Step 5 里被赋值，Step 5 自己还有一级前置
+# `dtype.Type == model.SkillTypeWrite`（generator.go:251）。于是合法理由恰好两条：
+#   ① `5/9 未按手册处理` —— 写作类技能，但手册抽取失败（设计好的退路）
+#   ② `3/9 技能类型: <非 write>` —— 非写作类技能，手册识别整段按设计不执行
+# ② 必须排除 write：否则写作类技能把「5/9」和「8.5/9」两段一起删掉，也能拿
+# 「3/9 技能类型: write」这句假证词换一个 N/A 绿。两个方向都钉在
+# judge_stats_three_state_check.py 里（S5 = ②真该绿，S6 = ②不许漏给 write）。
+# 每条理由 = (必须命中的正则, 必须不命中的正则或 None, 人话)。
+# ⚠️ 别用负向先行断言写「不是 write」：`技能类型:\s*(?!write\b)` 会被回溯穿透 ——
+# `\s*` 允许匹配 0 个字符，于是在那个空格上 `(?!write\b)` 立刻成立，write 也能绿
+# （S6 就是这么抓出来的）。改成「正向命中 + 反向否决」两个独立正则，无回溯空间。
+COND_REASONS = [
+    (r"5/9 未按手册处理", None, "写作类技能但手册抽取失败，改走通用流程"),
+    (r"3/9 技能类型:\s*[A-Za-z_]+", r"3/9 技能类型:\s*write\b",
+     "非写作类技能，手册识别这一步按设计整段不跑"),
+]
+COND_STAGES = {"8.5/9": COND_REASONS, "裁判": COND_REASONS}
 # 跨度 ≥ 该值却没滚出任何材料的阶段 → WARN（列出来给人看，但不判 FAIL：
 # 有些阶段天然是机械活，跑得久不代表坏了）
 WARN_SILENT_SPAN = float(os.environ.get("WARN_SILENT_SPAN", "60"))
@@ -246,23 +269,33 @@ def main() -> int:
     # A5 是三态：True / False / None（None = 被证明过的 N/A，不计入 bad）。
     all_stage_text = "\n".join(order)
     for p in EXPECT_STAGES:
+        name_a5 = "A5 点名阶段「%s」有材料滚出" % p
         if named[p] > 0:
-            checks.append(("A5 点名阶段「%s」有材料滚出" % p, True, "材料帧=%d" % named[p]))
+            checks.append((name_a5, True, "材料帧=%d" % named[p]))
         elif present[p]:
             # 阶段出现了却一帧材料都没有：漏接流式的产品故障（事故当场就是这个形状）。
-            checks.append(("A5 点名阶段「%s」有材料滚出" % p, False,
+            checks.append((name_a5, False,
                            "阶段已出现但零材料帧 —— 漏接流式，用户只会看到计时器在跳"))
-        elif p in COND_STAGES and COND_STAGES[p] in all_stage_text:
-            # 没跑，且日志自证了「为什么没跑」：条件阶段在本轮不适用。
-            checks.append(("A5 点名阶段「%s」有材料滚出" % p, None,
-                           "N/A：本轮走到「" + COND_STAGES[p] + "」→ 该阶段按设计不执行"
-                           "（不是通过，是未适用）"))
         else:
-            # 既没跑、也没解释 —— 阶段被删了 / 流程在它之前就崩了 / 正则过期了。
-            checks.append(("A5 点名阶段「%s」有材料滚出" % p, False,
-                           "日志里既没有该阶段、也没有「%s」这条不适用理由："
-                           "要么阶段被删/流程提前崩了，要么 EXPECT_STAGES 正则已过期"
-                           % COND_STAGES.get(p, "（无适用条件登记）")))
+            # 没跑：只有**日志自己写了**一条已登记理由，才算被证明过的 N/A；
+            # 否则 = 阶段被删 / 流程在它之前就崩了 / 正则过期，必须 FAIL。
+            why = None
+            for rx, forbid, human in COND_STAGES.get(p, []):
+                if forbid and re.search(forbid, all_stage_text):
+                    continue          # 反向否决命中（如类型就是 write）→ 这条理由不成立
+                if re.search(rx, all_stage_text):
+                    why = (rx, human)
+                    break
+            if why:
+                checks.append((name_a5, None,
+                               "N/A：日志自证「%s」（%s）→ 该阶段按本轮的技能类型"
+                               "按设计不执行（不是通过，是未适用）" % why))
+            else:
+                regs = "、".join("「%s」" % rx for rx, _f, _h in COND_STAGES.get(p, []))
+                checks.append((name_a5, False,
+                               "日志里既没有该阶段、也没有任何已登记的不适用理由"
+                               "（登记在案：%s）：要么阶段被删/流程提前崩了，"
+                               "要么 EXPECT_STAGES 正则已过期" % (regs or "（无）")))
     checks.append(("A6 可选中页零 OCR（解析帧写明文本层直取 N>0 且 OCR 只吃扫描页）",
                    bool(parse_ev) and parse_ev[0] > 0 and parse_ev[1] < parse_ev[0] + parse_ev[1],
                    ("文本层直取=%d OCR=%d" % parse_ev) if parse_ev else "未抓到解析帧"))

@@ -50,7 +50,10 @@ import time
 BASE = os.environ.get('BASE', 'https://skillforge.open-claw.click')
 MIN_LINES = int(os.environ.get('MIN_LINES', '2'))
 SAMPLE_SECONDS = float(os.environ.get('SAMPLE_SECONDS', '90'))
-TRAIN_NAME = os.environ.get('TRAIN_NAME', '线上训练进度验收160916')
+# 技能名必须**每轮唯一**：写死名字时第二次跑必然撞「! 技能 'xxx' 已存在，请换一个名称」，
+# 后端直接拒单 → T1/T2/T3/T5a 全红。那不是被测系统坏，是**尺子不可重跑**。
+# （2026-09-17 实测：一次红在这些断言上，采样 660s 全是同一行「已存在，请换一个名称」。）
+TRAIN_NAME = os.environ.get('TRAIN_NAME') or time.strftime('线上训练进度验收%m%d%H%M%S')
 
 # 素材用一段真需求（不给文件也能训练）。提示词写在这里而不是 runner 的 env 里：
 # 这是最该被审查的东西，藏进 scripts/ 没人看得见（roster 测试的注释专门讲过这点）。

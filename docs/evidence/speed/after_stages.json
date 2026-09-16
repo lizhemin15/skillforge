@@ -1,0 +1,188 @@
+{
+ "label": "after(v260917.0159)",
+ "path": "/tmp/after_frames.log",
+ "total": 549.4,
+ "delta_frames": 1143,
+ "stages": [
+  {
+   "stage": "1/9 分析参考文件，提取写作特征…",
+   "start": 0.0,
+   "end": 12.2,
+   "dur": 12.2,
+   "think_frames": 0,
+   "text_frames": 25,
+   "delta_frames": 25,
+   "max_silence": 1.6
+  },
+  {
+   "stage": "2/9 生成技能元数据与表单参数…",
+   "start": 12.2,
+   "end": 21.0,
+   "dur": 8.8,
+   "think_frames": 0,
+   "text_frames": 23,
+   "delta_frames": 23,
+   "max_silence": 0.6
+  },
+  {
+   "stage": "3/9 识别技能类型（写作 / 办事流程 / 模板下发）…",
+   "start": 21.0,
+   "end": 23.4,
+   "dur": 2.4,
+   "think_frames": 0,
+   "text_frames": 6,
+   "delta_frames": 6,
+   "max_silence": 1.1
+  },
+  {
+   "stage": "3/9 技能类型: write",
+   "start": 23.4,
+   "end": 23.4,
+   "dur": 0.0,
+   "think_frames": 0,
+   "text_frames": 1,
+   "delta_frames": 1,
+   "max_silence": 0.0
+  },
+  {
+   "stage": "4/9 撰写系统提示词（按类型/文风/结构/禁忌/长度）…",
+   "start": 23.4,
+   "end": 134.7,
+   "dur": 111.3,
+   "think_frames": 164,
+   "text_frames": 42,
+   "delta_frames": 206,
+   "max_silence": 6.5
+  },
+  {
+   "stage": "5/9 检测素材是否为写作手册（分类结构 / 范文锚点）…",
+   "start": 134.7,
+   "end": 192.2,
+   "dur": 57.5,
+   "think_frames": 0,
+   "text_frames": 101,
+   "delta_frames": 101,
+   "max_silence": 6.9
+  },
+  {
+   "stage": "5/9 识别到手册：12 个分类，切出 12 篇原文范文",
+   "start": 192.2,
+   "end": 211.6,
+   "dur": 19.4,
+   "think_frames": 0,
+   "text_frames": 48,
+   "delta_frames": 48,
+   "max_silence": 0.5
+  },
+  {
+   "stage": "5/9 已生成审稿清单 reviewer.md（可逐条核对）",
+   "start": 211.6,
+   "end": 211.6,
+   "dur": 0.0,
+   "think_frames": 0,
+   "text_frames": 1,
+   "delta_frames": 1,
+   "max_silence": 0.0
+  },
+  {
+   "stage": "5.5/9 校验交付物卫生（成稿不得附核对清单/自证附录）…",
+   "start": 211.6,
+   "end": 211.6,
+   "dur": 0.0,
+   "think_frames": 0,
+   "text_frames": 1,
+   "delta_frames": 1,
+   "max_silence": 0.0
+  },
+  {
+   "stage": "6/9 生成骨架模板…",
+   "start": 211.6,
+   "end": 238.3,
+   "dur": 26.7,
+   "think_frames": 0,
+   "text_frames": 62,
+   "delta_frames": 62,
+   "max_silence": 1.1
+  },
+  {
+   "stage": "7/9 范文取自手册原文切分（不重写，可机械校验保真）",
+   "start": 238.3,
+   "end": 238.3,
+   "dur": 0.0,
+   "think_frames": 0,
+   "text_frames": 1,
+   "delta_frames": 1,
+   "max_silence": 0.0
+  },
+  {
+   "stage": "8/9 本地校验（不齐不放行）…",
+   "start": 238.3,
+   "end": 238.3,
+   "dur": 0.0,
+   "think_frames": 0,
+   "text_frames": 1,
+   "delta_frames": 1,
+   "max_silence": 0.0
+  },
+  {
+   "stage": "8.5/9 裁判独立试用评分（上限 3 轮，不过线按扣分项回炉）…",
+   "start": 238.3,
+   "end": 293.2,
+   "dur": 54.9,
+   "think_frames": 74,
+   "text_frames": 22,
+   "delta_frames": 96,
+   "max_silence": 6.8
+  },
+  {
+   "stage": "8.5/9 裁判第 1 轮（公司动态通稿）：15/100 不通过 · 分类判定 0/25 · 要求依从 0/25 · 范文对齐 0/20 · 结构完整 0/15",
+   "start": 293.2,
+   "end": 293.2,
+   "dur": 0.0,
+   "think_frames": 0,
+   "text_frames": 1,
+   "delta_frames": 1,
+   "max_silence": 0.0
+  },
+  {
+   "stage": "8.5/9 第 1 轮未过线，按扣分项回炉重写提示词…",
+   "start": 293.2,
+   "end": 549.4,
+   "dur": 256.2,
+   "think_frames": 474,
+   "text_frames": 109,
+   "delta_frames": 583,
+   "max_silence": 2.5
+  },
+  {
+   "stage": "8.5/9 裁判第 2 轮（人事任免与团队变动新闻稿）：100/100 通过 · 五维满分",
+   "start": 549.4,
+   "end": 549.4,
+   "dur": 0.0,
+   "think_frames": 1,
+   "text_frames": 1,
+   "delta_frames": 2,
+   "max_silence": 0.0
+  },
+  {
+   "stage": "8.5/9 交付第 2 轮版本（1633 字）",
+   "start": 549.4,
+   "end": 549.4,
+   "dur": 0.0,
+   "think_frames": 1,
+   "text_frames": 1,
+   "delta_frames": 2,
+   "max_silence": 0.0
+  },
+  {
+   "stage": "9/9 落盘并注册…",
+   "start": 549.4,
+   "end": 549.4,
+   "dur": 0.0,
+   "think_frames": 1,
+   "text_frames": 1,
+   "delta_frames": 2,
+   "max_silence": 0.0
+  }
+ ]
+}

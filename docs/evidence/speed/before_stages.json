@@ -1,0 +1,128 @@
+{
+ "label": "before(01:10, 全阶段思考链开)",
+ "path": "/tmp/judge_new_frames.log",
+ "total": 860.6,
+ "delta_frames": 1566,
+ "stages": [
+  {
+   "stage": "1/9 分析参考文件，提取写作特征…",
+   "start": 0.0,
+   "end": 94.8,
+   "dur": 94.8,
+   "think_frames": 170,
+   "text_frames": 32,
+   "delta_frames": 202,
+   "max_silence": 1.4
+  },
+  {
+   "stage": "2/9 生成技能元数据与表单参数…",
+   "start": 94.8,
+   "end": 172.7,
+   "dur": 77.9,
+   "think_frames": 131,
+   "text_frames": 22,
+   "delta_frames": 153,
+   "max_silence": 12.9
+  },
+  {
+   "stage": "3/9 识别技能类型（写作 / 办事流程 / 模板下发）…",
+   "start": 172.7,
+   "end": 237.8,
+   "dur": 65.1,
+   "think_frames": 86,
+   "text_frames": 6,
+   "delta_frames": 92,
+   "max_silence": 6.4
+  },
+  {
+   "stage": "3/9 技能类型: write",
+   "start": 237.8,
+   "end": 237.8,
+   "dur": 0.0,
+   "think_frames": 1,
+   "text_frames": 1,
+   "delta_frames": 2,
+   "max_silence": 0.0
+  },
+  {
+   "stage": "4/9 撰写系统提示词（按类型/文风/结构/禁忌/长度）…",
+   "start": 237.8,
+   "end": 355.4,
+   "dur": 117.6,
+   "think_frames": 202,
+   "text_frames": 53,
+   "delta_frames": 255,
+   "max_silence": 2.1
+  },
+  {
+   "stage": "5/9 检测素材是否为写作手册（分类结构 / 范文锚点）…",
+   "start": 355.4,
+   "end": 785.8,
+   "dur": 430.4,
+   "think_frames": 651,
+   "text_frames": 62,
+   "delta_frames": 713,
+   "max_silence": 7.4
+  },
+  {
+   "stage": "5/9 未按手册处理，走通用流程：只抽出 1 个分类（需要 ≥2），按通用素材处理",
+   "start": 785.8,
+   "end": 785.8,
+   "dur": 0.0,
+   "think_frames": 1,
+   "text_frames": 1,
+   "delta_frames": 2,
+   "max_silence": 0.0
+  },
+  {
+   "stage": "5.5/9 校验交付物卫生（成稿不得附核对清单/自证附录）…",
+   "start": 785.8,
+   "end": 785.8,
+   "dur": 0.0,
+   "think_frames": 1,
+   "text_frames": 1,
+   "delta_frames": 2,
+   "max_silence": 0.0
+  },
+  {
+   "stage": "6/9 生成骨架模板…",
+   "start": 785.8,
+   "end": 860.5,
+   "dur": 74.7,
+   "think_frames": 147,
+   "text_frames": 16,
+   "delta_frames": 163,
+   "max_silence": 6.6
+  },
+  {
+   "stage": "7/9 挑选范文 / 生成示例…",
+   "start": 860.5,
+   "end": 860.5,
+   "dur": 0.0,
+   "think_frames": 1,
+   "text_frames": 1,
+   "delta_frames": 2,
+   "max_silence": 0.0
+  },
+  {
+   "stage": "8/9 本地校验（不齐不放行）…",
+   "start": 860.5,
+   "end": 860.5,
+   "dur": 0.0,
+   "think_frames": 1,
+   "text_frames": 1,
+   "delta_frames": 2,
+   "max_silence": 0.0
+  },
+  {
+   "stage": "9/9 落盘并注册…",
+   "start": 860.5,
+   "end": 860.6,
+   "dur": 0.1,
+   "think_frames": 1,
+   "text_frames": 1,
+   "delta_frames": 2,
+   "max_silence": 0.1
+  }
+ ]
+}

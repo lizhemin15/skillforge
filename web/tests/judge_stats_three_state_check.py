@@ -22,6 +22,16 @@
 
 S2/S3 是**同一条分支的两侧**，一起验才排得掉「恒 N/A」和「恒 FAIL」两种假绿。
 
+S5/S6 是为「第二条理由」补的一对（2026-09-17 线上 train_stream 腿抓到的实况）：
+8.5/9 除了「写作类但手册抽取失败」之外，还有一个**更常见**的不适用情形 ——
+技能类型不是 write，Step 5（手册识别）整段就不跑（generator.go:251），
+于是 8.5/9 也永远不出现。线上那轮就是 `3/9 技能类型: query`，旧尺子只认前一条，
+把「按设计不适用」判成了 FAIL（假红）。补第二条理由时最容易出的反作用是**放宽过头**：
+若只要求「有类型行」，那写作类技能把 5/9 与 8.5/9 两段一起删掉，也能拿
+`3/9 技能类型: write` 这句假证词换一个 N/A 绿 —— 所以：
+  S5 type=query 且两段都缺席 → N/A + RC=0（该绿的必须绿）
+  S6 type=write 且两段都缺席 → FAIL + RC=1（不该绿的绝不许绿）
+
 用法：python3 web/tests/judge_stats_three_state_check.py
 """
 from __future__ import annotations
@@ -48,10 +58,17 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     results.append((name, ok, detail))
 
 
-def build(case_dir: Path, *, has_named_stage: bool, has_reason: bool) -> tuple[Path, Path]:
-    """造一份最小可用的 SSE 料：20+ 帧、4s 间隔、材料 ≥400 字、解析帧合规。"""
+def build(case_dir: Path, *, has_named_stage: bool, has_reason: bool,
+          type_line: str = "", has_stage5: bool = True) -> tuple[Path, Path]:
+    """造一份最小可用的 SSE 料：20+ 帧、4s 间隔、材料 ≥400 字、解析帧合规。
+
+    type_line     —— 类型声明帧（如 `3/9 技能类型: query`）；空串 = 不带这句。
+    has_stage5    —— 是否带 Step 5 那一段（非写作类技能整段不跑，要能造出那种料）。
+    """
     case_dir.mkdir(parents=True, exist_ok=True)
     evs: list[dict] = [{"type": "step", "data": STAGE_OTHER}]
+    if type_line:
+        evs.append({"type": "step", "data": type_line})
 
     def think(stage: str, text: str) -> None:
         evs.append({"type": "delta",
@@ -60,13 +77,16 @@ def build(case_dir: Path, *, has_named_stage: bool, has_reason: bool) -> tuple[P
 
     # 12 帧（不是 9）：A1 的门槛是「≥20 帧」，缺席 8.5/9 的那两份料会少 3 帧，
     # 9 帧时总数只有 19 —— 尺子自己的前提没给全，会造出假红（踩过一次）。
-    for i in range(12):
+    # has_stage5=False 又少 6 帧，所以按缺席量补帧，否则 S5/S6 会被 A1 捎带判红
+    # （那就验不到 A5 了 —— 前提必须先给全）。
+    for i in range(12 + (0 if has_stage5 else 6)):
         think(STAGE_OTHER, "第%d页：文本层直取，未走 OCR。" % (i + 1))
     # 一段长材料，确保 A4（材料累计 ≥400 字）成立
     think(STAGE_OTHER, "素材要点：" + "可选中文本层直取，不需要 OCR。" * 25)
-    evs.append({"type": "step", "data": MARK if has_reason else "5/9 手册处理中"})
-    for i in range(5):
-        think(MARK if has_reason else "5/9 手册处理中", "手册分节解析第 %d 段。" % (i + 1))
+    if has_stage5:
+        evs.append({"type": "step", "data": MARK if has_reason else "5/9 手册处理中"})
+        for i in range(5):
+            think(MARK if has_reason else "5/9 手册处理中", "手册分节解析第 %d 段。" % (i + 1))
     if has_named_stage:
         evs.append({"type": "step", "data": STAGE_NAMED})
         think(STAGE_NAMED, "试用写稿：本段是裁判独立试用评分阶段的流式材料。" * 12)
@@ -102,8 +122,14 @@ def main() -> int:
     rc_s1, out_s1 = run(*build(tmp / "s1", has_named_stage=True, has_reason=False))
     rc_s2, out_s2 = run(*build(tmp / "s2", has_named_stage=False, has_reason=True))
     rc_s3, out_s3 = run(*build(tmp / "s3", has_named_stage=False, has_reason=False))
+    # S5/S6：同样的「8.5/9 与 5/9 都缺席」，只差类型声明那一行 —— 唯一变量。
+    rc_s5, out_s5 = run(*build(tmp / "s5", has_named_stage=False, has_reason=False,
+                               type_line="3/9 技能类型: query", has_stage5=False))
+    rc_s6, out_s6 = run(*build(tmp / "s6", has_named_stage=False, has_reason=False,
+                               type_line="3/9 技能类型: write", has_stage5=False))
 
     l1, l2, l3 = a5_line(out_s1), a5_line(out_s2), a5_line(out_s3)
+    l5, l6 = a5_line(out_s5), a5_line(out_s6)
 
     check("S1 阶段在且有材料 → PASS A5", l1.startswith("PASS A5") and rc_s1 == 0,
           "rc=%d 行=%s" % (rc_s1, l1))
@@ -124,6 +150,27 @@ def main() -> int:
           "FAIL A1" not in out_s1 and "FAIL A1" not in out_s2
           and "FAIL A6" not in out_s1 and "FAIL A6" not in out_s2,
           "s1_has_other_fail=%s" % ("FAIL A" in out_s1.replace("FAIL A5", "")))
+
+    # S5/S6：唯一变量是类型声明那一行，两侧必须一绿一红。
+    # 前提先自证：S5/S6 的料必须过 A1（≥20 帧）—— 否则 A5 的结论会被 A1 的红污染，
+    # 验的就不是「类型判定」而是「帧数不够」（尺子前提没给全 = 空跑/假红的老坑）。
+    check("S5 前提成立：非写作料本身不触发别的 FAIL（A5 的结论不被污染）",
+          "FAIL A" not in out_s5.replace("FAIL A5", ""),
+          "s5_其他FAIL=%s" % [ln for ln in out_s5.splitlines()
+                            if ln.strip().startswith("FAIL A") and "A5" not in ln])
+    check("S5 type=query 且阶段缺席 → 印 N/A 且 RC=0（线上实况：该绿的必须绿）",
+          l5.startswith("N/A") and "PASS" not in l5 and rc_s5 == 0,
+          "rc=%d 行=%s" % (rc_s5, l5))
+    check("S6 前提成立：同为缺席、类型换成 write 时料本身照样不触发别的 FAIL",
+          "FAIL A" not in out_s6.replace("FAIL A5", ""),
+          "s6_其他FAIL=%s" % [ln for ln in out_s6.splitlines()
+                            if ln.strip().startswith("FAIL A") and "A5" not in ln])
+    check("S6 type=write 且阶段缺席 → 必须 FAIL A5 + RC=1（②不许漏给 write，否则是假绿）",
+          l6.startswith("FAIL A5") and "不适用理由" in l6 and rc_s6 == 1,
+          "rc=%d 行=%s" % (rc_s6, l6))
+    n_fail_s6 = sum(1 for ln in out_s6.splitlines() if ln.strip().startswith("FAIL A"))
+    check("S6 只有 A5 一条 FAIL（红得精确）",
+          n_fail_s6 == 1, "FAIL 行数=%d" % n_fail_s6)
 
     print("===== 三态判定尺子（合成料）=====")
     bad = 0

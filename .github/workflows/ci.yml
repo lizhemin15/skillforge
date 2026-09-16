@@ -289,6 +289,13 @@ jobs:
       - name: A1~A6 流式判定器三态尺子（合成料）
         run: python3 web/tests/judge_stats_three_state_check.py
 
+      # 三态尺子自己的**松/紧双向**注入自证（见 scripts/preflight.sh 同名 selfcheck 的注释）。
+      # 「N/A」是唯一能让缺席阶段不算红的口子：宽到 write 也放行就是「一切正常」型假绿，
+      # 只有双向注入照得出来。后缀 *_mutation_check.py 由 preflight_parity.test.mjs 守着，
+      # 漏挂这一边会红。
+      - name: A5 判据双向注入自证
+        run: python3 web/tests/judge_a5_double_injection_mutation_check.py
+
       - name: Build
         run: |
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o skillforge ./cmd/server

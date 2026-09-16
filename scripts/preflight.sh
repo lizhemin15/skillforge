@@ -254,6 +254,14 @@ if [ "$QUICK" = 0 ]; then
   #   → 且计入 bad → 一个「本轮按设计不该跑」的阶段把整条尺子判红（假红）。
   # 现在用合成料把这三种状态钉住，秒级、不需要真跑训练。
   selfcheck '前端 / A1~A6 判定器三态'   python3 web/tests/judge_stats_three_state_check.py
+  # 上面那条只钉住「三种状态各自印对」；这条钉住**判据本身松紧两个方向**：
+  #   注入1 删掉一条登记理由 → S5(query 缺席) 该红必须红（尺子松了）
+  #   注入2 摘掉反向否决 → S6(write 缺席) 必须红（否则 write 也印 N/A = 假绿）
+  # 为什么非要有：三态判定里「N/A」是**唯一**能让缺席阶段不算红的口子。这个口子
+  # 一旦宽到把 write 也放进来，症状是「一切正常」——只有双向注入才照得出来。
+  # 文件名叫 *_mutation_check.py 是刻意的：preflight_parity.test.mjs 按后缀枚举，
+  # 漏挂 CI/preflight 会直接红，往后不会腐烂成「0 引用的尺子」。
+  selfcheck '前端 / A5 判据双向注入自证' python3 web/tests/judge_a5_double_injection_mutation_check.py
   # 解析服务（ocrd）的单测。它此前又是一把**游离尺子**：本机跑得动、0 引用，
   # 于是钉死的版本串 `ocrd-v5-quality` 一直没跟着真值改名而烂掉（2/15 红）。
   # 已改成「与部署门禁 scripts/deploy_ocrd.sh 对账」——不再抄字面量。
