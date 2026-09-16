@@ -11,6 +11,15 @@ set -uo pipefail
 # 以前这里写死 /root/skillforge，于是这把尺子只在本机跑得动、CI 里一接就废——
 # 这也是它此前一直没人接线（preflight_parity 守卫报「ci.yml 里没有调用它」）的成因。
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# 工具链：本机 /usr/bin/go 是发行版自带的 go1.18，读不了 go.mod 里的 `go 1.25.0`，
+# 报错长得像仓库坏了（`invalid go version '1.25.0': must match format 1.23`），实际
+# 只是 PATH 里挑到了老 go。走 preflight 时它已经替我们修好 PATH，但**直接 `bash 本脚本`**
+# （后台/干净 env 就是这样）会假红。这里自愈一次，省得下次又有人去查 go.mod。
+# CI 里 /usr/local/go/bin/go 通常不存在（go 由 setup-go 提供），所以这条是 no-op。
+if [[ -x /usr/local/go/bin/go && "$(command -v go)" != "/usr/local/go/bin/go" ]]; then
+  PATH="/usr/local/go/bin:$PATH"; export PATH
+fi
 cd "$ROOT/internal/skillgen" || exit 2
 
 restore() {
