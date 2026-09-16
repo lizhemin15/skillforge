@@ -7,10 +7,14 @@
 #   M3 行为面：streamingChat 偷偷返回裸客户端（结构面看着合规，实际材料丢了）
 #   M4 守卫自身退化：匹配串改回 g.llm.Chat( → 下限断言必须 Fatalf（防空跑绿）
 set -uo pipefail
-cd /root/skillforge/internal/skillgen || exit 2
+# 仓库根从脚本自身位置推出来：本地是 /root/skillforge，CI 里是 $GITHUB_WORKSPACE。
+# 以前这里写死 /root/skillforge，于是这把尺子只在本机跑得动、CI 里一接就废——
+# 这也是它此前一直没人接线（preflight_parity 守卫报「ci.yml 里没有调用它」）的成因。
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT/internal/skillgen" || exit 2
 
 restore() {
-  git -C /root/skillforge checkout -- internal/skillgen/manual.go internal/skillgen/generator.go internal/skillgen/stage_streaming_test.go 2>/dev/null
+  git -C "$ROOT" checkout -- internal/skillgen/manual.go internal/skillgen/generator.go internal/skillgen/stage_streaming_test.go 2>/dev/null
 }
 trap restore EXIT
 
@@ -18,9 +22,9 @@ trap restore EXIT
 # 为什么必须挡：restore 用 git checkout 还原，它会把**未提交的改动一起抹掉**——
 # 实测踩过一次：改好 gofmt 还没提交就跑本脚本，还原把格式修复覆盖回旧版，
 # 接着被 commit 进去，CI 的 gofmt 门禁红。不干净就直接不跑，别让尺子吃掉人的劳动。
-if [[ -n "$(git -C /root/skillforge status --porcelain internal/skillgen)" ]]; then
+if [[ -n "$(git -C "$ROOT" status --porcelain internal/skillgen)" ]]; then
   echo "拒绝运行：internal/skillgen 有未提交改动，restore 会把它抹掉。先提交或 stash。"
-  git -C /root/skillforge status --short internal/skillgen
+  git -C "$ROOT" status --short internal/skillgen
   exit 2
 fi
 

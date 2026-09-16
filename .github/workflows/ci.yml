@@ -241,6 +241,14 @@ jobs:
       - name: 素材验收断言自证（逐页统计解析器）
         run: bash testdata/mixed/verify_stats_selfcheck.sh
 
+      # 「模型链路偷偷不走流式」的守卫自证（失败用户报的原发现场：353.3 秒零帧）。
+      # 它一直在仓库里、也一直在本机能跑，但**没有任何地方调用**它 —— 而且更糟：
+      # 脚本里把仓库根写死成 /root/skillforge，CI 的工作目录是 $GITHUB_WORKSPACE，
+      # 所以它想接也接不上。这正是 preflight_parity 守卫报「ci.yml 里没有调用」的成因。
+      # 现在根目录从脚本自身位置推导，本地与 CI 同一份逻辑（连带守 gofmt：它用 sed 改 Go 源码）。
+      - name: 前端断言自证（漏接流式守卫）
+        run: bash web/tests/stage_streaming_guard_mutation_check.sh
+
       - name: Build
         run: |
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o skillforge ./cmd/server

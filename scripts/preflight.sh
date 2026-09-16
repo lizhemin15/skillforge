@@ -238,6 +238,10 @@ if [ "$QUICK" = 0 ]; then
   selfcheck '前端 / 输入区布局与贴底滚动自证' python3 web/tests/chat_composer_mutation_check.py
   selfcheck '前端 / 思考材料渲染自证'   python3 web/tests/chat_trace_mutation_check.py
   selfcheck '前端 / 线上验收 leg 接线自证' bash web/tests/live_e2e_roster_mutation_check.sh
+  # 「模型链路偷偷不走流式」的守卫自证（线上 353 秒零帧的原发现场）。
+  # 它此前是一把**游离尺子**：仓库里有、本机能跑，但没人调用；而且仓库根写死成
+  # /root/skillforge，CI 里想接也接不上（已改成从脚本自身位置推导）。
+  selfcheck '前端 / 漏接流式守卫自证'   bash web/tests/stage_streaming_guard_mutation_check.sh
   # Bug N「停用即从界面蒸发」的自证：跨前端契约 + 后端契约 + Go 行为三层。
   selfcheck '前端 / 停用技能列表自证'   python3 web/tests/skill_disabled_admin_ui_mutation_check.py
   # Bug O「误报目标机没有 python3」的自证：候选名单漂移 / 写死单路径 / 不探活。
