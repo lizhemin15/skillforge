@@ -583,6 +583,10 @@ umask 077
 	printf '# 这个文件里有密钥，权限已设为 600，别提交进任何仓库、别贴到聊天里。\n'
 	printf '# 改完要重启服务：systemctl restart %s\n\n' "$SERVICE_NAME"
 	printf '# ---- 服务 ----\n'
+	printf '# 实例名：用于拼出 systemd 单元名（%s / %s-ocr）。\n' "$SERVICE_NAME" "$SERVICE_NAME"
+	printf '# 主服务在报「解析服务不可用」这类环境问题时会直接引用它拼出修复命令，\n'
+	printf '# 所以多实例安装（--service 改名）时这里必须和实际单元名一致。\n'
+	printf 'SKILLFORGE_SERVICE_NAME=%s\n' "$SERVICE_NAME"
 	printf 'SKILLFORGE_ADDR=:%s\n' "$PORT"
 	printf 'SKILLFORGE_DATA_DIR=%s\n' "$DATA_DIR"
 	printf 'SKILLFORGE_DB=%s/skillforge.db\n' "$DATA_DIR"
@@ -650,6 +654,8 @@ else
 Description=SkillForge — skill-centric AI document workspace
 After=network-online.target
 Wants=network-online.target
+# 永不放弃重启（与 skillforge.service.template 同步）：见 ocr 单元里的同一段说明。
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -682,6 +688,11 @@ if [ "$DO_OCR" -eq 1 ]; then
 [Unit]
 Description=SkillForge document parser ($SERVICE_NAME-ocr, RapidOCR PP-OCRv4)
 After=network.target
+# StartLimitIntervalSec=0：永不放弃重启。
+# 主服务只是这个单元的 HTTP 客户端；systemd 一旦把它钉成 failed，主服务收到的就是
+# connection refused，用户看到的是「训练技能报错」这种他无法自救的报错。
+# 它的正常失败模式（PyInstaller 解包目录被清 → 引擎坏 → 守卫非零退出）本来就靠重启自愈。
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -692,7 +703,7 @@ Environment=TMPDIR=$PREFIX/run/ocr-tmp
 ExecStartPre=/bin/mkdir -p $PREFIX/run/ocr-tmp
 ExecStartPre=/bin/chmod 700 $PREFIX/run/ocr-tmp
 ExecStart=$OCR_BIN --port $OCR_PORT
-Restart=on-failure
+Restart=always
 RestartSec=3
 # 扫描件 OCR 峰值内存高（50 页约 1.8G），给 2G 余量，超了宁重启也不拖垮整机
 MemoryMax=2G

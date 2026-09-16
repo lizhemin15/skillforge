@@ -2,6 +2,16 @@
 Description=SkillForge 文档解析服务（RapidOCR PP-OCRv4，扫描件/Office 抽文本）
 Documentation=https://github.com/lizhemin15/skillforge
 After=network.target
+# StartLimitIntervalSec=0：**永不放弃重启**。
+#
+# 为什么（2026-09-16 现场）：主服务只是这个单元的 HTTP 客户端。一旦 systemd 因为
+# 「短时间内失败太多次」把它钉成 failed，主服务收到的就是 connection refused，
+# 而用户看到的是「训练技能报错」——一个他完全无法自救的死局（要么得知道去
+# systemctl reset-failed，要么得知道重装）。
+# 这个单元的正常失败模式是「PyInstaller 解包目录被清 → 引擎坏 → 守卫非零退出」，
+# 重启正是它的自愈手段；把重启掐掉等于把自愈能力掐掉。
+# 崩溃循环有 journalctl 与 systemctl status 的 NRestarts 可见，比「静默死了好」。
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -21,7 +31,9 @@ Environment=TMPDIR=__PREFIX__/run/ocr-tmp
 ExecStartPre=/bin/mkdir -p __PREFIX__/run/ocr-tmp
 ExecStartPre=/bin/chmod 700 __PREFIX__/run/ocr-tmp
 ExecStart=__OCR_BIN__ --port __OCR_PORT__
-Restart=on-failure
+# Restart=always + StartLimitIntervalSec=0（见 [Unit] 注释）：这个单元是主服务的外部依赖，
+# 「永久 failed」对用户就是一个无解的 connection refused，因此永不放弃重启。
+Restart=always
 RestartSec=3
 # 只监听 127.0.0.1（代码里写死），不对外暴露 —— 它不是公开接口，是主服务的内部依赖。
 #

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/lizhemin15/skillforge/internal/model"
+	"github.com/lizhemin15/skillforge/internal/ocrsvc"
 	"github.com/lizhemin15/skillforge/internal/store"
 )
 
@@ -350,18 +351,26 @@ func (a *Admin) extractDoc(filename string, data []byte) (docExtract, error) {
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	resp, err := client.Do(req)
 	if err != nil {
-		return res, err
+		// 连不上 = 环境问题（解析服务没在运行），不是这份文件有问题。
+		// 把 Go 的 dial 错误翻成可执行的中文，原始错误由 Unwrap 保留。
+		return res, ocrsvc.Explain(err, a.ocrURL)
 	}
 	defer resp.Body.Close()
 	var out struct {
-		OK      bool           `json:"ok"`
-		Text    string         `json:"text"`
-		Err     string         `json:"error"`
-		Warning string         `json:"warning"`
-		Stats   map[string]any `json:"stats"`
+		OK          bool           `json:"ok"`
+		Text        string         `json:"text"`
+		Err         string         `json:"error"`
+		Warning     string         `json:"warning"`
+		Stats       map[string]any `json:"stats"`
+		SelfHealing bool           `json:"self_healing"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return res, err
+	}
+	// 服务自报运行时被破坏、正在自动重启：文件没问题，稍后重试即可。
+	// 不识别它就只会把内部错误文案抛给用户，用户会以为是自己文件坏了。
+	if out.SelfHealing {
+		return res, errors.New(ocrsvc.SelfHealingMessage(a.ocrURL, out.Err))
 	}
 	if !out.OK {
 		return res, fmt.Errorf("解析服务: %s", out.Err)

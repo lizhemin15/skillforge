@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/lizhemin15/skillforge/internal/ocrsvc"
 )
 
 // 本文件是「写作手册 → 分类化 skill」流水线的接线层，负责把 categories.go 里的
@@ -184,6 +186,26 @@ func segBinary(seg string) bool {
 	return false
 }
 
+// needsDocParse 判断这次训练的素材里有没有「必须过解析服务」的二进制文档。
+// 只有存在时才值得做依赖预检：纯文本素材的训练不该为探活白等一次 HTTP。
+func needsDocParse(in *Input) bool {
+	if in == nil {
+		return false
+	}
+	for _, uf := range in.Files {
+		if uf == nil {
+			continue
+		}
+		if !isDocFile(filepath.Base(strings.TrimSpace(uf.Filename))) {
+			continue
+		}
+		if looksBinary(uf.Content) {
+			return true
+		}
+	}
+	return false
+}
+
 // isDocFile 判断文件名是否需要走 OCR 解析。
 func isDocFile(name string) bool {
 	return docExts[strings.ToLower(filepath.Ext(name))]
@@ -327,7 +349,9 @@ func ocrExtract(ctx context.Context, ocrURL, filename string, data []byte, clien
 	// 旧实现写死 300s，而真实扫描件要 397.5s，导致解析必然失败却只在流里留一行 ⚠️。
 	resp, err := client.Do(req)
 	if err != nil {
-		return res, err
+		// 连不上 = 环境问题（服务没在运行），不是这份文件有问题。
+		// 翻译成「照着敲就能修」的中文；原始错误仍由 Unwrap 保留，排障不受影响。
+		return res, ocrsvc.Explain(err, ocrURL)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
@@ -343,6 +367,12 @@ func ocrExtract(ctx context.Context, ocrURL, filename string, data []byte, clien
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
 		return res, fmt.Errorf("解析服务返回无法识别: %w", err)
+	}
+	// 服务自报「运行时损坏、正在自动重启」：与「这份文件解析不了」是两码事——
+	// 文件没问题，约 10 秒后重试就成功。不识别它，用户看到的是内部错误文案，
+	// 然后就再也不会重试了。
+	if ocrsvc.SelfHealing(body) {
+		return res, errors.New(ocrsvc.SelfHealingMessage(ocrURL, out.Error))
 	}
 	if !out.OK {
 		return res, fmt.Errorf("解析服务: %s", out.Error)
@@ -431,6 +461,14 @@ type materialReport struct {
 	Failures []string // 逐个失败原因：「文件名: 原因」
 	Warnings []string // 解析成功但可信度存疑（如平均每页字数过低）
 
+	// EnvHint 记录「这份失败是环境问题，不是文件问题」时**一次性**的修复指引。
+	//
+	// 为什么单独一个字段：解析服务没在运行时，上传 3 份文档就是 3 条一模一样的
+	// 「连不上」。把长指引塞进每一条 Failures 里，门禁报错会把同一段话印 3 遍，
+	// 用户反而找不到重点。逐文件那行只说「服务没在运行」，指引在这里存一份，
+	// 由 enforceMaterialGate 附在最终中止信息末尾。
+	EnvHint string
+
 	// SuspectFiles 记录「解析返回了非空文本，但逐页统计显示等于没读到正文」的文档数
 	// （整本页页空白，或平均每页字数低于 suspectAvgPageChars）。
 	//
@@ -470,6 +508,24 @@ const suspectAvgPageChars = 50
 // 判据只在 DocFiles > 0 时生效——没传文档、纯靠需求描述训练技能是正当用法，
 // 不能连带误杀。
 func (g *Generator) enforceMaterialGate(rep *materialReport) error {
+	if rep == nil || rep.DocFiles == 0 {
+		return nil
+	}
+	err := g.materialGateError(rep)
+	if err == nil {
+		return nil
+	}
+	// 环境类失败必须把修复指引附在**最终**中止信息里：否则用户只看到「全部无法解析」，
+	// 会去反复改自己的文件——而真正该动的是目标机上的 systemd 服务。
+	if rep.EnvHint != "" {
+		return fmt.Errorf("%w\n%s", err, rep.EnvHint)
+	}
+	return err
+}
+
+// materialGateError 是纯判据部分（不含环境指引的拼接），与 enforceMaterialGate 分开
+// 只为让「判据」和「怎么把结论说给用户听」各自可测。
+func (g *Generator) materialGateError(rep *materialReport) error {
 	if rep == nil || rep.DocFiles == 0 {
 		return nil
 	}
@@ -516,6 +572,22 @@ func (g *Generator) ingestFiles(ctx context.Context, in *Input, steps func(strin
 		return rep
 	}
 	rep.Chars = materialChars(in)
+	// 依赖预检：这次训练要用到解析服务时，先探一次活。
+	//
+	// 为什么值得多花一次 HTTP（正常时上限 3s，连不上时毫秒返回）：解析失败有两种，
+	// 「服务没在运行」和「这份文件读不出字」的用户动作完全不同——前者去重启服务，
+	// 后者去改文件。逐文件报错说得清失败，但说不清该往哪修；而且引擎坏掉时用户
+	// 要等一次真解析（数十秒）才知道。这里抢在长解析之前把结论给出来。
+	if g.ocrURL != "" && needsDocParse(in) {
+		if h := ocrsvc.Check(ctx, g.ocrURL); !h.Healthy() {
+			if msg := h.Detail(); msg != "" {
+				rep.EnvHint = "文档解析环境异常：" + strings.TrimPrefix(msg, "⚠️ ")
+				if steps != nil {
+					steps(msg)
+				}
+			}
+		}
+	}
 	for _, uf := range in.Files {
 		if uf == nil {
 			continue
@@ -545,6 +617,19 @@ func (g *Generator) ingestFiles(ctx context.Context, in *Input, steps func(strin
 		res, err := ocrExtract(ctx, g.ocrURL, fn, raw, g.ocrClient())
 		stopProgress()
 		if err != nil {
+			// 环境类失败（服务没在运行）：逐文件只留一行短句，完整修复指引走 EnvHint
+			// 一次性给出——否则上传 3 份文档就是把同一段指引印 3 遍。
+			if ocrsvc.Unreachable(err) {
+				reason := "文档解析服务没有在运行（" + ocrsvc.Endpoint(g.ocrURL) + " 连不上）"
+				rep.Failures = append(rep.Failures, fn+": "+reason)
+				if rep.EnvHint == "" {
+					rep.EnvHint = "文档解析环境异常：" + ocrsvc.Explain(err, g.ocrURL).Error()
+				}
+				if steps != nil {
+					steps(fmt.Sprintf("⚠️ %s 解析失败：%s", fn, reason))
+				}
+				continue
+			}
 			rep.Failures = append(rep.Failures, fmt.Sprintf("%s: %v", fn, err))
 			if steps != nil {
 				msg := fmt.Sprintf("⚠️ %s 解析失败：%v", fn, err)

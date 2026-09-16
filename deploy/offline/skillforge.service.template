@@ -3,6 +3,9 @@ Description=SkillForge — 技能驱动的 AI 办公文档工作台（离线包�
 Documentation=https://github.com/lizhemin15/skillforge
 After=network-online.target
 Wants=network-online.target
+# 永不放弃重启：这台机器上「服务没了」= 用户界面上什么都不通，而且他无从自救。
+# 崩溃循环可见（journalctl + NRestarts），静默死掉不可见 —— 宁可让它一直重试。
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
