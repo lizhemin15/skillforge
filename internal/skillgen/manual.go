@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/lizhemin15/skillforge/internal/ocrsvc"
+	"github.com/lizhemin15/skillforge/internal/tlsconf"
 )
 
 // 本文件是「写作手册 → 分类化 skill」流水线的接线层，负责把 categories.go 里的
@@ -241,7 +242,9 @@ func (g *Generator) ocrClient() *http.Client {
 	if d <= 0 {
 		d = DefaultOCRTimeout
 	}
-	return &http.Client{Timeout: d}
+	// 解析服务通常在本机（http://127.0.0.1:8093），但也可以指到内网另一台机器；
+	// 那种部署下多半是自签证书，所以照样走本机信任配置。
+	return tlsconf.NewClient(d)
 }
 
 // ocrProgress 在解析期间周期回报「还在跑、已等待多久」，避免前端看起来像卡死。

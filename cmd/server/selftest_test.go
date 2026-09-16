@@ -4,6 +4,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/lizhemin15/skillforge/internal/ocrsvc"
+	"github.com/lizhemin15/skillforge/internal/tlsconf"
 )
 
 // selftest_test.go 守护「自检本身」。
@@ -296,6 +299,137 @@ func TestFirstRunes(t *testing.T) {
 	}
 }
 
+// TestJudgeParseService 解析服务判定的五种结论各钉一条。
+//
+// 为什么这组用例必须存在：这一项的难点全在「坏了」和「按设计没有」的边界上 ——
+// 判严了，`--no-ocr` 的正常安装被报成「安装失败」，客户去折腾一个本来就不该跑的服务；
+// 判松了，真坏掉的解析服务被静默放过，客户只看到「生成的技能跟我给的素材没关系」。
+// 线上两种都发生过：前者是假红，后者是假绿。
+func TestJudgeParseService(t *testing.T) {
+	// healthy 是一个「自报 ok 且运行时正常」的响应。
+	healthy := ocrsvc.Health{Running: true, RuntimeOK: true, Version: "ocrd-v5-runtime-guard"}
+	// zombie 是线上真实形态：端口在听（HTTP 200），但运行时已坏（ok:false）。
+	zombie := ocrsvc.Health{Running: true, RuntimeOK: false, Version: "ocrd-v5-runtime-guard"}
+	// refused 是探不通的形态（连接被拒 / 超时）。
+	refused := ocrsvc.Health{Err: errors.New("dial tcp 127.0.0.1:8093: connect: connection refused")}
+
+	cases := []struct {
+		name      string
+		ev        parseEvidence
+		wantOK    bool
+		wantSkip  bool
+		wantHits  []string // 明细里必须全部出现（每条都是客户要的「下一步」）
+		wantAvoid []string // 明细里必须**不**出现（防止把预期行为说成事故）
+	}{
+		{
+			name:     "显式禁用（--no-ocr 安装）",
+			ev:       parseEvidence{RawEnv: "off", URL: ""},
+			wantSkip: true,
+			wantHits: []string{"显式禁用", "--no-ocr", "扫描件 PDF"},
+			// 跳过不是失败：不能出现「失败 / 损坏 / 重装」这类吓人的话术。
+			wantAvoid: []string{"损坏"},
+		},
+		{
+			name:     "禁用值的另一种写法（none）",
+			ev:       parseEvidence{RawEnv: "none", URL: ""},
+			wantSkip: true,
+			wantHits: []string{"显式禁用"},
+		},
+		{
+			name:     "真的能干活",
+			ev:       parseEvidence{RawEnv: "http://127.0.0.1:8093", URL: "http://127.0.0.1:8093", Loopback: true, Health: healthy},
+			wantOK:   true,
+			wantHits: []string{"正常", "ocrd-v5-runtime-guard"},
+		},
+		{
+			name:     "活着但没上报版本",
+			ev:       parseEvidence{RawEnv: "http://127.0.0.1:8093", URL: "http://127.0.0.1:8093", Loopback: true, Health: ocrsvc.Health{Running: true, RuntimeOK: true}},
+			wantOK:   true,
+			wantHits: []string{"正常", "未上报版本"},
+		},
+		{
+			name:     "指向远端却连不上",
+			ev:       parseEvidence{RawEnv: "http://10.0.0.9:8093", URL: "http://10.0.0.9:8093", Loopback: false, Health: refused},
+			wantOK:   false,
+			wantHits: []string{"远端解析服务", "curl", "connection refused"},
+		},
+		{
+			name: "本机没装这个单元（老版 --no-ocr 没写 off）",
+			ev: parseEvidence{RawEnv: "http://127.0.0.1:8093", URL: "http://127.0.0.1:8093",
+				Loopback: true, UnitName: "skillforge-ocr", UnitPath: "", Health: refused},
+			wantSkip: true,
+			wantHits: []string{"没有解析服务单元", "systemctl status", "不算失败"},
+		},
+		{
+			name: "端口在听但运行时已损坏（僵尸）",
+			ev: parseEvidence{RawEnv: "http://127.0.0.1:8093", URL: "http://127.0.0.1:8093",
+				Loopback: true, UnitName: "skillforge-ocr", UnitPath: "/etc/systemd/system/skillforge-ocr.service", Health: zombie},
+			wantOK: false,
+			// 关键：必须点明「端口在听 ≠ 能干活」，并给出 restart。
+			wantHits: []string{"端口在听", "systemctl restart", "journalctl"},
+		},
+		{
+			name: "单元在但服务没在跑",
+			ev: parseEvidence{RawEnv: "http://127.0.0.1:8093", URL: "http://127.0.0.1:8093",
+				Loopback: true, UnitName: "skillforge-ocr", UnitPath: "/etc/systemd/system/skillforge-ocr.service", Health: refused},
+			wantOK:   false,
+			wantHits: []string{"本该有解析服务", "systemctl restart", "connection refused"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := judgeParseService(tc.ev)
+			if got.ok != tc.wantOK {
+				t.Fatalf("ok=%v，期望 %v；明细：%v", got.ok, tc.wantOK, got.detail)
+			}
+			if got.skip != tc.wantSkip {
+				t.Fatalf("skip=%v，期望 %v；明细：%v", got.skip, tc.wantSkip, got.detail)
+			}
+			// 跳过的不许同时判通过（否则 N/N 分母会被跳过项灌水）。
+			if got.ok && got.skip {
+				t.Fatalf("不可能同时通过又跳过；明细：%v", got.detail)
+			}
+			if got.name != "文档解析服务" {
+				t.Fatalf("检查项名字变了：%q（-selftest 输出里靠它认人）", got.name)
+			}
+			for _, w := range tc.wantHits {
+				if !containsAny(got.detail, w) {
+					t.Fatalf("明细里没有 %q（客户据此没法自查）；实际：%v", w, got.detail)
+				}
+			}
+			for _, w := range tc.wantAvoid {
+				if containsAny(got.detail, w) {
+					t.Fatalf("明细里不该出现 %q（会把预期行为说成事故）；实际：%v", w, got.detail)
+				}
+			}
+		})
+	}
+}
+
+// TestJudgeParseServiceMultiLineErrorIsTrimmed 原始错误只留第一行。
+//
+// 为什么：底层错误常带多行 context（HTTP 响应体、堆栈），铺进 -selftest 输出会把
+// 「下一步怎么办」顶出屏幕 —— 这轮用户的投诉就是「一直卡着、看不到有用信息」。
+func TestJudgeParseServiceMultiLineErrorIsTrimmed(t *testing.T) {
+	ev := parseEvidence{
+		RawEnv: "http://127.0.0.1:8093", URL: "http://127.0.0.1:8093", Loopback: true,
+		UnitName: "skillforge-ocr", UnitPath: "/etc/systemd/system/skillforge-ocr.service",
+		Health: ocrsvc.Health{Err: errors.New("Get \"http://127.0.0.1:8093/health\": dial tcp 127.0.0.1:8093: connect: connection refused\n第二行不该出现\n第三行也不该出现")},
+	}
+	got := judgeParseService(ev)
+	if !containsAny(got.detail, "connection refused") {
+		t.Fatalf("第一行的关键信息丢了：%v", got.detail)
+	}
+	for _, bad := range []string{"第二行不该出现", "第三行也不该出现", "\n"} {
+		for _, l := range got.detail {
+			if strings.Contains(l, bad) {
+				t.Fatalf("多行错误没被掐掉（%q）：%v", bad, got.detail)
+			}
+		}
+	}
+}
+
 func containsAny(lines []string, needle string) bool {
 	for _, l := range lines {
 		if strings.Contains(l, needle) {
@@ -303,4 +437,259 @@ func containsAny(lines []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// ── TLS 信任库自检项 ────────────────────────────────────────────────────
+
+// TestJudgeTrustStoreConfiguredButNotLoaded 锁住最坏的一种「静默失效」：
+// 客户按文档配了 CA bundle，但一个证书都没装进来。此时必须报失败 ——
+// 若报通过，客户会以为 https 已经没问题，然后去怀疑我们程序本身。
+func TestJudgeTrustStoreConfiguredButNotLoaded(t *testing.T) {
+	c := judgeTrustStore(trustEvidence{st: tlsconf.Status{
+		BundlePath:  "/etc/skillforge/ca.pem",
+		BundleCerts: 0,
+		SystemOK:    true,
+		SystemCerts: 120,
+		Err:         errors.New("读不到 CA 文件 /x.pem：没有那个文件或目录"),
+	}})
+	if c.skip || c.ok {
+		t.Fatalf("配了 CA 却零证书，必须报失败，实际 ok=%v skip=%v", c.ok, c.skip)
+	}
+	joined := strings.Join(c.detail, "\n")
+	if !strings.Contains(joined, "没有那个文件或目录") {
+		t.Errorf("必须把加载失败的原因原样给出，实际：%s", joined)
+	}
+	if !strings.Contains(joined, "CA") {
+		t.Errorf("修复指引必须说清「要给签发服务端证书的 CA」，实际：%s", joined)
+	}
+}
+
+// TestJudgeTrustStoreEmptySystemStoreWithHTTPStepIsFailure：机器太素（没装
+// ca-certificates）、没配 CA，而且端点里有 https —— 这是 https 必失败的现场，
+// 必须失败并给出离线机可执行的两条修法，且要点名是哪一个端点在等 CA。
+func TestJudgeTrustStoreEmptySystemStoreWithHTTPStepIsFailure(t *testing.T) {
+	c := judgeTrustStore(trustEvidence{
+		st:             tlsconf.Status{SystemOK: false, SystemNote: "系统根证书库读不到"},
+		httpsEndpoints: []string{"SKILLFORGE_LLM_BASE_URL（llm.corp:8443）"},
+	})
+	if c.ok {
+		t.Fatal("没有信任来源、端点又是 https，却报通过 —— 客户会一头撞上证书错误")
+	}
+	joined := strings.Join(c.detail, "\n")
+	for _, want := range []string{"ca-certificates", tlsconf.EnvVarCA, "llm.corp:8443"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("修复指引缺少 %q，实际：%s", want, joined)
+		}
+	}
+}
+
+// TestJudgeTrustStoreEmptySystemStoreOnPlainHTTPIsNotBlamed：全部端点都是 http 的
+// 纯内网部署（很常见的离线形态）。此时没有系统 CA 不影响任何功能 ——
+// 判失败会让客户去修一个跟他无关的东西，反而消耗自检的可信度。必须通过，
+// 但要把「将来改 https 前先解决它」说明白。
+func TestJudgeTrustStoreEmptySystemStoreOnPlainHTTPIsNotBlamed(t *testing.T) {
+	c := judgeTrustStore(trustEvidence{
+		st: tlsconf.Status{SystemOK: false, SystemNote: "系统根证书库读不到"},
+	})
+	if !c.ok {
+		t.Fatalf("端点全是 http 时不该判失败，实际 detail=%v", c.detail)
+	}
+	joined := strings.Join(c.detail, "\n")
+	if !strings.Contains(joined, "当前不受影响") || !strings.Contains(joined, "https") {
+		t.Errorf("通过时也要把「为什么现在没事、什么时候会有事」说清楚，实际：%s", joined)
+	}
+}
+
+// TestJudgeTrustStoreHealthyNamesTheSource：通过时必须把「信任来源」摊开，
+// 让客户排障时不必再猜这次到底信了谁。
+func TestJudgeTrustStoreHealthyNamesTheSource(t *testing.T) {
+	c := judgeTrustStore(trustEvidence{st: tlsconf.Status{SystemOK: true, SystemCerts: 141}})
+	if !c.ok {
+		t.Fatalf("系统根可用应通过，实际 detail=%v", c.detail)
+	}
+	if !strings.Contains(strings.Join(c.detail, "\n"), "141") {
+		t.Errorf("通过时也要说清来源与数量，实际：%v", c.detail)
+	}
+
+	c2 := judgeTrustStore(trustEvidence{st: tlsconf.Status{BundlePath: "/etc/skillforge/ca.pem", BundleCerts: 2}})
+	if !c2.ok {
+		t.Fatalf("自定义 CA 加载成功应通过，实际 %v", c2.detail)
+	}
+	if !strings.Contains(strings.Join(c2.detail, "\n"), "2 份") {
+		t.Errorf("应报告加载了几份证书，实际：%v", c2.detail)
+	}
+}
+
+// TestJudgeTrustStoreInsecureIsLoudButNotFailure：跳过校验是客户可能刻意为之的选择，
+// 不算失败；但绝不能静默通过 —— 必须显眼警告「任何人都能冒充内网服务」。
+func TestJudgeTrustStoreInsecureIsLoudButNotFailure(t *testing.T) {
+	c := judgeTrustStore(trustEvidence{st: tlsconf.Status{SystemOK: true, SystemCerts: 100, Insecure: true}})
+	if !c.ok {
+		t.Fatal("Insecure 是客户的选择，不该判失败（否则自检会挡住合法用法）")
+	}
+	joined := strings.Join(c.detail, "\n")
+	if !strings.Contains(joined, "⚠") || !strings.Contains(joined, "跳过") {
+		t.Errorf("开了跳过校验必须显眼警告，实际：%s", joined)
+	}
+	if !strings.Contains(joined, tlsconf.EnvVarInsecure) {
+		t.Errorf("警告里要指名是哪个环境变量，实际：%s", joined)
+	}
+}
+
+// TestJudgeTrustStoreUnknownSystemStoreIsNotFailure：数不出系统证书数量
+// ≠ 没有证书。把「未知」当「失败」会冤枉一台本来没坏的机器。
+func TestJudgeTrustStoreUnknownSystemStoreIsNotFailure(t *testing.T) {
+	c := judgeTrustStore(trustEvidence{st: tlsconf.Status{
+		SystemOK:    true,
+		SystemNote:  "系统根证书库可用，但本平台取不到证书数量",
+		BundlePath:  "/etc/skillforge/ca.pem",
+		BundleCerts: 1,
+	}})
+	if !c.ok {
+		t.Fatalf("有自定义 CA 且系统根可用（数量未知）应通过，实际 %v", c.detail)
+	}
+	if !strings.Contains(strings.Join(c.detail, "\n"), "取不到证书数量") {
+		t.Errorf("系统根状况的说明必须原样带出来，实际：%v", c.detail)
+	}
+}
+
+// ── 时区 / 时间自检项 ────────────────────────────────────────────────────
+//
+// 这一项的失效形态是「静默差 8 小时」：没有任何报错，只有时间不对。
+// 所以判定必须区分两件修法完全不同的事：时区库没了（环境问题）vs TZ 写错了（配置问题）。
+
+// TestJudgeTimezoneMissingZoneDatabaseIsFailure：最小化安装/精简容器里没有
+// /usr/share/zoneinfo，老二进制又没内嵌时区库 —— 这时时间会静默按 UTC 走。
+// 必须判失败，并且给出**离线机器也能执行**的修法（装 tzdata 包 / 换内嵌版本 / 拷目录）。
+func TestJudgeTimezoneMissingZoneDatabaseIsFailure(t *testing.T) {
+	c := judgeTimezone(tzEvidence{tzEnv: "Asia/Shanghai", probeErr: "unknown time zone Asia/Shanghai"})
+	if c.ok {
+		t.Fatalf("时区库不可用必须判失败，否则客户永远不知道时间错在哪：%v", c.detail)
+	}
+	joined := strings.Join(c.detail, "\n")
+	for _, want := range []string{"tzdata", tzProbeZone, "差 8 小时", "/usr/share/zoneinfo"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("修法说明里缺 %q，客户照着修不下去。实际：\n%s", want, joined)
+		}
+	}
+}
+
+// TestJudgeTimezoneBadTZNameIsFailure：时区库好好的，但客户把 TZ 写成了
+// 解析不了的名字。这时不能报「时区库缺失」—— 那是把客户指到错的方向。
+func TestJudgeTimezoneBadTZNameIsFailure(t *testing.T) {
+	c := judgeTimezone(tzEvidence{
+		tzEnv: "Asia/shanghai", probeOK: true, tzResolved: "", systemDirs: []string{"/usr/share/zoneinfo"},
+	})
+	if c.ok {
+		t.Fatalf("TZ 解析不了必须判失败：%v", c.detail)
+	}
+	joined := strings.Join(c.detail, "\n")
+	if !strings.Contains(joined, "Asia/shanghai") {
+		t.Errorf("要点名客户自己写的那个值，否则他找不到改哪里：%s", joined)
+	}
+	if !strings.Contains(joined, "CST") {
+		t.Errorf("必须警告 CST 这类歧义名的实际后果（差 14 小时），否则客户会改成 CST 再踩一次：%s", joined)
+	}
+	if strings.Contains(joined, "apt-get install") {
+		t.Errorf("库是好的，不该让客户去装 tzdata：%s", joined)
+	}
+}
+
+// TestJudgeTimezoneHealthyReportsOffset：通过时要把「现在是几点、偏移多少」摊开，
+// 让客户不必再猜服务跑在哪个时区。
+func TestJudgeTimezoneHealthyReportsOffset(t *testing.T) {
+	c := judgeTimezone(tzEvidence{
+		tzEnv: "Asia/Shanghai", tzResolved: "Asia/Shanghai", utcOffset: "+08:00",
+		localNow: "2026-09-16 21:30:00", probeOK: true, systemDirs: []string{"/usr/share/zoneinfo"},
+	})
+	if !c.ok {
+		t.Fatalf("正常配置不该判失败：%v", c.detail)
+	}
+	joined := strings.Join(c.detail, "\n")
+	for _, want := range []string{"Asia/Shanghai", "+08:00", "2026-09-16 21:30:00"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("通过时也应摊开 %q，实际：%s", want, joined)
+		}
+	}
+}
+
+// TestJudgeTimezoneEmbeddedFallbackIsStated：机器上没有 zoneinfo、靠内嵌兜住时，
+// 必须把这件事说出来。客户下次换机器/换包时会重新踩这个坑，只有这里能告诉他原因。
+func TestJudgeTimezoneEmbeddedFallbackIsStated(t *testing.T) {
+	c := judgeTimezone(tzEvidence{
+		tzEnv: "Asia/Shanghai", tzResolved: "Asia/Shanghai", utcOffset: "+08:00",
+		localNow: "2026-09-16 21:30:00", probeOK: true, systemDirs: nil,
+	})
+	if !c.ok {
+		t.Fatalf("内嵌时区库生效时应通过：%v", c.detail)
+	}
+	joined := strings.Join(c.detail, "\n")
+	if !strings.Contains(joined, "内嵌") {
+		t.Errorf("靠内嵌兜住时必须说清来源，否则客户换包后会以为程序坏了：%s", joined)
+	}
+}
+
+// TestJudgeTimezoneUnsetTZIsNotFailureButWarnsOnUTC：没配 TZ 是合法配置，
+// 不能判失败；但如果是 UTC 静默生效，必须提醒差 8 小时。
+// 反例同样要锁：时间本来就是 +08:00 时不该再刷这句提示（否则提示贬值成噪音）。
+func TestJudgeTimezoneUnsetTZIsNotFailureButWarnsOnUTC(t *testing.T) {
+	utc := judgeTimezone(tzEvidence{
+		tzResolved: "Local", utcOffset: "+00:00", localNow: "2026-09-16 13:30:00", probeOK: true,
+	})
+	if !utc.ok {
+		t.Fatalf("没配 TZ 不该判失败（这是合法配置）：%v", utc.detail)
+	}
+	if !strings.Contains(strings.Join(utc.detail, "\n"), "TZ=Asia/Shanghai") {
+		t.Errorf("UTC 生效时必须给出可直接抄的修法：%v", utc.detail)
+	}
+
+	cst := judgeTimezone(tzEvidence{
+		tzResolved: "Local", utcOffset: "+08:00", localNow: "2026-09-16 21:30:00", probeOK: true,
+	})
+	if strings.Contains(strings.Join(cst.detail, "\n"), "TZ 没配") {
+		t.Errorf("时间已经是对的，不该再提示改时区：%v", cst.detail)
+	}
+}
+
+// TestJudgeTimezoneGorootZipIsNotReportedAsEmbedded：打包机/开发机上装了 Go，
+// time.LoadLocation 会命中 $GOROOT/lib/time/zoneinfo.zip 这一级 —— 客户机上没有 Go 安装目录。
+// 老实现把这种「本机 OK」报成「二进制内嵌已兜住」，等于给了客户一个假的安心：
+// 他换到真正的离线裸机才发现时间差 8 小时。这里锁死：来源必须按证据报，并点明这一级客户机没有。
+func TestJudgeTimezoneGorootZipIsNotReportedAsEmbedded(t *testing.T) {
+	zip := "/usr/local/go/lib/time/zoneinfo.zip"
+	c := judgeTimezone(tzEvidence{
+		tzResolved: "Asia/Shanghai", utcOffset: "+08:00", localNow: "2026-09-16 21:30:00",
+		probeOK: true, systemDirs: nil, gorootZip: zip,
+	})
+	if !c.ok {
+		t.Fatalf("时区解析成功时不该判失败：%v", c.detail)
+	}
+	joined := strings.Join(c.detail, "\n")
+	if !strings.Contains(joined, zip) {
+		t.Errorf("必须点名命中的是 GOROOT 里那份（否则客户没法判断这份在他机器上有没有）：%s", joined)
+	}
+	if strings.Contains(joined, "**二进制内嵌**") {
+		t.Errorf("不能断言「二进制内嵌已生效」—— 这一级的出处是 Go 安装目录，客户机上没有：%s", joined)
+	}
+	for _, want := range []string{"装了 Go", "客户机"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("必须点明这一级只在装了 Go 的机器上有、客户机通常没有，缺 %q：%s", want, joined)
+		}
+	}
+}
+
+// TestJudgeTimezoneBareMachineReportsEmbedded：既没有系统 zoneinfo 也没有 Go 安装目录，
+// 还能解析出时区 → 只有一种解释：内嵌兜住了。这时候报「内嵌」才是可信的结论。
+func TestJudgeTimezoneBareMachineReportsEmbedded(t *testing.T) {
+	c := judgeTimezone(tzEvidence{
+		tzResolved: "Asia/Shanghai", utcOffset: "+08:00", localNow: "2026-09-16 21:30:00",
+		probeOK: true, systemDirs: nil, gorootZip: "",
+	})
+	if !c.ok {
+		t.Fatalf("内嵌兜住时不该判失败：%v", c.detail)
+	}
+	joined := strings.Join(c.detail, "\n")
+	if !strings.Contains(joined, "**二进制内嵌**") {
+		t.Errorf("裸机上解析成功只能是内嵌兜的，必须明说：%s", joined)
+	}
 }

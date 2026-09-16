@@ -220,7 +220,7 @@ if [ "$QUICK" = 0 ]; then
   # 早就跟实现脱钩（categoryErrStatus 里 ErrNotManualSkill 被有意删掉），脚本每次
   # 都在打印「锚点失效 ✗」，但因为它既不在 CI 也没人手动跑，谁也没看见。
   # 「永远绿的自证脚本」比没有更糟：它让人以为这块有人看着。
-  step '7/7 断言自证（7 条）'
+  step '7/7 断言自证'
   selfcheck() {   # $1=标签，其余=命令
     local label="$1"; shift
     local out rc
@@ -250,6 +250,35 @@ if [ "$QUICK" = 0 ]; then
   selfcheck '后端 / 分类结构管理自证'   python3 scripts/category_guard_inject.py
   selfcheck '后端 / 思考开关矩阵自证'   python3 scripts/fastjson_knob_inject.py
   selfcheck '后端 / 提速与中间材料自证' python3 scripts/thinking_knob_inject.py
+  # 离线包 install.sh 的装后服务探测（三段：正向场景 / 两路注入自证）。
+  # 注入模式的退出码是反的 —— rc=0 表示「确实按预期转红了」，所以这里不能吞错：
+  # selfcheck 把非 0 当失败，正好是我们要的语义。
+  selfcheck '安装包 / 装后探测（正向场景）'   bash deploy/offline/tests/install_probe_test.sh
+  selfcheck '安装包 / 装后探测自证（注入 1）' env INJECT=1 bash deploy/offline/tests/install_probe_test.sh
+  selfcheck '安装包 / 装后探测自证（注入 2）' env INJECT=2 bash deploy/offline/tests/install_probe_test.sh
+  # install.sh 其余几把尺子（同样从出货文件里抠真代码跑）。
+  # 内存那两条：正向 6 档 + 5 路突变自证（含着「检查整段被删」这类假绿的兜底）。
+  selfcheck '安装包 / 装前内存检查'          bash deploy/offline/tests/test_install_memory.sh
+  selfcheck '安装包 / 装前内存检查突变自证'  bash deploy/offline/tests/test_install_memory_mutation.sh
+  selfcheck '安装包 / 对外地址默认值'        bash deploy/offline/tests/test_install_public_url.sh
+  selfcheck '安装包 / 时区处理'              bash deploy/offline/tests/test_install_timezone.sh
+  selfcheck '安装包 / TLS 信任预检'          bash deploy/offline/tests/test_install_trust_precheck.sh
+  # 安装期三把尺子（信任预检 / 对外地址 / 时区）的**注入自证**：
+  # 正向场景只证明这些字样在当前实现下会出现，不证明实现退化后它们会消失。
+  # 4 路真故障各红在预期那条：坏路径被静默忽略 / 无根证书时沉默 /
+  # 客户显式 --public-url 被覆盖 / 探测到时区却不写进 env。
+  selfcheck '安装包 / 安装期预检突变自证'    bash deploy/offline/tests/test_install_precheck_mutation.sh
+  # 需要 root + unshare 造「没有时区库的机器」；条件不满足时脚本自己 SKIP 并说清怎么补。
+  selfcheck '自检 / 时区栏离线双向对照'      bash deploy/offline/tests/test_selftest_tz_offline.sh
+  # 同目录唯一一条 .py 真跑尺子（`-selftest` 的「文档解析服务」栏 + 4 路注入自证）。
+  # 它曾整条免疫：目录里只有它不带 .sh、也不在 web/tests 下，于是写死的检查项数量
+  # 在 F3/F5 加了两栏后失配、7 个场景全红，却没有任何闸门调用它 —— 报的还是一句
+  # 误导人的「输出格式变了」。接进来这条由 preflight_parity.test.mjs 守着（按目录收，
+  # 连扩展名一起收），别再让它掉出去。
+  selfcheck '自检 / 解析服务栏真跑 + 注入自证' python3 deploy/offline/tests/selftest_parse_live_check.py
+  # 元守卫（preflight_parity.test.mjs）自己的行为自证：它就是拦「零引用的尺子」的那把，
+  # 失效形态同样是「一切正常」—— 所以它也得有人拿真故障去戳它。
+  selfcheck '接线守卫自证（拿掉接线 / 吞错 / 游离尺子）' bash web/tests/preflight_parity_mutation_check.sh
 fi
 
 printf '\n\033[1m========== preflight 汇总 ==========\033[0m\n'

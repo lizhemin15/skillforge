@@ -77,6 +77,62 @@ usage() {
 	exit 0
 }
 
+# ---------- 地址探测 ----------
+# 默认的「对外访问地址」决定下载链接、分享链接里写的是什么主机名。
+# 老实现一律填 localhost —— 单机自己用没问题，但客户的典型用法是「装在一台
+# 内网服务器上，同事用浏览器打开」，localhost 会让每个连接都指向同事自己的机器，
+# 表现就是「打不开 / 下载失败」，而错误现场里完全看不出是地址填错了。
+# 所以默认改成探测本机内网 IP，探不到才退回 localhost，并且**把这次的选择念出来**。
+# 全过程只读路由表/网卡列表，不发任何包（离线可用）。
+detect_lan_ip() {
+	_lan=""
+	if command -v ip >/dev/null 2>&1; then
+		# 默认路由的源地址 = 本机主动出网时会用的那个地址，最接近「同事看到的 IP」
+		_lan="$(ip route get 1 2>/dev/null | sed -n 's/.*[[:space:]]src[[:space:]]\([0-9][0-9.]*\).*/\1/p' | head -1)"
+	fi
+	if [ -z "$_lan" ] && command -v hostname >/dev/null 2>&1; then
+		_lan="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -Ev '^$|^127\.|^169\.254\.' | head -1)"
+	fi
+	if [ -z "$_lan" ] && command -v ip >/dev/null 2>&1; then
+		_lan="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -Ev '^$|^127\.' | head -1)"
+	fi
+	printf '%s' "$_lan"
+}
+
+# 默认 PUBLIC_URL：内网 IP 优先。$1=端口（端口冲突时会被改，所以要能重算）
+default_public_url() {
+	_dip="$(detect_lan_ip)"
+	if [ -n "$_dip" ]; then
+		printf 'http://%s:%s' "$_dip" "$1"
+	else
+		printf 'http://localhost:%s' "$1"
+	fi
+}
+
+# 探测本机时区名（IANA 形式，如 Asia/Shanghai）。
+#
+# 为什么要替客户填这个值：离线机器的默认时区经常是 UTC，日志/页面时间比北京时间早 8 小时，
+# 而且**不报任何错**。填进去比让客户自己发现「时间不对」再回头找原因便宜得多。
+# 注意：这里只做「探测」，不硬编码 —— 万一探测不出来就留注释（不瞎填），
+# 因为把一台本来正确的 UTC 机器改成 +08 也是错的。
+detect_timezone() {
+	_tz=""
+	if [ -n "${TZ:-}" ]; then
+		_tz="$TZ"
+	elif [ -r /etc/timezone ]; then
+		# Debian/Ubuntu 风格：文件里就写着时区名
+		_tz="$(tr -d '[:space:]' < /etc/timezone 2>/dev/null)"
+	elif [ -L /etc/localtime ]; then
+		# RHEL/CentOS 风格：软链到 /usr/share/zoneinfo/<区域>/<城市>
+		_tz="$(readlink /etc/localtime 2>/dev/null | sed -n 's#.*/zoneinfo/##p')"
+	fi
+	# UTC 等价物等于「没配」：写进去反而让人以为已经设过了，不如留注释。
+	case "$_tz" in
+		""|UTC|GMT|Etc/UTC|Etc/GMT|Etc/GMT+0|Etc/UTC0) _tz="" ;;
+	esac
+	printf '%s' "$_tz"
+}
+
 # ---------- 参数 ----------
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -101,7 +157,15 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$DATA_DIR" ] || DATA_DIR="$PREFIX/data"
-[ -n "$PUBLIC_URL" ] || PUBLIC_URL="http://localhost:$PORT"
+# AUTO=1 表示这是我们替客户猜的（装完要念出来 + 告诉怎么改）。
+PUBLIC_URL_AUTO=0
+if [ -z "$PUBLIC_URL" ]; then
+	PUBLIC_URL="$(default_public_url "$PORT")"
+	PUBLIC_URL_AUTO=1
+fi
+# 时区：探测到才写，探测不到留注释（见 detect_timezone 的说明）。
+TZ_DETECTED="$(detect_timezone)"
+
 # 字体按实例隔离：/usr/local/share/fonts/skillforge-<服务名>。
 # 这样卸载本实例只删自己的字体，不会把同机其它实例正在用的那份抽走（Bug K）。
 [ "$FONT_DIR_SET" -eq 1 ] || FONT_DIR="/usr/local/share/fonts/skillforge-$SERVICE_NAME"
@@ -147,6 +211,86 @@ fi
 command -v systemctl >/dev/null 2>&1 || die "找不到 systemctl（systemd 在但 PATH 里没有？请用 root 完整环境重跑）"
 command -v systemd-run >/dev/null 2>&1 || die "找不到 systemd-run（systemd 太旧或安装不完整）。沙箱不可用，拒绝安装。"
 c_ok "systemd / systemd-run 可用"
+
+# ---------- 装前内存检查（只警告，不拦）----------
+#
+# 为什么要有这一栏：文档解析服务（ocrd）加载 PP-OCRv4 模型后常驻约 1GB，识别一张 A4
+# 扫描件时峰值再涨几百 MB。内存小的机器上它会被内核 OOM killer 干掉 —— 客户看到的
+# 现象是「扫描件时好时坏」「偶尔抽不出内容」，而安装输出和服务日志里都看不出
+# 「这台机器内存不够」这层原因，最后变成一轮来回扯皮。
+#
+# 为什么不拦：内存紧的机器**仍然能用**（纯文字写作类完全不碰 OCR 模型），硬拦会把
+# 本来可用的客户挡在门外。这里只把事实、阈值和离线可做的缓解办法摆出来。
+# 这也和上面 python3 那栏同一个原则：拿不准的事只提醒，不替客户做决定。
+MEM_MIN_MB=1024    # 低于此值：强烈警告（大概率被 OOM）
+MEM_COMFY_MB=2048  # 低于此值：温和提醒（能跑，但批量扫描件时会紧张）
+
+# mem_limit_mb 返回「这台机器实际能给本服务的内存上限」，单位 MB；
+# 探测不到返回 0（= 不判定，而不是「内存为 0」）。
+#
+# 为什么要和 cgroup 限额取小者：容器/受管环境里 /proc/meminfo 显示的是宿主机的
+# 内存（常见 64GB），而容器实际只能用 512MB —— 只看 MemTotal 会把这种机器判成
+# 「充裕」，正好漏掉最容易 OOM 的那一类。
+mem_limit_mb() {
+	local phys_kb cg_bytes limit=0
+	phys_kb="$(awk '$1 == "MemTotal:" { print $2; exit }' "${SKILLFORGE_MEMINFO:-/proc/meminfo}" 2>/dev/null)"
+	case "$phys_kb" in ''|*[!0-9]*) phys_kb=0 ;; esac
+	[ "$phys_kb" -gt 0 ] && limit=$((phys_kb / 1024))
+
+	cg_bytes=""
+	for f in "${SKILLFORGE_CGROUP_MEMORY_MAX:-/sys/fs/cgroup/memory.max}" \
+		"${SKILLFORGE_CGROUP_MEMORY_LIMIT:-/sys/fs/cgroup/memory/memory.limit_in_bytes}"; do
+		[ -r "$f" ] || continue
+		local raw; raw="$(head -n1 "$f" 2>/dev/null | tr -d '[:space:]')"
+		case "$raw" in ''|max|*[!0-9]*) continue ;; esac
+		# cgroup v1 的「无限制」是一个天文数字，不是文件缺失 —— 不当成限额。
+		[ "$raw" -gt 4611686018427387904 ] && continue
+		cg_bytes="$raw"
+		break
+	done
+	if [ -n "$cg_bytes" ]; then
+		local cg_mb=$((cg_bytes / 1048576))
+		[ "$cg_mb" -lt 1 ] && cg_mb=1
+		if [ "$limit" -eq 0 ] || [ "$cg_mb" -lt "$limit" ]; then
+			limit=$cg_mb
+		fi
+	fi
+	printf '%s\n' "$limit"
+}
+
+check_memory() {
+	local mb; mb="$(mem_limit_mb)"
+	if [ "$mb" -eq 0 ]; then
+		# 探测不到 ≠ 有问题。把「未知」报成失败，客户会为一件不存在的事折腾。
+		c_info "内存：探测不到上限（${SKILLFORGE_MEMINFO:-/proc/meminfo} 不可读）—— 跳过这项检查"
+		return 0
+	fi
+	if [ "$mb" -ge "$MEM_COMFY_MB" ]; then
+		# 用一位小数报 GB：8000MB 整除成 7GB 会把「8GB 的机器」说小一档，
+		# 客户对着规格表一看数字对不上，反而不信这一栏。
+		c_ok "内存：上限约 $(awk -v m="$mb" 'BEGIN { printf "%.1f", m / 1024 }') GB（文档解析服务常驻约 1GB，够用）"
+		return 0
+	fi
+	if [ "$mb" -ge "$MEM_MIN_MB" ]; then
+		c_warn "内存偏紧：本机上限约 ${mb} MB（建议 4GB 以上）"
+		c_warn "  说明：文档解析服务加载 OCR 模型后常驻约 1GB。单份扫描件通常够用，"
+		c_warn "        批量导入扫描件/大附件时可能被系统 OOM 中断 —— 遇到再加 swap 或加内存。"
+		return 0
+	fi
+	c_warn "内存偏小：本机上限约 ${mb} MB —— 文档解析服务大概率会被系统 OOM 干掉。"
+	c_warn "  现象：扫描件/Word/Excel 抽取时好时坏（服务会自动重启，但那一批抽取会失败）。"
+	c_warn "  缓解（任选其一）："
+	c_warn "  · 加 swap（离线可用，最省事）："
+	c_warn "      fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile"
+	c_warn "      重启后仍生效：echo '/swapfile none swap sw 0 0' >> /etc/fstab"
+	c_warn "  · 给这台机器加内存到 4GB 以上（要批量处理扫描件建议 8GB）"
+	c_warn "  怎么看确实被 OOM 了：journalctl -k | grep -i 'killed process'；"
+	c_warn "  或 systemctl status $SERVICE_NAME 里看到 OOM/killed 字样。"
+	c_warn "  本项不拦安装：纯文字写作类功能不依赖 OCR，现在就能用。"
+	return 0
+}
+
+check_memory
 
 # python3：代码执行沙箱（自检探针 + 「执行代码」工具）的解释器。
 #
@@ -424,7 +568,10 @@ if [ "$MAIN_BUSY" -eq 1 ] || [ "$OCR_BUSY" -eq 1 ]; then
 	fi
 	c_ok "端口确定：主服务 $PORT ／ 文档解析 $OCR_PORT"
 	# 端口变了，PUBLIC_URL 的默认值要跟着改（否则下载链接里还是旧端口）
-	[ -n "$PUBLIC_URL_SET" ] || PUBLIC_URL="http://localhost:$PORT"
+	if [ "$PUBLIC_URL_SET" -eq 0 ]; then
+		PUBLIC_URL="$(default_public_url "$PORT")"
+		PUBLIC_URL_AUTO=1
+	fi
 else
 	c_ok "端口检查通过（主服务 $PORT$([ "$DO_OCR" -eq 1 ] && printf ' ／ 文档解析 %s' "$OCR_PORT") 都空闲）"
 fi
@@ -590,8 +737,20 @@ umask 077
 	printf 'SKILLFORGE_ADDR=:%s\n' "$PORT"
 	printf 'SKILLFORGE_DATA_DIR=%s\n' "$DATA_DIR"
 	printf 'SKILLFORGE_DB=%s/skillforge.db\n' "$DATA_DIR"
-	printf '# 对外可访问地址：生成下载链接用。改成客户实际访问的域名/IP 后再重启。\n'
+	printf '# 对外可访问地址：生成下载链接/分享链接时写进 URL 的主机。\n'
+	printf '# 默认值取自本机内网 IP（自动探测）；若这台机器走反向代理或有多张网卡，\n'
+	printf '# 请改成同事/浏览器里真正会输入的那个域名或 IP，改完重启服务生效。\n'
 	printf 'SKILLFORGE_PUBLIC_URL=%s\n\n' "$PUBLIC_URL"
+	printf '# ---- 时间 ----\n'
+	if [ -n "$TZ_DETECTED" ]; then
+		printf '# 时区：安装时从本机探测得到。日志时间、页面时间、定时任务都按它算。\n'
+		printf '# 二进制内嵌了 IANA 时区库，所以本机即使没有 /usr/share/zoneinfo 也能正确解析。\n'
+		printf 'TZ=%s\n\n' "$TZ_DETECTED"
+	else
+		printf '# 时区：本机是 UTC（或探测不出时区名），所以没设。国内看日志/页面时间会比北京时间早 8 小时。\n'
+		printf '# 要按北京时间看，取消下面这行注释并重启服务（二进制已内嵌时区库，离线可用）：\n'
+		printf '# TZ=Asia/Shanghai\n\n'
+	fi
 	printf '# ---- 管理端账号 ----\n'
 	printf 'SKILLFORGE_ADMIN_USER=%s\n' "$ADMIN_USER"
 	printf '%s=%s\n' SKILLFORGE_ADMIN_PASS "$FINAL_PW"
@@ -624,6 +783,13 @@ umask 077
 		printf '# 只监听 127.0.0.1，主服务用它把 PDF/Word/Excel/扫描件抽成文本。\n'
 		printf '# 端口冲突时安装脚本会问你换端口，改完这里要同步重启两个服务。\n'
 		printf 'SKILLFORGE_OCR_URL=http://127.0.0.1:%s\n\n' "$OCR_PORT"
+	else
+		printf '# ---- 文档解析服务：本次安装用了 --no-ocr，按设计没装 ----\n'
+		printf '# 显式写 off，而不是「不写这一行」：不写等于回落到默认地址 127.0.0.1:8093，\n'
+		printf '# 主服务之后会一直报「解析服务连不上」，用户会以为装坏了。写 off 表示\n'
+		printf '# 「这台机器按设计就没有解析服务」——二进制素材走告警降级，\n'
+		printf '# 装后自检 -selftest 也据此判「跳过」，而不是把预期行为误报成安装失败。\n'
+		printf 'SKILLFORGE_OCR_URL=off\n\n'
 	fi
 	printf '# ---- 离线自检用来证明「沙箱确实读不到机密」的证据文件 ----\n'
 	printf 'SKILLFORGE_ENV_FILE=%s\n\n' "$ENV_FILE"
@@ -636,9 +802,80 @@ umask 077
 chmod 600 "$ENV_FILE"
 umask 022
 c_ok "配置：$ENV_FILE（权限 600，含随机密钥）"
+if [ -n "$TZ_DETECTED" ]; then
+	c_ok "时区：$TZ_DETECTED（日志时间、页面时间、定时任务都按它算）"
+else
+	c_info "时区：本机是 UTC（或探测不出来）—— 日志/页面时间会比北京时间早 8 小时。"
+	c_info "      要按北京时间看：$ENV_FILE 里取消一行 TZ=Asia/Shanghai 的注释，然后重启服务。"
+fi
+if [ "$PUBLIC_URL_AUTO" -eq 1 ]; then
+	# 这句话必须出现：地址填错的表现是「同事打不开/下载失败」，而现场里根本
+	# 看不出是地址问题。宁可多一行提示，也别让客户自己去猜这个值哪来的。
+	if [ "$PUBLIC_URL" = "http://localhost:$PORT" ]; then
+		c_warn "对外访问地址没探测到内网 IP，先填的 localhost:$PORT。"
+		c_warn "  · 只有「就在本机浏览器打开」的用法能直接work；给同事用会打不开。"
+		c_warn "  · 改成同事能访问到的地址：$ENV_FILE 里 SKILLFORGE_PUBLIC_URL=http://<内网IP或域名>:$PORT，然后重启服务"
+	else
+		c_ok "对外访问地址：$PUBLIC_URL（自动探测本机内网 IP）"
+		c_warn "  若这台机器走反向代理/域名访问，请把 $ENV_FILE 里的 SKILLFORGE_PUBLIC_URL 改成"
+		c_warn "  浏览器里真正输入的那个地址，否则下载与分享链接里的主机是内网 IP。"
+	fi
+fi
 if [ -n "$OLD_FONT" ] && [ "$OLD_FONT" != "$BUNDLED_FONT" ]; then
 	c_warn "注意：上一版配置里指定的 PDF 字体是 $OLD_FONT，本次已改为包内自带字体。"
 	c_warn "如果你当初显式换过字体，请在装后把 $ENV_FILE 里的 SKILLFORGE_PDF_FONT_FILE 改回去。"
+fi
+
+# ---- 3.5 TLS 信任预检（黄字提醒，不阻断）----
+# 为什么在这里做：客户内网常有两类证书现场 ——（a）服务端用自签证书，（b）机器
+# 太素没装 ca-certificates。这两种都会让「配好模型地址后一直连不上」，而报错是
+# x509 的英文栈，客户第一反应是怀疑程序。装的时候就把机器的信任现状摊开，
+# 比让他事后翻日志便宜得多。
+# 只做「文件在不在 / 系统库在不在」这种确定性判断；证书能不能解析出内容
+# 交给装后自检（那边有真解析）。预检一律黄字，不判死。
+trust_warn=0
+if grep -qE '^SKILLFORGE_CA_BUNDLE=' "$ENV_FILE" 2>/dev/null; then
+	trust_bundle="$(grep -E '^SKILLFORGE_CA_BUNDLE=' "$ENV_FILE" | tail -1 | cut -d= -f2-)"
+	trust_missing=""
+	while IFS= read -r trust_one; do
+		[ -n "$trust_one" ] || continue
+		# 支持 ~ 与相对路径（install.sh 允许客户从任意目录跑）
+		case "$trust_one" in
+			"~"/*) trust_one="$HOME/${trust_one#\~/}" ;;
+		esac
+		if [ ! -f "$trust_one" ]; then
+			trust_missing="$trust_missing $trust_one"
+		fi
+	done <<TRUSTLIST
+$(printf '%s' "$trust_bundle" | tr ':' '\n')
+TRUSTLIST
+	if [ -n "$trust_missing" ]; then
+		trust_warn=1
+		c_warn "SKILLFORGE_CA_BUNDLE 里这些路径在本机不存在：${trust_missing}"
+		c_warn "  报错会是什么样：模型服务/接口地址一路 https 请求全部证书校验失败。"
+		c_warn "  修法：把内网 CA 证书（通常是 .crt/.pem）拷到本机，改 $ENV_FILE 里的路径；"
+		c_warn "  多个文件用冒号分隔。改完重启：sudo systemctl restart $SERVICE_NAME"
+	else
+		c_ok "自定义 CA 已在位：$trust_bundle"
+	fi
+fi
+if [ ! -s /etc/ssl/certs/ca-certificates.crt ] \
+   && [ ! -s /etc/pki/tls/certs/ca-bundle.crt ] \
+   && [ ! -s /etc/ssl/certs/ca-bundle.crt ]; then
+	if grep -qE '^SKILLFORGE_CA_BUNDLE=[^[:space:]]' "$ENV_FILE" 2>/dev/null; then
+		c_warn "本机没装系统根证书（ca-certificates），但你已配了自定义 CA —— 依赖内网证书的地址可用，"
+		c_warn "  访问其它 https 站点（如公网模型 API）仍会失败。离线机可装发行版 ISO 里的 ca-certificates。"
+	else
+		trust_warn=1
+		c_warn "本机既没有系统根证书（ca-certificates），也没配 SKILLFORGE_CA_BUNDLE。"
+		c_warn "  影响：服务端证书是「自签」或机器信任库为空时，任何 https 地址都会证书校验失败。"
+		c_warn "  · 内网服务用自签证书 → 把签发它的 CA 证书路径写进 $ENV_FILE 的 SKILLFORGE_CA_BUNDLE（冒号分隔多个）"
+		c_warn "  · 机器太素（最小化安装常见） → 离线装包：rpm 包 ca-certificates，或 deb 包 ca-certificates"
+		c_warn "  · 当前全部用 http 内网地址 → 可以忽略本条，装后自检也会照实标注「当前不受影响」"
+	fi
+fi
+if [ "$trust_warn" -ne 0 ]; then
+	c_warn "  细节自查：装完跑 $BIN -selftest，看「TLS 信任库」一栏（它会点名哪些 https 端点在等证书）。"
 fi
 
 # ---------- 5. 安装 systemd 服务 ----------
@@ -734,6 +971,12 @@ fi
 step "6/7" "等待服务就绪"
 
 SELFTEST_RC=0
+# OCR_RC 与 SELFTEST_RC 分开记：两件事的失败原因和修复动作完全不同（一个是解析服务坏了，
+# 一个是自检里的某几项没过），最终退出码取两者的合取（见脚本末尾）。
+OCR_RC=0
+# 体检脚本路径：包内躺在 install.sh 旁边，装完再拷一份到 $PREFIX/bin。提示语只在文件真的
+# 存在时才给 —— 旧离线包压根没把 sf-ocr-doctor.sh 打进去，指向不存在的路径比不给提示更糟。
+DOCTOR=""
 if [ "$DO_START" -eq 1 ]; then
 	# 不依赖 curl/wget（离线机可能都没有），用 bash 自带的 /dev/tcp 探活
 	wait_port() {
@@ -750,39 +993,143 @@ if [ "$DO_START" -eq 1 ]; then
 		return 1
 	}
 
+	# ---------- HTTP 功能探测：端口在听 ≠ 能干活 ----------
+	#
+	# 为什么必须探到 HTTP 层（2026-09-15 的线上事故）：ocrd 是 PyInstaller onefile，运行时把
+	# 自己解包到 $TMPDIR/_MEI*；那个目录被系统的 tmpfiles 清理掉之后，进程还活着、端口还听着，
+	# 但每次抽字都秒失败（引擎重建时读不到 config.yaml）。旧版这里只探「端口在听」，装完一路绿，
+	# 用户拿到的是一个「看起来装好了、实际抽不出字」的部署 —— 一直等到训练出的技能跟素材毫无
+	# 关系才发现。端口在听只说明 socket 起来了，所以这里改成读 /health 里的 ok / runtime_ok。
+	#
+	# 实现只用 bash 内置能力：离线机没有 curl/wget，也不能假设有 timeout 命令。
+	http_get() { # $1=端口 $2=路径 → 打印原始响应（含状态行）；连不上返回 1
+		local p="$1" path="$2" out="" line=""
+		exec 3<>"/dev/tcp/127.0.0.1/$p" 2>/dev/null || return 1
+		printf 'GET %s HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' "$path" >&3 2>/dev/null || {
+			exec 3<&- 2>/dev/null || true
+			return 1
+		}
+		# 逐行读、每行 2 秒超时：对端在听但不回话、或回一半就断，都不能让安装界面挂死。
+		# HTTP 正文里的 JSON 一读完（出现配对的 { }）就收手，不等对端关连接。
+		#
+		# `|| [ -n "$line" ]` 这个尾巴是必须的：ocrd 的 /health 是 `wfile.write(json.dumps(...))`，
+		# **正文结尾没有换行**（deploy/ocr/ocrd.py）。read 在「读到 EOF 且没有分隔符」时返回非零，
+		# 只写 while 条件的话最后那一行正文会被整条丢掉 —— 于是 json_true 对健康的 /health 也返回
+		# 假，装好的服务被判红。判断有数据就继续，才能把没有换行结尾的正文收进来。
+		while IFS= read -r -t 2 -u 3 line || [ -n "$line" ]; do
+			out="$out$line"$'\n'
+			case "$out" in *'{'*'}'*) break ;; esac
+		done
+		exec 3<&- 2>/dev/null || true
+		printf '%s' "$out"
+	}
+	http_ok() { # 状态行必须是 200
+		case "$1" in *" 200 "*) return 0 ;; esac
+		return 1
+	}
+	json_true() { # $1=响应 $2=键 → 该键在 JSON 里为 true（"ok": true 与 "ok":true 都认）
+		case "$(printf '%s' "$1" | tr -d ' 	\r\n')" in *"\"$2\":true"*) return 0 ;; esac
+		return 1
+	}
+	json_str() { # $1=响应 $2=键 → 字符串值（没有该键则打印空）
+		local s
+		s="$(printf '%s' "$1" | tr -d ' 	\r\n')"
+		case "$s" in *"\"$2\":\""*) ;; *) return 0 ;; esac
+		s="${s#*\"$2\":\"}"
+		printf '%s' "${s%%\"*}"
+	}
+	probe() { # $1=端口 $2=路径 $3=重试次数 → 打印最后一次响应；非 200 返回 1
+		local p="$1" path="$2" n="${3:-10}" i=0 resp=""
+		while [ "$i" -lt "$n" ]; do
+			resp="$(http_get "$p" "$path" || true)"
+			if http_ok "$resp"; then
+				printf '%s' "$resp"
+				return 0
+			fi
+			i=$((i + 1))
+			sleep 0.5
+		done
+		printf '%s' "$resp"
+		return 1
+	}
+	# 起不来时把日志尾巴贴出来：常见死因（端口被占、PrivateTmp 导致的 203/EXEC、数据目录
+	# 不可写、OCR 被 OOM 杀掉）在日志里一眼可见，比让客户自己去翻 journalctl 高效得多。
+	dump_log() { # $1=单元名
+		if command -v journalctl >/dev/null 2>&1; then
+			c_info "最近日志："
+			journalctl -u "$1" -n 15 --no-pager 2>/dev/null | sed 's/^/      /' || true
+		fi
+		c_info "看完整日志：journalctl -u $1 -n 50 --no-pager"
+	}
+	one_line() { # 把多行响应压成一行、截断，供人眼快速对比
+		printf '%s' "$1" | tr -d '\r' | tr '\n' ' ' | cut -c1-200
+	}
+	# 解析服务出问题时的「下一步」提示。restart 只治「进程死了」，治不了「引擎坏了」或
+	# 「端口被占」—— 所以体检脚本这一行必须给，而且只在它真的存在时才给。
+	ocr_hint() {
+		c_info "修复：sudo systemctl restart $SERVICE_NAME-ocr"
+		if [ -n "$DOCTOR" ]; then
+			c_info "体检：sudo $DOCTOR"
+			c_info "      （按「单元状态 / 进程内存 / 抽字实测」三种情形分别给修法）"
+		else
+			c_info "体检：本包没带 sf-ocr-doctor.sh，看日志判断：journalctl -u $SERVICE_NAME-ocr -n 50 --no-pager"
+		fi
+	}
+
+	# 把体检脚本装到位（在线修复路径要能找到它）
+	if [ -f "$HERE/sf-ocr-doctor.sh" ]; then
+		mkdir -p "$PREFIX/bin" 2>/dev/null || true
+		if install -m 0755 "$HERE/sf-ocr-doctor.sh" "$PREFIX/bin/sf-ocr-doctor.sh" 2>/dev/null; then
+			DOCTOR="$PREFIX/bin/sf-ocr-doctor.sh"
+		else
+			DOCTOR="$HERE/sf-ocr-doctor.sh"
+		fi
+	elif [ -x "$PREFIX/bin/sf-ocr-doctor.sh" ]; then
+		DOCTOR="$PREFIX/bin/sf-ocr-doctor.sh"
+	fi
+
 	# 解析服务只等"端口在监听"，**不等模型加载完**：ocrd 的引擎是首次抽文本时才惰性加载的，
 	# 在这里等它等于让用户对着一个卡住的安装界面等半分钟，而它根本不影响主服务启动。
+	# 但等完必须探一次功能 ——「端口在听但引擎已坏」正是那次线上事故的形态。
 	if [ "$DO_OCR" -eq 1 ]; then
-		if wait_port "$OCR_PORT" "文档解析" 60; then
-			c_ok "文档解析服务已监听 $OCR_PORT"
+		if ! wait_port "$OCR_PORT" "文档解析" 60; then
+			c_fail "文档解析服务 30 秒内没监听 $OCR_PORT（扫描件/Word/Excel 抽取不可用）"
+			dump_log "$SERVICE_NAME-ocr"
+			ocr_hint
+			OCR_RC=1
 		else
-			c_warn "文档解析服务 30 秒内没监听 $OCR_PORT（主服务仍可用，扫描件/Word/Excel 抽取会失败）"
-			if command -v journalctl >/dev/null 2>&1; then
-				journalctl -u "$SERVICE_NAME-ocr" -n 10 --no-pager 2>/dev/null | sed 's/^/      /' || true
+			oh="$(probe "$OCR_PORT" /health 6 || true)"
+			if http_ok "$oh" && json_true "$oh" ok; then
+				c_ok "文档解析服务功能探测通过（$OCR_PORT /health：ok，版本 $(json_str "$oh" version)）"
+			else
+				c_fail "文档解析服务端口在听，但功能探测没通过（$OCR_PORT /health 未回 ok）"
+				ohh="$(one_line "$oh")"
+				c_info "原始响应：${ohh:-（空：端口接受连接但读不到任何响应）}"
+				dump_log "$SERVICE_NAME-ocr"
+				ocr_hint
+				OCR_RC=1
 			fi
 		fi
 	fi
 
-	ready=0
-	for _ in $(seq 1 40); do
-		if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
-			exec 3<&- 2>/dev/null || true
-			ready=1
-			break
+	# 主服务同样要探到 HTTP 层：端口在听只说明 socket 起来了，不代表路由/数据库/模板是好的
+	# （二进制与配置不匹配时进程能监听却每个请求 500）。用公开的 GET /api/site 当探针：
+	# 它匿名可读、不碰密钥，而且被 site_test.go 钉住「必须公开」—— 哪天被挪到鉴权后面会有单测爆红。
+	if wait_port "$PORT" "主服务" 40; then
+		mh="$(probe "$PORT" /api/site 10 || true)"
+		if http_ok "$mh"; then
+			c_ok "主服务功能探测通过（$PORT /api/site：HTTP 200）"
+		else
+			c_fail "主服务端口在听，但功能探测没通过（$PORT /api/site 未回 200）"
+			mhh="$(one_line "$mh")"
+			c_info "原始响应：${mhh:-（空：端口接受连接但读不到任何响应）}"
+			dump_log "$SERVICE_NAME"
+			c_info "服务本身没装好，先别接业务：这条不是警告，是失败。"
+			exit 1
 		fi
-		sleep 0.5
-	done
-	if [ "$ready" -eq 1 ]; then
-		c_ok "端口 $PORT 已监听"
 	else
 		c_fail "等待 20 秒仍未监听 $PORT"
-		# 直接把最后几行日志贴出来：常见原因（端口被占、PrivateTmp 导致的 203/EXEC、
-		# 数据目录不可写）在日志里一眼可见，比让客户自己去翻 journalctl 高效得多。
-		if command -v journalctl >/dev/null 2>&1; then
-			c_info "最近日志："
-			journalctl -u "$SERVICE_NAME" -n 15 --no-pager 2>/dev/null | sed 's/^/      /' || true
-		fi
-		c_info "看完整日志：journalctl -u $SERVICE_NAME -n 50 --no-pager"
+		dump_log "$SERVICE_NAME"
 		exit 1
 	fi
 else
@@ -809,13 +1156,20 @@ else
 fi
 
 printf '\n\033[1m────────────────────────────────────────────\033[0m\n'
-if [ "$SELFTEST_RC" -eq 0 ]; then
+if [ "$SELFTEST_RC" -eq 0 ] && [ "$OCR_RC" -eq 0 ]; then
 	printf '\033[32m\033[1m安装完成\033[0m\n'
+elif [ "$OCR_RC" -ne 0 ]; then
+	# 解析服务探测失败单独说清（红字，不是黄字）：它不是「某个自检项没通过」，而是核心功能
+	# 不可用 —— 上传的 PDF/Word 会抽不出正文，训练会被素材门禁中止。
+	printf '\033[31m\033[1m安装完成，但文档解析服务不可用（见上）\033[0m\n'
 else
 	printf '\033[33m\033[1m安装完成，但自检有未通过项（见上）\033[0m\n'
 fi
 printf '\033[1m────────────────────────────────────────────\033[0m\n'
-c_info "访问地址 : http://<本机IP>:$PORT"
+c_info "访问地址 : $PUBLIC_URL"
+if [ "$PUBLIC_URL" = "http://localhost:$PORT" ]; then
+	c_info "           ← 这是本机地址，只有在这台机器上开浏览器才通；给同事用请改 $ENV_FILE 里的 SKILLFORGE_PUBLIC_URL"
+fi
 c_info "管理账号 : $ADMIN_USER"
 if [ -z "$ADMIN_PASS" ] && [ -z "$OLD_ADMIN_PW" ]; then
 	c_info "管理密码 : $FINAL_PW   ← 只显示这一次，请立刻记下"
@@ -827,8 +1181,21 @@ c_info "配置文件 : $ENV_FILE"
 c_info "看日志   : journalctl -u $SERVICE_NAME -f"
 c_info "卸载     : sudo $HERE/uninstall.sh"
 printf '\n'
-if [ "$SELFTEST_RC" -ne 0 ]; then
+if [ "$SELFTEST_RC" -ne 0 ] || [ "$OCR_RC" -ne 0 ]; then
 	c_info "自检失败时先看「PDF 中文字体」一栏：它提示缺哪些字符，就换一个覆盖这些字符的 .ttf，"
 	c_info "然后在 $ENV_FILE 里改 SKILLFORGE_PDF_FONT_FILE 并重启服务。"
 fi
-exit "$SELFTEST_RC"
+if [ "$OCR_RC" -ne 0 ]; then
+	c_info "文档解析服务没通过功能探测：sudo systemctl restart $SERVICE_NAME-ocr，然后跑体检"
+	if [ -n "$DOCTOR" ]; then
+		c_info "  sudo $DOCTOR"
+		c_info "脚本会按「单元状态 / 进程内存 / 抽字实测」三种情形分别告诉你怎么修。"
+	else
+		c_info "  本包没带 sf-ocr-doctor.sh，看日志判断：journalctl -u $SERVICE_NAME-ocr -n 50 --no-pager"
+	fi
+fi
+# 退出码取两者合取：任一没通过，装的这套东西就不能算「装好了」。
+if [ "$SELFTEST_RC" -ne 0 ]; then
+	exit "$SELFTEST_RC"
+fi
+exit "$OCR_RC"

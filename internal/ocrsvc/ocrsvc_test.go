@@ -185,7 +185,7 @@ func TestCheckDistinguishesNotRunningFromRuntimeLost(t *testing.T) {
 	if h := Check(context.Background(), dead); h.Running || h.Healthy() || h.Detail() == "" {
 		t.Fatalf("空端口应判为没在运行且有话可说，得到 %+v", h)
 	} else {
-		// 排查入口必须给全：线上取证（ocr_dependency_ux_live_check.py 的 leg A）
+		// 排查入口必须给全：线上验收 leg（ocr_dependency_ux_e2e.py 的 leg A）
 		// 抓出过一条真缺口 —— 预检只给 restart、没给 status/journalctl，
 		// 用户遇到「restart 也不行」就没有下一步。这条断言把它钉住。
 		for _, want := range []string{"systemctl restart", "systemctl status", "journalctl"} {

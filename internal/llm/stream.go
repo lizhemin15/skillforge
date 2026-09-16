@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/lizhemin15/skillforge/internal/tlsconf"
 )
 
 // StreamOpts 控制一次流式调用的可选行为。
@@ -119,9 +121,9 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 	req.Header.Set("Accept", "text/event-stream")
 
-	resp, err := streamHTTPClient.Do(req)
+	resp, err := streamHTTPClient().Do(req)
 	if err != nil {
-		return "", 0, NormalizeErr(err)
+		return "", 0, c.wrapErr(err)
 	}
 	defer resp.Body.Close()
 
@@ -180,11 +182,16 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 		if sb.Len() > 0 {
 			return sb.String(), resp.StatusCode, nil
 		}
-		return "", resp.StatusCode, NormalizeErr(err)
+		return "", resp.StatusCode, c.wrapErr(err)
 	}
 	return sb.String(), resp.StatusCode, nil
 }
 
 // streamHTTPClient：整体超时远大于普通请求。关思考链之后这些调用都在十几秒内，
 // 但 provider 偶发抖动时不该被 60s 卡死；真正生效的截止时间是 ctx。
-var streamHTTPClient = &http.Client{Timeout: 10 * time.Minute}
+//
+// 写成函数而不是包级变量：包级变量在 main() 之前求值，那时实例 env
+// （SKILLFORGE_CA_BUNDLE）还没读进来，会造出一个「没有 CA」的 transport 并被缓存
+// ——症状是「证书放好了也不生效」，客户会转头怀疑证书本身。
+// 放在请求路径上求值才安全；transport 在 tlsconf 内部已缓存，这里只包一层结构体。
+func streamHTTPClient() *http.Client { return tlsconf.NewClient(10 * time.Minute) }

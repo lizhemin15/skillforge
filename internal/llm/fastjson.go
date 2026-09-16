@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/lizhemin15/skillforge/internal/tlsconf"
 )
 
 // FastJSON：一次「必须在 1~2 秒内回来」的 JSON 调用。给首页推荐行（/api/chat/suggest）用。
@@ -131,10 +133,11 @@ func (c *Client) fastOnce(ctx context.Context, system, user string, maxTokens in
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 
-	resp, err := fastHTTPClient.Do(req)
+	resp, err := fastHTTPClient().Do(req)
 	if err != nil {
 		// 超时/连不上都打上瞬时标记，与 Chat 的行为保持一致（调用方按同一套判据决定重试）。
-		return "", 0, NormalizeErr(err)
+		// 证书类错误在 wrapErr 里先被翻成人话：它看着像「网络抖动」，但重试一万次也不会好。
+		return "", 0, c.wrapErr(err)
 	}
 	defer resp.Body.Close()
 	// 只读 8KB：错误体是给人看的，不需要把整段 HTML 网关页吞进内存。
@@ -184,7 +187,10 @@ func (c *Client) fastOnce(ctx context.Context, system, user string, maxTokens in
 
 // fastHTTPClient：整体超时远大于推荐行的 5s 预算。真正生效的截止时间是 ctx
 // （流式那条路要长连接，所以这里单独一个 client，不去动全局默认）。
-var fastHTTPClient = &http.Client{Timeout: 60 * time.Second}
+//
+// 同样写成函数：包级变量会在 main() 之前求值，那时实例 env 还没读进来，
+// 会把「没有 CA」的 transport 缓存下来（详见 stream.go 的同类说明）。
+func fastHTTPClient() *http.Client { return tlsconf.NewClient(60 * time.Second) }
 
 // normalizeBaseURL：BaseURL 为空走 OpenAI 默认；填了但没带 /v1 的补上
 // （很多 provider 给的是 https://api.deepseek.com 这种）。

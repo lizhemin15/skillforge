@@ -153,6 +153,58 @@ jobs:
           # 所以必须排在本 step 之后的 Go 环境里 —— setup-go 在上面，照跑。
           python3 web/tests/skill_disabled_admin_ui_mutation_check.py
 
+      # 离线包 install.sh 的「装后服务探测」：正向场景 + 两路注入自证。
+      #
+      # 为什么要紧：2026-09-15 线上事故的判定方式就是这段代码 —— ocrd 进程活着、
+      # 端口听着，但抽字全废，安装过程一路绿。用户在内网机上看到的
+      # 「8093/extract connection refused / 扫描件解析全废」正是这么漏出去的。
+      #
+      # 为什么三路都要跑：这段逻辑是「读 HTTP 正文 + 判断 JSON 字段」，两路注入
+      # 各打一个真实退化形态 —— INJECT=1 退回「只认 HTTP 200」（历史判定方式）、
+      # INJECT=2 退回「只写 while 条件」的读循环（丢掉无换行结尾的最后一行正文，
+      # 而那正是真 ocrd 的响应形态）。只跑正向的话，这两路会静静地腐烂：
+      # 它们的代码路径在平时根本不执行，不跑就既不报错也不变红。
+      #
+      # 注入模式的退出码语义是反的：**rc=0 表示"确实按预期转红了"**，
+      # 所以这里绝不能加 `|| true` —— 那会让「注入后根本没红」也变成通过。
+      # preflight_parity.test.mjs 里有一条专门盯这个。
+      - name: 离线包装后探测自证（正向 + 两路注入）
+        run: |
+          bash deploy/offline/tests/install_probe_test.sh
+          INJECT=1 bash deploy/offline/tests/install_probe_test.sh
+          INJECT=2 bash deploy/offline/tests/install_probe_test.sh
+
+      # 离线包 install.sh 的几把尺子（都是从 install.sh 里抠真代码跑，不重抄实现）：
+      #   · 装前内存检查：正向 6 档（充裕/偏紧/偏小/容器限额/探测不到/硬拦回归）+ 5 路突变自证
+      #   · 对外访问地址默认值、时区处理、TLS 信任预检：三种「静默失效」的现场
+      #   · 自检时区栏的离线双向对照（需要 root + unshare，CI 里非 root 会显式 SKIP 而非假绿）
+      #   · TLS 信任预检：正向 5 场景（已在位 / 路径缺失 / 无系统根证书 / 两样都缺 / 纯 http）+ 4 路突变自证
+      #     —— 突变那 4 路专治「安装期三把尺子只有正向场景」这个缺口：
+      #        坏路径被静默忽略、无根证书时沉默、客户显式 --public-url 被覆盖、时区探测了却不写进 env
+      - name: 离线包 install.sh 验收（内存 / 地址 / 时区 / 信任预检 / 自检时区）
+        run: |
+          bash deploy/offline/tests/test_install_memory.sh
+          bash deploy/offline/tests/test_install_memory_mutation.sh
+          bash deploy/offline/tests/test_install_public_url.sh
+          bash deploy/offline/tests/test_install_timezone.sh
+          bash deploy/offline/tests/test_install_trust_precheck.sh
+          bash deploy/offline/tests/test_install_precheck_mutation.sh
+          bash deploy/offline/tests/test_selftest_tz_offline.sh
+
+      # `-selftest` 的「文档解析服务」这一栏：真跑出货二进制，五种结论各一条场景
+      # （真能干活 / 僵尸服务 / 冒名服务 / 显式禁用 / 指向远端连不上）。
+      # 单测喂的是合成证据，证明不了「从敲命令到屏幕出现结论」这条真链。
+      # 这条脚本本身就是「自称的尺子」的活教材：它写死的检查项数量在 F3/F5 加了两栏后
+      # 失配，而它当时没被任何闸门调用 —— 于是红着也没人知道。现已接进两头。
+      - name: 离线包自检「文档解析服务」栏真跑
+        run: python3 deploy/offline/tests/selftest_parse_live_check.py
+
+      # 元守卫的行为自证：preflight_parity.test.mjs 本身也是「纯文本断言 + 按目录枚举」，
+      # 它的失效形态同样是「一切正常」。这里对它注入真故障（拿掉接线、拿掉 INJECT=2、
+      # 挂 || true、往黑洞目录丢没人接线的尺子），要求它每次都红在预期那条。
+      - name: 接线守卫自证（preflight_parity 注入）
+        run: bash web/tests/preflight_parity_mutation_check.sh
+
       # 推荐行（输入框上方那几颗小胶囊）的后端：/api/chat/suggest。
       # 它的失败形态全是「静默降级」——前端 fetch 挂在 .catch 里，404/500/超时
       # 都只是退回规则版推荐行，页面上没有任何异常，日志里也没有。

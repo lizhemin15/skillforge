@@ -17,6 +17,7 @@ import (
 	"github.com/lizhemin15/skillforge/internal/model"
 	"github.com/lizhemin15/skillforge/internal/ocrsvc"
 	"github.com/lizhemin15/skillforge/internal/store"
+	"github.com/lizhemin15/skillforge/internal/tlsconf"
 )
 
 // ===== Knowledge-base style skill file management =====
@@ -327,7 +328,7 @@ type docExtract struct {
 func (a *Admin) extractDoc(filename string, data []byte) (docExtract, error) {
 	var res docExtract
 	// 超时必须可配：写死 300s 而真实扫描件要 397.5s，只会让上传解析永远失败。
-	client := &http.Client{Timeout: a.ocrTimeoutOrDefault()}
+	client := tlsconf.NewClient(a.ocrTimeoutOrDefault())
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	name := path.Base(filename)

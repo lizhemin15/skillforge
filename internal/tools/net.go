@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/lizhemin15/skillforge/internal/tlsconf"
 )
 
 // HTTPConfig 是 http_request 工具的配置。
@@ -112,6 +114,9 @@ func (t *HTTPRequestTool) Run(ctx context.Context, args map[string]any) (Result,
 
 	cli := &http.Client{
 		Timeout: t.cfg.Timeout,
+		// 走本机信任配置：内网的接口文档站/知识库常挂自签证书，
+		// 不接这一处，客户把 CA 放好了抓取照样失败。
+		Transport: tlsconf.Transport(),
 		// 每一跳都重新校验，防止用 302 绕过初始检查打到内网
 		CheckRedirect: func(r *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
@@ -122,7 +127,9 @@ func (t *HTTPRequestTool) Run(ctx context.Context, args map[string]any) (Result,
 	}
 	resp, err := cli.Do(req)
 	if err != nil {
-		return Result{}, fmt.Errorf("请求失败: %w", err)
+		// 证书类错误先翻成人话：内网自签证书是常态，
+		// 原文是 "certificate signed by unknown authority"，客户看不出要做什么。
+		return Result{}, fmt.Errorf("请求失败: %w", tlsconf.Explain(err, req.URL.String()))
 	}
 	defer resp.Body.Close()
 
@@ -251,7 +258,8 @@ func GuardedGet(ctx context.Context, rawURL string, headers map[string]string, a
 		req.Header.Set(k, v)
 	}
 	cli := &http.Client{
-		Timeout: timeout,
+		Timeout:   timeout,
+		Transport: tlsconf.Transport(),
 		CheckRedirect: func(r *http.Request, via []*http.Request) error {
 			// 重定向是绕开 SSRF 防护的经典手法：必须逐跳复检。
 			// 例如允许列表里的公网域名 302 到 169.254.169.254（云元数据）。
@@ -263,7 +271,7 @@ func GuardedGet(ctx context.Context, rawURL string, headers map[string]string, a
 	}
 	resp, err := cli.Do(req)
 	if err != nil {
-		return 0, nil, fmt.Errorf("请求失败: %w", err)
+		return 0, nil, fmt.Errorf("请求失败: %w", tlsconf.Explain(err, req.URL.String()))
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))

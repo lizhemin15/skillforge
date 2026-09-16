@@ -19,11 +19,26 @@
   凭据从 /opt/skillforge/skillforge.env 读，**不打印、不落盘**。
 
 用法：
-    python3 web/tests/ocr_dependency_ux_live_check.py
-    BIN=/opt/skillforge/skillforge python3 web/tests/ocr_dependency_ux_live_check.py
-退出码：0 = 全部断言通过；1 = 有失败（含「前置条件不成立」，绝不当成通过）。
+    bash scripts/acceptance-live.sh                 # 跟着线上验收一起跑（推荐）
+    ONLY=ocrdep bash scripts/acceptance-live.sh     # 只跑这一条 leg
+    python3 web/tests/ocr_dependency_ux_e2e.py      # 直接跑
+    BIN=/opt/skillforge/skillforge python3 web/tests/ocr_dependency_ux_e2e.py
+退出码：0 = 断言全通过（前置条件不成立时打 SKIP 并退 0 —— 但 runner 默认据此判
+      FAIL/未验证，要放行必须显式 ALLOW_SKIP=1）；1 = 有断言失败。
+
+为什么文件名从 `..._live_check.py` 改成 `..._e2e.py`（2026-09-16）：
+  它原来是**零引用**的：ci.yml 没有、preflight.sh 没有、docs 没有，而
+  `scripts/acceptance-live.sh` 只枚举 `web/tests/*_e2e.py` —— 名字不匹配 =
+  这条线上验收永远不跑，失败形态是「一切正常」。这跟 `deploy/offline/tests/`
+  那个「同名黑洞」是同一种病：**尺子没接进任何闸门，红着绿着都没人知道**。
+  改后缀 + 声明 `# LIVE-LEGS:` 之后，它归 runner 管，`live_e2e_roster.test.mjs`
+  守它跟文件真身不许脱钩。
 """
+# LIVE-LEGS: ocrdep
+# ↑ 线上验收 leg 声明（单条 leg：脚本内部自己跑 leg A 依赖不可用 / leg B 依赖正常）。
+#   枚举规则见 scripts/acceptance-live.sh 与 web/tests/live_e2e_roster.test.mjs。
 import json
+
 import os
 import re
 import shutil
@@ -63,7 +78,10 @@ def fail(msg):
 def skip(msg):
     global skip_n
     skip_n += 1
-    print(f"[SKIP] {msg}")
+    # 行首必须是 SKIP：scripts/acceptance-live.sh 用 `grep -qE '^SKIP'` 判「踢过球
+    # 但没验证」，默认判 FAIL，只有显式 ALLOW_SKIP=1 才放行。写成 [SKIP] 就漏判，
+    # 于是「一条断言都没验」会被当成绿 —— 这正是 SKIP≠PASS 要防的假绿。
+    print(f"SKIP {msg}")
 
 
 def free_port():
@@ -87,7 +105,7 @@ def read_env(path):
                 if k.strip() in ("SKILLFORGE_ADMIN_USER", "SKILLFORGE_ADMIN_PASS"):
                     out[k.strip()] = v.strip().strip('"').strip("'")
     except OSError as e:
-        print(f"[SKIP] 读不到 {path}：{e}")
+        print(f"SKIP 读不到 {path}：{e}")
     return out
 
 
@@ -238,14 +256,14 @@ def train_stream(inst, token, fixture_bytes, fixture_name, timeout=180, stop_whe
 def main():
     print("=== 解析服务依赖的「用户可见行为」线上取证 ===")
     if not os.path.exists(BIN):
-        print(f"[SKIP] 找不到出货二进制 {BIN}")
+        print(f"SKIP 找不到出货二进制 {BIN}")
         return 0
     if not os.path.isdir(SRC_DATA):
-        print(f"[SKIP] 找不到数据目录 {SRC_DATA}")
+        print(f"SKIP 找不到数据目录 {SRC_DATA}")
         return 0
     fixture_path = os.path.join(ROOT, FIXTURE)
     if not os.path.exists(fixture_path):
-        print(f"[SKIP] 找不到夹具 {fixture_path}")
+        print(f"SKIP 找不到夹具 {fixture_path}")
         return 0
     with open(fixture_path, "rb") as f:
         fixture_bytes = f.read()
@@ -255,7 +273,7 @@ def main():
     os.makedirs(WORKDIR, exist_ok=True)
     creds = read_env(ENV_FILE)
     if not creds.get("SKILLFORGE_ADMIN_PASS"):
-        print("[SKIP] 没读到管理端密码（环境文件缺失或权限不足）")
+        print("SKIP 没读到管理端密码（环境文件缺失或权限不足）")
         return 0
     print("  凭据  ：已从环境文件读取（未打印）")
 
@@ -334,7 +352,13 @@ def main():
     finally:
         b.stop()
 
-    print(f"\n--- {ok_n}/{ok_n + fail_n} ok（skip {skip_n}）---")
+    # 小结格式必须逐字是 `--- N/M ok ---`：scripts/acceptance-live.sh 用
+    # grep -oE '--- [0-9]+/[0-9]+ ok ---' 抠断言数，抠不到就判「绿得没有断言」。
+    # skip 单独一行、行首大写 —— 让 runner 的 SKIP 判据能看见它（否则
+    # 「leg A 全绿 + leg B 跳过」会被报成 PASS，那是假绿）。
+    print(f"\n--- {ok_n}/{ok_n + fail_n} ok ---")
+    if skip_n:
+        print(f"SKIP {skip_n} 条断言未验证（见上面的 SKIP 行）")
     if fail_n:
         print("结论：FAIL —— 修复没达到「用户能自助」的标准")
         return 1

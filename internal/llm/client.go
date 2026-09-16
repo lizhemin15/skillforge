@@ -10,6 +10,7 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 
 	"github.com/lizhemin15/skillforge/internal/model"
+	"github.com/lizhemin15/skillforge/internal/tlsconf"
 )
 
 // Client wraps an OpenAI-compatible client with provider overrides.
@@ -26,7 +27,32 @@ func New(cfg *model.LLMConfig) *Client {
 	// 归一化逻辑与 FastJSON 共用一处（fastjson.go 的 normalizeBaseURL）：
 	// 两条路各写一份的话，某天只改一条，同一个 provider 在两条路上会打到不同地址。
 	conf.BaseURL = normalizeBaseURL(cfg.BaseURL)
+	// 走本机信任配置（SKILLFORGE_CA_BUNDLE）：内网网关用自签证书时，
+	// 不这样接就是把证书放好了也照样「certificate signed by unknown authority」。
+	// 这里不设整体超时——流式问答要长连接，截止时间由 ctx 负责。
+	conf.HTTPClient = tlsconf.NewClient(0)
 	return &Client{cfg: cfg, cli: openai.NewClientWithConfig(conf)}
+}
+
+// endpointForErr：报错里要能看出「打到哪个地址」。内网常有多套网关（灰度/生产各一套），
+// 只说「证书不可信」客户不知道该修哪一个。
+func (c *Client) endpointForErr() string {
+	if c == nil || c.cfg == nil {
+		return ""
+	}
+	return normalizeBaseURL(c.cfg.BaseURL)
+}
+
+// wrapErr 是 LLM 出错的统一出口（两条路 streamOnce/fastOnce + Chat 都走它）：
+// 先把证书类错误翻成人话（含修复与自查命令），再打瞬时故障标记。
+// 顺序不能反：NormalizeErr 只会给瞬时错误套一层壳，套完仍保留原文，
+// 所以先翻译不会被吞掉；反过来则可能出现「TransientError 包着证书错误」，
+// 调用方看到「网络抖动，稍后重试」，而真相是证书没配——重试一万次也没用。
+func (c *Client) wrapErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return NormalizeErr(tlsconf.Explain(err, c.endpointForErr()))
 }
 
 // ErrNoLLM 是"引擎手里根本没装模型"时的统一错误。
@@ -75,7 +101,7 @@ func (c *Client) CompleteEx(ctx context.Context, system, user string, onDelta fu
 	}
 	stream, err := c.cli.CreateChatCompletionStream(ctx, req)
 	if err != nil {
-		return "", NormalizeErr(err)
+		return "", c.wrapErr(err)
 	}
 	defer stream.Close()
 
@@ -86,7 +112,7 @@ func (c *Client) CompleteEx(ctx context.Context, system, user string, onDelta fu
 			break
 		}
 		if err != nil {
-			return sb.String(), NormalizeErr(err)
+			return sb.String(), c.wrapErr(err)
 		}
 		if len(resp.Choices) == 0 {
 			continue
@@ -135,7 +161,7 @@ func (c *Client) Chat(ctx context.Context, sys, user string, jsonMode ...bool) (
 	if err != nil {
 		// 归一化：瞬时故障（429/5xx/网关抖动/超时）打上标记，让调用方能决定重试；
 		// 文案不变，只是多带一个可判定的身份。
-		return "", NormalizeErr(err)
+		return "", c.wrapErr(err)
 	}
 	if len(resp.Choices) == 0 {
 		// 空 choices 在实践中同样出现在上游过载时，按瞬时处理。

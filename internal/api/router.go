@@ -13,6 +13,7 @@ import (
 
 	"github.com/lizhemin15/skillforge/internal/agent"
 	"github.com/lizhemin15/skillforge/internal/llm"
+	"github.com/lizhemin15/skillforge/internal/ocrsvc"
 	"github.com/lizhemin15/skillforge/internal/skillgen"
 	"github.com/lizhemin15/skillforge/internal/store"
 	"github.com/lizhemin15/skillforge/internal/version"
@@ -72,16 +73,11 @@ func toolMaxRounds() int {
 // ocrServiceURL 返回文档解析微服务（ocrd）的地址。
 // 约定优于配置：不设置环境变量就走本机默认端口，运维不必额外配；
 // 显式设为 off/-/none 表示禁用（返回空串），此时二进制素材降级为告警而不是报错。
-func ocrServiceURL() string {
-	v := strings.TrimSpace(os.Getenv("SKILLFORGE_OCR_URL"))
-	switch strings.ToLower(v) {
-	case "":
-		return "http://127.0.0.1:8093"
-	case "off", "-", "none", "disable", "disabled":
-		return ""
-	}
-	return v
-}
+//
+// 实现只有一份（ocrsvc.URLFromEnv）：-selftest 的自检项读同一份。两处各写一套 switch
+// 迟早会出现「主服务认为启用了、自检认为禁用了」这种互相打脸的状态，
+// 而那种 bug 只会在客户机器上才现形 —— 本地怎么自测都是绿的。
+func ocrServiceURL() string { return ocrsvc.URLFromEnv() }
 
 // ocrTimeout 返回单次文档解析的客户端超时上限（默认 30 分钟，见 DefaultOCRTimeout）。
 // 接受 "20m" / "90s" 这类时长写法，也接受纯秒数（"600" = 600 秒）；

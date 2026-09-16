@@ -30,6 +30,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/lizhemin15/skillforge/internal/tlsconf"
 )
 
 const (
@@ -39,6 +41,10 @@ const (
 	DefaultUnitSuffix = "-ocr"
 	// ProbingService 是用于给出修复命令的默认服务名（install.sh --service 可改名）。
 	ProbingService = "skillforge"
+	// EnvVarURL 是指定解析服务地址的环境变量名。
+	// 主服务（api/router.go）与自检（cmd/server -selftest）都从这里取地址，
+	// 常量放在本包是为了让「禁用」的语义只有一个实现（见 URLFromEnv）。
+	EnvVarURL = "SKILLFORGE_OCR_URL"
 	// ProbeTimeout 是探活上限。3s 是刻意取的：真连不上时 refused 是毫秒级返回，
 	// 真正要防的是「对端黑洞」——那种情况下用户宁可早点看到人话，也不要等默认 30 分钟的解析超时。
 	ProbeTimeout = 3 * time.Second
@@ -111,6 +117,48 @@ func Explain(err error, svcURL string) error {
 			where, unit, unit, unit, firstLine(err.Error())),
 		cause: err,
 	}
+}
+
+// URLFromEnv 返回本实例实际要用的解析服务地址（唯一真源）。
+//
+// 约定优于配置：不设置就走默认地址，运维不必额外配；显式设为 off/-/none/disable
+// 表示「这台机器按设计不装解析服务」（离线安装 --no-ocr 就会写入 off），返回空串 ——
+// 此时二进制素材降级为告警而不是报错。
+//
+// 之所以把它抽到这里，是因为读它的地方已有两个：api/router.go 决定「能不能解析」，
+// cmd/server 的 -selftest 决定「这次安装算不算成功」。两处各写一份 switch，早晚会
+// 出现「主服务认为启用了、自检认为禁用了」这种互相打脸的状态，而那种 bug 只在
+// 客户机器上现形 —— 本地怎么自测都是绿的。
+func URLFromEnv() string {
+	v := strings.TrimSpace(os.Getenv(EnvVarURL))
+	switch strings.ToLower(v) {
+	case "":
+		return DefaultURL
+	case "off", "-", "none", "disable", "disabled":
+		return ""
+	}
+	return v
+}
+
+// Loopback 判断解析服务地址是否指向本机。
+//
+// 自检需要它来区分两种「连不上」：指向本机却连不上，可能是这台机器按设计就没装
+// 解析服务（--no-ocr、或安装包缺 bin/ocrd），可以判「跳过」；而指向**别的机器**却
+// 连不上，永远是失败 —— 那说明地址写错了或对端挂了，没有「设计如此」的解释空间。
+func Loopback(svcURL string) bool {
+	host := Endpoint(svcURL)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	switch strings.ToLower(host) {
+	case "localhost", "127.0.0.1", "::1", "0.0.0.0":
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // Endpoint 从解析服务地址里取出「主机:端口」，用于给用户指出到底是哪个地址连不上。
@@ -187,7 +235,7 @@ func Check(ctx context.Context, svcURL string) Health {
 		h.Err = err
 		return h
 	}
-	client := &http.Client{Timeout: ProbeTimeout}
+	client := tlsconf.NewClient(ProbeTimeout)
 	resp, err := client.Do(req)
 	if err != nil {
 		h.Err = err
@@ -238,6 +286,10 @@ func SelfHealingMessage(svcURL, raw string) string {
 	return fmt.Sprintf("文档解析服务刚重启过（运行时被破坏，已自愈）：%s。约 10 秒后重试即可，"+
 		"文件本身没有问题。原始信息：%s", Endpoint(svcURL), firstLine(raw))
 }
+
+// FirstLine 导出给自检用：它要打印的原始错误同样得掐掉多行 context，
+// 否则一行底层错误会把关键信息顶出屏幕。
+func FirstLine(s string) string { return firstLine(s) }
 
 // firstLine 只取第一行：底层错误常带多行 context，铺进界面会把关键信息顶掉。
 func firstLine(s string) string {

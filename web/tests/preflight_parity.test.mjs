@@ -11,7 +11,7 @@
 // 所以这里把「枚举」和「参数一致」都钉死：谁把清单写回去、谁改了一边参数，立刻红。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync } from 'node:fs';
 
 const REPO = new URL('../../', import.meta.url);
 const read = (p) => readFileSync(new URL(p, REPO), 'utf8');
@@ -29,12 +29,48 @@ const PF = read('scripts/preflight.sh');
 // `*_mutation_check.py`（chat_composer / chat_trace）落在名单外 —— 后果实测到了：
 // chat_trace_mutation_check.py 只在 ci.yml 里跑，scripts/preflight.sh 里没有，
 // 本地闸门比 CI 少一道，本地全绿推上去才红。后缀不是防线，能不能被漏掉才是。
-const selfCheckScripts = () => [
-  ...readdirSync(new URL('internal/api/', REPO)).filter((f) => f.endsWith('_mutation_check.sh')).map((f) => `internal/api/${f}`),
-  ...readdirSync(new URL('web/tests/', REPO)).filter((f) => f.endsWith('_mutation_check.sh')).map((f) => `web/tests/${f}`),
-  ...readdirSync(new URL('web/tests/', REPO)).filter((f) => f.endsWith('_mutation_check.py')).map((f) => `web/tests/${f}`),
-  ...readdirSync(new URL('scripts/', REPO)).filter((f) => /inject.*\.py$/.test(f)).map((f) => `scripts/${f}`),
+//
+// 2026-09-16 补：`deploy/offline/tests/` 是第二个同名黑洞 —— 那里的 .sh 既不叫
+// `_mutation_check` 也不在 web/tests 下，于是**整个目录自动免疫**：新加的
+// install_probe_test.sh（装后服务探测的正向 + 两路注入自证）写好了、能跑了，
+// 却不会有任何机制要求 CI/preflight 调用它。所以这里按**目录**收（该目录下每个
+// .sh 都必须被两边调用），而不是再加一个后缀规则。目录比后缀更难绕过：
+// 往后往那儿放测试的人不需要记得改这个文件。
+//
+// 2026-09-16 再补：按目录收只收了 `.sh`，同目录的 `selftest_parse_live_check.py`
+// （`-selftest` 的「文档解析服务」栏真跑）照样漏 —— 它写死的检查项数量在 F3/F5
+// 加了两栏之后失配，7 个场景全红，而它没被任何闸门调用，所以没人看见，
+// 报的还是一句误导人的「输出格式变了」。**「按目录收」必须连扩展名一起收干净**，
+// 否则就是换了个姿势的黑洞。`.py` 里只有真跑型的尺子算，被 spawn 的假服务 helper 除外。
+// 2026-09-16 三补（由自己那把负向自证尺子抓出来的真缺陷）：
+// 上面这些枚举**按组拼成一个大数组**，配一句全局下限 `scripts.length >= 8`。
+// 于是「某一个目录的 readdir 整条死掉」是**看不见**的：另外几个目录照样把总数
+// 顶过下限，测试全绿 —— 而后果恰恰是本文件存在的理由（整个目录再次免疫）。
+// 这不是假设：把 deploy/offline/tests 那一组的 filter 改成恒 false，
+// 老写法下守卫 0 报错，`preflight_parity_mutation_check.sh` 的 A3 直接抓到了。
+// 所以改成**按组枚举 + 每组各自非空 + 点名**：任何一组塌成 0 都要红，
+// 而且要报出是哪一组（报「总数不够」是没法归因的）。
+const PY_HELPERS = new Set(['fake_http.py']);
+const selfCheckGroups = () => [
+  ['internal/api 的 *_mutation_check.sh',
+    readdirSync(new URL('internal/api/', REPO)).filter((f) => f.endsWith('_mutation_check.sh')).map((f) => `internal/api/${f}`)],
+  ['web/tests 的 *_mutation_check.sh',
+    readdirSync(new URL('web/tests/', REPO)).filter((f) => f.endsWith('_mutation_check.sh')).map((f) => `web/tests/${f}`)],
+  ['web/tests 的 *_mutation_check.py',
+    readdirSync(new URL('web/tests/', REPO)).filter((f) => f.endsWith('_mutation_check.py')).map((f) => `web/tests/${f}`)],
+  ['scripts 的 inject*.py',
+    readdirSync(new URL('scripts/', REPO)).filter((f) => /inject.*\.py$/.test(f)).map((f) => `scripts/${f}`)],
+  ['deploy/offline/tests 的可执行测试（.sh 全收 + .py 除 helper）',
+    readdirSync(new URL('deploy/offline/tests/', REPO))
+      .filter((f) => f.endsWith('.sh') || (f.endsWith('.py') && !PY_HELPERS.has(f)))
+      .map((f) => `deploy/offline/tests/${f}`)],
 ];
+const selfCheckScripts = () => selfCheckGroups().flatMap(([, files]) => files);
+
+// 注入模式也必须被真调用：只跑正向模式的 CI 里，INJECT 那两路会静静地腐烂
+// （它们只在被显式传 INJECT= 时才生效，平时连语法错都不会暴露）。
+// 这类「可选参数才是本体」的自证脚本，光看「文件被调用了」不够。
+const INJECT_MODES = ['INJECT=1', 'INJECT=2'];
 
 test('preflight 与 CI 的 Go 单测命令必须逐字一致（含 -race -count=1）', () => {
   const WANT = 'go test -race -count=1 ./...';
@@ -130,15 +166,25 @@ test('tidy / gofmt 两道闸门本地与 CI 都要有', () => {
 });
 
 test('每条注入自证脚本都必须在 CI 与 preflight 里被真正调用', () => {
-  const scripts = selfCheckScripts();
+  const groups = selfCheckGroups();
+  const scripts = groups.flatMap(([, files]) => files);
 
-  // 先守枚举本身：数目对不上说明上面的 readdir 逻辑失效了，
-  // 那样下面的循环会「空转通过」—— 这是所有守卫最常见的自杀方式。
+  // 先守枚举本身，而且是**按组**守：某一组的 readdir 塌成 0 时，别的组照样把
+  // 总数顶过全局下限，于是「整个目录自动免疫」会静默回来（实测过：老写法的全局
+  // 下限对这种塌陷 0 报错）。哪一组空了都要红，并且要点出是哪一组。
+  for (const [label, files] of groups) {
+    assert.ok(
+      files.length > 0,
+      `枚举规则失效：${label} 一个文件都没收到 —— 这一组的尺子从此无人看守，` +
+        `而症状是「一切正常」。要么是 readdir/后缀规则写错了，要么是这组真的没了（那要删掉这条枚举）。`,
+    );
+  }
   assert.ok(
-    scripts.length >= 8,
-    `只枚举到 ${scripts.length} 条自证脚本（期望 ≥8：internal/api 的 .sh 1 条、` +
-      `web/tests 的 .sh 3 条 + .py 2 条、scripts 的 inject*.py 3 条，共 9 条，留 1 条余量）。` +
-      `枚举逻辑失效时这个测试会空转通过，所以必须把下限也钉死。实得：${scripts.join(', ')}`,
+    scripts.length >= 10,
+    `只枚举到 ${scripts.length} 条自证脚本（期望 ≥10，各组实得：` +
+      groups.map(([l, f]) => `${l}=${f.length}`).join('；') +
+      `）。全局下限是防「枚举整体失效」的第二道，报「总数不够」没法归因，` +
+      `所以归因请以上面那条按组断言为准。`,
   );
 
   for (const s of scripts) {
@@ -152,5 +198,49 @@ test('每条注入自证脚本都必须在 CI 与 preflight 里被真正调用',
       `scripts/preflight.sh 里没有调用 ${s} —— 本地闸门比 CI 少一道，` +
         `于是这类问题只能等推送之后由 CI 告诉你。`,
     );
+  }
+});
+
+test('离线包装后探测自证：正向与两路注入都必须在 CI / preflight 里真跑', () => {
+  const HARNESS = 'deploy/offline/tests/install_probe_test.sh';
+  const esc = HARNESS.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  // 先守「文件真的在」：脚本被删掉时，下面的每一条 includes 都会失败得很难懂
+  // （"没有调用 xxx"），而真正的问题是文件没了。这条断言让报错说人话。
+  assert.ok(
+    existsSync(new URL(HARNESS, REPO)),
+    `${HARNESS} 不存在 —— 装后探测的尺子丢了。这条守卫会因此变成空转，所以先钉住它。`,
+  );
+
+  for (const [name, txt] of [['ci.yml', CI], ['scripts/preflight.sh', PF]]) {
+    // 正向模式
+    assert.ok(
+      txt.includes(HARNESS),
+      `${name} 里没有跑 ${HARNESS} —— 装后服务探测（/health 真功能判定）没有闸门，` +
+        `2026-09-15 那次「端口在听但抽字全废、安装一路绿」的形态会原样回来。`,
+    );
+
+    for (const mode of INJECT_MODES) {
+      // 注入模式必须在**同一行**上出现（`INJECT=1 bash xxx.sh`），
+      // 不能只把 INJECT=1 写在别处的注释里 —— 那种"看着有、其实没传"正是
+      // 本文件存在的理由（本地绿、CI 绿、注入从没生效过）。
+      const re = new RegExp(`${mode}\\s+(?:bash\\s+)?${esc}([^\\n]*)`);
+      const m = txt.match(re);
+      assert.ok(
+        m,
+        `${name} 里没有以「${mode}」真跑 ${HARNESS} —— 这一路注入自证不会被执行，` +
+          `它只会静静地腐烂（不跑的时候它既不报错也不变红）。`,
+      );
+      // 反向要求：不许把注入模式的红吞掉。注入模式的退出码 0 表示"确实按预期转红了"，
+      // 所以 `|| true` / `continue-on-error` 会让"注入后根本没红"也变成通过 ——
+      // 那正是负向自证最常见的假绿形态。
+      const tail = m[1] || '';
+      assert.ok(
+        !/\|\|\s*true|continue-on-error/.test(tail),
+        `${name} 里「${mode} ${HARNESS}」后面带了吞错写法（${tail.trim()}）—— ` +
+          `注入模式返回非 0 意味着「没红 / 红错了 / 顺带把别人也判红」，必须让 CI 红，` +
+          `不许用 || true 装作没事。`,
+      );
+    }
   }
 });

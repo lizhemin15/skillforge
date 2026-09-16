@@ -333,6 +333,9 @@ if [ -n "$OCR_BIN" ]; then install -m 0755 "$OCR_BIN" "$STAGE/bin/ocrd"; fi
 install -m 0644 "$font_pick" "$STAGE/fonts/$(basename "$font_pick")"
 install -m 0755 "$REPO_ROOT/deploy/offline/install.sh" "$STAGE/install.sh"
 install -m 0755 "$REPO_ROOT/deploy/offline/uninstall.sh" "$STAGE/uninstall.sh"
+# 体检脚本必须随包走：install.sh 在解析服务探测失败时会把它写成「下一步」给用户
+# （sudo $PREFIX/bin/sf-ocr-doctor.sh），旧包漏装过这份文件 —— 提示指向不存在的路径比不给提示更糟。
+install -m 0755 "$REPO_ROOT/scripts/sf-ocr-doctor.sh" "$STAGE/sf-ocr-doctor.sh"
 install -m 0644 "$REPO_ROOT/deploy/offline/skillforge.service.template" "$STAGE/skillforge.service.template"
 install -m 0644 "$REPO_ROOT/deploy/offline/skillforge-ocr.service.template" "$STAGE/skillforge-ocr.service.template"
 install -m 0644 "$REPO_ROOT/deploy/offline/skillforge.env.example" "$STAGE/skillforge.env.example"

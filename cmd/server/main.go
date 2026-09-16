@@ -11,6 +11,13 @@ import (
 	"log"
 	"os"
 
+	// 内嵌 IANA 时区库（约 450KB）。理由：离线机器（最小化安装的 CentOS/AlmaLinux、
+	// 精简容器）常常没有 /usr/share/zoneinfo，此时 time.LoadLocation("Asia/Shanghai")
+	// 直接报错 —— 表现是日志时间、页面上的时间、定时任务全按 UTC 走，差 8 小时，
+	// 而且没有任何报错，客户只会觉得「时间不对」却查不到原因。
+	// 内嵌后即使系统一个时区文件都没有，TZ=Asia/Shanghai 也能正确解析。
+	_ "time/tzdata"
+
 	"github.com/lizhemin15/skillforge/internal/server"
 	"github.com/lizhemin15/skillforge/internal/version"
 )
