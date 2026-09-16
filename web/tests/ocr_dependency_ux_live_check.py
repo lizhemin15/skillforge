@@ -274,6 +274,12 @@ def main():
                 fail(f"训练请求异常中断：{text[:160]}")
             else:
                 ok(f"训练请求已发出并收到响应（HTTP {status}，{elapsed:.1f}s）")
+                # 落一份「用户到底看到什么」的原文证据：验收结论会过期，
+                # 原文不会 —— 下次有人问「当时用户看到的是哪句话」有据可查。
+                ev = os.path.join(WORKDIR, "legA-stream.txt")
+                with open(ev, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                print(f"  证据：{ev}")
                 if "没有在运行" in text:
                     ok("流里明确说了「解析服务没有在运行」（用户能分清：不是他的文件问题）")
                 else:
@@ -313,6 +319,8 @@ def main():
         else:
             token = b.login(creds)
             status, text, elapsed = train_stream(b, token, fixture_bytes, fx_name, timeout=90, stop_when="解析完成")
+            with open(os.path.join(WORKDIR, "legB-stream.txt"), "w", encoding="utf-8") as fh:
+                fh.write(text)
             if "解析完成" in text or "解析完成：" in text:
                 ok(f"素材照常解析成功（{elapsed:.1f}s 内出现「解析完成」）—— 正常路径未被弄坏")
             elif "未配置 LLM" in text or "未配置" in text:
