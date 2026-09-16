@@ -144,6 +144,7 @@ READ_JS = """() => {
           genfile: Array.from(document.querySelectorAll('a.atx-link .atx-hint'))
                      .some(e => (e.innerText || '').includes('已生成文档')),
           active: !!document.querySelector('.ctk-step.active'),
+          sendIdle: !document.querySelector('#chat-send').disabled,
           steps: document.querySelectorAll('.ctk-step').length};
 }"""
 
@@ -194,21 +195,34 @@ def run_checks(pg):
     pg.fill('textarea', PROMPT)
     pg.click('#chat-send')
 
-    # 轮询到「没有 active 步 且 正文连续 4 次采样不再增长」为止，或超时。
+    # 轮询到**整轮真的结束**为止，或超时。
+    #
+    # 为什么不能只看「没有 active 步 + 正文连续几次采样不涨」（2026-09-17 线上实测）：
+    # writing 腿就是这么假红的 —— 两个阶段之间的空档里 active=0、正文还停在 94 字
+    # （正文刚开流），循环当场收工、采样停掉，接着「M5 前提：整轮真收到 ≥200 字正文」
+    # 不成立 → 判红。而材料末帧尾部已经是「特此通知。XX公司数据治理办公室2026年X月」，
+    # 说明正文马上就写完了：**是尺子提前收工，不是产品没产出**。
+    # 真终态信号只有一个：发送按钮重新可用（chat.js 在 turn 结束时 send.disabled=false）。
     deadline = time.time() + MAXW
     stable = 0
     last_bubble = 0
     last = {}
+    turn_ended = False
     while time.time() < deadline:
         time.sleep(1.0)
         last = pg.evaluate(READ_JS)
-        if last['bubble'] > 0 and last['bubble'] == last_bubble and not last['active']:
+        if last.get('sendIdle') and last['bubble'] > 0 and last['bubble'] == last_bubble \
+                and not last['active']:
             stable += 1
-            if stable >= 4:
+            if stable >= 2:
+                turn_ended = True
                 break
         else:
             stable = 0
         last_bubble = last['bubble']
+    if not turn_ended:
+        print(f'⚠ 采样窗口用尽（MAXW={MAXW}s）而整轮尚未结束 —— 下面的 M5 前提可能因此不成立，'
+              f'那不是产品红，是窗口给短了')
     pg.evaluate('() => clearInterval(window.__iv)')
     last = pg.evaluate(READ_JS)
 

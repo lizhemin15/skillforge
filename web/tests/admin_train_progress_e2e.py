@@ -277,7 +277,16 @@ def main():
         print(f"    '{BASE}/api/admin/skills/{TRAIN_NAME}'")
         browser.close()
 
-    print(f'\n--- {ok_cnt} ok / {fail_cnt} fail ---')
+    # 小结格式必须逐字是 `--- N/M ok ---`：scripts/acceptance-live.sh 用
+    # grep -oE '--- [0-9]+/[0-9]+ ok ---' 抠断言数，抠不到就判「绿得没有断言」→ FAIL。
+    # 2026-09-17 线上实测：本腿原样打的是 `--- 9 ok / 0 fail ---`，9 条断言全绿却整条判红
+    # ——**尺子格式不匹配被当成被测系统红**。格式由 live_e2e_roster.test.mjs 统一守着。
+    total = ok_cnt + fail_cnt
+    if total == 0:
+        print('\n--- 0/0 ok ---')
+        print('FAILED: 一条断言都没跑（绿得没有断言，不算通过）')
+        return 1
+    print(f'\n--- {ok_cnt}/{total} ok ---')
     if fail_cnt:
         print('FAILED: 训练页进度帧链路（真浏览器）')
         return 1

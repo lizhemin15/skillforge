@@ -34,10 +34,17 @@ PROBE="$ROOT/web/tests/zzz_live_e2e_roster_probe_e2e.py"
 TMP="$(mktemp -d)"
 RUNNER_BAK="$TMP/acceptance-live.sh.bak"
 cp "$RUNNER" "$RUNNER_BAK"
+# A5 要往**真 leg** 上注入（这条断言的职责就是盯真腿的小结格式，假脚本证明不了），
+# 所以真腿也得先备份 —— 且 cleanup 里必须还原，脚本中途挂掉也不能把仓库改脏。
+LEG='web/tests/admin_train_progress_e2e.py'
+LEG_BAK="$TMP/leg.bak"
+cp "$LEG" "$LEG_BAK"
+LEG_BEFORE="$(md5sum "$LEG" | awk '{print $1}')"
 
 cleanup() {
   rm -f "$PROBE"
   cp "$RUNNER_BAK" "$RUNNER" 2>/dev/null || true
+  cp "$LEG_BAK" "$LEG" 2>/dev/null || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -138,6 +145,25 @@ if inject "$RUNNER" 'files=("$E2E_DIR"/*_e2e.py)' 'files=(web/tests/chat_layer_e
   cp "$RUNNER_BAK" "$RUNNER"
 else
   bad "A3 注入点不存在：runner 的枚举行写法变了，锚点要跟着改"
+fi
+
+# A5 真实 leg 的小结格式退回旧写法 `N ok / M fail ---`
+# → 这是 2026-09-17 线上实测过的假红形态：admin_train_progress 腿 9 条断言全绿，
+#   runner 却抠不到 `--- N/M ok ---`，整条 leg 判红（**尺子格式不匹配被当成被测系统红**）。
+# 注意注入的是**真 leg**：那条 roster 断言的职责就是盯真腿，拿假脚本注入等于没验。
+if inject "$LEG" "print(f'\n--- {ok_cnt}/{total} ok ---')" \
+                "print(f'\n--- {ok_cnt} ok / {total} fail ---')"; then
+  roster_run
+  expect_roster_red "A5 真 leg 的小结退回旧格式（N ok / M fail）" "打的是旧格式"
+  cp "$LEG_BAK" "$LEG"
+  if [ "$(md5sum "$LEG" | awk '{print $1}')" = "$LEG_BEFORE" ]; then
+    ok "A5 真 leg 已逐字节还原"
+  else
+    bad "A5 真 leg 没还原干净 —— 这个脚本在改坏仓库"
+  fi
+else
+  bad "A5 注入点不存在：leg 的小结行写法变了，锚点要跟着改"
+  cp "$LEG_BAK" "$LEG"
 fi
 
 # A4 还原后必须回绿
@@ -303,4 +329,4 @@ if [ "$fails" -gt 0 ]; then
   echo "FAILED: 有 $fails 条自证不合格"
   exit 1
 fi
-echo "自证通过：结构注入 4 条 + 行为注入 10 条，红的都是预期那条，还原后全绿。"
+echo "自证通过：结构注入 5 条 + 行为注入 10 条，红的都是预期那条，还原后全绿。"

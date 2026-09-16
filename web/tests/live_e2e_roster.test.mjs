@@ -154,3 +154,39 @@ test('runner 必须把「跑不了」和「没结论」当失败，不许静默�
   assert.match(code, /--- \[0-9\]\+\/\[0-9\]\+ ok ---/, 'runner 没有校验断言小结行 —— 没有断言的绿会被放过');
   assert.match(code, /绿得没有断言/, 'runner 缺少「没打断言小结就判失败」的判据');
 });
+
+// 小结格式必须统一：runner 用 `grep -oE '--- [0-9]+/[0-9]+ ok ---'` 抠断言数，
+// 抠不到就判「绿得没有断言」→ FAIL。
+// 2026-09-17 线上实测（这不是假想）：admin_train_progress 腿原本打的是
+// `--- 9 ok / 0 fail ---`，9 条断言全绿，整条 leg 却被判红 ——
+// **尺子格式不匹配被当成了被测系统红**。这条测试就是不让它再发生：
+// 谁以后写新 leg 用了别的格式，在 CI 里当场红，而不是等线上验收时才让人一头雾水。
+test('每条 leg 都必须打 runner 认得出的 `--- N/M ok ---` 小结（否则绿也会被判红）', () => {
+  const files = e2eFiles();
+  assert.ok(files.length > 0, '没有枚举到任何 _e2e.py —— 上面那条测试应该先红了');
+  // 只看**真打印语句**：注释/文档里讲历史格式是允许的（本文件上面那段就在讲），
+  // 但那不算「这条腿会打对格式」。首跑就是被我自己写在注释里的 `9 ok / 0 fail ---`
+  // 例子命中的 —— 尺子先抓自己，属于好尺子的正常表现，按语义收窄即可，别改断言迁就。
+  const printLines = (txt) =>
+    txt
+      .split('\n')
+      .filter((l) => !/^\s*#/.test(l) && /print\(/.test(l))
+      .join('\n');
+  for (const f of files) {
+    const txt = printLines(read(new URL(`web/tests/${f}`, REPO)));
+    assert.ok(
+      txt.length > 0,
+      `web/tests/${f} 里一行打印都没有 —— 那它靠什么给 runner 报断言数？`
+    );
+    assert.ok(
+      /---[^'"`\n]*ok ---/.test(txt),
+      `web/tests/${f} 没有打 \`--- N/M ok ---\` 小结：runner 抠不到断言数，` +
+        '这条腿绿了也会被判红（历史形态：`--- 9 ok / 0 fail ---`）'
+    );
+    assert.ok(
+      !/[^/\n]*\bok \/ [^/\n]*fail ---/.test(txt),
+      `web/tests/${f} 打的是旧格式 \`N ok / M fail ---\`（历史上就这么假红过），` +
+        '请统一成 `--- N/M ok ---`'
+    );
+  }
+});
