@@ -17,6 +17,8 @@ OCR 全程打桩：不加载 RapidOCR 权重，也不依赖 ONNX。
 运行：python3 -m pytest deploy/ocr/test_ocrd_quality.py -q   （或 python3 -m unittest）
 """
 import os
+import pathlib
+import re
 import sys
 import types
 import unittest
@@ -318,8 +320,30 @@ class TestPdfPerPageQuality(unittest.TestCase):
 class TestServiceSurface(unittest.TestCase):
     """版本串与 /health 字段：CI/上层要能从外部断言线上跑的是这一版规则。"""
 
-    def test_版本与判据串(self):
-        self.assertEqual(ocrd.VERSION, "ocrd-v5-quality")
+    # 版本串的**真值不在这里**：它是部署门禁的判据 —— scripts/deploy_ocrd.sh 拿它
+    # 拒绝上线旧件，写错整次发版就停在那里。所以本文件不该再抄一份字面量：
+    # 抄了就会像这次一样烂掉（本文件此前钉的 "ocrd-v5-quality"，而线上早就
+    # 因为「运行时守卫」那次修复改成了别的串，14 条里 2 条红了很久没人看见 ——
+    # 因为它没被 CI/preflight 调用，是「0 引用的尺子」）。
+    # 改成跟部署门禁对账：谁改 VERSION 都必须同时改门禁，否则发不出去；
+    # 而对账这条在 CI 里守着两边不许分叉。
+    GATE = pathlib.Path(__file__).resolve().parents[2] / "scripts/deploy_ocrd.sh"
+
+    def test_版本串必须与部署门禁一致(self):
+        src = self.GATE.read_text(encoding="utf-8")
+        gates = set(re.findall(r"ocrd-v[0-9A-Za-z._+-]*", src))
+        self.assertTrue(gates, "部署门禁里找不到版本串 —— 门禁失效了，本对账也就没意义了")
+        self.assertEqual(
+            len(gates), 1,
+            "部署门禁里出现了多个版本串（%s）：它自己就自相矛盾，发版必然卡死" % sorted(gates),
+        )
+        self.assertEqual(
+            ocrd.VERSION, gates.pop(),
+            "ocrd.VERSION 与部署门禁（scripts/deploy_ocrd.sh）里的版本串分叉了 —— "
+            "改了一边没改另一边，上线校验会拿旧串去比新件",
+        )
+
+    def test_判据串(self):
         self.assertEqual(ocrd.QUALITY_RULE, "fffd_or_pua>2%|readable<60%")
 
     def test_health_回报quality_rule(self):
@@ -334,7 +358,9 @@ class TestServiceSurface(unittest.TestCase):
 
         _H().do_GET()
         self.assertEqual(sent["code"], 200)
-        self.assertEqual(sent["obj"]["version"], "ocrd-v5-quality")
+        # 断言的是「/health 报的就是这个常数」，而不是某个冻结字面量：
+        # 上面那条对账负责钉住这个常数该等于什么。
+        self.assertEqual(sent["obj"]["version"], ocrd.VERSION)
         self.assertEqual(sent["obj"]["quality_rule"], "fffd_or_pua>2%|readable<60%")
         self.assertEqual(sent["obj"]["min_page_chars"], ocrd.MIN_PAGE_CHARS)
 

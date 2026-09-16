@@ -246,6 +246,41 @@ EOF
 runner_run "$D"
 expect_runner "B7 脚本没声明 leg 时 runner 必须报错而非静默跳过" 1 "没有 # LIVE-LEGS: 声明"
 
+# B8 逐腿超时必须真生效：leg 声明 TIMEOUT_S=1，脚本睡 5 秒 —— 必须在 1 秒上被砍。
+# 这条守的是「长腿自己报数」这个机制：420s 的默认值砍 12 分钟的训练腿等于永远红，
+# 而如果 TIMEOUT_S 被无视（还是用默认值），腿上那些「太慢了」的判断就全是假的。
+D="$TMP/legtimeout"
+fresh "$D"
+mkfake "$D" slow_e2e.py <<'EOF'
+# LIVE-LEGS: default TIMEOUT_S=1
+import time
+time.sleep(5)
+print('SHOULD_NOT_FINISH 睡满了 5 秒 —— 逐腿超时没生效')
+print('--- 1/1 ok ---')
+EOF
+runner_run "$D"
+if [ "$RUNNER_RC" -eq 0 ]; then
+  bad "B8 TIMEOUT_S=1 竟然放过了睡 5 秒的腿 —— 逐腿超时被无视了"
+elif ! printf '%s' "$RUNNER_OUT" | grep -qF -- 'rc=124'; then
+  bad "B8 腿被砍了，但报告里没有 rc=124（超时的原话）—— 分不清「超时」和「断言失败」"
+elif printf '%s' "$RUNNER_OUT" | grep -qF 'SHOULD_NOT_FINISH'; then
+  bad "B8 TIMEOUT_S=1 的腿居然睡满了 5 秒并打了自己的小结"
+else
+  ok "B8 逐腿超时真生效：TIMEOUT_S=1 的腿在 1 秒上被砍（rc=124），脚本没跑完"
+fi
+
+# B9 超时值写错（不是秒数）必须当场报错，不许**静默退回**默认值继续跑 ——
+# 静默退回的后果是：以为自己在跑一个 35 分钟的长腿，实际被 420s 砍掉，报的是「超时」。
+D="$TMP/badtimeout"
+fresh "$D"
+mkfake "$D" badto_e2e.py <<'EOF'
+# LIVE-LEGS: default TIMEOUT_S=35min
+print('ok   x')
+print('--- 1/1 ok ---')
+EOF
+runner_run "$D"
+expect_runner "B9 非秒数的 TIMEOUT_S 必须当场报错（不许静默退回默认值）" 1 "不是秒数"
+
 echo
 echo "==== 收尾：全部还原后必须回绿 ===="
 roster_run
@@ -268,4 +303,4 @@ if [ "$fails" -gt 0 ]; then
   echo "FAILED: 有 $fails 条自证不合格"
   exit 1
 fi
-echo "自证通过：结构注入 4 条 + 行为注入 8 条，红的都是预期那条，还原后全绿。"
+echo "自证通过：结构注入 4 条 + 行为注入 10 条，红的都是预期那条，还原后全绿。"

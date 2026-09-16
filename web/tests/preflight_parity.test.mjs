@@ -51,6 +51,9 @@ const PF = read('scripts/preflight.sh');
 // 所以改成**按组枚举 + 每组各自非空 + 点名**：任何一组塌成 0 都要红，
 // 而且要报出是哪一组（报「总数不够」是没法归因的）。
 const PY_HELPERS = new Set(['fake_http.py']);
+// deploy/ocr 里不是「尺子」的 .py：ocrd.py 是被测的生产件（要求它「被调用」没意义），
+// make_fixture.py 是被测试 spawn 的造料 helper。白名单以外的 .py 一律要求两边闸门真调用。
+const OCR_NON_TEST = new Set(['ocrd.py', 'make_fixture.py']);
 const selfCheckGroups = () => [
   ['internal/api 的 *_mutation_check.sh',
     readdirSync(new URL('internal/api/', REPO)).filter((f) => f.endsWith('_mutation_check.sh')).map((f) => `internal/api/${f}`)],
@@ -60,6 +63,26 @@ const selfCheckGroups = () => [
     readdirSync(new URL('web/tests/', REPO)).filter((f) => f.endsWith('_mutation_check.py')).map((f) => `web/tests/${f}`)],
   ['scripts 的 inject*.py',
     readdirSync(new URL('scripts/', REPO)).filter((f) => /inject.*\.py$/.test(f)).map((f) => `scripts/${f}`)],
+  ['deploy/ocr 的可跑单测（.py 除生产件与造料 helper）',
+    // 2026-09-17 补：这是**第三个免疫区**，形状和前两个一模一样。
+    // deploy/ocr/test_ocrd_quality.py 是「可选中页直取 / 乱码页回落 OCR」这条
+    // 用户抱怨的自证尺子，写好、能在本机跑，但 0 引用 —— 于是它静静地烂了：
+    // 钉死的版本串还是 `ocrd-v5-quality`，而真值早改成了 `ocrd-v5-runtime-guard`
+    // （改名的那次提交只改了实现和部署门禁，没人被提醒去改这把尺子）。
+    // 修法不许再抄字面量，改成**与部署门禁对账**（见该文件
+    // test_版本串必须与部署门禁一致）—— 抄的那份永远不会红。
+    //
+    // 为什么是「整目录减白名单」而不是「只收 test_*.py」：后者是又一个后缀黑洞，
+    // 本文件上面已经为这个形状付过一次代价。第一次写这条时就踩了 —— C2 自证
+    // （往 deploy/ocr 丢一个 `zzz_stray_probe_check.py`）当场判「注入后守卫仍全绿」，
+    // 因为那个探针不以 test_ 开头。任何**新名字**的尺子都会重蹈覆辙，所以按目录收。
+    // 排掉的两类：ocrd.py 是生产件（被测对象，不能要求「被调用」）；
+    // make_fixture.py 是被测试 spawn 的造料 helper。剩下 verify_*.sh 要 PyInstaller
+    // 冻结二进制（本机没有就 SKIP/FAIL exit 2，见 verify_runtime_loss.sh:56），
+    // 它们不在本组，由 deploy/ocr/Dockerfile:97 与 scripts/deploy_ocrd.sh 在发版时挡住。
+    readdirSync(new URL('deploy/ocr/', REPO))
+      .filter((f) => f.endsWith('.py') && !OCR_NON_TEST.has(f))
+      .map((f) => `deploy/ocr/${f}`)],
   ['deploy/offline/tests 的可执行测试（.sh 全收 + .py 除 helper）',
     readdirSync(new URL('deploy/offline/tests/', REPO))
       .filter((f) => f.endsWith('.sh') || (f.endsWith('.py') && !PY_HELPERS.has(f)))

@@ -23,9 +23,18 @@
   A3 全局最长静默 ≤ MAX_SILENCE（默认 120s）——「卡着计时」的直接反面指标
   A4 材料总量要够看：材料帧累计字符 ≥ 400
   A5 点名阶段（默认 8.5/9）有材料滚出 —— 8.5/9「裁判独立试用评分」是漏接流式的
-     原发地（trialDraft 试用写稿 + judgeDraft 逐维评分都在这一段），且**必跑**；
-     可用 EXPECT_STAGES 覆盖。条件性才跑的阶段（如 5/9 审稿清单只在素材是手册时才跑）
-     不计入断言，只在报告里列出来 —— 否则会拿「本 run 本来就不该跑」当失败（假红）。
+     原发地（trialDraft 试用写稿 + judgeDraft 逐维评分都在这一段）。**它不是必跑阶段**：
+     generator.go:312 的开关是 `mp != nil && len(mp.Structure.Categories) > 0`，
+     也就是「素材被识别成写作手册」才会跑。素材是普通文档时它按设计不出现。
+     可用 EXPECT_STAGES 覆盖。
+
+     所以 A5 有三态，缺一不可：
+       · 出现且有材料 → PASS
+       · 出现却零材料 → FAIL（这才是真正的漏接流式）
+       · 没出现       → 只有当日志里同时出现「5/9 未按手册处理」（=本轮确实走了通用
+                        路径）才算 N/A；否则 FAIL（没在手边的解释）。
+     没有第三条前置条件，「把 8.5/9 整段删掉」或「手册识别永远失败」都会让尺子
+     一路绿 —— 那是空跑绿，不是通过。
   A6 抽取层活证据：解析帧必须写明「文本层直取 N / OCR M」且 M < N+M
      （可选中页不许喂 OCR —— 用户投诉②的线上出证）
 
@@ -45,9 +54,15 @@ RAW_LOG = os.environ.get("RAW_LOG", "/tmp/judge_live_raw.sse")
 FRAMES_LOG = os.environ.get("FRAMES_LOG", "/tmp/judge_live_frames.log")
 MAX_SILENCE = float(os.environ.get("MAX_SILENCE", "120"))
 # 8.5/9 那段（裁判独立试用评分：试用写稿 + 逐维打分）是「漏接流式」事故的原发地，
-# commit 16ce74d 之前这里是个跳秒的计时器，所以这一段必须被点名验到、且必跑。
+# commit 16ce74d 之前这里是个跳秒的计时器，所以这一段必须被点名验到。
+# （但只有手册模式才跑它 —— 见下面 COND_STAGES 的三态判定。）
 EXPECT_STAGES = [s for s in os.environ.get(
     "EXPECT_STAGES", "8.5/9").split("|") if s]
+# 「本轮没跑这个阶段」的**唯一**可接受理由：日志里出现了这个标记，说明流程真的走了
+# 通用路径（8.5/9 的开关是 mp!=nil && 手册分类>0，见 generator.go:312）。
+# 没这条前置，把 8.5/9 整段删掉也能绿 —— N/A 必须是**被证明过的**不适用。
+COND_STAGES = {"8.5/9": "5/9 未按手册处理",
+               "裁判": "5/9 未按手册处理"}
 # 跨度 ≥ 该值却没滚出任何材料的阶段 → WARN（列出来给人看，但不判 FAIL：
 # 有些阶段天然是机械活，跑得久不代表坏了）
 WARN_SILENT_SPAN = float(os.environ.get("WARN_SILENT_SPAN", "60"))
@@ -190,10 +205,13 @@ def main() -> int:
                    if stage_stats[s]["last"] - stage_stats[s]["first"] >= 120]
     silent_long = [s for s in long_stages if stage_stats[s]["mat"] < 3]
     named = {p: 0 for p in EXPECT_STAGES}
+    present = {p: False for p in EXPECT_STAGES}
     for s in order:
         for p in EXPECT_STAGES:
-            if re.search(p, s) and stage_stats[s]["mat"] > 0:
-                named[p] += stage_stats[s]["mat"]
+            if re.search(p, s):
+                present[p] = True
+                if stage_stats[s]["mat"] > 0:
+                    named[p] += stage_stats[s]["mat"]
 
     print("\n抽取层活证据（投诉②：可选中页不许走 OCR）：")
     if parse_ev:
@@ -225,16 +243,40 @@ def main() -> int:
         ("A4 材料累计≥400 字",
          mat_chars >= 400, "材料帧=%d 累计=%d 字" % (len(mat_frames), mat_chars)),
     ]
+    # A5 是三态：True / False / None（None = 被证明过的 N/A，不计入 bad）。
+    all_stage_text = "\n".join(order)
     for p in EXPECT_STAGES:
-        checks.append(("A5 点名阶段「%s」有材料滚出" % p, named[p] > 0,
-                       "材料帧=%d" % named[p]))
+        if named[p] > 0:
+            checks.append(("A5 点名阶段「%s」有材料滚出" % p, True, "材料帧=%d" % named[p]))
+        elif present[p]:
+            # 阶段出现了却一帧材料都没有：漏接流式的产品故障（事故当场就是这个形状）。
+            checks.append(("A5 点名阶段「%s」有材料滚出" % p, False,
+                           "阶段已出现但零材料帧 —— 漏接流式，用户只会看到计时器在跳"))
+        elif p in COND_STAGES and COND_STAGES[p] in all_stage_text:
+            # 没跑，且日志自证了「为什么没跑」：条件阶段在本轮不适用。
+            checks.append(("A5 点名阶段「%s」有材料滚出" % p, None,
+                           "N/A：本轮走到「" + COND_STAGES[p] + "」→ 该阶段按设计不执行"
+                           "（不是通过，是未适用）"))
+        else:
+            # 既没跑、也没解释 —— 阶段被删了 / 流程在它之前就崩了 / 正则过期了。
+            checks.append(("A5 点名阶段「%s」有材料滚出" % p, False,
+                           "日志里既没有该阶段、也没有「%s」这条不适用理由："
+                           "要么阶段被删/流程提前崩了，要么 EXPECT_STAGES 正则已过期"
+                           % COND_STAGES.get(p, "（无适用条件登记）")))
     checks.append(("A6 可选中页零 OCR（解析帧写明文本层直取 N>0 且 OCR 只吃扫描页）",
                    bool(parse_ev) and parse_ev[0] > 0 and parse_ev[1] < parse_ev[0] + parse_ev[1],
                    ("文本层直取=%d OCR=%d" % parse_ev) if parse_ev else "未抓到解析帧"))
     bad = 0
     for name, ok, detail in checks:
-        print("  %s %s（%s）" % ("PASS" if ok else "FAIL", name, detail))
-        if not ok:
+        # 三态：ok is None = 被证明过的 N/A（阶段本轮按设计不跑）。
+        # 关键：N/A **绝不许印成 PASS**（否则等于把「没验」说成「验过了」），
+        # 也**不许计入 bad**（那会把「本轮本来就不该跑」当故障 —— 假红）。
+        if ok is None:
+            print("  %s %s（%s）" % ("N/A ", name, detail))
+        elif ok:
+            print("  PASS %s（%s）" % (name, detail))
+        else:
+            print("  FAIL %s（%s）" % (name, detail))
             bad += 1
     print("\n逐帧明细：%s\n原始 SSE：%s" % (FRAMES_LOG, RAW_LOG))
     if "--assert" in sys.argv and bad:

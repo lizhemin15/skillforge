@@ -249,6 +249,29 @@ jobs:
       - name: 前端断言自证（漏接流式守卫）
         run: bash web/tests/stage_streaming_guard_mutation_check.sh
 
+      # 解析服务（ocrd）的纯单测。它们是**第三个免疫区**：本机能跑、0 引用，
+      # 于是 test_ocrd_quality.py 里钉死的版本串 `ocrd-v5-quality` 跟真值
+      # `ocrd-v5-runtime-guard` 分叉了很久，2/15 一直在红，但没人被提醒去看。
+      # 现在它们由 web/tests/preflight_parity.test.mjs 的「deploy/ocr 可跑单测」
+      # 那一组按目录守着（新增 test_*.py 不接进来就红）。
+      # 抱怨②「可选中页该直取文本层、不该无脑走 OCR」的判据就在这里。
+      # 同目录的 verify_*.sh 要靠 PyInstaller 冻结二进制，本机没有时是 SKIP/FAIL
+      # exit 2（见 verify_runtime_loss.sh:56），所以它们不在这条路上，
+      # 由 deploy/ocr/Dockerfile:97 与 scripts/deploy_ocrd.sh 在发版时挡住。
+      - name: OCR 解析服务单测（质量判据 / 退出等待）
+        run: |
+          python3 deploy/ocr/test_ocrd_quality.py
+          python3 deploy/ocr/test_guard_wait.py
+
+      # A1~A6 判定器（web/tests/judge_stage_streaming_stats.py）自己的尺子。
+      # 它此前是本仓库最后一把「CI 里没人碰过」的尺子：判定逻辑只被
+      # judge_stage_streaming_e2e.py 执行，而那个 e2e 要真跑一轮 20 分钟训练、
+      # 只在 acceptance-live.sh 里被调。于是「ok is None（N/A）被印成 FAIL 且计入 bad」
+      # 这种三态错误在 CI 里一路绿灯，只有真跑完一轮训练才可能被看见。
+      # 这里用合成料（20+ 帧、4s 间隔）把 PASS / N/A / FAIL 三种状态钉死，秒级。
+      - name: A1~A6 流式判定器三态尺子（合成料）
+        run: python3 web/tests/judge_stats_three_state_check.py
+
       - name: Build
         run: |
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o skillforge ./cmd/server

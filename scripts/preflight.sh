@@ -242,6 +242,20 @@ if [ "$QUICK" = 0 ]; then
   # 它此前是一把**游离尺子**：仓库里有、本机能跑，但没人调用；而且仓库根写死成
   # /root/skillforge，CI 里想接也接不上（已改成从脚本自身位置推导）。
   selfcheck '前端 / 漏接流式守卫自证'   bash web/tests/stage_streaming_guard_mutation_check.sh
+  # A1~A6 判定器（judge_stage_streaming_stats.py）自身的三态尺子。
+  # 为什么必须有：那份判定逻辑此前只被 judge_stage_streaming_e2e.py 执行，而那个 e2e 要真跑
+  # 一轮 20 分钟训练、只在 acceptance 里被调 —— 等于**CI 里没有任何东西碰过它**。于是刚发生过：
+  #   ok is None（被证明过的 N/A）→ 打印成 `"PASS" if ok else "FAIL"` → None 假值 → 印 FAIL
+  #   → 且计入 bad → 一个「本轮按设计不该跑」的阶段把整条尺子判红（假红）。
+  # 现在用合成料把这三种状态钉住，秒级、不需要真跑训练。
+  selfcheck '前端 / A1~A6 判定器三态'   python3 web/tests/judge_stats_three_state_check.py
+  # 解析服务（ocrd）的单测。它此前又是一把**游离尺子**：本机跑得动、0 引用，
+  # 于是钉死的版本串 `ocrd-v5-quality` 一直没跟着真值改名而烂掉（2/15 红）。
+  # 已改成「与部署门禁 scripts/deploy_ocrd.sh 对账」——不再抄字面量。
+  # 这条对应用户抱怨②：可选中页该直取文本层、不该无脑走 OCR。
+  selfcheck 'OCR / 质量判据单测'        python3 deploy/ocr/test_ocrd_quality.py
+  # 退出前等在飞请求走完（有上限），且不许把自愈路径堵死 —— 也是 0 引用的游离尺子。
+  selfcheck 'OCR / 退出等待与自愈单测'  python3 deploy/ocr/test_guard_wait.py
   # Bug N「停用即从界面蒸发」的自证：跨前端契约 + 后端契约 + Go 行为三层。
   selfcheck '前端 / 停用技能列表自证'   python3 web/tests/skill_disabled_admin_ui_mutation_check.py
   # Bug O「误报目标机没有 python3」的自证：候选名单漂移 / 写死单路径 / 不探活。

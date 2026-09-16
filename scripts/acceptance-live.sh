@@ -84,7 +84,22 @@ for f in "${files[@]}"; do
     [ -z "$p" ] && continue
     read -r -a toks <<<"$p"
     leg="${toks[0]}"
-    assigns=("${toks[@]:1}")
+    # 单腿超时：默认 LEG_TIMEOUT（LIVE_TIMEOUT 覆盖），但长腿得能自己报数 ——
+    # 训练页「长阶段流式」那条要真建一次技能，12~25 分钟；拿 420s 的默认值去砍它，
+    # 结果是这条尺子**每次都红在超时上**，下场就是被人忽略（等于又回到没人看）。
+    # 所以允许 leg 自己写 TIMEOUT_S=秒数：runner 用它做外层硬砍，同一个键也传进脚本，
+    # 脚本拿它算自己的等待预算（roster 测试要求 leg 里的键必须被脚本真读到）。
+    leg_timeout="$LEG_TIMEOUT"
+    assigns=()
+    for kv in ${toks[@]:1}; do
+      case "$kv" in
+        TIMEOUT_S=*) leg_timeout="${kv#TIMEOUT_S=}" ;;
+        *) assigns+=("$kv") ;;
+      esac
+    done
+    case "$leg_timeout" in
+      ''|*[!0-9]*) echo "::error::$f 的 leg「$leg」TIMEOUT_S=$leg_timeout 不是秒数" >&2; exit 1 ;;
+    esac
 
     if [ -n "$ONLY" ] && [[ "$leg" != *"$ONLY"* ]]; then
       continue
@@ -92,11 +107,15 @@ for f in "${files[@]}"; do
 
     run=$((run + 1))
     log="$LOGDIR/$(basename "$f" .py).$leg.log"
-    printf '\n======================= %s :: %s   (env: %s)\n' \
-      "$f" "$leg" "${assigns[*]:-无}"
+    printf '\n======================= %s :: %s   (env: %s / 超时 %ss)\n' \
+      "$f" "$leg" "${assigns[*]:-无}" "$leg_timeout"
 
     start="$(date +%s)"
-    env "${assigns[@]}" BASE="$BASE" timeout "$LEG_TIMEOUT" python3 "$f" >"$log" 2>&1
+    # 注意：`${assigns[@]:-}` 在空数组时会**多吐一个空参数**（env 收到空字符串当命令），
+    # 结果是把「不带 env 的 leg」全判红 —— 这正是本文件自证脚本 B3 抓出来的。
+    # 空数组安全展开只有一种写法：`${arr[@]+"${arr[@]}"}`。
+    env ${assigns[@]+"${assigns[@]}"} TIMEOUT_S="$leg_timeout" BASE="$BASE" \
+      timeout "$leg_timeout" python3 "$f" >"$log" 2>&1
     rc=$?
     dur=$(( $(date +%s) - start ))
     cat "$log"

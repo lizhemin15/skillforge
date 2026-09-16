@@ -46,6 +46,7 @@ STRAY="$ROOT/deploy/offline/tests/zzz_stray_probe_check.py"
 
 cleanup() {
   rm -f "$STRAY"
+  rm -f "$ROOT/deploy/ocr/zzz_stray_probe_check.py"
   cp "$CI_BAK" "$CI_FILE" 2>/dev/null || true
   cp "$PF_BAK" "$PF_FILE" 2>/dev/null || true
   cp "$GUARD_BAK" "$GUARD" 2>/dev/null || true
@@ -169,6 +170,26 @@ else
 fi
 rm -f "$STRAY"
 
+# C2 同样的形状，但目标是本轮新收进来的第三个免疫区（deploy/ocr 的可跑单测）。
+#    为什么值得单独立一条：C1 证的是「deploy/offline/tests 那一组活着」，
+#    它证不了「新加的组被同一套机制看着」。而 deploy/ocr 恰恰是刚被收进来的
+#    免疫区（那里的 test_ocrd_quality.py 烂了很久、没有任何机制提醒）。
+#    不给新组一条行为证据，它完全可能写成骑在空集上的装饰 —— 那正是本文件
+#    存在的理由（枚举塌成 0 时全绿）。
+STRAY_OCR="$ROOT/deploy/ocr/zzz_stray_probe_check.py"
+cat > "$STRAY_OCR" <<'EOF'
+#!/usr/bin/env python3
+# mutation 探针：deploy/ocr 下一条没人接线的真跑尺子
+print('--- 1/1 ok ---')
+EOF
+if [ -f "$STRAY_OCR" ]; then
+  guard_run
+  expect_red "C2 deploy/ocr 新增没接线的 .py（任意名字）" "里没有调用 deploy/ocr/zzz_stray_probe_check.py"
+else
+  bad "C2 注入点不存在：探针文件没写进 deploy/ocr/"
+fi
+rm -f "$STRAY_OCR"
+
 echo
 echo "==== 收尾：全部还原后必须回绿 ===="
 guard_run
@@ -198,4 +219,4 @@ if [ "$fails" -gt 0 ]; then
   echo "FAILED: 有 $fails 条自证不合格"
   exit 1
 fi
-echo "自证通过：接线注入 2 条 + 按组枚举守卫 1 条 + 注入模式 2 条 + 枚举活性 1 条 + 收尾 2 条，红的都是预期那条，还原后全绿。"
+echo "自证通过：接线注入 2 条 + 按组枚举守卫 1 条 + 注入模式 2 条 + 枚举活性 2 条 + 收尾 2 条，红的都是预期那条，还原后全绿。"
