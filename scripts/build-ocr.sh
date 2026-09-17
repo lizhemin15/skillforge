@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
 #
-# build-ocr.sh —— 构建 ocrd（文档解析服务）单文件可执行，并**在干净镜像里验它真能 OCR**。
+# build-ocr.sh —— 构建 ocrd（文档解析服务）单文件可执行，并**在基线镜像里验它真能 OCR**。
 #
 # 为什么不用本机 venv 直接 pyinstaller：
 #   本机 venv 会把 PyInstaller 看得见的所有 .so 一起打包，包括 opencv 的 GUI 依赖
 #   （libGL/libX11）。开发机上有这些库，客户机的裸 server 上没有 → 包看着 176MB 很完整，
 #   到客户机上 cv2 加载失败、OCR 静默失效。所以构建与验证都在容器里做，一次说清。
 #
+# 为什么基线是 **glibc 2.17**（manylinux2014，2026-09-17 现场后改）：
+#   客户离线部署在 CentOS 7 系机器上，ocrd 反复启动退出，journal 只有一行
+#     Failed to load Python shared library '…/_MEI…/libpython3.11.so.1.0':
+#     /lib64/libc.so.6: version `GLIBC_2.28' not found
+#   产物是按 glibc 2.28 构建的，在 2.17 上加载不了 —— 而文件就在那儿，客户怎么重装都没用。
+#   现在把基线降到 2.17（glibc 向后兼容 → 新系统照样跑），并且**在 2.17 镜像里真跑一轮**：
+#   基线声明必须由一次真实运行来证明，不能只写在注释里（在更新的镜像里验证等于没验证）。
+#
 # 用法：
 #   scripts/build-ocr.sh --arch amd64 --out dist-bin/ocrd-amd64
 #   scripts/build-ocr.sh --arch arm64 --out dist-bin/ocrd-arm64     # 走 QEMU，慢（10-30 分钟）
 #   scripts/build-ocr.sh --arch amd64 --selfcheck                   # 自证：故意让断言失配
 #
-# 产出：--out 指定的文件（可执行），并打印 sha256。
+# 产出：--out 指定的文件（可执行）+ `<out>.baseline`（构建基线说明，随离线包发给客户）。
+#       并打印 sha256。
 #
 # 自证（--selfcheck）在做什么：
 #   把验证用的关键词换成一个绝不可能出现在样张里的词，此时验证阶段**必须失败**。
@@ -47,14 +56,14 @@ command -v docker >/dev/null 2>&1 || die "需要 docker（构建在容器里跑�
 docker buildx version >/dev/null 2>&1 || die "需要 docker buildx"
 
 PLATFORM="linux/$ARCH"
-# manylinux_2_28 是 glibc 2.28 的构建基线（见 Dockerfile 头部"坑 2"）。
+# manylinux2014 是 glibc **2.17** 的构建基线（= RHEL/CentOS 7 系），见脚本头部说明。
 # 镜像名后缀是 x86_64 / aarch64，跟 GOARCH 的 amd64 / arm64 不同名，所以要显式映射 ——
 # 写错后缀的后果是 docker 直接拉不到镜像（不会静默出错），但映射表还是集中在这里好。
 case "$ARCH" in
-	amd64) MANYLINUX="quay.io/pypa/manylinux_2_28_x86_64" ;;
-	arm64) MANYLINUX="quay.io/pypa/manylinux_2_28_aarch64" ;;
+	amd64) MANYLINUX="quay.io/pypa/manylinux2014_x86_64" ;;
+	arm64) MANYLINUX="quay.io/pypa/manylinux2014_aarch64" ;;
 esac
-printf '\033[1m构建 ocrd · %s（基线 %s）\033[0m\n' "$PLATFORM" "$MANYLINUX"
+printf '\033[1m构建 ocrd · %s（基线 %s = glibc 2.17）\033[0m\n' "$PLATFORM" "$MANYLINUX"
 
 # ---------- 0. 守卫语义单测（不依赖二进制，几秒级，先跑省得白等容器构建）----------
 # 背景：verify_runtime_loss.sh 的 S4 在本轮真二进制上抓到「守卫固定 sleep 0.4s 就 os._exit，
@@ -72,19 +81,52 @@ else
 	die "缺 $GUARD_TEST（守卫退出语义的确定性单测）"
 fi
 
-# ---------- 1. 干净镜像里跑真 OCR（构建的 verify 阶段就是这道门）----------
-c_info "在 almalinux:8（glibc 2.28 基线、无 GUI 库）里验证自包含性 + OCR 真能出字…"
+# ---------- 0.5 解释器取料：便携 CPython 3.11（PyInstaller 需要 shared libpython）----------
+# 为什么是便携运行时而不是发行版 python：manylinux2014 自带的 /opt/python/cp3x 是
+# **--enable-shared=no**（pypa 构建），PyInstaller 直接拒绝；CentOS 7 base 源里也没有 3.11。
+# 便携运行时是 shared 的，而且它自己就按 glibc 2.17 构建 —— 正好是我们要的基线。
+# 摘要必须来自上游 API（fetch 脚本会校验），这里再算一次送给 Dockerfile 里的 sha256sum -c。
+PYRT_DIR="/tmp/sf-ocr-pyrt-$ARCH"
+mkdir -p "$PYRT_DIR"
+c_info "取便携 CPython 3.11（$ARCH）…"
+RUNTIME_TGZ="$(bash "$REPO_ROOT/scripts/fetch-python-runtime.sh" --arch "$ARCH" --series 3.11 --outdir "$PYRT_DIR" 2>"$PYRT_DIR/fetch.log" | tail -1)"
+[ -f "$RUNTIME_TGZ" ] || { tail -5 "$PYRT_DIR/fetch.log" >&2; die "没取到便携 CPython 运行时"; }
+PYRT_ASSET="$(basename "$RUNTIME_TGZ")"
+PYRT_TAG="$(printf '%s' "$PYRT_ASSET" | sed -n 's/^cpython-[0-9.]*+\([0-9]\{8\}\)-.*$/\1/p')"
+[ -n "$PYRT_TAG" ] || die "便携运行时资产名不是预期格式（拿不到日期 tag）：$PYRT_ASSET —— 上游命名变了，别硬猜"
+PYRT_SHA="$(sha256sum "$RUNTIME_TGZ" | cut -d' ' -f1)"
+PYRT_URL="https://github.com/astral-sh/python-build-standalone/releases/download/$PYRT_TAG/$PYRT_ASSET"
+c_ok "解释器：$PYRT_ASSET（sha256 ${PYRT_SHA:0:12}…）"
+
+# ---------- 1. 基线镜像里跑真 OCR（构建的 verify-baseline 阶段就是这道门）----------
+c_info "在 $MANYLINUX（glibc 2.17 = 构建基线本身）里验证「能加载 + 真能 OCR」…"
 set +e
 docker buildx build --progress plain --platform "$PLATFORM" \
 	--build-arg "MANYLINUX_IMAGE=$MANYLINUX" \
-	--target verify -f "$BUILD_CONTEXT/Dockerfile" "$BUILD_CONTEXT" \
-	2>&1 | tail -25
+	--build-arg "PYRT_URL=$PYRT_URL" --build-arg "PYRT_SHA256=$PYRT_SHA" \
+	--target verify-baseline -f "$BUILD_CONTEXT/Dockerfile" "$BUILD_CONTEXT" \
+	2>&1 | tail -30
 VERIFY_RC=${PIPESTATUS[0]}
 set -e
 if [ "$VERIFY_RC" -ne 0 ]; then
-	die "验证失败：这个 ocrd 在干净最小系统上跑不起来或 OCR 出不了字 —— 不许出包"
+	die "基线验证失败：这个 ocrd 在 glibc 2.17 上跑不起来或 OCR 出不了字 —— 不许出包"
 fi
-c_ok "验证通过：干净镜像里能启动、能对纯图像 PDF 跑出预期文字"
+c_ok "基线验证通过：glibc 2.17 上能启动、能对纯图像 PDF 跑出预期文字"
+
+# ---------- 1.5 自包含性：无 GUI 库的裸镜像里再跑一轮 ----------
+c_info "在 almalinux:8（无 GUI 库的最小镜像）里验证自包含性…"
+set +e
+docker buildx build --progress plain --platform "$PLATFORM" \
+	--build-arg "MANYLINUX_IMAGE=$MANYLINUX" \
+	--build-arg "PYRT_URL=$PYRT_URL" --build-arg "PYRT_SHA256=$PYRT_SHA" \
+	--target verify-bare -f "$BUILD_CONTEXT/Dockerfile" "$BUILD_CONTEXT" \
+	2>&1 | tail -20
+BARE_RC=${PIPESTATUS[0]}
+set -e
+if [ "$BARE_RC" -ne 0 ]; then
+	die "自包含性验证失败：这个 ocrd 依赖了只有构建机才有的库（多半是 libGL/libX11）—— 不许出包"
+fi
+c_ok "自包含性验证通过：裸镜像里也能跑"
 
 # ---------- 2. 自证：把关键词改成绝不可能出现的词，验证必须变红 ----------
 if [ "$SELFCHECK" -eq 1 ]; then
@@ -92,7 +134,8 @@ if [ "$SELFCHECK" -eq 1 ]; then
 	set +e
 	docker buildx build --progress plain --platform "$PLATFORM" \
 		--build-arg "MANYLINUX_IMAGE=$MANYLINUX" \
-		--target verify --build-arg EXPECT=绝不可能出现的词zzz \
+		--build-arg "PYRT_URL=$PYRT_URL" --build-arg "PYRT_SHA256=$PYRT_SHA" \
+		--target verify-baseline --build-arg EXPECT=绝不可能出现的词zzz \
 		-f "$BUILD_CONTEXT/Dockerfile" "$BUILD_CONTEXT" >/tmp/ocr-selfcheck.log 2>&1
 	RED_RC=$?
 	set -e
@@ -100,6 +143,7 @@ if [ "$SELFCHECK" -eq 1 ]; then
 		tail -20 /tmp/ocr-selfcheck.log | sed 's/^/      /'
 		die "自证失败（假绿）：换成错误关键词后验证仍然通过 —— 那道断言根本没在检查 OCR 结果"
 	fi
+	# 「红在崩溃上不算红」：必须是断言失配那一条红的，不能是崩溃红的（那样等于没验证断言）。
 	if ! grep -q '结果里没有' /tmp/ocr-selfcheck.log; then
 		c_fail "自证时确实失败了，但不是因为断言失配（看不出是哪一步红的）"
 		tail -20 /tmp/ocr-selfcheck.log | sed 's/^/      /'
@@ -112,6 +156,7 @@ fi
 ART_TAG="sf-ocr-art:$ARCH"
 docker buildx build --platform "$PLATFORM" \
 	--build-arg "MANYLINUX_IMAGE=$MANYLINUX" \
+	--build-arg "PYRT_URL=$PYRT_URL" --build-arg "PYRT_SHA256=$PYRT_SHA" \
 	--target artifact --load \
 	-t "$ART_TAG" -f "$BUILD_CONTEXT/Dockerfile" "$BUILD_CONTEXT" >/dev/null
 CID="$(docker create --platform "$PLATFORM" "$ART_TAG")"
@@ -123,6 +168,11 @@ fi
 mkdir -p "$(dirname "$OUT")"
 docker cp "$CID:/ocrd" "$OUT"
 chmod 0755 "$OUT"
+# 基线说明必须跟着产物走：客户机上产物**起不来**时，安装/体检脚本就靠它
+# 说清「这个包要 glibc ≥2.17，本机是多少」——缺了它，客户只能看到一句加载器报错。
+docker cp "$CID:/ocrd.baseline" "$OUT.baseline"
+[ -s "$OUT.baseline" ] || die "产物里没带构建基线说明（baseline 丢了）"
+grep -q '^glibc=' "$OUT.baseline" || die "baseline 文件里没有 glibc 行：$(cat "$OUT.baseline")"
 docker rm -f "$CID" >/dev/null 2>&1 || true
 trap - EXIT
 

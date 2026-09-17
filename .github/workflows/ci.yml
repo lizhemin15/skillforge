@@ -191,6 +191,23 @@ jobs:
           bash deploy/offline/tests/test_install_precheck_mutation.sh
           bash deploy/offline/tests/test_selftest_tz_offline.sh
 
+      # 基座体检（`-diag`）：这条链路的失败形态全是「客户装完才发现」——
+      # 老基座（glibc 2.17 / systemd 219）上 ocrd 起不来，journal 只有一行加载器报错；
+      # 而修法（换基座？改配置？）光看那行原文判断不出来。所以判据前移到**装之前**：
+      #   · test_install_prediag.sh         —— 从出货 install.sh 抠出真 prediag_gate 跑 5 场景
+      #   · test_install_prediag_mutation.sh —— 4 路真故障注入（放行 / 吞错码 / 老包被误判 / 不转发原文）
+      #   · baseline_diag_mutation_check.py —— **双向**真跑：假 systemd-run（219 真实帮助文本）
+      #     造老基座 vs 真环境，A 场景必须命中结论、B 场景必须不命中同一条。
+      #     只验 A：把判定写成「恒报不可用」也能过；只验 B：写成「恒报可用」也能过。
+      # 这三条曾整目录免疫（`deploy/offline/tests` 既不叫 `_mutation_check` 也不在
+      # web/tests 下）—— 写好了、能跑了，却没有任何闸门调用。现由 preflight_parity.test.mjs
+      # 按目录收着，掉出去会红。
+      - name: 离线包装前体检 / 基座体检（-diag 双向 + 两路自证）
+        run: |
+          bash deploy/offline/tests/test_install_prediag.sh
+          bash deploy/offline/tests/test_install_prediag_mutation.sh
+          python3 deploy/offline/tests/baseline_diag_mutation_check.py
+
       # `-selftest` 的「文档解析服务」这一栏：真跑出货二进制，五种结论各一条场景
       # （真能干活 / 僵尸服务 / 冒名服务 / 显式禁用 / 指向远端连不上）。
       # 单测喂的是合成证据，证明不了「从敲命令到屏幕出现结论」这条真链。

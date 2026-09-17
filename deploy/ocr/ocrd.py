@@ -95,6 +95,25 @@ def runtime_dir() -> str:
     return getattr(sys, "_MEIPASS", "") or ""
 
 
+def build_baseline() -> str:
+    """本产物的构建基线（打包时由 Dockerfile 写进包内 baseline.txt）。
+
+    为什么服务自己要知道这件事（2026-09-17 现场）：产物在 glibc 比基线老的机器上
+    **根本起不来**，那时任何 /health 都拿不到 —— 但旁挂的 bin/ocrd.baseline 还在，
+    安装脚本/体检脚本据此就能直接说「这个包要 glibc ≥2.17，本机 2.17 → 满足/不满足」，
+    不用等它起不来再去猜。这里负责「起得来的时候把基线一起报出来」，两处信息同源。
+    读不到（老包没带 baseline.txt）返回空串 —— 宁可不报，也不许编一个基线。
+    """
+    base = runtime_dir()
+    if not base:
+        return ""
+    try:
+        with open(os.path.join(base, "baseline.txt"), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def runtime_ok() -> bool:
     """运行时解包目录还在不在。非冻结运行恒为 True（没有解包目录，也就无所谓丢失）。"""
     if _RUNTIME_GUARD_OFF:
@@ -638,6 +657,7 @@ class Handler(BaseHTTPRequestHandler):
             # ok 跟着 runtime_ok 走：任何只看 ok 的老监控/脚本也能因此发现异常。
             rok = runtime_ok()
             self._send_json(200, {"ok": rok, "service": "ocrd", "version": VERSION,
+                                  "baseline": build_baseline(),
                                   "runtime_ok": rok, "runtime_dir": runtime_dir(),
                                   "min_page_chars": MIN_PAGE_CHARS,
                                   "quality_rule": QUALITY_RULE,
@@ -766,12 +786,42 @@ def sweep_stale_tmp():
                 pass
     return n
 
+def preflight() -> int:
+    """启动自检：把「这台机器上这个产物到底能不能干活」一次问清，不占端口、不驻留。
+
+    为什么要有它（2026-09-17 现场）：客户机器上服务反复重启、8093 一直 refused，
+    他能拿到的只有 journal 里加载器的一行原文。安装期/体检期如果能**真跑一次这个产物**，
+    就能在「装完才发现」之前给出结论；跑不出来时的原始报错正是归因层的输入。
+    注意：在加载器就把它挡住的机器上，这个函数**根本执行不到** —— 那种情况由上层
+    （Go 侧 internal/ocrsvc 的归因层 + bin/ocrd.baseline）负责，不指望这里。
+    """
+    info = {"ok": False, "service": "ocrd", "version": VERSION,
+            "baseline": build_baseline(), "python": sys.version.split()[0],
+            "frozen": bool(getattr(sys, "frozen", False)),
+            "runtime_dir": runtime_dir(), "runtime_ok": runtime_ok(), "tmpdir": tempfile.gettempdir()}
+    try:
+        import cv2, numpy, onnxruntime, fitz       # noqa: F401
+        import rapidocr_onnxruntime                # noqa: F401
+        info.update({"cv2": cv2.__version__, "numpy": numpy.__version__,
+                     "onnxruntime": onnxruntime.__version__, "pymupdf": fitz.version[0],
+                     "rapidocr": True})
+        info["ok"] = runtime_ok()
+    except Exception as e:                          # 依赖加载不了 = 这个产物在这台机器上废
+        info["error"] = f"{type(e).__name__}: {e}"
+    print(json.dumps(info, ensure_ascii=False), flush=True)
+    return 0 if info["ok"] else 2
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8093)
     ap.add_argument("--dpi", type=int, default=200)
     ap.add_argument("--max-cache", type=int, default=64, help="缓存MB上限")
+    ap.add_argument("--preflight", action="store_true",
+                    help="只做启动自检（依赖可加载/解包目录/构建基线），打印 JSON 后退出")
     a = ap.parse_args()
+    if a.preflight:
+        sys.exit(preflight())
     n = sweep_stale_tmp()
     print(f"启动清理残留临时目录: {n} 个", flush=True)
     # 把「解包目录落在哪」打出来：一旦它落在 /tmp，就会在 systemd-tmpfiles 的下一次清理里

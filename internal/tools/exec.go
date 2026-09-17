@@ -341,6 +341,14 @@ func (t *RunPythonTool) Run(ctx context.Context, args map[string]any) (Result, e
 		// fail closed：沙箱不可用就不执行
 		return Result{}, errors.New("沙箱不可用（缺少 systemd-run），已拒绝执行代码")
 	}
+	// 先判「这台机器给不给得了沙箱」，再动手。
+	// 老 systemd（<232）上 systemd-run 会直接拒收 --pipe/--wait 退出，工具层只会拿到一句
+	// `unrecognized option '--pipe'` —— 客户既看不出原因，也不知道这台机器永远做不到。
+	// 这里提前把「不可能」说清（含修法），并且**绝不降级成裸跑**。
+	if env := ProbeSandboxEnv(); !env.Usable {
+		return Result{}, fmt.Errorf("沙箱不可用（本机环境不支持），已拒绝执行代码：%s。修法：%s",
+			strings.Join(env.Missing, "；"), strings.Join(SandboxEnvFixes(), " "))
+	}
 
 	dir, err := t.makeWorkspace()
 	if err != nil {

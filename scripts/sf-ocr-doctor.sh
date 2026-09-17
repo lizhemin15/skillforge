@@ -153,6 +153,29 @@ if journalctl -u "$UNIT" -n 400 --no-pager 2>/dev/null | grep -qiE "oom-kill|Kil
 	add_fix "...如反复 OOM：装新版（解析服务按 20 页回收引擎）+ 增加内存，或 sudo ./install.sh --ocr-port 8094 单机分服务"
 fi
 
+# ── 5.5 基座归因：只调主程序自己的 -diag，不在这里另写一套判据 ──────
+# 为什么不在本脚本里再实现一遍 glibc/能力判定：同一件事有两份实现，迟早分叉 ——
+# 分叉之后客户会看到「装前体检说没问题、这里说有问题」这种最难解释的矛盾，而且
+# 谁也不知道哪份是对的。判据只有一份，在包里主程序里（与装后自检共用）。
+DIAG_BIN="$PREFIX/skillforge"
+if [ -x "$DIAG_BIN" ]; then
+	echo
+	echo "基座归因（$DIAG_BIN -diag，与装前体检/装后自检同一份判据）："
+	DIAG_RC=0
+	DIAG_OUT="$("$DIAG_BIN" -diag 2>&1)" || DIAG_RC=$?
+	printf '%s\n' "$DIAG_OUT" | sed "s/^/${C_DIM}  /;s/$/${C_OFF}/"
+	case "$DIAG_OUT" in
+		*"flag provided but not defined"*|*"无法识别的参数"*)
+			echo "  ${C_DIM}（这个包的主程序还不支持 -diag：老包，无法归因，按上面的日志人工判断）${C_OFF}" ;;
+		*)
+			if [ "$DIAG_RC" -ne 0 ]; then
+				add_problem "⑧ 基座体检有需要处理的问题（见上面的 -diag 输出：基线 / 解析服务 / 沙箱能力）"
+			fi ;;
+	esac
+else
+	add_problem "⑧ 找不到 $DIAG_BIN → 无法做基座归因（先看 ls -l $PREFIX/bin 与单元里的 ExecStart）"
+fi
+
 # ── 6. 结论 ──────────────────────────────────────────────────────────
 hr
 if [ "${#PROBLEMS[@]}" -eq 0 ]; then

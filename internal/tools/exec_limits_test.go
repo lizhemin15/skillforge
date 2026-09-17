@@ -299,9 +299,7 @@ func TestRunReportsSandboxOOMToModel(t *testing.T) {
 	// 内核 OOM 现场的真串。刻意不含 Timeout/timeout：Run() 用这两个子串判超时，
 	// 混进去会把 OOM 现场误判成超时。
 	logLine := "Memory cgroup out of memory: Killed process 4711 (python3) total-vm:2000000kB, anon-rss:1500000kB\n"
-	if err := os.WriteFile(fake, []byte("#!/bin/sh\nprintf '%s' '"+logLine+"' >&2\nexit 1\n"), 0o755); err != nil {
-		t.Fatalf("写假 systemd-run 失败：%v", err)
-	}
+	writeFakeSystemdRun(t, fake, "printf '%s' '"+logLine+"' >&2\nexit 1")
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	me, err := user.Current()

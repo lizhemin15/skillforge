@@ -66,6 +66,18 @@ type selfCheck struct {
 	// 跳过不算失败、也不计入「N/N 通过」的分母，但必须显式打印出来 ——
 	// 静默跳过等于让用户以为自己有这项能力，那是最坏的一种误导。
 	skip bool
+	// unavail：这项能力在**本机的环境里根本给不出来**（例：systemd 219 的 systemd-run
+	// 提供不了 PrivateNetwork=/ProtectSystem=strict，沙箱不成立）。
+	//
+	// 与另外两种状态的分界（2026-09-17 客户现场后加的）：
+	//   * 失败   = 我们的东西坏了，客户按提示修就能好；
+	//   * skip   = 按设计就不该跑（配置决定），不算缺件；
+	//   * unavail= 环境给不了 —— 客户没有东西可修，只能换基座或接受缺这一项功能。
+	// 这一类的历史形态是：客户看到一句 `systemd-run: unrecognized option '--pipe'`，
+	// 既不知道该改什么，也没人告诉他「这台机器永远做不到」。
+	// 所以它必须显式打印（绝不显示成 OK），又**不能算作「未通过」**（那会把一台正常
+	// 装好的机器判成装失败）；判定理由与修法要一起给出来。
+	unavail bool
 }
 
 // runSelfTest 执行自检，返回进程退出码。
@@ -95,10 +107,14 @@ func runSelfTest() int {
 		checkSandbox(),
 	}
 
-	failed, skipped := 0, 0
+	failed, skipped, unavail := 0, 0, 0
 	for i, c := range checks {
 		status := "OK"
 		switch {
+		case c.unavail:
+			// 环境给不了：显式打印，但不算「未通过」（那是我们的东西坏了才用的词）。
+			status = "不可用（环境）"
+			unavail++
 		case c.skip:
 			status = "跳过"
 			skipped++
@@ -116,6 +132,17 @@ func runSelfTest() int {
 	if failed > 0 {
 		fmt.Printf("自检结果：%d/%d 项未通过，请按上面提示修复\n", failed, len(checks))
 		return 1
+	}
+	if unavail > 0 {
+		// 有「环境给不了」的项：既不能报「全部通过」（客户会以为这项能力在跑），
+		// 也不能报「未通过」（他按提示修不了，而且这台机器是正常装好的）。
+		line := fmt.Sprintf("自检结果：%d/%d 项通过", len(checks)-skipped-unavail, len(checks))
+		if skipped > 0 {
+			line += fmt.Sprintf("，另有 %d 项按本机配置跳过", skipped)
+		}
+		line += fmt.Sprintf("；%d 项因本机环境不支持未启用（不影响其它功能，详见上）", unavail)
+		fmt.Println(line)
+		return 0
 	}
 	if skipped > 0 {
 		fmt.Printf("自检结果：全部通过（%d/%d，另有 %d 项按本机配置跳过）\n",
@@ -427,6 +454,23 @@ func judgeParseService(ev parseEvidence) selfCheck {
 				ocrsvc.Endpoint(ev.URL), ev.UnitName, ev.UnitPath),
 			fmt.Sprintf("修复：`systemctl restart %s`。", ev.UnitName),
 			fmt.Sprintf("排查：`systemctl status %s` / `journalctl -u %s -n 50`。", ev.UnitName, ev.UnitName))
+		// 起不来 ≠ 重启就能好。把 journal 里的死因归类后再说话：
+		// 2026-09-17 客户现场（CentOS 7 系）服务反复重启，客户能看到的只有
+		//   Failed to load Python shared library '…/_MEI…/libpython3.11.so.1.0':
+		//   version `GLIBC_2.28' not found
+		// 而真因是「目标机 glibc 比产物的构建基线老」—— 文件在不在根本不重要。
+		// 归因与修法在 internal/ocrsvc 里（同一份逻辑给 -diag / doctor 用，不重复实现）。
+		if d := ocrsvc.DiagnoseUnitStartup(ev.UnitName, ocrBinaryFromUnit(ev.UnitPath)); d.Class != "unknown" {
+			c.detail = append(c.detail, "归因："+d.Summary)
+			for _, f := range d.Fixes {
+				c.detail = append(c.detail, "· "+f)
+			}
+			if d.Evidence != "" {
+				c.detail = append(c.detail, "原始日志："+ocrsvc.FirstLine(d.Evidence))
+			}
+		} else if d.Evidence != "" {
+			c.detail = append(c.detail, "归因：没认出这一类失败，journal 最后一行原文："+ocrsvc.FirstLine(d.Evidence))
+		}
 		if d := doctorHint(); d != "" {
 			c.detail = append(c.detail, fmt.Sprintf("一条命令分诊：`%s`。", d))
 		}
@@ -782,6 +826,13 @@ func checkSandbox() selfCheck {
 			"找不到任何真实存在的机密文件可作证据（env 文件没装？）——"+
 				"拿不存在路径测「读不到」是假证据，不存在的文件当然打不开"))
 	}
+	// 先问「这台机器给不给得了沙箱」，再谈探针结果。
+	// 顺序不能反：systemd 太老时 systemd-run 直接拒收参数退出，探针一个字都不吐，
+	// 上层只能报「没有 uid」—— 而客户拿到的那句 `unrecognized option '--pipe'`
+	// 既看不出原因，也看不出「这台机器永远做不到」。见 tools.ProbeSandboxEnv。
+	if env := tools.ProbeSandboxEnv(); !env.Usable {
+		return judgeSandboxEnv(env)
+	}
 	if !systemdRunAvailable() {
 		return judgeSandbox(nil, secretPaths, fmt.Errorf(
 			"缺少 systemd-run，代码沙箱不可用（服务会拒绝执行代码，绝不裸跑）"+
@@ -791,6 +842,32 @@ func checkSandbox() selfCheck {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	return judgeSandbox(tools.SandboxDiagnosticsFor(ctx, secretPaths), secretPaths, nil)
+}
+
+// judgeSandboxEnv 渲染「本机环境给不了沙箱」这一结论。
+//
+// 为什么单独一个函数：这条路径跟「探针发现危险」是完全不同的两件事，混在一起写就会
+// 让客户以为「沙箱坏了、要去修沙箱」。这里要说的恰恰相反：机器没坏、程序没坏，
+// 是这份能力在这台机器上不可能成立，且我们**故意**不降级执行代码。
+func judgeSandboxEnv(env tools.SandboxEnvVerdict) selfCheck {
+	c := selfCheck{name: "代码执行沙箱", unavail: true}
+	ver := env.Version
+	if ver == "" {
+		ver = "读不出来"
+	}
+	c.detail = append(c.detail,
+		fmt.Sprintf("本机 systemd：%s（沙箱需要 ≥%d）。", ver, tools.MinSystemdVersion),
+		"缺的能力："+strings.Join(env.Missing, "；")+"。",
+		"为什么不能让一步：降权（User=nobody）、断网（PrivateNetwork=yes）、写不进敏感路径"+
+			"（ProtectSystem=strict + ReadWritePaths）这三条必须同时成立才算沙箱 —— "+
+			"前两条是 systemd 232 才有的能力，删掉任何一条就不是沙箱了，所以**不会降级执行代码**。",
+		"影响：只有 AI「执行代码」这一项不可用；写作、文档生成、素材解析（PDF/Word/Excel 抽文本）、技能训练都不受影响。",
+		"修法：")
+	for _, f := range tools.SandboxEnvFixes() {
+		c.detail = append(c.detail, "· "+f)
+	}
+	c.detail = append(c.detail, "自查：`systemd-run --version`、`systemd-run --help | grep -E -- '--(pipe|wait)'`。")
+	return c
 }
 
 // judgeSandbox 判定沙箱证据。纯函数：任何一条「危险」或「证据无效」都必须判失败。
@@ -929,6 +1006,34 @@ func defaultDBPath() string {
 	}
 	if d := config.Load().DataDir; d != "" {
 		return filepath.Join(d, "skillforge.db")
+	}
+	return ""
+}
+
+// ocrBinaryFromUnit 从单元文件里取 ExecStart 的可执行文件路径；取不到返回空串。
+//
+// 用途：体检/自检要「真跑一次产物」时必须知道它在哪。取不到不致命 ——
+// 归因层会退化成只读 journal（见 ocrsvc.DiagnoseUnitStartup）。
+// 只认绝对路径且跳过 systemd 的前缀修饰符（-, @, +, !），否则会拿到一个奇怪的名字。
+func ocrBinaryFromUnit(unitPath string) string {
+	if unitPath == "" {
+		return ""
+	}
+	b, err := os.ReadFile(unitPath)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "ExecStart=") {
+			continue
+		}
+		for _, f := range strings.Fields(strings.TrimPrefix(line, "ExecStart=")) {
+			f = strings.TrimLeft(f, "-@+!")
+			if strings.HasPrefix(f, "/") {
+				return f
+			}
+		}
 	}
 	return ""
 }

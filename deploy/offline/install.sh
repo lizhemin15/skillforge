@@ -17,6 +17,7 @@
 #   sudo ./install.sh --service sf-test     # 换服务名（同一台机器装第二份实例用）
 #   sudo ./install.sh --force               # 顶掉同名的、别的前缀的既有实例（危险，见下）
 #   sudo ./install.sh --skip-selftest       # 跳过装后自检（仅开发调试用）
+#   sudo ./install.sh --allow-degraded      # 装前体检有问题也继续装（打横幅；不推荐）
 #
 # 端口冲突：安装前会**先扫描**主服务端口和 OCR 端口。任一被别的进程占用时，
 # 交互式终端里会直接问你「换成哪个端口」（回车用建议值），非交互环境下会失败并
@@ -54,6 +55,8 @@ DO_SELFTEST=1
 PUBLIC_URL=""
 # 顶掉「别人家的」服务单元需要显式 --force（见 0.5 冲突检查）。
 FORCE=0
+# 装前体检（prediag_gate）判定「有需要动手的问题」时默认**不装**；这是显式放行开关。
+ALLOW_DEGRADED=0
 # --public-url 有没有显式给过：端口冲突时我们会改 PORT，默认的 PUBLIC_URL 必须跟着重算
 PUBLIC_URL_SET=0
 
@@ -73,7 +76,7 @@ step()    { printf '\n\033[1m[%s]\033[0m %s\n' "$1" "$2"; }
 die()     { c_fail "$*"; exit 1; }
 
 usage() {
-	sed -n '2,22p' "$SELF" | sed 's/^# \{0,1\}//'
+	sed -n '2,23p' "$SELF" | sed 's/^# \{0,1\}//'
 	exit 0
 }
 
@@ -133,6 +136,54 @@ detect_timezone() {
 	printf '%s' "$_tz"
 }
 
+# >>> prediag_gate —— 装前体检（离线包测试脚本按这对标记从出货文件里抠出本函数来跑，别删标记）
+#
+# 为什么必须有这一步（2026-09-17 客户离线部署现场）：客户装完之后才自己发现两件事 ——
+#   ① 解析服务反复重启失败，8093 一直 connection refused，journal 里只有一行加载器报错；
+#   ② 自检里「代码执行沙箱」红，原文是 systemd-run: unrecognized option '--pipe'。
+# 两条真因是同一个：目标机比这份包的构建基线老。装完才发现意味着客户要自己从一句报错里
+# 猜「该换包还是该改配置」；而这两条**装之前就判得出来** —— 包里主程序自己会判
+# （`bin/skillforge -diag`，与装后自检共用同一份判据，不是这里另写一套）。
+#
+# 行为（默认不替客户猜）：
+#   rc=0              → 没有需要动手的问题，继续装
+#   rc≠0 且 --no-ocr  → 本次不装解析服务，不受影响 → 提醒后继续
+#   rc≠0 且 --allow-degraded → 显式放行：打横幅继续，并先说清「这不是修复」
+#   其余              → 停在动任何文件之前，把两条可选路径写清楚
+prediag_gate() {
+	local bin="$1" rc=0 out=""
+	if [ ! -x "$bin" ]; then
+		c_warn "包里没有可执行的 bin/skillforge → 跳过装前体检（后面的步骤会自行拒绝）"
+		return 0
+	fi
+	out="$("$bin" -diag 2>&1)" || rc=$?
+	printf '%s\n' "$out"
+	case "$out" in
+		*"flag provided but not defined"*|*"无法识别的参数"*|*"unknown flag"*)
+			# 老包（还没有 -diag 的版本）：这不是故障 —— 据此判失败会把一份本来
+			# 好好的老包报成「装不了」，那是把尺子的缺陷算到客户头上。
+			c_warn "这个包的主程序还不支持 -diag（老包）→ 跳过装前体检。"
+			return 0 ;;
+	esac
+	[ "$rc" -eq 0 ] && return 0
+	if [ "$DO_OCR" -eq 0 ]; then
+		c_warn "装前体检发现需要处理的问题（见上）。本次用了 --no-ocr，不受影响 → 继续安装。"
+		return 0
+	fi
+	if [ "$ALLOW_DEGRADED" -eq 1 ]; then
+		c_warn "装前体检有问题，按 --allow-degraded 继续安装。"
+		c_warn "这不是修复：上面那些能力装完仍然不可用，请按体检输出里的修法处理。"
+		return 0
+	fi
+	c_fail "装前体检发现需要处理的问题（见上），已停在动文件之前。"
+	printf '  %s\n' "两条可选路径（选一条重跑）："
+	printf '    %s\n' "sudo ./install.sh --no-ocr            # 这次不装文档解析服务：主服务 / 写作 / 技能训练照常可用"
+	printf '    %s\n' "sudo ./install.sh --allow-degraded    # 明知有问题也继续（不推荐：能力仍然不可用）"
+	printf '  %s\n' "要根治：换一份与本机匹配的离线包（体检输出里写着本机 glibc 与这份包的要求）。"
+	exit 1
+}
+# <<< prediag_gate
+
 # ---------- 参数 ----------
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -151,6 +202,7 @@ while [ $# -gt 0 ]; do
 		--no-start)    DO_START=0; shift ;;
 		--skip-selftest) DO_SELFTEST=0; shift ;;
 		--force)       FORCE=1; shift ;;
+		--allow-degraded) ALLOW_DEGRADED=1; shift ;;
 		-h|--help)     usage ;;
 		*)             die "无法识别的参数：$1（用 --help 看用法）" ;;
 	esac
@@ -211,6 +263,11 @@ fi
 command -v systemctl >/dev/null 2>&1 || die "找不到 systemctl（systemd 在但 PATH 里没有？请用 root 完整环境重跑）"
 command -v systemd-run >/dev/null 2>&1 || die "找不到 systemd-run（systemd 太旧或安装不完整）。沙箱不可用，拒绝安装。"
 c_ok "systemd / systemd-run 可用"
+
+# ---------- 0.1 装前体检：这份包在这台机器上能不能跑，装之前就判 ----------
+# 位置刻意选在「写任何文件之前」：体检有问题时客户机器上什么都没被改，重跑一条命令即可。
+step "0/7" "装前体检（基线 / 解析服务 / 沙箱能力）"
+prediag_gate "$HERE/bin/skillforge"
 
 # ---------- 装前内存检查（只警告，不拦）----------
 #

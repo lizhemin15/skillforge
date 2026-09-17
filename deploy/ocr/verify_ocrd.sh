@@ -19,6 +19,28 @@ FAILED=0
 fail() { echo "FAIL: $*"; FAILED=1; }
 ok()   { echo "  ok: $*"; }
 
+echo "=== 0) 启动自检 --preflight（不占端口：依赖可加载 / 解包目录 / 构建基线）==="
+# 为什么先跑这一步：它比「起服务 + curl /health」更早暴露问题（几秒钟、不需要端口），
+# 也正是安装期与体检期用的同一条路径 —— 出货前先证明它在**基线镜像**里能跑通。
+PF="$(ocrd --preflight 2>&1)"
+PF_RC=$?
+echo "  rc=$PF_RC $PF"
+if [ "$PF_RC" -ne 0 ]; then
+  fail "ocrd --preflight 失败（rc=$PF_RC）：这台机器上这个产物起不来"
+else
+  PF_FLAT=$(printf '%s' "$PF" | tr -d '[:space:]')
+  case "$PF_FLAT" in
+    *'"ok":true'*) ok "preflight ok=true" ;;
+    *) fail "preflight 没报 ok=true（依赖加载不全，服务起来也干不了活）" ;;
+  esac
+  # 基线必须随产物走：老机器上产物**起不来**，那时 /health 拿不到，
+  # 只有旁挂的 baseline 还在 —— 它是「这个包要什么 glibc」的唯一凭据。
+  case "$PF" in
+    *'"baseline": "glibc='*) ok "构建基线随包上报：$(printf '%s' "$PF" | sed -n 's/.*"baseline": "\([^"]*\)".*/\1/p' | head -1 | tr '\n' ' ')" ;;
+    *) fail "preflight 没报构建基线（baseline 丢了 → 客户机上是「装完才发现起不来」）" ;;
+  esac
+fi
+
 echo "=== 1) 启动 ocrd（干净容器，无 GUI 库）==="
 ocrd --port "$PORT" >"$LOG" 2>&1 &
 PID=$!

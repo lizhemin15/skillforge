@@ -218,6 +218,16 @@ jobs:
             esac
           done
 
+          # 解析服务的「构建基线说明」必须随包：包里主程序 -diag 与 install.sh 的装前体检
+          # 都读 bin/ocrd.baseline 才能回答「这份 ocrd 在这台机器上能不能起来」。缺了它，
+          # 客户机上永远只能报「读不到基线」，等于把这条诊断能力悄悄降级成没用 —— 而这类
+          # 缺件在本地打带 ocr 的包时最容易漏（本机真跑得起来，看不出少了什么）。
+          # 按行锚定（^…bin/ocrd$），不用裸子串：bin/ocrd.baseline 也会命中 "bin/ocrd"。
+          if grep -qE '(^|/)bin/ocrd$' <<<"$LIST"; then
+            grep -qE '(^|/)bin/ocrd\.baseline$' <<<"$LIST" \
+              || { echo "::error::离线包里有 bin/ocrd 却没有 bin/ocrd.baseline"; exit 1; }
+          fi
+
           # 3) 脚本语法要在解包前就验证：客户机器上 bash -n 报错等于「一键安装」当场失效
           TMP="$(mktemp -d)"
           tar xzf "$TGZ" -C "$TMP"

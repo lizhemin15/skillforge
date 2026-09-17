@@ -300,6 +300,14 @@ if [ "$QUICK" = 0 ]; then
   # 内存那两条：正向 6 档 + 5 路突变自证（含着「检查整段被删」这类假绿的兜底）。
   selfcheck '安装包 / 装前内存检查'          bash deploy/offline/tests/test_install_memory.sh
   selfcheck '安装包 / 装前内存检查突变自证'  bash deploy/offline/tests/test_install_memory_mutation.sh
+  # 装前体检（prediag_gate）：把「这份包在这台机器上能不能跑」在动文件之前说清。
+  # 正向 = 从出货 install.sh 里抠出真函数跑五种场景；负向 = 四种真实故障注入必须精确转红。
+  selfcheck '安装包 / 装前体检'              bash deploy/offline/tests/test_install_prediag.sh
+  selfcheck '安装包 / 装前体检负向自证'      bash deploy/offline/tests/test_install_prediag_mutation.sh
+  # 基座体检（-diag / -selftest 沙箱三态）的**双向**真跑：用 systemd 219 的真实帮助文本
+  # 造一个假 systemd-run 当「老基座」，跑同一份出货二进制 —— 老基座上必须给出结论与修法，
+  # 正常机器上不许乱报同一条。单向的那种（只验老基座）写成「恒报不可用」也能过。
+  selfcheck '安装包 / 基座体检双向对照'      python3 deploy/offline/tests/baseline_diag_mutation_check.py
   selfcheck '安装包 / 对外地址默认值'        bash deploy/offline/tests/test_install_public_url.sh
   selfcheck '安装包 / 时区处理'              bash deploy/offline/tests/test_install_timezone.sh
   selfcheck '安装包 / TLS 信任预检'          bash deploy/offline/tests/test_install_trust_precheck.sh

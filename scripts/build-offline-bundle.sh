@@ -330,6 +330,17 @@ install -m 0755 "$BINARY" "$STAGE/bin/skillforge"
 # 用 if 而不是 `[ -n ] && install`：后者在 OCR_BIN 为空时整条列表状态非零，
 # 跟 set -e 的交互容易被误读（有的 shell 布局下会中断打包）。
 if [ -n "$OCR_BIN" ]; then install -m 0755 "$OCR_BIN" "$STAGE/bin/ocrd"; fi
+# 构建基线说明必须跟 ocrd 一起进包：主程序 `-diag` 与 install.sh 的装前体检都读它，
+# 用来说清「这份 ocrd 要求 glibc ≥X，本机是多少」。它是「产物起不来」时唯一能给出
+# 结论的东西 —— 缺了它，客户只能看到一句加载器报错，接着去删缓存 / 重装 / 满世界
+# 找那个 .so（都不会有用）。build-ocr.sh 本来就是随产物一起生成它的，所以这里缺了
+# 说明**出包流程错了**，不是「这台机器没这个文件」：直接 die，不许沉默地把包内体检
+# 能力降级成永远报「读不到基线」。
+if [ -n "$OCR_BIN" ]; then
+	[ -s "$OCR_BIN.baseline" ] || die "ocrd 旁边没有构建基线说明：$OCR_BIN.baseline（build-ocr.sh 随产物生成；缺了包内体检报不出基线）"
+	grep -q '^glibc=' "$OCR_BIN.baseline" || die "基线说明里没有 glibc 行：$OCR_BIN.baseline"
+	install -m 0644 "$OCR_BIN.baseline" "$STAGE/bin/ocrd.baseline"
+fi
 install -m 0644 "$font_pick" "$STAGE/fonts/$(basename "$font_pick")"
 install -m 0755 "$REPO_ROOT/deploy/offline/install.sh" "$STAGE/install.sh"
 install -m 0755 "$REPO_ROOT/deploy/offline/uninstall.sh" "$STAGE/uninstall.sh"
@@ -457,6 +468,9 @@ if [ -n "$OCR_BIN" ]; then
 包里带了两个程序：
   bin/skillforge  主服务（Web 界面 + 技能引擎）
   bin/ocrd        文档解析服务（扫描件/Word/Excel 抽文本，含 OCR 模型，无需额外依赖）
+  bin/ocrd.baseline  解析服务的构建基线说明（它要求的最低 glibc 版本）。装前体检与
+                     `bin/skillforge -diag` 用它回答「这份 ocrd 在这台机器上能不能起来」。
+                     解析服务起不来时先看它，别删。
 安装时会先扫描端口：默认主服务 8092、文档解析 8093。端口被占时会提示你指定新端口。
 EOF
 else
@@ -503,12 +517,20 @@ OCR_CLAIM='bin/ocrd[[:space:]]*文档解析服务'
 if [ -n "$OCR_BIN" ]; then
 	grep -q "$OCR_CLAIM" "$STAGE/INSTALL.txt" \
 		|| die "说明与产物不一致：包里有 ocrd（$OCR_BIN），INSTALL.txt 却没把它列为随包程序"
+	# 基线说明同理：包里有 ocrd 就必须有它，且说明书里必须提到它 —— 说明书没提，
+	# 客户就不知道那是个有用的文件（清理磁盘时第一个被删）。
+	[ -s "$STAGE/bin/ocrd.baseline" ] \
+		|| die "包里有 bin/ocrd 却没有 bin/ocrd.baseline —— 客户机上的装前体检/诊断会永远报「读不到基线」"
+	grep -q 'bin/ocrd.baseline' "$STAGE/INSTALL.txt" \
+		|| die "INSTALL.txt 没说明 bin/ocrd.baseline 是干什么的"
 else
 	if grep -q "$OCR_CLAIM" "$STAGE/INSTALL.txt"; then
 		die "说明与产物不一致：这次打了 --no-ocr，INSTALL.txt 却声称随包提供 bin/ocrd"
 	fi
 	grep -q '没有' "$STAGE/INSTALL.txt" \
 		|| die "说明与产物不一致：包里没有 ocrd，INSTALL.txt 却没如实告诉用户"
+	[ ! -e "$STAGE/bin/ocrd.baseline" ] \
+		|| die "说明与产物不一致：这次打了 --no-ocr，包里却躺着 bin/ocrd.baseline（会让体检按「有 ocrd」去判）"
 fi
 
 # 出包前自检：INSTALL.txt 对「要不要目标机自备 python3」的说法必须与包内实际内容一致。

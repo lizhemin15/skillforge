@@ -28,11 +28,18 @@ func main() {
 	addr := flag.String("addr", os.Getenv("SKILLFORGE_ADDR"), "listen address (env SKILLFORGE_ADDR)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	selfTest := flag.Bool("selftest", false, "run offline self-test (version / PDF font / sandbox) and exit")
+	// -diag：基座体检（不联网）。装前/排障用：把「这台机器上什么能跑、什么不能跑、为什么」一次说清。
+	// 详见 cmd/server/diag.go 顶部的现场说明（2026-09-17 客户离线部署事故）。
+	diag := flag.Bool("diag", false, "offline host baseline check (glibc / systemd / ocrd) and exit")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println("skillforge " + version.String())
 		return
+	}
+
+	if *diag {
+		os.Exit(runDiag())
 	}
 
 	if *selfTest {
