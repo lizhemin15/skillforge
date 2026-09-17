@@ -111,6 +111,20 @@ if [ -n "$OCR_BIN" ]; then
 		die "ocrd 架构与 --arch 不符：--arch=$ARCH，但文件是 $OCR_ARCH（$OCR_DESC）"
 	fi
 	c_ok "ocrd 架构核对通过：$ARCH（$(du -h "$OCR_BIN" | cut -f1)）"
+
+	# 构建基线说明必须跟 ocrd 一起进包：主程序 `-diag` 与 install.sh 的装前体检都读它，
+	# 用来说清「这份 ocrd 要求 glibc ≥X，本机是多少」。它是「产物起不来」时唯一能给出
+	# 结论的东西 —— 缺了它，客户只能看到一句加载器报错，接着去删缓存 / 重装 / 满世界
+	# 找那个 .so（都不会有用）。build-ocr.sh 本来就是随产物一起生成它的，所以这里缺了
+	# 说明**出包流程错了**，不是「这台机器没这个文件」：直接 die，不许沉默地把包内体检
+	# 能力降级成永远报「读不到基线」。
+	#
+	# 位置：放在**搭目录之前**（跟架构核对同一段）。它只是对入参的判据，
+	# 真跑验证过：原来放在 install 之后，die 会留下一个名字完整、内容残缺的
+	# 包目录（dist/x/skillforge-offline-v…-linux-amd64/），任谁看一眼都会以为
+	# 「包已经打好了，只是 tar 那步失败了」——失败就必须什么都不留下。
+	[ -s "$OCR_BIN.baseline" ] || die "ocrd 旁边没有构建基线说明：$OCR_BIN.baseline（build-ocr.sh 随产物生成；缺了包内体检报不出基线）"
+	grep -q '^glibc=' "$OCR_BIN.baseline" || die "基线说明里没有 glibc 行：$OCR_BIN.baseline"
 elif [ -n "$NO_OCR" ]; then
 	c_warn "按 --no-ocr 打一个不含文档解析服务的包（扫描件/Office 抽文本会不可用）"
 else
@@ -330,15 +344,10 @@ install -m 0755 "$BINARY" "$STAGE/bin/skillforge"
 # 用 if 而不是 `[ -n ] && install`：后者在 OCR_BIN 为空时整条列表状态非零，
 # 跟 set -e 的交互容易被误读（有的 shell 布局下会中断打包）。
 if [ -n "$OCR_BIN" ]; then install -m 0755 "$OCR_BIN" "$STAGE/bin/ocrd"; fi
-# 构建基线说明必须跟 ocrd 一起进包：主程序 `-diag` 与 install.sh 的装前体检都读它，
-# 用来说清「这份 ocrd 要求 glibc ≥X，本机是多少」。它是「产物起不来」时唯一能给出
-# 结论的东西 —— 缺了它，客户只能看到一句加载器报错，接着去删缓存 / 重装 / 满世界
-# 找那个 .so（都不会有用）。build-ocr.sh 本来就是随产物一起生成它的，所以这里缺了
-# 说明**出包流程错了**，不是「这台机器没这个文件」：直接 die，不许沉默地把包内体检
-# 能力降级成永远报「读不到基线」。
+# 构建基线说明（ocrd.baseline）：判据在**上面入参核对那一档**就过完了（缺件 / 没 glibc 行
+# 都在动产物之前 die），这里只负责把它拷进包，不再重复判一遍 —— 同一件事两处实现，
+# 迟早分叉成「一处拦、一处放」。
 if [ -n "$OCR_BIN" ]; then
-	[ -s "$OCR_BIN.baseline" ] || die "ocrd 旁边没有构建基线说明：$OCR_BIN.baseline（build-ocr.sh 随产物生成；缺了包内体检报不出基线）"
-	grep -q '^glibc=' "$OCR_BIN.baseline" || die "基线说明里没有 glibc 行：$OCR_BIN.baseline"
 	install -m 0644 "$OCR_BIN.baseline" "$STAGE/bin/ocrd.baseline"
 fi
 install -m 0644 "$font_pick" "$STAGE/fonts/$(basename "$font_pick")"

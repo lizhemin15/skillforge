@@ -369,3 +369,91 @@ test('deploy/ocr 单测的第三方依赖：清单与真 import 双向对账，�
       `那时红的是环境、归因却会落到判据上（比直接炸更难查）。`,
   );
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 判据同源：装前体检 / 装后自检 / 故障归因 —— 同一件事只许有**一份**实现。
+//
+// 为什么单独立一条：这三处都是「给客户下结论」的地方，结论打架时最难解释 ——
+// 「装之前说这台机器没问题，装完自检说坏了」（或反过来）客户只能理解成
+// 「你们自己都不知道」。而分叉是自然发生的：三个文件、两种语言（shell + Go），
+// 每一处都会有人想「顺手在这里补一句判断，反正输出更好看」。
+//
+// 2026-09-17 客户现场（CentOS 7 系，glibc 2.17 / systemd 219）就是这个形状：
+// 装之前没人事先告诉他会起不来；装完 journal 只有一行加载器报错
+// （`Failed to load Python shared library … GLIBC_2.28 not found`）；
+// doctor 的沙箱栏只给一句 `systemd-run: unrecognized option '--pipe'`。
+// 三处各说各的，客户拼不出一个结论，只能靠猜（删缓存 / 重装 / 满世界找 .so，全都没用）。
+//
+// 所以钉死：**判据只有一份，在包里主程序里**（`-diag` / `-selftest` 共用
+// internal/ocrsvc + internal/tools 那批证据函数）；两个 shell 脚本只许调它，
+// 不许自己再实现一遍 glibc / systemd 的判定。
+test('基座判据同源：装前体检与故障归因只许复用主程序 -diag，不许各自实现一遍', () => {
+  const install = read('deploy/offline/install.sh');
+  const doctor = read('scripts/sf-ocr-doctor.sh');
+
+  // ① 正向：两处都必须真调主程序的 -diag。抠区块（而不是全文 includes）是因为
+  //    `-diag` 三个字符在注释里也能出现 —— 注释里的调用等于没调用，正是本文件
+  //    开头说的「看着有、其实没传」。所以这里**先剥注释、再认调用式**
+  //    （`"$bin" -diag` 这种带引号变量的形式），而不是在整段文本里 includes 一下：
+  //    实测过，把真调用改成 -diagx、注释里的 `-diag` 原样留着，includes 版照样绿。
+  //    标记是给测试用的，删了就得红。
+  const stripComments = (s) => s.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
+  // 词尾边界（(?![-\w])）不是装饰：没有它，`-diagx` 也能满足 /-diag/ —— 子串匹配
+  // 会把「参数名被改错」判成通过。实测：改名成 -diagx 时带边界才红。
+  const gate = install.split('# >>> prediag_gate')[1]?.split('# <<< prediag_gate')[0] ?? '';
+  const gateCode = stripComments(gate);
+  assert.ok(
+    /"\$bin"\s+-diag(?![-\w])/.test(gateCode),
+    `install.sh 的 prediag_gate 区块里没有真调主程序 -diag（剥掉注释后找不到「"$bin" -diag」）—— ` +
+      `装前体检不再问「这份包在这台机器上能不能跑」，会退回「装完起不来再让客户猜」。` +
+      `抠到的区块长度=${gate.length}、剥注释后=${gateCode.length}（0 表示连标记都没了，` +
+      `那先修标记：它是本断言唯一的取值来源）。`,
+  );
+  assert.ok(
+    /"\$DIAG_BIN"\s+-diag(?![-\w])/.test(stripComments(doctor)),
+    `scripts/sf-ocr-doctor.sh 里没有真调 $PREFIX/skillforge -diag（剥掉注释后找不到「"$DIAG_BIN" -diag」）` +
+      `—— 故障归因会退化成一堆「看日志猜」，而客户打这条命令要的恰恰是一个结论。`,
+  );
+
+  // ② 反向：不许自己实现基座判据。自己写的那一版永远「看起来更清楚、实际更不准」，
+  //    而且它不准的时候不会报错 —— 只会给出跟 -diag 不一样的结论。
+  const FORKS = [
+    [/GLIBC_[0-9]/, '自己拼 GLIBC_x.y 版本号'],
+    [/getconf\s+GNU_LIBC_VERSION/, '自己读 glibc 版本（getconf）'],
+    [/ldd\s+--version/, '自己读 glibc 版本（ldd）'],
+    [/systemd-run\s+--version/, '自己判 systemd 支不支持沙箱'],
+    [/systemctl\s+--version/, '自己判 systemd 版本'],
+  ];
+  for (const [name, txt] of [
+    ['deploy/offline/install.sh', install],
+    ['scripts/sf-ocr-doctor.sh', doctor],
+  ]) {
+    for (const [re, what] of FORKS) {
+      assert.ok(
+        !re.test(txt),
+        `${name} 里出现了「${what}」（命中 ${re}）—— 基座判据就有了第二份实现，` +
+          `它跟主程序 -diag 的分叉方式是**静默给出不同结论**：` +
+          `装前说没问题、装后说有问题，谁也不知道哪份是对的。` +
+          `要加判定请加在 internal/ocrsvc / internal/tools 里，让 -diag 与 -selftest 一起用。`,
+      );
+    }
+  }
+
+  // ③ 主程序内部同源：-diag 与 -selftest 的沙箱结论必须来自同一个证据函数
+  //    （tools.ProbeSandboxEnv），解析服务结论必须来自同一个包（internal/ocrsvc）。
+  //    只看「两处都有」不看「调的是不是同一个」，等于没守 —— 有人复制一份
+  //    probeSandboxEnv 到 cmd/server 下也能骗过「都有」。
+  const diag = read('cmd/server/diag.go');
+  const self = read('cmd/server/selftest.go');
+  for (const [name, txt] of [['cmd/server/diag.go', diag], ['cmd/server/selftest.go', self]]) {
+    assert.ok(
+      txt.includes('tools.ProbeSandboxEnv'),
+      `${name} 没有用 tools.ProbeSandboxEnv 取沙箱能力 —— 沙箱判据出现了第二份来源，` +
+        `-diag 与装后自检会各自回答「这台机器能不能跑代码」。`,
+    );
+    assert.ok(
+      /ocrsvc\.[A-Z]\w+/.test(txt),
+      `${name} 没有用 internal/ocrsvc 的证据函数 —— 解析服务判据出现第二份来源。`,
+    );
+  }
+});
