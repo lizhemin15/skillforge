@@ -13,7 +13,11 @@
   几何（输入框该占满的位置只剩「发送」按钮那点地儿）：
     G1 胶囊行在 textarea 上方（两行，不同 y）
     G2 胶囊行与 textarea 无水平/垂直重叠
-    G3 textarea 空值高度 ≤ 60px（96px 死区回归防线）
+    G3 textarea 空值高度 = 3 行（85~92px；改前恒定 41px，96 是漏全局 textarea 的指纹）
+    G3c 计算样式 max-height = 240px（上限真在生效，不是死配置）
+    G6 打字即增高（20 行 → 顶到上限 240px，不越界）
+    G7 40 行长素材也不越界（≤ 242px，不把对话区挤没）
+    G8 清空后回落 3 行（不是只涨不落）
     G4 textarea + 发送按钮 ≈ 输入框内宽（空隙只允许内边距+gap ≤ 34px，
        即证明没有别的东西在旁边偷宽度）
     G4b textarea 宽 ≥ 输入框宽 - 90px（历史 bug 时 630/860，这条是「占满」锚点）
@@ -27,6 +31,13 @@
   python3 web/tests/chat_composer_geometry_e2e.py                 # 打 127.0.0.1:8092
   BASE=http://127.0.0.1:9999 python3 web/tests/chat_composer_geometry_e2e.py
   PROMPT='...' python3 web/tests/chat_composer_geometry_e2e.py     # 换提示词
+  INJECT_FLAT=1 ...    # 负向自证：活页面注入 min/max-height:41px（复刻改前的恒定 1 行）
+  SKIP_STREAM=1 ...    # 只跑几何腿（本地静态靶面无后端）；**不构成线上验收**
+
+本地几何对照靶面（线上把 web/ 挂在 /assets/ 前缀，直接 serve web/ 会让 js/css 404，
+量出来的是一堆 fallback 值 —— 靶面没起对时 e2e 会给出「看起来正常」的错数字）：
+  python3 scripts/serve_web_static.py 8123
+  SKIP_STREAM=1 BASE=http://127.0.0.1:8123 python3 web/tests/chat_composer_geometry_e2e.py
 
 SKIP 规则：playwright 不可用 / 页面打不开 → 打 SKIP 并 exit 0。SKIP != PASS。
 
@@ -37,6 +48,17 @@ SKIP 规则：playwright 不可用 / 页面打不开 → 打 SKIP 并 exit 0。S
           （10/11），报的就是预期那条，S2b 仍绿 → 是流式中的落后，不是崩溃红。
   为什么注入后是 81px 而不是历史 994px：无头 Chromium 帧间还能追上一些；真浏览器带
   重渲染时落后更狠。断言有牙齿即可 —— 0 → 81 且必须红，就够了。
+
+实测存证（2026-09-17，输入框高度，用户原话「输入窗口上下太窄了」）：
+  改前线上真值：textarea 恒定 h=41（1 行）—— autoGrow 存在但没接 input 事件，所以
+    「打字变高」这件事根本没发生过；CSS 的 max-height:160px 与 JS 里的 160 都是死代码。
+  改后本地真 Chromium（scripts/serve_web_static.py 8123 照线上 /assets/ 前缀挂载）：
+    几何 11/11 绿 —— 默认 h=88（3 行）、min-height=88px、max-height=240px、
+    20 行顶到 240、40 行不越界、清空回落 88。
+  负向自证（INJECT_FLAT=1 注入 41px）：6/11，G3 / G3c / G6 / G7 / G8 五条精确转红，
+    G1/G2/G4/G4b/G5/S1 仍绿（是断言红了，不是崩溃红），退出码 1。
+  坑（踩过）：① 注入必须放在「量几何」之前，放后面 G3 量的是注入前那一帧 → 假绿；
+  ② G7 只写上界（h ≤ 242）时 41px 也能过 —— 单边上界就是假绿形状，必须双边卡区间。
 """
 # LIVE-LEGS: default
 # ↑ 线上验收 leg 声明（只有一条 leg，不需要额外 env）。枚举规则见
@@ -57,6 +79,12 @@ PROMPT = os.environ.get('PROMPT', (
 # INJECT_SMOOTH=1：活页面注入 scroll-behavior: smooth（复刻历史根因），S2 必须转红。
 # 这是 S2 的负向自证 —— 不注入时绿、注入后必须红，否则断言没有牙齿。
 INJECT_SMOOTH = os.environ.get('INJECT_SMOOTH') == '1'
+# INJECT_FLAT=1：活页面注入 min/max-height:41px !important（复刻改前的「恒定 1 行」），
+# G3/G6/G7 必须转红。这是高度那三条断言的负向自证。
+INJECT_FLAT = os.environ.get('INJECT_FLAT') == '1'
+# SKIP_STREAM=1：只跑几何腿，不跑真流式（本地静态靶面没有后端，发消息必然没正文）。
+# 只用来看「改前/改后」的几何对照；它**不构成**线上验收 —— 线上必须跑全腿。
+SKIP_STREAM = os.environ.get('SKIP_STREAM') == '1'
 
 fails = []
 checks = 0
@@ -93,6 +121,7 @@ GEOM_JS = """() => {
   return {scroll: R(sc), mrow: mrow ? R(mrow) : null, ta: R(ta),
           send: send ? R(send) : null, box: R(box),
           taMinH: getComputedStyle(ta).minHeight,
+          taMaxH: getComputedStyle(ta).maxHeight,
           scrollBehavior: getComputedStyle(sc).scrollBehavior};
 }"""
 
@@ -131,6 +160,11 @@ def main():
                 return 0
             pg.wait_for_selector('.ch-scroll', timeout=10000)
             pg.wait_for_selector('textarea', timeout=10000)
+            if INJECT_FLAT:
+                # 必须在「量几何」之前注入：量之前注入才可能让 G3/G3c 也红。
+                # （反例：注入放在量之后 → G3 量的是注入前那一帧，负向自证变假绿。）
+                pg.add_style_tag(content='.ch-input { min-height: 41px !important; max-height: 41px !important; }')
+                print('已注入 min/max-height:41px（负向自证模式：G3/G3c/G6/G7/G8 应当转红）')
             return run_checks(pg)
         finally:
             br.close()
@@ -152,7 +186,33 @@ def run_checks(pg):
         oy = min(ta['y'] + ta['h'], mrow['y'] + mrow['h']) - max(ta['y'], mrow['y'])
         check('G2 胶囊行与 textarea 无重叠（胶囊不挤占输入区）',
               not (ox > 0 and oy > 0), f'重叠 {ox}x{oy}px')
-    check('G3 空输入框高度 ≤ 60px（96px 死区回归防线）', ta['h'] <= 60, f"h={ta['h']}")
+    # 20260917 用户原话「输入窗口上下太窄了」。改前线上实测：恒定 41px（1 行）——
+    # 因为 autoGrow 存在但没接 input 事件（静态单测 C 段钉这条）。3 行 88px 是本次目标值。
+    # 96px 是「.ch-input 自己没声明 min-height、被全局 textarea 规则穿透」的指纹，
+    # 所以下限卡在 85（也就是 96 落不进这个区间）。
+    check('G3 textarea 默认高度 = 3 行（85~92px；改前恒定 41px，96 是漏全局的指纹）',
+          85 <= ta['h'] <= 92, f"h={ta['h']}（41=改前，96=漏全局）")
+    check('G3c 计算样式 max-height = 240px（上限真在生效，不是死配置）',
+          g['taMaxH'] == '240px', f"实际={g['taMaxH']}")
+
+    # 打字即增高：真输入事件驱动，量的是真实布局（改前 fill 完 20 行也还是 41px）。
+    n_lines = 20
+    pg.fill('textarea', '\n'.join(f'第 {i} 行长素材，用来把输入框顶到上限看看会不会越界' for i in range(1, n_lines + 1)))
+    pg.wait_for_timeout(250)
+    h20 = pg.evaluate("() => Math.round(document.querySelector('.ch-input').getBoundingClientRect().height)")
+    check(f'G6 打字即增高（{n_lines} 行 → 顶到上限 240px，且不越界）',
+          230 <= h20 <= 242, f'h={h20}（改前无论多少行都是 41）')
+
+    pg.fill('textarea', '\n'.join(f'第 {i} 行' for i in range(1, 41)))
+    pg.wait_for_timeout(250)
+    h40 = pg.evaluate("() => Math.round(document.querySelector('.ch-input').getBoundingClientRect().height)")
+    # 双边卡：只写上界（h ≤ 242）时 41px 也能过 —— 那是假绿形状，改坏成 1 行它照样绿。
+    check('G7 40 行长素材顶到上限且不越界（230~242px）', 230 <= h40 <= 242,
+          f'h={h40}（改前无论多少行都是 41）')
+    pg.fill('textarea', '')
+    pg.wait_for_timeout(250)
+    h0 = pg.evaluate("() => Math.round(document.querySelector('.ch-input').getBoundingClientRect().height)")
+    check('G8 清空后回落 3 行（不是只涨不落）', 85 <= h0 <= 92, f'h={h0}')
     slack = box['w'] - ta['w'] - (send['w'] if send else 0)
     check('G4 textarea + 发送按钮 ≈ 输入框内宽（没别的东西在旁边偷宽度，空隙 ≤34px）',
           slack <= 34, f"box.w={box['w']} ta.w={ta['w']} send.w={send and send['w']} 空隙={slack}")
@@ -162,6 +222,10 @@ def run_checks(pg):
           0 <= ta['x'] - box['x'] <= 14, f"内缩={ta['x'] - box['x']}px")
     check('S1 .ch-scroll 计算样式 scroll-behavior == auto（smooth 是根因）',
           g['scrollBehavior'] == 'auto', f"实际={g['scrollBehavior']}")
+
+    if SKIP_STREAM:
+        print('SKIP_STREAM=1 → 只评几何腿（本地静态靶面无后端），不构成线上验收')
+        return report()
 
     # —— 真流式（必须真撑破容器才算测到） ——
     if INJECT_SMOOTH:

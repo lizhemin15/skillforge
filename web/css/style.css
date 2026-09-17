@@ -923,7 +923,7 @@ select.ch-field-ctl { appearance: none; }
 .ch-skill-pill span { font-family: var(--mono); color: var(--text); }
 .ch-input {
   flex: 1; min-width: 0; resize: none; border: none; outline: none; background: transparent;
-  color: var(--text); font: inherit; font-size: 14.5px; line-height: 1.6; max-height: 160px;
+  color: var(--text); font: inherit; font-size: 14.5px; line-height: 1.6; max-height: 240px;
 }
 .ch-input::placeholder { color: var(--text-faint); }
 .ch-send {
@@ -1855,9 +1855,17 @@ header.topbar {
    ① 胶囊独占一行：原来 `.ch-switch` 与 `textarea` 同行（`flex:none`，宽 166px），
       textarea 要到框内 x≈518 才开始 —— 左边被占 176px、宽度只剩 630/860。
       现在 `.ch-mrow` 是 `flex: 0 0 100%` 的整行，textarea 从框的左内边距起算。
-   ② `.ch-input` 必须显式 `min-height: 0`：本表顶部有一条**给 admin 表单用的全局**
-      `textarea { min-height: 96px }`（元素选择器），`.ch-input` 不写就会被它漏进来
-      —— 空输入框 96px 高、中间一大片摸不到的死区（实测 offsetHeight 96 vs 正文 23）。
+   ② `.ch-input` 的高度是**刻意选的 3 行**（20260917 用户原话：「输入窗口请大一些，
+      目前上下太窄了」）。改前实测真实几何：空框 offsetHeight **41px**
+      （= 1 行 23.2 + 上下 padding 18），而且**打字根本不涨** —— `autoGrow()` 只挂在
+      init / 清空 / 点推荐词三处，「输入」事件压根没接：灌 20 行文字后高度仍是 41px
+      （浏览器实测），所以那两条 `max-height: 160px` 一直是死配置。
+      现在定：默认 3 行（= 3×23.2 + padding 18 ≈ 87.6 → 取 88px）、上限 240px、
+      打字实时增高（JS 见 js/chat.js 的 composer:grow 段，上限从本表的 max-height 读，
+      不另写一个数 —— 两处写死必漂）。
+      为什么是 88px 而不是全局那条的 96px：96px 是 admin 表单规则的**泄漏值**，
+      换一个不同的数（88）才能让几何断言用**值**区分「刻意选了 3 行」和
+      「全局规则又漏回来了」—— 96px 落在断言带 [85,92] 外，会直接红。
    ③ `.ch-scroll` 的 scroll-behavior 必须是 auto（原因见文件顶部 `.ch-scroll` 处注释）。
 
    ⚠️ 这块必须留在**文件末尾**：本表同名规则多处覆盖，写在前面会被后面的规则翻掉
@@ -1865,5 +1873,5 @@ header.topbar {
    ============================================================ */
 .ch-mrow { flex: 0 0 100%; display: flex; align-items: center; padding-bottom: 4px; }
 .ch-mrow .ch-switch { align-self: auto; margin-bottom: 0; }
-.ch-input { min-height: 0; }
+.ch-input { min-height: 88px; }
 .ch-scroll { scroll-behavior: auto; }

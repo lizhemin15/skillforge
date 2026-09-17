@@ -338,6 +338,9 @@
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
     });
+    // 打字即增高。改前这里没有 input 监听：autoGrow 只挂在 init / 清空 / 点推荐词三处，
+    // 于是输入框永远钉在 41px（1 行），灌 20 行字也不涨 —— 用户抱怨的「上下太窄」就是这个。
+    input.addEventListener('input', autoGrow);
     send.addEventListener('click', submit);
     window.addEventListener('resize', keepBottom);
     window.addEventListener('storage', (e) => {
@@ -612,10 +615,17 @@
   }
 
   function setInput(t) { input.value = t; autoGrow(); }
+  // --- composer:grow-begin（测试按标记切片抽取这段来跑，勿删；chat_composer.test.mjs 靠它盯「打字不涨」）
+  // 高度：下限由 CSS 的 min-height（3 行 = 88px）定，上限也由 CSS 的 max-height（240px）定。
+  // 这里**不另写一个数**：JS 里写死 240 而 CSS 里 160，就会出现「涨到 240 却只显示 160」
+  // 这种两处漂移，所以上限每次都从计算样式读回来。
   function autoGrow() {
-    input.style.height = 'auto';
-    input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+    input.style.height = 'auto';   // 必须先归零：不归零的话 scrollHeight 被当前高度锁住，只降不升
+    const cs = getComputedStyle(input);
+    const cap = parseFloat(cs.maxHeight);
+    input.style.height = Math.min(input.scrollHeight, isNaN(cap) ? Infinity : cap) + 'px';
   }
+  // --- composer:grow-end
 
   /* ---------- DOM helpers ---------- */
   function addUser(text) {

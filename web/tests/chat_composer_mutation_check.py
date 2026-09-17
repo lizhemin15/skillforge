@@ -72,9 +72,11 @@ INJECTIONS = [
      '          <button type="button" class="ch-switch-opt" id="mode-manual" data-mode="manual" role="tab" aria-selected="false">指定技能</button>\n'
      '        </div>\n',
      '直系子元素'),
-    # ④ 全局 textarea{min-height:96px} 重新漏回输入框（空框 96px 高的大死区）。
-    ('4) .ch-input 不再显式 min-height:0（吃全局 textarea 的 96px）',
-     CSS, '.ch-input { min-height: 0; }\n', '', 'min-height'),
+    # ④ 全局 textarea{min-height:96px} 重新漏回输入框。
+    #    改前 .ch-input 显式写 min-height:0（为了压掉全局 96）；20260917 起改成显式 3 行 88px。
+    #    删掉这条声明 → 有效值落回全局 96 → 默认高度漂到「4 行多一点」，正好被 88±3 的容差逮住。
+    ('4) .ch-input 不再显式声明 min-height（吃全局 textarea 的 96px，默认高度漂成 96）',
+     CSS, '.ch-input { min-height: 88px; }\n', '', '默认高度 = 3 行'),
     # ⑤ textarea 不再占满剩余宽度。
     ('5) .ch-input 退回 flex:none（不再占满剩余宽度）',
      CSS, '  flex: 1; min-width: 0; resize: none;', '  flex: none; min-width: 0; resize: none;', '撑满'),
@@ -104,6 +106,31 @@ INJECTIONS = [
     #    没有这条，删掉标记 + 删掉补帧可以同时全绿。
     ('9) 删掉 composer:stick-begin 标记（B 段会静默跳过 → 必须自己报红）',
      JS, '  // --- composer:stick-begin', '  // ', '切到 keepBottom'),
+
+    # —— C 段：高度（默认 3 行 / 上限 / 打字即增高）——
+    # ⑩ ★ 回滚本次修复的根因：JS 里又把上限写死成 160（改前的样子）。
+    #    这等价于「CSS 说 240、JS 只给 160」的两处漂移，正是要防的那类 bug。
+    ('10) autoGrow 上限写死回 160（不再从 CSS 读 → 涨到 240 却只显示 160）',
+     JS,
+     "    const cs = getComputedStyle(input);\n"
+     "    const cap = parseFloat(cs.maxHeight);\n"
+     "    input.style.height = Math.min(input.scrollHeight, isNaN(cap) ? Infinity : cap) + 'px';\n",
+     "    input.style.height = Math.min(input.scrollHeight, 160) + 'px';\n",
+     '被上限夹住'),
+    # ⑪ ★ 回滚最核心那条故障：autoGrow 没接 input 事件 → 打字永远不涨（改前恒定 41px）。
+    ('11) 删掉 input → autoGrow 的接线（打字不再增高，= 改前的真实故障）',
+     JS, '    input.addEventListener(\'input\', autoGrow);\n', '', '已挂到 input 事件'),
+    # ⑫ 去掉「先归零」：内容变短后回不去（框被永久撑在上限上）。
+    ('12) autoGrow 不再先把高度归零（内容删掉后回不落）',
+     JS, "    input.style.height = 'auto';   // 必须先归零：不归零的话 scrollHeight 被当前高度锁住，只降不升\n",
+     '', '能回落'),
+    # ⑬ CSS 上限被砍回 160（改前的死配置）——A 段必须逮住。
+    ('13) CSS .ch-input 上限砍回 160px（长素材只多显示 3 行）',
+     CSS, 'font-size: 14.5px; line-height: 1.6; max-height: 240px;',
+     'font-size: 14.5px; line-height: 1.6; max-height: 160px;', '上限 240px'),
+    # ⑭ HTML 行数退回 1（首屏兜底又变窄）。
+    ('14) index.html rows 退回 1（首屏兜底窄回去）',
+     HTML, 'id="chat-input" class="ch-input" rows="3"', 'id="chat-input" class="ch-input" rows="1"', 'rows ≥ 3'),
 ]
 
 bad = 0

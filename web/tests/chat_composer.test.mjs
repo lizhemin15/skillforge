@@ -211,13 +211,29 @@ const chInput = mergedDecls(CSS, '.ch-input', vars);
 check('.ch-input 撑满剩余宽度（flex: 1）', (chInput['flex'] || '').trim() === '1', `flex=${chInput['flex']}`);
 check('.ch-input 允许收缩（min-width: 0）', (chInput['min-width'] || '').trim() === '0', `min-width=${chInput['min-width']}`);
 
-// min-height：全局 `textarea { min-height: 96px }` 是元素选择器，会漏进 .ch-input。
-// 这里比的是**有效值**（类选择器覆盖元素选择器），不是「那条全局规则还在不在」。
+// min-height：这里是**刻意选的 3 行**，不是随手一个数。
+// 20260917 用户原话「skillforge 主聊天界面的输入窗口请大一些，目前上下太窄了」。
+// 改前线上实测：恒定 41px（1 行），而且打字根本不涨 —— 根因是 autoGrow 没接 input 事件（见 C 段）。
+// 3 行 = line-height 23.2 × 3 + 上下 padding 18 ≈ 87.6 → 取 88。
 const globalTa = mergedDecls(CSS, 'textarea', vars);
-const effMinH = chInput['min-height'] !== undefined ? chInput['min-height'] : globalTa['min-height'];
-check('.ch-input 生效的 min-height 是 0（只有自己定死，才不吃全局 textarea 的 96px）',
-  effMinH !== undefined && parseFloat(effMinH) === 0,
-  `有效值=${effMinH}（.ch-input=${chInput['min-height']}，全局 textarea=${globalTa['min-height']}）`);
+// 全局那条 `textarea { min-height: 96px }` 是元素选择器，会漏进 .ch-input。
+// 「96」正是**没自己声明、被全局穿透**的指纹值，所以下面拿它当参照，而不是当目标。
+check('全局 textarea 的 min-height 仍是 96px（「96 = 泄漏指纹」这句话得站得住）',
+  parseFloat(globalTa['min-height']) === 96, `全局 textarea min-height=${globalTa['min-height']}`);
+check('.ch-input 自己声明了 min-height（不吃全局 textarea 的 min-height）',
+  chInput['min-height'] !== undefined,
+  `.ch-input 没声明 → 有效值会落到全局 textarea 的 ${globalTa['min-height']}`);
+const chMinH = parseFloat(chInput['min-height'] || '');
+check('.ch-input 默认高度 = 3 行（88px，容差 ±3 吃字体差异）',
+  !isNaN(chMinH) && chMinH >= 85 && chMinH <= 91,
+  `实际 ${chInput['min-height']}（全局 textarea=${globalTa['min-height']}；96 落在容差外，就是「又漏回全局」）`);
+// 上限：改前是 160px（而且因为没接 input 事件，一直是死配置）。
+// 240 = 默认 3 行的近 3 倍，长素材贴进来时能多显示 ~7 行，又不至于把对话区挤没。
+const chMaxH = parseFloat(chInput['max-height'] || '');
+check('.ch-input 上限 240px（长内容最多涨到这里，不再把对话区挤没）',
+  chMaxH === 240, `实际 max-height=${chInput['max-height']}`);
+check('上限确实大于默认值（否则「能涨」这件事本身不成立）',
+  chMaxH > chMinH, `max-height=${chMaxH} vs min-height=${chMinH}`);
 
 // 结构：直系子元素顺序必须是「胶囊行 → textarea → 发送键」
 const boxInner = innerOf(html, 'class="ch-input-box"');
@@ -230,6 +246,16 @@ check('.ch-input-box 的直系子元素是「胶囊行 → textarea#chat-input �
     kids[1].tag === 'textarea' && hasAttr(kids[1].attrs, 'id="chat-input"') &&
     kids[2].tag === 'button',
   kids.map(desc).join(' → '));
+
+// HTML 侧兜底：rows 是「CSS/JS 都还没生效」时的高度（首屏闪一下、打印、JS 被拦）。
+// CSS 的 min-height 才是主力，但两处都写 3 行，才不会出现「首屏先窄一下再跳高」。
+const taRows = (() => {
+  const t = kids.find((c) => c.tag === 'textarea');
+  const m = t && /(?:^|\s)rows\s*=\s*"?(\d+)"?/.exec(t.attrs);
+  return m ? parseInt(m[1], 10) : null;
+})();
+check('index.html 的 textarea rows ≥ 3（首屏兜底也跟着变高）', taRows !== null && taRows >= 3,
+  `rows=${taRows}`);
 
 const mrowInner = innerOf(html, 'class="ch-mrow"');
 check('胶囊 #ch-switch 在 .ch-mrow 里（不是 .ch-input-box 的直系子元素，不占 input 的行）',
@@ -303,8 +329,72 @@ if (!stickSrc) {
     !threw && h4.scroll.scrollTop === 1000, `threw=${threw} scrollTop=${h4.scroll.scrollTop}`);
 }
 
-// ---------- C. 断言自证：别骑在空集 / 空切片上 ----------
-console.log('C. 自证（解析器与切片本身有效，断言不是恒真）');
+// ---------- C. 高度：默认 3 行，且有上限；打字要实时增高 ----------
+console.log('C. 高度：default 3 行 / 上限 240px / 打字实时增高');
+
+// 这里测的是「输入框会长高」这件事本身。改前它是不可能成立的：
+// autoGrow 存在、逻辑也对，但只在 init / 清空 / 点推荐词三处被调用，
+// 没有任何 input 事件监听 —— 于是无论打多少字，高度都是 41px。
+const GBEGIN = '// --- composer:grow-begin';
+const GEND = '// --- composer:grow-end';
+const growSrc = (() => {
+  const a = CHAT_JS.indexOf(GBEGIN), b = CHAT_JS.indexOf(GEND);
+  return a < 0 || b <= a ? null : CHAT_JS.slice(a, b);
+})();
+
+check('能从 chat.js 切到 autoGrow 的实现（composer:grow-begin/end 标记还在）', !!growSrc,
+  '标记被删 → 下面整段会静默跳过，那才是真的失去防线');
+
+if (growSrc) {
+  // 假元素：模仿真浏览器的 scrollHeight 语义 —— 元素已有固定高度时，
+  // scrollHeight 只会 ≥ 这个高度（内容变短也读不回小值）。这正是「不先归零就只会涨不会落」的由来。
+  function fakeInput(realScroll) {
+    const el = { style: {}, _real: realScroll, cs: { maxHeight: '240px' } };
+    Object.defineProperty(el, 'scrollHeight', {
+      get() {
+        const fixed = parseFloat(el.style.height);
+        return isNaN(fixed) ? el._real : Math.max(el._real, fixed);
+      },
+    });
+    return el;
+  }
+  const mk = (el) => new Function('input', 'getComputedStyle',
+    `"use strict";\n${growSrc}\nreturn autoGrow;`)(el, () => el.cs);
+
+  const e1 = fakeInput(41);        // 空框：一行
+  mk(e1)();
+  check('一行内容时高度 = 内容高（不被 min-height 之外的数夹住）', e1.style.height === '41px',
+    `style.height=${e1.style.height}`);
+
+  const e2 = fakeInput(900);       // 20 行长素材
+  mk(e2)();
+  check('长内容按内容高算，但被上限夹住（900 → 240）', e2.style.height === '240px',
+    `style.height=${e2.style.height}`);
+
+  // 关键：上限必须来自 CSS，而不是 JS 里另写一个数。
+  // 改前 JS 写死 160 而 CSS 是 160，看起来一致，但只要有人只改一处就会「涨到 240 却只显示 160」。
+  const e3 = fakeInput(900);
+  e3.cs.maxHeight = '160px';
+  mk(e3)();
+  check('上限是从 CSS 读回来的（CSS 说 160 就夹到 160；写死在 JS 里这条会红）',
+    e3.style.height === '160px', `style.height=${e3.style.height}（CSS max-height=${e3.cs.maxHeight}）`);
+
+  const e4 = fakeInput(900);
+  const grow4 = mk(e4);
+  grow4();
+  e4._real = 41;                   // 内容删空
+  grow4();
+  check('内容变短后能回落（否则「先贴长素材再删」会把框永久撑在上限上）',
+    e4.style.height === '41px', `style.height=${e4.style.height}（先 240，删空后应回 41）`);
+}
+
+// 光有实现没用：必须真的挂到输入事件上，否则又是死代码（改前就是）。
+check('autoGrow 已挂到 input 事件（改前只在 init/清空/推荐词三处调用 → 打字不涨）',
+  /input\.addEventListener\(\s*['"]input['"]\s*,\s*autoGrow\s*\)/.test(CHAT_JS),
+  'chat.js 里没有 input → autoGrow 的接线');
+
+// ---------- D. 断言自证：别骑在空集 / 空切片上 ----------
+console.log('D. 自证（解析器与切片本身有效，断言不是恒真）');
 
 check('切片非空且含 scrollTop 赋值', !!stickSrc && stickSrc.includes('scrollTop'),
   `切片长度=${stickSrc ? stickSrc.length : 0}`);
