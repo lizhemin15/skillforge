@@ -8,9 +8,41 @@ permissions:
   contents: write
 
 jobs:
+  # 先把发布点占住（草稿态），后面各矩阵任务**直接**往这个 Release 传资产。
+  #
+  # 为什么不走 actions/upload-artifact 中转（原来就是那么写的）：
+  # Actions 的 artifact 存储有配额，用满之后的报错是
+  #   `Failed to CreateArtifact: Artifact storage quota has been hit`，
+  # 而这个计数**每 6~12 小时才重算一次** —— 清了旧 artifact 也照样传不上去，
+  # 只能干等。2026-09-17 就是这样卡住的：门店里 400+ 个历史 artifact 堆到 8.9 GB
+  # （离线包单个 185 MB，每轮 Release 都要 stage ~300 MB），配额一爆，**发布链路整条
+  # 停摆**，而且停的原因跟代码毫无关系。Release 的资产存储不占这块配额，所以：
+  # 编译产物直接进 Release（草稿），中间的转发环节整个去掉 —— 顺带也少传一遍 300 MB。
+  draft:
+    name: 建草稿 Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: 建草稿（占住发布点，避免各矩阵任务抢着建）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # 预发布判定与旧流程保持一致（tag 里带 `-` 视为预发布，例如 v260917.1915-rc1）。
+          EXTRA=()
+          [[ "$TAG" == *-* ]] && EXTRA+=(--prerelease)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在（重跑场景），继续沿用。"
+          else
+            gh release create "$TAG" --draft --title "$TAG" --generate-notes "${EXTRA[@]}"
+            echo "已建草稿 Release $TAG。"
+          fi
+
   # 裸二进制：给「我自己会部署」的用户（有 Go 或有自己的一套流程）。
   goreleaser-simple:
     name: 交叉编译并发布
+    needs: [draft]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -64,19 +96,21 @@ jobs:
           sha256sum "$out" > "$out.sha256"
           ls -lh "$out"
 
-      - name: 上传产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: skillforge-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: |
-            skillforge-*
-          if-no-files-found: error
-          retention-days: 7
+      - name: 上传产物（直接进 Release，不经 artifact 存储）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # --clobber：重跑同一 tag 时覆盖同名资产，不然会因「已存在」失败。
+          gh release upload "${GITHUB_REF_NAME}" skillforge-* --clobber
+          echo "已上传：$(ls skillforge-*)"
 
   # 离线一键安装包：给「拷到内网机器上一条命令装完」的用户。
   # 只做 linux（离线包的目标就是 Linux 服务器），带中文字体、许可证和安装脚本。
   offline-bundle:
     name: 离线安装包（linux/${{ matrix.goarch }}）
+    needs: [draft]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -307,46 +341,53 @@ jobs:
 
           echo "验货通过"
 
-      - name: 上传离线包
-        uses: actions/upload-artifact@v4
-        with:
-          name: skillforge-offline-linux-${{ matrix.goarch }}
-          path: |
-            dist/skillforge-offline-*.tar.gz
-            dist/skillforge-offline-*.tar.gz.sha256
-          if-no-files-found: error
-          retention-days: 7
+      - name: 上传离线包（直接进 Release，不经 artifact 存储）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release upload "${GITHUB_REF_NAME}" \
+            dist/skillforge-offline-*.tar.gz dist/skillforge-offline-*.tar.gz.sha256 --clobber
+          echo "已上传：$(ls dist/skillforge-offline-*)"
 
   release:
-    name: 创建 GitHub Release
+    name: 校验资产并去草稿
     needs: [goreleaser-simple, offline-bundle]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: 下载全部产物
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: 列出产物
-        run: ls -lh dist
-
-      # Release 是给人下载的，发布前再确认一次「离线包在里面」，免得链接发出去了才发现没附上。
-      - name: 确认离线包已附
+      # Release 是给人下载的，对外可见前再确认一次「该有的资产都在」，免得链接发出去了
+      # 才发现没附上。判据没变（原来查 dist/ 里的文件），只是资产现在直接在 Release 上，
+      # 所以改成查资产列表 —— 反而更直接：查的就是客户能看到的那份清单。
+      - name: 确认资产齐全
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          gh release view "$TAG" --json assets --jq '.assets[].name' | sort > /tmp/assets.txt
+          echo "── 当前资产 ──"
+          cat /tmp/assets.txt
+
+          # 离线包：两个架构的 tar.gz **和它的 .sha256** 都必须在（客户是拿着 .sha256 验货的）。
+          # 用 grep -x 整行锚定，不用裸子串：`…linux-amd64.sha256` 会命中 `…linux-amd64`。
           for a in amd64 arm64; do
-            ls dist/skillforge-offline-*-linux-$a.tar.gz >/dev/null \
+            grep -qx "skillforge-offline-${TAG}-linux-$a.tar.gz" /tmp/assets.txt \
               || { echo "::error::Release 缺少 linux/$a 的离线包"; exit 1; }
+            grep -qx "skillforge-offline-${TAG}-linux-$a.tar.gz.sha256" /tmp/assets.txt \
+              || { echo "::error::Release 缺少 linux/$a 离线包的 .sha256"; exit 1; }
           done
 
-      - name: 生成 Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          # 裸二进制：五个平台一个都不能少（缺了 platforms 那栏的下载链接就会指向 404）。
+          for p in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64.exe; do
+            grep -qx "skillforge-${TAG}-${p}" /tmp/assets.txt \
+              || { echo "::error::Release 缺少裸二进制 $p"; exit 1; }
+          done
+          echo "资产齐全 ✓"
+
+      - name: 去草稿（到此才对客户可见）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "${GITHUB_REF_NAME}" --draft=false

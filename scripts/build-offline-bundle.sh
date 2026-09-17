@@ -15,7 +15,7 @@
 # 取便携运行时：scripts/fetch-python-runtime.sh --arch amd64 --outdir /tmp
 # CI 里由 .github/workflows/release.yml 调用，逐架构产出并附到 Release。
 #
-# 输出：dist/skillforge-<version>-offline-linux-<arch>.tar.gz（含同名 .sha256）
+# 输出：dist/skillforge-offline-<version>-linux-<arch>.tar.gz（含同名 .sha256）
 #
 # 设计要点：
 #   - **确定性**：固定 mtime、固定属主、按名字排序打包、gzip -n，同样的输入产出同样的字节
