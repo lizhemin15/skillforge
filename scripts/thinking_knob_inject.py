@@ -85,8 +85,11 @@ MUTATIONS = [
     ),
     (
         "M4 思考链漏进正文", "internal/llm/stream.go",
-        '\t\t\tif r := ch.Delta.ReasoningContent; r != "" && o.OnReasoning != nil {\n\t\t\t\to.OnReasoning(r)\n\t\t\t}',
-        '\t\t\tif r := ch.Delta.ReasoningContent; r != "" {\n\t\t\t\tsb.WriteString(r) // 注入：思考链混进正文\n\t\t\t}',
+        # 锚点跟着实现走：加了空正文守卫（reasonChunks 计数）之后，
+        # 原来那句 `r != "" && o.OnReasoning != nil` 已经不存在了。
+        # 脚本故意「锚点找不到就判失败」——它替我们发现了这次漂移，别把这条判据删了。
+        '\t\t\tif r := ch.Delta.ReasoningContent; r != "" {\n\t\t\t\treasonChunks++\n\t\t\t\tif o.OnReasoning != nil {\n\t\t\t\t\to.OnReasoning(r)\n\t\t\t\t}\n\t\t\t}',
+        '\t\t\tif r := ch.Delta.ReasoningContent; r != "" {\n\t\t\t\treasonChunks++\n\t\t\t\tsb.WriteString(r) // 注入：思考链混进正文\n\t\t\t\tif o.OnReasoning != nil {\n\t\t\t\t\to.OnReasoning(r)\n\t\t\t\t}\n\t\t\t}',
         [GO_MARK, "test", "-v", "./internal/llm/", "-run", "TestStreamChatSeparates", "-count=1"],
         "TestStreamChatSeparatesReasoningFromContent",
         "思考链混进正文 → 用户看到一大段自我嘀咕被当成答案写进稿子。",

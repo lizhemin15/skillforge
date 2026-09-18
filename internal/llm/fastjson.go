@@ -99,9 +99,20 @@ const (
 	knobEffortOnly
 )
 
-// errEmptyContent 是「200 但 content 空」的哨兵错误。调用方要能把它和
-// 「超时」「连不上」「格式坏」区分开：前者的修法是放大预算，后者不是。
-var errEmptyContent = errors.New("LLM 返回空 content")
+// ErrEmptyContent 是「HTTP 200 但 content 空」的哨兵错误。调用方要能把它和
+// 「超时」「连不上」「格式坏」区分开：前者的修法是放大预算重试，后者不是。
+//
+// 导出给上层包用：skillgen 拿到空正文时，必须报「模型没干活」，
+// 而不是把空串丢给 json.Unmarshal —— 那样用户看到的是
+// 「step2 元数据 模型输出不是合法json unexpected end of json input 原文=<<>>」，
+// 一句正确的废话，既指不出原因也给不出修法。
+var ErrEmptyContent = errors.New("LLM 返回空 content")
+
+// errEmptyContent 是包内旧名，保留（fastjson 的重试判据与既有测试引用它）。
+var errEmptyContent = ErrEmptyContent
+
+// IsEmptyContent 让上层包也能认这个哨兵。nil 安全：错误链里没有就返回 false。
+func IsEmptyContent(err error) bool { return err != nil && errors.Is(err, ErrEmptyContent) }
 
 // fastOnce 发一次请求。knob 决定带哪些关思考链的开关。
 func (c *Client) fastOnce(ctx context.Context, system, user string, maxTokens int, knob thinkKnob) (string, int, error) {

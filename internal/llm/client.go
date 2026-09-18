@@ -167,7 +167,24 @@ func (c *Client) Chat(ctx context.Context, sys, user string, jsonMode ...bool) (
 		// 空 choices 在实践中同样出现在上游过载时，按瞬时处理。
 		return "", &TransientError{Err: fmt.Errorf("LLM returned no choices")}
 	}
-	return resp.Choices[0].Message.Content, nil
+	content := resp.Choices[0].Message.Content
+	if strings.TrimSpace(content) == "" {
+		// 「200 但没有正文」必须是一个能判定的身份（ErrEmptyContent），不能是空串：
+		// 调用方把它当正常结果往下走，就会在 json.Unmarshal 那里炸成
+		// 「unexpected end of json input 原文=<<>>」，把真因（模型没干活）说成了格式问题。
+		// reasoning_tokens 一起报出来：它 ≈ completion_tokens 就是「思考链吃光预算」的指纹。
+		return "", fmt.Errorf("%w（非流式：completion_tokens=%d，reasoning_tokens=%d，多半是思考链吃掉了 max_tokens）",
+			ErrEmptyContent, resp.Usage.CompletionTokens, reasoningTokensOf(resp.Usage))
+	}
+	return content, nil
+}
+
+// reasoningTokensOf：provider 不一定报 completion_tokens_details，指针要做空值保护。
+func reasoningTokensOf(u openai.Usage) int {
+	if u.CompletionTokensDetails == nil {
+		return 0
+	}
+	return u.CompletionTokensDetails.ReasoningTokens
 }
 
 // Config returns the underlying LLM config (for display). nil 接收者返回 nil，

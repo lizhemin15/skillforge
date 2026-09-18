@@ -88,14 +88,60 @@ func (g *Generator) chatWithMaterial(ctx context.Context, sys, user string, json
 		DisableThinking: thinkingOff(ctx),
 		OnReasoning:     func(s string) { sink(MaterialThink, s) },
 		OnContent:       func(s string) { sink(MaterialText, s) },
+		OnNote:          func(s string) { sink(MaterialNote, s) },
 	})
 	if err != nil {
 		// 流式失败不能把这一阶段整个干掉：退回阻塞调用重来一次，并把原因当材料吐出来。
 		// 不给旁白的话，用户看到的是「材料忽然没了」，比从来没流过还费解。
-		sink(MaterialNote, "（流式中断，回退阻塞调用："+err.Error()+"）")
-		return g.llm.Chat(ctx, sys, user, jsonMode...)
+		//
+		// 旁白要区分两种失败：空正文是「模型没干活」，值得换通道再问一次；
+		// 其他（网关 502、超时）是「路断了」，说成空正文会把运维引到错的排查方向。
+		if llm.IsEmptyContent(err) {
+			sink(MaterialNote, "（这一轮模型只回了思考过程、没有正文，换非流式通道再问一次）")
+		} else {
+			sink(MaterialNote, "（流式中断，回退阻塞调用："+err.Error()+"）")
+		}
+		alt, altErr := g.llm.Chat(ctx, sys, user, jsonMode...)
+		// 非流式通道也给空 → 两条通道都试过了，这时候能给的只有「你自己动手」的话：
+		// 直接把哨兵抛出去，用户看到的是「LLM 返回空 content」，仍然不知道该改什么。
+		if llm.IsEmptyContent(altErr) || (altErr == nil && strings.TrimSpace(alt) == "") {
+			return "", errors.New(emptyReplyHint + emptyErrDetail(altErr))
+		}
+		return alt, altErr
+	}
+	if strings.TrimSpace(out) == "" {
+		// 正常到不了这里：StreamChat 现在把「200 但正文空」当错误返回（哨兵 ErrEmptyContent），
+		// 会在上面那段回退处理掉。留着这一道，是防「同一个坑换个入口再踩一次」——
+		// 任何一条流式实现只要把空串当成功返回，下游 json.Unmarshal 就会炸成
+		// 「unexpected end of json input 原文=<<>>」，把「模型没干活」说成「格式不对」。
+		// 材料流里也要有旁白：用户盯着计时器时，得知道这一轮为什么白等了。
+		sink(MaterialNote, "（这一轮模型没吐出正文，只回了思考过程，换非流式通道再问一次）")
+		alt, altErr := g.llm.Chat(ctx, sys, user, jsonMode...)
+		if altErr == nil && strings.TrimSpace(alt) != "" {
+			return alt, nil
+		}
+		if altErr != nil && !llm.IsEmptyContent(altErr) {
+			return "", altErr
+		}
+		return "", errors.New(emptyReplyHint + emptyErrDetail(altErr))
 	}
 	return out, nil
+}
+
+// emptyReplyHint 是「模型两次都只回思考过程」时给用户看的话。
+// 必须带上修法：这属于 provider/模型配置问题，用户自己改不了提示词就能修。
+const emptyReplyHint = "模型连续两次都只回了思考过程、没有正文（流式与非流式通道都试过）。" +
+	"多半是当前模型是推理模型，而 provider 没有认关思考链的开关，把输出预算全花在思考上。" +
+	"可到管理端「LLM 服务」换一个非推理模型，或调大输出上限后重试。"
+
+// emptyErrDetail 把底层报错附在提示后面（可能是 nil，那就什么都不附）。
+// 附上去是为了让运维看到 reasoning_tokens 这类指纹——用户看到的那句话要能动手，
+// 运维看到的那句话要能定位，两者不冲突。
+func emptyErrDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	return "（底层报错：" + err.Error() + "）"
 }
 
 // Generator is the "skill-generator" (女娲) pipeline: it ingests reference
@@ -995,6 +1041,12 @@ func looksLikeArticle(s string) bool {
 //
 // 完全看不出模型把哪里写坏了。这里把原文（rune 安全截断）一起回带出来。
 func jsonErrDetail(step, raw string, err error) error {
+	if strings.TrimSpace(raw) == "" {
+		// 空串交给 json.Unmarshal 只会吐出「unexpected end of json input 原文=<<>>」——
+		// 一句正确的废话：它把「模型没干活」说成了「格式不对」，用户拿着这句话
+		// 既不知道发生了什么，也不知道该改什么。线下实测就是这么误报的。
+		return fmt.Errorf("%s：模型这一轮返回了空正文，没有任何内容可解析（不是格式问题，是模型没干活）", step)
+	}
 	return fmt.Errorf("%s：模型输出不是合法 JSON：%w；原文=<<%s>>", step, err, snippet(raw, 400))
 }
 

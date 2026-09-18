@@ -38,6 +38,12 @@ type StreamOpts struct {
 	OnReasoning func(string)
 	// OnContent 收正文片段。可为 nil。
 	OnContent func(string)
+	// OnNote 收「调用方该知道的旁白」（重试、降级、放大预算…）。可为 nil。
+	//
+	// 单独一个回调而不是混进 OnReasoning：思考链是模型说的话，旁白是流水线自己
+	// 说的话，前端按类别分开显示（skillgen 的 MaterialThink / MaterialNote）。
+	// 混在一起的话，用户会把「系统正在重试」误读成模型想到了重试这件事。
+	OnNote func(string)
 }
 
 // StreamChat 走流式 chat/completions，把思考链与正文片段分别交给回调，返回正文全文。
@@ -53,28 +59,73 @@ func (c *Client) StreamChat(ctx context.Context, sys, user string, o StreamOpts)
 		return "", errors.New("未配置 LLM API Key（请在管理端配置）")
 	}
 
-	// 与 FastJSON 同构的两段重试：① 两个开关都带 ② 网关 400（严格校验未知字段）
-	// → 摘掉非标准的 enable_thinking，留下真正管用的 reasoning_effort。
-	// 关思考链是「快 10 倍」这件事的全部来源，能不能摘、摘到什么程度，只能靠这一次重试问出来。
+	// 与 FastJSON 同构的三段重试：① 网关 400（严格校验未知字段）→ 摘掉非标准的
+	// enable_thinking，留下真正管用的 reasoning_effort；② 网关 400 且开了 JSONMode
+	// → 摘掉 response_format（部分 provider 的 json_object 与推理模型不兼容）；
+	// ③ 200 但正文空（哨兵 ErrEmptyContent）→ 放大输出预算重试。
+	//
+	// 第 ③ 段是这次线上事故的正面回击：step2 元数据调用拿到空 content，
+	// 调用方把空串喂给 json.Unmarshal，用户看到
+	// 「模型输出不是合法json unexpected end of json input 原文=<<>>」。
+	// fastjson 那条路早就有这段（errEmptyContent + 放大预算），流式这条没有——
+	// 同一件事两套标准，于是修在缺的那一边。
 	knob := knobBoth
 	if !o.DisableThinking {
 		knob = knobNone
 	}
+	opt := o
+	triedBigger, droppedJSON := false, false
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		content, status, err := c.streamOnce(ctx, sys, user, o, knob)
+	for attempt := 0; attempt < 4; attempt++ {
+		content, status, err := c.streamOnce(ctx, sys, user, opt, knob)
 		if err == nil {
 			return content, nil
 		}
 		lastErr = err
-		if status == http.StatusBadRequest && knob == knobBoth {
+		switch {
+		case status == http.StatusBadRequest && opt.JSONMode && !droppedJSON:
+			// 有的网关/模型组合不吃 response_format=json_object，直接 400。
+			// 提示词里本来就写着「只输出JSON」，且调用方用 extractJSON 兜底，
+			// 所以摘掉它重试是安全的；不摘就只能把 400 原样丢给用户。
+			droppedJSON = true
+		case status == http.StatusBadRequest && knob == knobBoth:
+			// 网关不认 enable_thinking（严格校验未知字段的 Azure / 部分自建）。
 			knob = knobEffortOnly
-			continue
+		case IsEmptyContent(err) && !triedBigger && ctx.Err() == nil:
+			// 200 但一个字正文都没有 ⇒ 思考链把 completion 预算吃光了。
+			// 放大预算再问一次：慢，但比「整个阶段失败」强。
+			// 上限见 maxEmptyRetryTokens 的注释。
+			triedBigger = true
+			mt := opt.MaxTokens
+			if mt <= 0 {
+				// 没设过上限时 provider 用的是它自己的默认值（可能很小）。
+				// 显式给一个下限，否则「放大」这件事无从谈起。
+				mt = emptyRetryBaseTokens
+			}
+			if mt *= 4; mt > maxEmptyRetryTokens {
+				mt = maxEmptyRetryTokens
+			}
+			opt.MaxTokens = mt
+			if opt.OnNote != nil {
+				// 用户这一轮白等了几十秒，得当场知道为什么，以及系统正在做什么。
+				// 不说的话，材料流会莫名其妙地从头再念一遍思考链。
+				opt.OnNote(fmt.Sprintf("这一轮模型只回了思考过程、没有正文，正在放大输出预算到 max_tokens=%d 重试一次…", mt))
+			}
+		default:
+			return content, err
 		}
-		return content, err
 	}
 	return "", lastErr
 }
+
+const (
+	// emptyRetryBaseTokens：调用方没指定 max_tokens 时的放大起点（×4 = 4096）。
+	emptyRetryBaseTokens = 1024
+	// maxEmptyRetryTokens 是空正文重试的预算上限。比 fastjson 的 4096 宽：
+	// 这条路上跑的是长文执笔与结构化产出，4096 可能把稿子截断；而且只有
+	// 「第一轮一个字都没吐出来」才会走到这里，不存在常态多花钱的问题。
+	maxEmptyRetryTokens = 8192
+)
 
 // knobNone 表示不带任何关思考链的开关（正文执笔走这条）。
 const knobNone thinkKnob = -1
@@ -138,6 +189,9 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 	}
 
 	var sb strings.Builder
+	// 空正文诊断用：思考链片数与 provider 报的 token 明细。片数 > 0 而正文 0 字，
+	// 就是「关了思考链的开关被无视、预算全花在想」的指纹。
+	reasonChunks, completionTokens, reasoningTokens := 0, 0, 0
 	sc := bufio.NewScanner(resp.Body)
 	// SSE 的 data 行里带整段 delta JSON；默认 64KB 上限对长思考片段偏紧，放宽到 1MB。
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
@@ -160,14 +214,29 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 					ReasoningContent string `json:"reasoning_content"`
 				} `json:"delta"`
 			} `json:"choices"`
+			Usage *struct {
+				CompletionTokens        int `json:"completion_tokens"`
+				CompletionTokensDetails *struct {
+					ReasoningTokens int `json:"reasoning_tokens"`
+				} `json:"completion_tokens_details"`
+			} `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			// 单帧坏掉不该让整轮作废：provider 的 usage 尾帧/空心跳帧都不是标准 delta。
 			continue
 		}
+		if u := chunk.Usage; u != nil {
+			completionTokens = u.CompletionTokens
+			if u.CompletionTokensDetails != nil {
+				reasoningTokens = u.CompletionTokensDetails.ReasoningTokens
+			}
+		}
 		for _, ch := range chunk.Choices {
-			if r := ch.Delta.ReasoningContent; r != "" && o.OnReasoning != nil {
-				o.OnReasoning(r)
+			if r := ch.Delta.ReasoningContent; r != "" {
+				reasonChunks++
+				if o.OnReasoning != nil {
+					o.OnReasoning(r)
+				}
 			}
 			if d := ch.Delta.Content; d != "" {
 				sb.WriteString(d)
@@ -184,7 +253,30 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 		}
 		return "", resp.StatusCode, c.wrapErr(err)
 	}
-	return sb.String(), resp.StatusCode, nil
+	content := sb.String()
+	if strings.TrimSpace(content) == "" {
+		// 流跑完、HTTP 200，但一个字的正文都没有 —— 这不是「格式坏」，是「模型没干活」。
+		// 与 fastjson.fastOnce 同一判据、同一个哨兵，上层才有一致的修法（放大预算重试）；
+		// 空串直通调用方的话，json.Unmarshal 会报出那句正确的废话
+		// 「unexpected end of json input 原文=<<>>」。
+		return "", resp.StatusCode, fmt.Errorf("%w（流式：%s）", ErrEmptyContent, emptyStreamDetail(reasonChunks, completionTokens, reasoningTokens, o))
+	}
+	return content, resp.StatusCode, nil
+}
+
+// emptyStreamDetail 把人话拼给用户/运维：片数与 token 明细决定了修法完全不同。
+func emptyStreamDetail(reasonChunks, completionTokens, reasoningTokens int, o StreamOpts) string {
+	if reasonChunks > 0 {
+		s := fmt.Sprintf("流完整跑完但正文 0 字，只收到 %d 片思考链；completion_tokens=%d、reasoning_tokens=%d",
+			reasonChunks, completionTokens, reasoningTokens)
+		if o.MaxTokens > 0 {
+			s += fmt.Sprintf("（本次 max_tokens=%d，思考链多半把它吃光了）", o.MaxTokens)
+		} else {
+			s += "（本次没指定 max_tokens，用的是 provider 默认上限，思考链多半把它吃光了）"
+		}
+		return s
+	}
+	return "流完整跑完但正文 0 字，连思考链都没有（provider 返回了空响应）"
 }
 
 // streamHTTPClient：整体超时远大于普通请求。关思考链之后这些调用都在十几秒内，
