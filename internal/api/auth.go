@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -68,6 +69,17 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"token": tok, "username": c.Username})
 }
 
+// ctxKeyUser 是 Middleware 往 context 里塞当前用户名用的键。
+// 不导出：只有同包拿得到，避免外部包往 context 里塞一个假的用户名。
+type ctxKeyUser struct{}
+
+// currentUsername 取出 Middleware 校验过的用户名。
+// 拿不到就返回 false —— 调用方一律按「未登录」处理，别猜默认值。
+func (a *Auth) currentUsername(r *http.Request) (string, bool) {
+	u, ok := r.Context().Value(ctxKeyUser{}).(string)
+	return u, ok && u != ""
+}
+
 // Middleware requires a valid Bearer token.
 func (a *Auth) Middleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -87,6 +99,14 @@ func (a *Auth) Middleware(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusUnauthorized, "登录已失效，请重新登录")
 			return
 		}
-		next(w, r)
+		sub, _ := tok.Claims.GetSubject()
+		// token 里的 sub 必须对得上库里还存在的账号。
+		// 不然改名/删号之后，手里那枚 72 小时长效 token 还能继续用 ——
+		// 改密码这个动作就等于没有回收旧凭据。
+		if _, err := a.store.GetAdminHash(sub); err != nil {
+			writeErr(w, http.StatusUnauthorized, "账号已变更，请重新登录")
+			return
+		}
+		next(w, r.WithContext(context.WithValue(r.Context(), ctxKeyUser{}, sub)))
 	}
 }

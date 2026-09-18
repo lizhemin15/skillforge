@@ -366,16 +366,21 @@ func (s *SkillStore) DeleteLLMConfig(id int) error {
 
 // ===== admin auth =====
 
-// EnsureAdmin creates the default admin if none exists.
-// EnsureAdmin inserts the first admin if none exists, OR resets the password
-// of an existing one. The env-provided password is always authoritative.
-func (s *SkillStore) EnsureAdmin(username, hash string) error {
+// BootstrapAdmin 只在「库里一个管理员都没有」时建号。
+//
+// ⚠️ 原来是另一个语义：每次启动都用 env 里的密码覆盖已有账号。那等于管理端
+// 改的密码活不过一次重启 —— 用户改完看着成功，重启后旧密码又能登进去，
+// 而新密码失效。表现比「不能改」更坏：它让人以为自己记错了密码。
+//
+// 所以 env 的定位是「第一次开机用的初始密码」，不是「持续生效的配置」。
+// 已经在用的部署不受影响：库里早有账号时这函数是空操作（密码保持现状）。
+func (s *SkillStore) BootstrapAdmin(username, hash string) error {
 	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM admins WHERE username=?`, username).Scan(&n); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM admins`).Scan(&n); err != nil {
 		return err
 	}
 	if n > 0 {
-		return s.SetAdminPassword(username, hash)
+		return nil
 	}
 	_, err := s.db.Exec(`INSERT INTO admins(username,pass_hash) VALUES(?,?)`, username, hash)
 	return err
@@ -388,10 +393,52 @@ func (s *SkillStore) GetAdminHash(username string) (string, error) {
 	return h, err
 }
 
+// CountAdmins 给「改自己账号」的校验用：改完不能把系统里最后一个管理员改没了。
+func (s *SkillStore) CountAdmins() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM admins`).Scan(&n)
+	return n, err
+}
+
 // SetAdminPassword updates a password hash.
 func (s *SkillStore) SetAdminPassword(username, hash string) error {
-	_, err := s.db.Exec(`UPDATE admins SET pass_hash=? WHERE username=?`, hash, username)
-	return err
+	res, err := s.db.Exec(`UPDATE admins SET pass_hash=? WHERE username=?`, hash, username)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		// 没打中任何行必须报错：静默成功只会让「改密码成功、登录还是旧密码」这种
+		// 幽灵故障流到用户面前（改用户名时写错旧名就会这样）。
+		return fmt.Errorf("账号不存在：%s", username)
+	}
+	return nil
+}
+
+// RenameAdmin 改用户名 + 可选改密码（hash 为空表示只改名）。
+// 一步完成是刻意的：分成两次写，中间失败会留下「密码已换、名字还是旧的」的
+// 半截状态，而用户以为自己改的是同一个账号。
+func (s *SkillStore) RenameAdmin(oldName, newName, hash string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if hash != "" {
+		res, err := tx.Exec(`UPDATE admins SET pass_hash=? WHERE username=?`, hash, oldName)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return fmt.Errorf("账号不存在：%s", oldName)
+		}
+	}
+	if newName != "" && newName != oldName {
+		// UNIQUE 约束兜底：重名会返回错误，交给上层翻成人话。
+		if _, err := tx.Exec(`UPDATE admins SET username=? WHERE username=?`, newName, oldName); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // SetTrainStatus stores per-skill training metadata (trained_from, generated_by).

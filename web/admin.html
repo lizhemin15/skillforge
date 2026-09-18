@@ -47,6 +47,7 @@
         <button class="active" data-tab="llm">LLM 服务</button>
         <button data-tab="skills">技能管理</button>
         <button data-tab="site">站点设置</button>
+        <button data-tab="account">账号</button>
       </div>
 
       <!-- Tab: LLM -->
@@ -113,6 +114,50 @@
             </div>
             <div class="site-preview-row"><span class="dim">浏览器标签页</span><span id="site-preview-title"></span></div>
             <div class="site-preview-row"><span class="dim">页脚</span><span id="site-preview-footer"></span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab: Account -->
+      <div class="tab-pane hidden" id="tab-account" style="display:none">
+        <div class="admin-grid">
+          <div class="card">
+            <h3>管理员账号</h3>
+            <p class="card-sub">在这里改自己的登录账号。保存后立即生效，<b>重启服务也不会被初始化配置覆盖</b></p>
+            <form id="account-form" autocomplete="off">
+              <div class="field">
+                <label>用户名</label>
+                <input type="text" id="account-user" autocomplete="off" placeholder="admin">
+                <p class="dim" style="margin:6px 0 0;font-size:12px">字母、数字、下划线、点、横杠或 @，2~32 位</p>
+              </div>
+              <div class="field">
+                <label>当前密码</label>
+                <input type="password" id="account-current" autocomplete="current-password" placeholder="改密码或改用户名时必须填写">
+              </div>
+              <div class="field">
+                <label>新密码</label>
+                <input type="password" id="account-new" autocomplete="new-password" placeholder="只改用户名就留空">
+                <p class="dim" style="margin:6px 0 0;font-size:12px">至少 8 位；留空表示不改密码</p>
+              </div>
+              <div class="field">
+                <label>确认新密码</label>
+                <input type="password" id="account-confirm" autocomplete="new-password" placeholder="再输一遍新密码">
+              </div>
+              <button type="submit" class="btn primary" id="account-save">保存</button>
+              <div class="msg" id="account-msg"></div>
+            </form>
+          </div>
+          <div class="card">
+            <h3>说明</h3>
+            <p class="card-sub">两个常见疑问</p>
+            <div class="site-preview-row" style="align-items:flex-start">
+              <span class="dim" style="flex:0 0 92px">为什么要填当前密码</span>
+              <span>改的是登录凭据本身。登录状态最长保留 72 小时，光凭登录状态就能静默换掉密码的话，谁拿到你的浏览器就等于拿到这台机器。</span>
+            </div>
+            <div class="site-preview-row" style="align-items:flex-start">
+              <span class="dim" style="flex:0 0 92px">改完要重登吗</span>
+              <span>不用。保存成功后本页会换用新令牌。但改了<b>用户名</b>后，别处（其它浏览器/标签页）的旧登录会失效，需要重新登录。</span>
+            </div>
           </div>
         </div>
       </div>
@@ -212,6 +257,6 @@
 <script src="/assets/vendor/codemirror/addon/fold/foldcode.min.js?v=20260908A"></script>
 <script src="/assets/vendor/codemirror/addon/fold/foldgutter.min.js?v=20260908A"></script>
 <script src="/assets/js/site.js?v=20260911M"></script>
-<script src="/assets/js/admin.js?v=20260916B"></script>
+<script src="/assets/js/admin.js?v=20260918A"></script>
 </body>
 </html>

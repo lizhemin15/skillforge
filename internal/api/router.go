@@ -25,6 +25,7 @@ type Handler struct {
 	Skills *Skills
 	Admin  *Admin
 	Auth   *Auth
+	Acc    *Account
 	Site   *Site
 	Chat   *chatHandler
 	Eng    *agent.Engine // exposed so admin can hot-swap the engine LLM
@@ -51,7 +52,7 @@ func NewHandler(s *store.SkillStore, l *llm.Client, secret string) (*Handler, er
 	// 工具能力：按环境变量装配（默认开，SKILLFORGE_TOOLS=off 可回退纯对话）
 	toolReg := buildToolRegistry(s)
 	return &Handler{
-		Skills: skills, Admin: admin, Auth: auth, Site: NewSite(s),
+		Skills: skills, Admin: admin, Auth: auth, Acc: NewAccount(s, auth), Site: NewSite(s),
 		Chat: &chatHandler{eng: eng, gen: genCache, tools: toolReg, maxRound: toolMaxRounds()}, Eng: eng,
 		gen: genCache,
 	}, nil
@@ -143,6 +144,9 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/site", h.Site.Get)
 	mux.HandleFunc("GET /api/admin/site", h.Auth.Middleware(h.Site.GetAdmin))
 	mux.HandleFunc("PUT /api/admin/site", h.Auth.Middleware(h.Site.Update))
+	// 管理员账号：页面里改用户名/密码。改密要验当前密码（见 account.go 注释）。
+	mux.HandleFunc("GET /api/admin/account", h.Auth.Middleware(h.Acc.Get))
+	mux.HandleFunc("PUT /api/admin/account", h.Auth.Middleware(h.Acc.Update))
 	mux.HandleFunc("GET /api/skills", h.Skills.List)
 	mux.HandleFunc("GET /api/skills/{slug}", h.Skills.Get)
 	mux.HandleFunc("POST /api/generate", h.Skills.Generate)

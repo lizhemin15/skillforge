@@ -58,7 +58,8 @@ func Run() error {
 	if adminPass == "" {
 		adminPass = "admin"
 	}
-	if err := st.EnsureAdmin(adminUser, api.HashPassword(adminPass)); err != nil {
+	// 首次开机用 env 里的账号做种；之后 env 不再覆盖 —— 管理端改过的账号才是权威。
+	if err := st.BootstrapAdmin(adminUser, api.HashPassword(adminPass)); err != nil {
 		return err
 	}
 

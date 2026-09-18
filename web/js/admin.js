@@ -47,6 +47,7 @@
     loadProviders();
     loadManageSkills();
     loadSite();
+    loadAccount();
   }
 
   // ---------- tabs ----------
@@ -1396,6 +1397,64 @@
     siteResetBtn.addEventListener('click', () => {
       $('site-name').value = ''; $('site-tagline').value = '';
       saveSite({ name: '', tagline: '' }, '已恢复默认');
+    });
+  }
+
+  // ---------- account ----------
+  // 管理员账号页：改用户名 / 改密码。
+  // 关键点：PUT 成功时**服务端会换发新令牌**（改名后旧令牌的 sub 指向不存在的
+  // 账号，会被 Middleware 401）。所以这里必须把新令牌写回 localStorage，
+  // 否则用户一改完名字，下一次点任何按钮就被弹回登录页 —— 看着像"改坏了"。
+  function showAccMsg(text, cls) {
+    const m = $('account-msg');
+    if (!m) return;
+    m.className = 'msg ' + (cls || '');
+    m.textContent = text;
+  }
+
+  async function loadAccount() {
+    if (!$('account-user')) return;
+    try {
+      const r = await fetch('/api/admin/account', { headers: authHdr() });
+      const j = await r.json();
+      if (!r.ok) { showAccMsg(j.error || '读取失败', 'err'); return; }
+      $('account-user').value = j.username || '';
+      showAccMsg('');
+    } catch (err) { showAccMsg('网络错误', 'err'); }
+  }
+
+  const accountForm = $('account-form');
+  if (accountForm) {
+    accountForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const cur = $('account-current').value;
+      const npw = $('account-new').value;
+      const cfm = $('account-confirm').value;
+      if (!cur) { showAccMsg('请先填写当前密码', 'err'); return; }
+      if (npw && npw.length < 8) { showAccMsg('新密码至少 8 位', 'err'); return; }
+      if (npw && cfm !== npw) { showAccMsg('两次输入的新密码不一致', 'err'); return; }
+      showAccMsg('保存中…');
+      try {
+        const r = await fetch('/api/admin/account', {
+          method: 'PUT', headers: authHdr(),
+          body: JSON.stringify({
+            current_password: cur,
+            new_username: $('account-user').value.trim(),
+            new_password: npw,
+            confirm_password: cfm
+          })
+        });
+        const j = await r.json();
+        if (!r.ok) { showAccMsg(j.error || '保存失败', 'err'); return; }
+        if (j.token) localStorage.setItem(TOKEN_KEY, j.token);
+        $('account-user').value = j.username || '';
+        $('account-current').value = '';
+        $('account-new').value = '';
+        $('account-confirm').value = '';
+        const what = [j.username_changed ? '用户名' : '', j.password_changed ? '密码' : ''].filter(Boolean).join('和');
+        showAccMsg('已保存（' + what + '已更新）', '');
+        toast('账号已更新', 'ok');
+      } catch (err) { showAccMsg('网络错误', 'err'); }
     });
   }
 

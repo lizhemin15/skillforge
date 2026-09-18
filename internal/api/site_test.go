@@ -23,6 +23,12 @@ import (
 func newSiteHandlerForTest(t *testing.T) (*Handler, *store.SkillStore) {
 	t.Helper()
 	s := newTestStore(t)
+	// 种一个管理员：Auth.Middleware 会核验令牌里的用户名**在库里还存在**（这样
+	// 改名/删号才能立刻回收旧令牌），所以「拿得到令牌」的前提是「账号真存在」。
+	// 不种的话下面 testAdminToken 签出的令牌会被 401，看着像「字段没下发」。
+	if err := s.BootstrapAdmin("admin", HashPassword("pw"+"-site"+"-test0001")); err != nil {
+		t.Fatalf("种管理员失败：%v", err)
+	}
 	h, err := NewHandler(s, llm.New(&model.LLMConfig{}), "test-secret")
 	if err != nil {
 		t.Fatalf("装配 Handler 失败：%v", err)
