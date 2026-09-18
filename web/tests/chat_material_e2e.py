@@ -15,6 +15,9 @@
     M4 材料只挂**进行中**那一步：`.ctk-step.done .ctk-mat` 全程为 0
     M5 前提：整轮真收到 ≥200 字正文（否则「没材料」可能只是这轮太短，M1 是空跑）
     M6 真流式过程中页面无 JS 异常（历史坑：RAF 丢接收者）
+    M7 最长静默 ≤8s：**屏幕连续多久没有任何东西在动**（材料/正文/步骤任一在动即算不静默）。
+       M1~M4 只看「整轮曾经有没有材料」，放得过「材料两秒滚完、之后四十秒全静止」这种形态
+       —— 而那正是用户投诉「一直卡着计时」的那一段，所以必须单列这条闸。
 
 负向自证（INJECT_NOMAT=1）：
   用 page.route 在**网络层**把 chat.js 里材料渲染分支改掉（`(s.material` → `(false && s.material`），
@@ -38,11 +41,83 @@ SKIP 规则：playwright 不可用 / 页面打不开 → 打 SKIP 并 exit 0。S
 #   （不许在 runner 里写死文件名 —— 那是「漏加 = 这个 leg 不存在」的老洞）；
 #   web/tests/live_e2e_roster.test.mjs 守着它跟文件真身不许脱钩。
 import os
+import re
 import sys
 import time
 
 BASE = os.environ.get('BASE', 'http://127.0.0.1:8092')
 MAXW = int(os.environ.get('MAXW', '240'))  # 单轮最长等多久（秒）
+# M7 的门槛：屏幕最长允许几秒不变。默认 8s —— 依据是线上正常流的最长帧间隔实测
+# ~1.2s（关思考链首片 0.6s），8s 已是六倍余量，而用户投诉的那段是 39.8s。
+# 0 = 关掉这条断言（只在明确要跑「不设阈值的观察」时用）。
+GAP_MAX_MS = int(os.environ.get('GAP_MAX_MS', '8000'))
+# 负向自证要打的那**一个**条件：`(s.material ? '<span class="ctk-mat">…`。
+# 只认这个形态（后面紧跟材料 span），不去碰 `esc(s.material)` 这类无关出现。
+NOMAT_RE = re.compile(r'''\(s\.material(?=\s*\?\s*'<span class="ctk-mat")''')
+INJ = {'hits': 0, 'landed': False}  # 注入落地状态，供 N1 断言自证前提
+# DUMP_TIMELINE=1 打「哪一段没有任何东西在动」的时间线。
+#
+# 为什么要有这个开关：用户的投诉原话是「现在速度过于慢了，中间可以流式输出思考的一些
+# 中间材料，现在一直卡着计时」。要回答「慢在哪」，唯一可信的来源是**真浏览器里的帧时序**
+# ——服务端日志只能证明它发出去了，证明不了用户屏幕上有没有东西在动。
+# 这条时间线就是把人眼看到的「卡住」量成秒：每个采样点记 [时刻] 进行中的步骤 / 材料字数 /
+# 正文字数；只在「步骤变了 / 材料长了 / 正文长了」时打点，所以两行之间的时间差就是
+# **屏幕上什么都没变的那段静默**，长间隔一眼看得出来。
+DUMP_TIMELINE = os.environ.get('DUMP_TIMELINE', '') == '1'
+
+
+def print_timeline(samples, limit_gap_ms=1500):
+    """把采样打成时间线；只打变化点，间隔 >limit_gap_ms 时标注静默时长。"""
+    if not samples:
+        print('时间线：（没有采样）')
+        return
+    print('---- 时间线（只打变化点；两行之间 = 屏幕上什么都没变）----')
+    prev = None
+    prev_t = 0
+    for s in samples:
+        t, mlen, tail, blen, active, _done, label = (list(s) + ['', ''])[:7]
+        # 去重键必须带**材料内容**（tail），不能只看字数：材料是截尾的滚动窗口
+        # （M3 要求 ≤220 字），长度早就顶到上限了，新内容进来时长度一点不变——
+        # 按长度判「有没有变化」会把一段真在滚的材料误报成 40 秒静默（实测踩过）。
+        key = (label, mlen, tail, blen, active)
+        if key == prev:
+            continue
+        gap = t - prev_t
+        mark = ''
+        if prev is not None and gap > limit_gap_ms:
+            mark = f'   ← 前面 {gap / 1000:.1f}s 无任何变化'
+        print(f'[{t / 1000:6.1f}s] 步骤={label or "-":<10} 材料={mlen:>5}字 正文={blen:>5}字 '
+              f'进行中={int(bool(active))}{mark}')
+        prev, prev_t = key, t
+    t, mlen, _tail, blen, active, _done, label = (list(samples[-1]) + ['', ''])[:7]
+    print(f'[{(samples[-1][0]) / 1000:6.1f}s] （末次采样）材料={mlen}字 正文={blen}字')
+
+
+def silent_gaps(samples):
+    """按「内容有没有变」切出静默段：返回 [(起点ms, 终点ms, 时长ms, 步骤标签)]。
+
+    什么算「有东西在动」：进行中步骤变了、材料内容变了（长度或尾部原文任一）、
+    正文长度变了。**材料尾部原文必须算**——理由见 print_timeline 的注释。
+    """
+    out = []
+    if not samples:
+        return out
+    prev_key, prev_t, prev_label, prev_active = None, None, '', False
+    for s in samples:
+        t, mlen, tail, blen, active, _done, label = (list(s) + ['', ''])[:7]
+        key = (label, mlen, tail, blen, active)
+        if key != prev_key:
+            # 只统计「进行中」时的静默：整轮答完之后的静止不是用户在等，
+            # 把它算进来会让采样尾巴拖多长就报多长（假红）。
+            if prev_active and prev_t is not None and t - prev_t > 0:
+                out.append((prev_t, t, t - prev_t, prev_label))
+            prev_key, prev_t, prev_label, prev_active = key, t, label, bool(active)
+    # 收尾：末尾这段「一直冻结到采样结束」的静止必须报出来。
+    # 漏掉它是**最坏形态**：流真的挂住时画面冻死后再无任何变化，循环里永远等不到
+    # 「下一次变化」来结算这段静默 —— M7 会假绿（离线自证 case ② 实测抓到过）。
+    if prev_active and prev_t is not None and samples[-1][0] - prev_t > 0:
+        out.append((prev_t, samples[-1][0], samples[-1][0] - prev_t, prev_label))
+    return out
 
 # 提示词预设：**必须放在文件里**，不能让 runner 用命令行传。
 # 原因：runner 是 bash，leg 声明按空格切；把中文长提示词塞进 leg 的 env 赋值里，
@@ -131,6 +206,7 @@ SAMPLER_JS = """() => {
       b ? (b.innerText || '').replace(/\\s+/g, '').length : 0,
       !!act,
       document.querySelectorAll('.ctk-step.done .ctk-mat').length,
+      act ? ((act.querySelector('.ctk-label') || {}).innerText || '').trim() : '',
     ]);
   }, 200);
   return true;
@@ -167,10 +243,15 @@ def main():
                     try:
                         r = route.fetch()
                         body = r.text()
-                        n = body.count('(s.material')
-                        body = body.replace('(s.material', '(false && s.material')
-                        print(f'[inject] chat.js 里材料渲染分支命中 {n} 处，已改成恒不渲染')
-                        route.fulfill(status=r.status, body=body,
+                        # 只打「材料渲染」那一个条件：`(s.material ? '<span class="ctk-mat">…`
+                        # ⚠ 老的 body.replace('(s.material', …) 会连 `esc(s.material)` 一起改（两处命中），
+                        #   那是把注入撒到无关代码上；更要命的是命中 0 处时它**一声不响**就放行，
+                        #   于是「注入死了」会被当成「负向自证通过」。所以这里：精确匹配 + 命中数不对就标红。
+                        new_body, hits = NOMAT_RE.subn('(false', body)
+                        INJ['hits'] = hits
+                        INJ['landed'] = hits == 1 and 'ctk-mat' in body
+                        print(f'[inject] 材料渲染分支命中 {hits} 处（要求恰好 1 处），已改成恒不渲染')
+                        route.fulfill(status=r.status, body=new_body,
                                       headers={k: v for k, v in r.headers.items()
                                                if k.lower() not in ('content-length', 'content-encoding')})
                     except Exception as e:
@@ -191,6 +272,23 @@ def main():
 
 
 def run_checks(pg):
+    if INJECT_NOMAT:
+        # 注入前提自证 —— 先断「这把刀真砍到了」，再看血。
+        # ① 请求的路线要真被改写（命中数恰好 1）；② 改写后的脚本要**语法合法**：
+        #    改坏成语法错只会让整页 JS 死掉，那不是「材料不渲染」而是「页面崩了」，
+        #    两种形态混在一起，红得再漂亮也证明不了 M1/M7 抓的是材料缺失（实测踩过：
+        #    一次注入让整轮 150s 连正文都没出现，M5 前提跟着红，证据就脏了）。
+        # ③ 还要看浏览器**实际拿到**的那份（不是我们自己手里的变量）。
+        info = pg.evaluate("""() => fetch('/assets/js/chat.js').then(r => r.text()).then(t => {
+            let parses = true;
+            try { new Function(t); } catch (e) { parses = false; }
+            return {injected: /\\(false\\s*\\?\\s*'<span class="ctk-mat"/.test(t),
+                    parses: parses, len: t.length};
+        })""")
+        check('N1 注入前提：浏览器真收到改写后的 chat.js（命中 1 处 + 语法合法）',
+              INJ['landed'] and info['injected'] and info['parses'],
+              f"hits={INJ['hits']} injected={info['injected']} parses={info['parses']} len={info['len']}")
+
     pg.evaluate(SAMPLER_JS)
     pg.fill('textarea', PROMPT)
     pg.click('#chat-send')
@@ -228,6 +326,8 @@ def run_checks(pg):
 
     samples = last['samples']
     print(f"采样 {len(samples)} 帧 / steps={last['steps']} / 正文 {last['bubble']} 字 / errs={last['errs'][:2]}")
+    if DUMP_TIMELINE:
+        print_timeline(samples)
     mats = [s for s in samples if s[1] > 0]
     if mats:
         print('材料首帧: ' + str(mats[0]))
@@ -274,6 +374,24 @@ def run_checks(pg):
               max((s[5] for s in samples), default=0) == 0, '')
 
     check('M6 真流式过程中页面无 JS 异常', not last['errs'], str(last['errs'][:2]))
+
+    # M7 是「用户到底卡了多久」的硬闸。M1~M4 只要整轮**曾经**有过材料就算绿，
+    # 所以它们放得过这种形态：材料在两秒内滚完、之后四十秒屏幕一个字都不动
+    # （真实线上时间线：材料 12.0s 定格后，直到 51.8s 才出第一个正文字 —— 用户原话
+    # 「一直卡着计时」说的就是这一段）。最长静默必须按**内容**算（材料尾部原文），
+    # 按字数算会把截尾滚动窗口误判成静默，见 print_timeline 注释。
+    gaps = silent_gaps(samples)
+    biggest = max(gaps, key=lambda g: g[2], default=(0, 0, 0, ''))
+    if DUMP_TIMELINE:
+        top = sorted(gaps, key=lambda g: -g[2])[:3]
+        print('最长静默段（内容级：材料尾部原文/正文长度/步骤标签任一变化即打断）：')
+        for g in top:
+            print(f'  {g[2] / 1000:6.1f}s  {g[0] / 1000:6.1f}s→{g[1] / 1000:6.1f}s  步骤={g[3] or "-"}')
+    check(f'M7 最长静默 ≤{GAP_MAX_MS / 1000:.1f}s（材料/正文/步骤任一在动即算不静默）',
+          biggest[2] <= GAP_MAX_MS,
+          f'最长 {biggest[2] / 1000:.1f}s（{biggest[0] / 1000:.1f}s→{biggest[1] / 1000:.1f}s '
+          f'步骤={biggest[3] or "-"}）；静默 >{GAP_MAX_MS / 1000:.1f}s 的段数 '
+          f'{sum(1 for g in gaps if g[2] > GAP_MAX_MS)}')
     return report()
 
 

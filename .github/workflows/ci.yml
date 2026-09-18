@@ -313,6 +313,16 @@ jobs:
       - name: A5 判据双向注入自证
         run: python3 web/tests/judge_a5_double_injection_mutation_check.py
 
+      # 「屏幕上有没有东西在动」那把尺子（chat_material_e2e.py 的 silent_gaps）的离线自证。
+      # 用户投诉原话：「一直卡着计时，用户体验不佳」。这条判据最初按**材料长度**判变化，
+      # 而材料是截尾滚动窗口（长度顶死 163 字），于是「正在滚」被误报成 **39.8s 静默** ——
+      # 差点带着人去修一个没坏的起草跳。改成按材料尾部原文判之后，两个方向都要钉住：
+      #   ① 滚动窗口不得报静默（假红会让人修不存在的问题）；
+      #   ② 真静止必须被抓出来（假绿意味着流真挂住时 M7 会安静地绿）。
+      # 纯逻辑合成料，毫秒级，不需要浏览器与线上服务。
+      - name: 静默段判据自证
+        run: python3 web/tests/silent_gaps_mutation_check.py
+
       - name: Build
         run: |
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o skillforge ./cmd/server

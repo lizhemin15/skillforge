@@ -9,7 +9,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/lizhemin15/skillforge/internal/tlsconf"
@@ -74,7 +77,7 @@ func (c *Client) StreamChat(ctx context.Context, sys, user string, o StreamOpts)
 		knob = knobNone
 	}
 	opt := o
-	triedBigger, droppedJSON := false, false
+	triedBigger, droppedJSON, triedPartial := false, false, false
 	var lastErr error
 	for attempt := 0; attempt < 4; attempt++ {
 		content, status, err := c.streamOnce(ctx, sys, user, opt, knob)
@@ -91,6 +94,15 @@ func (c *Client) StreamChat(ctx context.Context, sys, user string, o StreamOpts)
 		case status == http.StatusBadRequest && knob == knobBoth:
 			// 网关不认 enable_thinking（严格校验未知字段的 Azure / 部分自建）。
 			knob = knobEffortOnly
+		case IsStreamBroken(err) && !triedPartial && ctx.Err() == nil:
+			// 流断在半路（上游把连接挂住 / 没给结束标记）。与 5xx 的区别很关键：
+			// 5xx 是「请求没成」，交给上层决定重试；这里是「请求成了但回答不完整」，
+			// 当场重试一次最省事——而且绝不能把半截正文漏给调用方（那会变成
+			// 「模型输出不是合法json」这种指向错方向的诊断）。
+			triedPartial = true
+			if opt.OnNote != nil {
+				opt.OnNote("上游流式中断（连接被挂住或没有结束标记），正在重试一次…")
+			}
 		case IsEmptyContent(err) && !triedBigger && ctx.Err() == nil:
 			// 200 但一个字正文都没有 ⇒ 思考链把 completion 预算吃光了。
 			// 放大预算再问一次：慢，但比「整个阶段失败」强。
@@ -127,6 +139,135 @@ const (
 	maxEmptyRetryTokens = 8192
 )
 
+// 流「断在半路」的两枚哨兵。
+//
+// 为什么单独一组：这类故障里 HTTP 是 200、请求也成功了，坏的是「这次回答不完整」。
+// 它们与 5xx/429 那种「请求没成」必须分开处理——
+//
+//   - 对调用方：绝不能把已经收到的半截正文当结果返回。分类跳拿半截 JSON 去
+//     json.Unmarshal，报出来的是「模型输出不是合法json」，一句把用户和运维
+//     都带向错误方向的诊断（线上 raw_out="{\"" 就是这么来的）。
+//   - 对重试策略：请求成了但回答没成，当场重试一次最省事；5xx 那种仍交给上层。
+var (
+	ErrStreamStalled   = errors.New("上游流式响应卡住：连接没关但一直不给数据")
+	ErrStreamTruncated = errors.New("上游流式响应不完整：没有结束标记")
+)
+
+// IsStreamBroken 判断错误是不是「流断在半路」这一类。
+func IsStreamBroken(err error) bool {
+	return err != nil && (errors.Is(err, ErrStreamStalled) || errors.Is(err, ErrStreamTruncated))
+}
+
+// streamIdleLimit 是「读流期间连续多久没有任何字节」就判上游卡死。
+// 为什么必须有这把尺子：streamHTTPClient 的整体超时是 10 分钟（流式问答要长连接，
+// 不能像普通请求那样 60s）。但上游有一种真实故障形态——把答案流完之后**既不关
+// 连接、也不再给字节**。此时 Read 会一直阻塞，客户端只能干等到 10 分钟：线上实测
+// 一整轮 616.5s（600s 超时 + 16.5s 重试），用户看到的就是「一直卡着计时」。
+//
+// 20s 的由来：线上正常流的最长帧间隔实测 1.2s（思考链连续片），关思考链的分类跳
+// 首片 0.6s；20s 是十几倍余量，正常流不可能触发。0 表示关掉看门狗。
+func streamIdleLimit() time.Duration {
+	v := strings.TrimSpace(os.Getenv("SKILLFORGE_STREAM_IDLE_SEC"))
+	if v == "" {
+		return 20 * time.Second
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 20 * time.Second
+	}
+	return time.Duration(n) * time.Second
+}
+
+const (
+	// disabledThinkingBudget：要求关思考链时顺手带的思考预算上限（第三道闸，
+	// 见 streamOnce 的 knobBoth 分支）。关思考链本来应该是 0 片，512 只是给
+	// 「开关失灵」兜个底，对正常路径没有任何影响。
+	disabledThinkingBudget = 512
+)
+
+// writingThinkBudget 是起草/审稿这类**要**思考链的调用可以配的上限。
+//
+// 默认 0 = 不限（质量优先）。配了就掐上限：实测同一段提示词 thinking_budget=512
+// 把首片正文从 37.8s 提到 21.1s，思考链仍在想（512 片）。
+// 长文档位的实测结论见 scripts/probe_think_budget_article.py 的输出。
+func writingThinkBudget() int {
+	v := strings.TrimSpace(os.Getenv("SKILLFORGE_THINK_BUDGET"))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// idleReader 记住「最后一次读到字节」的时刻，供看门狗判定上游是不是挂了。
+type idleReader struct {
+	rc   io.ReadCloser
+	last atomic.Int64
+}
+
+func newIdleReader(rc io.ReadCloser) *idleReader {
+	r := &idleReader{rc: rc}
+	r.last.Store(time.Now().UnixNano())
+	return r
+}
+
+func (r *idleReader) Read(p []byte) (int, error) {
+	n, err := r.rc.Read(p)
+	if n > 0 {
+		r.last.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+func (r *idleReader) Close() error { return r.rc.Close() }
+
+func (r *idleReader) idleFor() time.Duration {
+	return time.Since(time.Unix(0, r.last.Load()))
+}
+
+// watchIdle 起一个看门狗：连续 idle 没有新字节就**关掉连接**，让阻塞住的 Read 当场
+// 返回。返回的 stop 必须在读完流之后调用一次，并且它会给出「是不是看门狗动的手」
+// ——事后判断故障性质要靠它，而不是靠 sc.Err()（被我们主动关掉时，那个错误是
+// 「read on closed response body」，会掩盖真正的原因）。
+func watchIdle(r *idleReader, idle time.Duration) func() bool {
+	var aborted atomic.Bool
+	if idle <= 0 {
+		return func() bool { return false }
+	}
+	done := make(chan struct{})
+	iv := idle / 4
+	if iv < 100*time.Millisecond {
+		iv = 100 * time.Millisecond
+	}
+	go func() {
+		t := time.NewTicker(iv)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				if r.idleFor() >= idle {
+					aborted.Store(true)
+					_ = r.Close() // 关连接 => 阻塞的 Read 立即返回
+					return
+				}
+			}
+		}
+	}()
+	stopped := false
+	return func() bool {
+		if !stopped {
+			stopped = true
+			close(done)
+		}
+		return aborted.Load()
+	}
+}
+
 // knobNone 表示不带任何关思考链的开关（正文执笔走这条）。
 const knobNone thinkKnob = -1
 
@@ -154,8 +295,20 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 		// reasoning_effort 给 astron 系（详见 fastjson.go 文件头那张实测表）。
 		body["enable_thinking"] = false
 		body["reasoning_effort"] = "none"
+		// 第三道闸：有的 provider/网关对上面两个开关都免疫（关了也照想），此时
+		// 思考链把预算和时间全吃掉——实测同一段提示词带思考 63.0s、关思考 4.8s。
+		// thinking_budget 实测被认账（思考链片数 1050 → 512），所以留作兜底：
+		// 开关管用就无所谓（0 片最好），开关失灵时给浪费封个顶。
+		body["thinking_budget"] = disabledThinkingBudget
 	case knobEffortOnly:
+		// 网关不认 enable_thinking（严格校验未知字段）时走这里：只留最保守的一条，
+		// 不再带 thinking_budget——免得又踩一个「未知字段 400」。
 		body["reasoning_effort"] = "none"
+	case knobNone:
+		// 正文执笔这条：思考链**要留着**（长文质量靠它），只是可以配一个上限。
+		if b := writingThinkBudget(); b > 0 {
+			body["thinking_budget"] = b
+		}
 	}
 
 	raw, err := json.Marshal(body)
@@ -176,11 +329,14 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 	if err != nil {
 		return "", 0, c.wrapErr(err)
 	}
-	defer resp.Body.Close()
+	// 读流全程经过 idleReader：它记住「最后一次读到字节」的时刻，看门狗据此判断
+	// 上游是不是把连接挂住了（详见 streamIdleLimit / watchIdle 的注释）。
+	rc := newIdleReader(resp.Body)
+	defer rc.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// 只读 8KB：错误体是给人看的，不必把整段网关 HTML 吞进内存。
-		tail, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		tail, _ := io.ReadAll(io.LimitReader(rc, 8<<10))
 		e := fmt.Errorf("LLM HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(tail)))
 		if isTransientStatus(resp.StatusCode) {
 			return "", resp.StatusCode, &TransientError{Err: e}
@@ -188,11 +344,20 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 		return "", resp.StatusCode, e
 	}
 
+	// 看门狗：连续 streamIdleLimit() 没有任何字节就关掉连接，让阻塞住的 Read 当场
+	// 返回。没有它的话，「上游流完却不关连接」会把客户端钉到 10 分钟整体超时
+	// ——线上实测一整轮 616.5s，用户看到的就是「一直卡着计时」。
+	stopWatch := watchIdle(rc, streamIdleLimit())
+	defer func() { stopWatch() }()
+
 	var sb strings.Builder
 	// 空正文诊断用：思考链片数与 provider 报的 token 明细。片数 > 0 而正文 0 字，
 	// 就是「关了思考链的开关被无视、预算全花在想」的指纹。
 	reasonChunks, completionTokens, reasoningTokens := 0, 0, 0
-	sc := bufio.NewScanner(resp.Body)
+	// 终止信号：正常收尾**必给其中一个**（线上 provider 实测 3/3 都给
+	// finish_reason=stop + [DONE]）。两者都缺 ⇒ 这次回答是被截断的。
+	sawDone, sawStop := false, false
+	sc := bufio.NewScanner(rc)
 	// SSE 的 data 行里带整段 delta JSON；默认 64KB 上限对长思考片段偏紧，放宽到 1MB。
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
 	for sc.Scan() {
@@ -205,6 +370,7 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
+			sawDone = true
 			break
 		}
 		var chunk struct {
@@ -213,6 +379,7 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 					Content          string `json:"content"`
 					ReasoningContent string `json:"reasoning_content"`
 				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
 			Usage *struct {
 				CompletionTokens        int `json:"completion_tokens"`
@@ -232,6 +399,11 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 			}
 		}
 		for _, ch := range chunk.Choices {
+			if fr := ch.FinishReason; fr != nil && *fr != "" {
+				// provider 说自己讲完了（stop/length/tool_calls…）。这是除了
+				// [DONE] 之外唯一可信的「这次回答是完整的」凭据。
+				sawStop = true
+			}
 			if r := ch.Delta.ReasoningContent; r != "" {
 				reasonChunks++
 				if o.OnReasoning != nil {
@@ -246,12 +418,43 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 			}
 		}
 	}
-	if err := sc.Err(); err != nil {
-		// 有内容就别把整轮判死：网络在末尾抖一下，正文往往是完整的。
-		if sb.Len() > 0 {
+	stalled := stopWatch()
+	if stalled {
+		// 上游把连接挂住：没关、也不再给字节。两种情形分开判，判据是**有没有终止信号**：
+		//  ① 已经收到终止信号（provider 说了 stop / 给了 [DONE]）⇒ 回答本身是完整的，
+		//     只是它没关连接。这是线上 616.5s 那一轮的形态：按成功返回最贴合事实，
+		//     也省掉一次「重跑一遍、再挂一遍」的无谓重试。
+		//  ② 没有终止信号 ⇒ 半截回答，按不完整丢弃，绝不交给调用方
+		//     （半截 JSON 会让分类跳报「模型输出不是合法json」，把人带向错的病）。
+		if (sawDone || sawStop) && sb.Len() > 0 {
 			return sb.String(), resp.StatusCode, nil
 		}
+		return "", resp.StatusCode, &TransientError{Err: fmt.Errorf(
+			"%w（等了 %s 没有新字节）：已收到 %d 字节，按不完整丢弃",
+			ErrStreamStalled, streamIdleLimit(), sb.Len())}
+	}
+	if err := sc.Err(); err != nil {
+		// 读流中途出错（不是看门狗动的手，是网络自己断了）。判据同样是终止信号：
+		// 已经说过 stop/[DONE] ⇒ 回答完整，网络只是收尾时抖了一下，正文照收；
+		// 没说过 ⇒ 半截，按不完整丢弃。以前这里只按「有没有内容」判，等于把
+		// 半截 JSON 放进了调用方的 json.Unmarshal。
+		if (sawDone || sawStop) && sb.Len() > 0 {
+			return sb.String(), resp.StatusCode, nil
+		}
+		if sb.Len() > 0 {
+			return "", resp.StatusCode, &TransientError{Err: fmt.Errorf(
+				"%w（读流中断：%v）：已收到 %d 字节，按不完整丢弃",
+				ErrStreamTruncated, err, sb.Len())}
+		}
 		return "", resp.StatusCode, c.wrapErr(err)
+	}
+	if !sawDone && !sawStop {
+		// EOF 到了却既没 [DONE] 也没 finish_reason ⇒ 这是一条被截断的流。
+		// 线上 provider 正常收尾实测 3/3 都给（finish_reason=stop + [DONE]），
+		// 所以「两者都缺」可以放心判不完整；半截结果一律不当正文返回。
+		return "", resp.StatusCode, &TransientError{Err: fmt.Errorf(
+			"%w（既无 [DONE] 也无 finish_reason）：已收到 %d 字节，按不完整丢弃",
+			ErrStreamTruncated, sb.Len())}
 	}
 	content := sb.String()
 	if strings.TrimSpace(content) == "" {

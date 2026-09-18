@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lizhemin15/skillforge/internal/db"
 	"github.com/lizhemin15/skillforge/internal/llm"
@@ -35,6 +36,9 @@ type fakeProvider struct {
 	content string
 	// reasoning 非空时，先吐思考链片段再吐 content（模拟 reasoning 模型）。
 	reasoning string
+	// hang 为真时：只回响应头，然后一直不给字节也不关连接——复刻线上
+	// 「上游把连接挂住」的形态（那一轮整轮 616.5s）。
+	hang bool
 }
 
 func (f *fakeProvider) server(t *testing.T) *httptest.Server {
@@ -45,11 +49,19 @@ func (f *fakeProvider) server(t *testing.T) *httptest.Server {
 		_ = json.Unmarshal(raw, &body)
 		f.mu.Lock()
 		f.bodies = append(f.bodies, body)
-		content, reasoning := f.content, f.reasoning
+		content, reasoning, hang := f.content, f.reasoning, f.hang
 		f.mu.Unlock()
 
-		stream, _ := body["stream"].(bool)
 		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if hang {
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			<-r.Context().Done()
+			return
+		}
+		stream, _ := body["stream"].(bool)
 		if !stream {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":` + jsonStr(content) + `}}]}`))
@@ -255,4 +267,36 @@ func TestGenerateWithoutProgressSink(t *testing.T) {
 func TestReportProgressWithoutSink(t *testing.T) {
 	ReportProgress(context.Background(), "没人接")
 	ReportProgress(nil, "连 ctx 都没有") //nolint:staticcheck // 故意传 nil，验证不 panic
+}
+
+// 分类这一跳必须有自己的时间预算（这是 R1 的第二道闸）。
+//
+// 线上那一轮 616.5s 的账：600s 全耗在分类这一跳——它拿的是整轮 ctx，靠整轮兜底
+// 等于没有兜底。正常流完只要 6s（关思考链，线上实测），预算给十倍余量就够。
+// 超时必须兜底成普通对话，绝不把错误甩给用户。
+func TestEvalTurnBoundsClassifierHop(t *testing.T) {
+	t.Setenv("SKILLFORGE_CLASSIFY_TIMEOUT_SEC", "1")
+	fp := &fakeProvider{hang: true}
+	eng := newTestEngine(t, fp)
+
+	start := time.Now()
+	ev, err := eng.EvalTurn(context.Background(), "s1", "写一份数据治理通知", nil)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("分类这一跳挂住时不能把错误抛给用户，必须兜底成普通对话: %v", err)
+	}
+	if ev == nil {
+		t.Fatal("超时后必须给出兜底 Eval，nil 会让整轮没法继续")
+	}
+	if elapsed > 6*time.Second {
+		t.Fatalf("分类预算 1s 就该收手，实际等了 %s —— 说明这一跳还在靠整轮 ctx 兜底（线上 600s 就是这么来的）", elapsed)
+	}
+	// 超时不是「结果不好」，不该再重试一次把用户等待翻倍。
+	fp.mu.Lock()
+	n := len(fp.bodies)
+	fp.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("超时后不该重试（等待会翻倍），实际发生 %d 次请求", n)
+	}
 }

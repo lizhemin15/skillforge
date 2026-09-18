@@ -411,6 +411,24 @@ action 必须根据上面「意图→动作」映射严格输出，不要省略�
 	return eval, nil
 }
 
+// classifyHopLimit 是意图识别这一跳的独立时间预算。
+//
+// 为什么单独给：它挡在用户第一句话后面，拿的是整轮 ctx，一旦上游挂住就会把
+// 整轮一起拖下去（线上 616.5s 那一轮，600s 全耗在这一跳）。正常流完只要 6s
+// （线上实测，关思考链），60s 是十倍余量——够慢的 provider 冷启动，又远小于
+// 让用户觉得「卡死」的量级。超时按识别失败兜底，退化成普通对话。
+func classifyHopLimit() time.Duration {
+	v := strings.TrimSpace(os.Getenv("SKILLFORGE_CLASSIFY_TIMEOUT_SEC"))
+	if v == "" {
+		return 60 * time.Second
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 60 * time.Second
+	}
+	return time.Duration(n) * time.Second
+}
+
 // classify runs one classifier completion. Returns (eval, retry) where retry
 // is true when the result was unusable (bad JSON or empty intent).
 //
@@ -421,6 +439,12 @@ action 必须根据上面「意图→动作」映射严格输出，不要省略�
 //   - 流式：万一 provider 忽略开关照旧产思考链（astron 就会静默忽略
 //     enable_thinking），思考片段能当中间材料流出去，用户至少看得见它在干活。
 func (e *Engine) classify(ctx context.Context, id, sys string, history []Message, user string) (*Eval, bool) {
+	// hop 级预算：这一跳挡在用户**第一句话**后面，正常 6s 就流完（线上实测），
+	// 所以绝不能拿整轮级别的 ctx 陪着等——传进来的 ctx 覆盖整个请求（几十秒到
+	// 几分钟）。线上曾有一整轮 616.5s，就是这一跳挂住 600s 造成的（见 R1）。
+	// 超时后按「识别失败」走兜底：宁可退化成普通对话，也不让用户对着计时器干等。
+	ctx, cancel := context.WithTimeout(ctx, classifyHopLimit())
+	defer cancel()
 	// 意图识别也吃上下文：用户说「整理成 word」时，识别「这是承接上一轮新闻稿」
 	// 才能路由到正确的技能，而不是当成一句没头没尾的新指令。
 	out, err := e.llm.StreamChat(ctx, sys, "对话历史（供参考，重点回应最新消息）：\n"+e.ContextBlock(ctx, id, history)+"\n\n用户最新消息：\n"+user, llm.StreamOpts{

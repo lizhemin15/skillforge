@@ -36,6 +36,8 @@ import zipfile
 BASE = os.environ.get('BASE', 'http://127.0.0.1:8092')
 MAXW = int(os.environ.get('MAXW', '300'))       # 单轮最长等多久（秒）
 SKIP_TURN1 = os.environ.get('SKIP_TURN1') == '1'
+# DUMP_TIMELINE=1：把「哪一段屏幕上什么都没变」量成秒（见 print_timeline 注释）。
+DUMP_TIMELINE = os.environ.get('DUMP_TIMELINE', '') == '1'
 
 # 本轮唯一锚串：32 位随机，只出现在第 1 轮的提示词里。
 ANCHOR = '锚串' + uuid.uuid4().hex[:8]
@@ -73,6 +75,16 @@ READ_JS = """() => {
   const bubbles = Array.from(document.querySelectorAll('.ch-msg.assistant .ch-bubble'));
   const link = Array.from(document.querySelectorAll('a.atx-link'))
     .find(a => ((a.innerText || '').includes('已生成文档')));
+  const act = document.querySelector('.ctk-step.active');
+  const mat = act ? act.querySelector('.ctk-mat') : null;
+  window.__tl = window.__tl || [];
+  window.__tl.push([
+    Date.now() - window.__tl0,
+    act ? ((act.querySelector('.ctk-label') || {}).innerText || '').trim() : '',
+    mat ? (mat.innerText || '').length : 0,
+    bubbles.length ? (bubbles[bubbles.length - 1].innerText || '').replace(/\\s+/g, '').length : 0,
+    !!act,
+  ]);
   return {
     bubbleCount: bubbles.length,
     lastBubble: bubbles.length ? (bubbles[bubbles.length - 1].innerText || '') : '',
@@ -86,8 +98,40 @@ READ_JS = """() => {
   };
 }"""
 
+
+def _reset_tl(pg):
+    """每一轮重置时间线基点：不重置的话第 2 轮的秒数会从第 1 轮开头算起。"""
+    pg.evaluate('() => { window.__tl = []; window.__tl0 = Date.now(); }')
+
+
+def _dump_tl(pg, tag):
+    if not DUMP_TIMELINE:
+        return
+    rows = pg.evaluate('() => (window.__tl || [])')
+    print_timeline(tag, rows)
+
+
+def print_timeline(tag, rows):
+    """把每秒采样打成时间线：两行之间就是屏幕上什么都没变的那段静默。
+
+    wait_turn 本来就在每秒轮询，顺手记一行比新起采样器更省——而且测的正是
+    「用户盯着屏幕等」的那段时间。只在 label/材料/正文有变化时打点。
+    """
+    print(f'---- 时间线 {tag}（只打变化点；两行之间 = 屏幕上什么都没变）----')
+    prev, prev_t = None, 0
+    for r in rows:
+        t, label, mlen, blen, active = (list(r) + ['', 0, 0, 0])[:5]
+        if (label, mlen, blen, active) == prev:
+            continue
+        gap = t - prev_t
+        mark = f'   ← 前面 {gap / 1000:.1f}s 无任何变化' if prev is not None and gap > 1500 else ''
+        print(f'[{t / 1000:6.1f}s] 步骤={label or "-":<10} 材料={mlen:>5}字 '
+              f'正文={blen:>5}字 进行中={int(bool(active))}{mark}')
+        prev, prev_t = (label, mlen, blen, active), t
+
 ERR_HOOK = """() => {
   window.__errs = [];
+  window.__tl0 = Date.now();
   window.addEventListener('error', e => window.__errs.push(String(e.message).slice(0, 120)));
   return true;
 }"""
@@ -122,7 +166,6 @@ def wait_turn(pg, need_file=False, maxw=None):
             stable = 0
         last_len = len(last['lastBubble'])
     return last, False
-
 
 def office_text(raw: bytes) -> str:
     """从 docx/xlsx/pptx 里把所有可见文本抽出来（纯标准库，不看格式细节）。"""
@@ -170,9 +213,11 @@ def main():
 def run_checks(pg):
     turn1_text = ''
     if not SKIP_TURN1:
+        _reset_tl(pg)
         pg.fill('textarea', PROMPT1)
         pg.click('#chat-send')
         first, ended1 = wait_turn(pg)
+        _dump_tl(pg, '第1轮')
         turn1_text = first.get('firstBubble') or ''
         print(f"[第1轮] 结束={ended1} 产物 {len(turn1_text)} 字 / 尾部「{turn1_text[-40:] if turn1_text else ''}」")
     else:
@@ -185,9 +230,11 @@ def run_checks(pg):
         check('P2 前提：第 1 轮产物里真带上了本轮锚串（锚串没进产物的话 F2 无从判断）',
               ANCHOR in turn1_text, f'锚串 {ANCHOR} 不在第 1 轮产物里')
 
+    _reset_tl(pg)
     pg.fill('textarea', PROMPT2)
     pg.click('#chat-send')
     last, ended2 = wait_turn(pg, need_file=True)
+    _dump_tl(pg, '第2轮')
     print(f"[第2轮] 结束={ended2} 文件卡片={last.get('genfile')} href={last.get('genHref')} "
           f"气泡 {len(last.get('lastBubble') or '')} 字")
 

@@ -69,15 +69,25 @@ try:
                     print(f"[{now-t0:6.1f}s] (非 JSON 载荷，{len(payload)} 字节)", flush=True)
                     continue
                 if isinstance(ev, list):
-                    st = ev[0] if ev else {}
-                    mat = st.get("material") or ""
+                    # 材料只挂在 **active 那一步**上（服务端 snapshot 的规则），所以
+                    # 不能只看 ev[0]：起草/审稿阶段 active 是后面的步骤，读 ev[0]
+                    # 得到的永远是空材料，会把「产品在滚材料」误判成「卡着计时」。
+                    # 曾经的 probe 就踩了这个坑（0 素材），把锅安在了产品头上。
+                    act = None
+                    for s in reversed(ev):
+                        if s.get("status") == "active":
+                            act = s
+                            break
+                    if act is None:
+                        act = ev[0] if ev else {}
+                    mat = act.get("material") or ""
                     if mat:
                         n_mat += 1
                         print(f"[{now-t0:6.1f}s] 🧱素材(+{len(mat)}字，间隔{gap:5.1f}s)：{mat[-70:]}", flush=True)
                     else:
                         n_hb += 1
                         heartbeat_gap = max(heartbeat_gap, gap)
-                        print(f"[{now-t0:6.1f}s] 💓心跳(间隔{gap:5.1f}s)：{st.get('detail','')[:50]}", flush=True)
+                        print(f"[{now-t0:6.1f}s] 💓心跳(间隔{gap:5.1f}s)：{act.get('detail','')[:50]}", flush=True)
                     continue
                 k = ev.get("type") or ev.get("kind") or ev_name
                 txt = ev.get("t") or ev.get("text") or ""

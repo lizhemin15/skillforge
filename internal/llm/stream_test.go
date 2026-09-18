@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lizhemin15/skillforge/internal/model"
 )
@@ -230,5 +231,214 @@ func TestStreamChatWithoutKey(t *testing.T) {
 	c := New(&model.LLMConfig{BaseURL: "http://127.0.0.1:1", Model: "m"})
 	if _, err := c.StreamChat(context.Background(), "s", "u", StreamOpts{}); err == nil {
 		t.Fatal("没配 API Key 必须报错")
+	}
+}
+
+// ===========================================================================
+// 「流断在半路」这一组（R1 + R2）
+//
+// 守的是两种真实故障形态，它们的共同点是**HTTP 200、请求成功、没有 5xx**，
+// 所以旧代码一条都没拦住：
+//
+//	R1 上游把连接挂住：答案流完之后既不关连接、也不再给字节。旧代码的 Read 一直
+//	   阻塞，只能等 streamHTTPClient 的 10 分钟整体超时——线上实测一整轮 616.5s
+//	   （600s 超时 + 16.5s 重试）。用户的原话就是「一直卡着计时」。
+//	R2 上游流到一半就断：EOF 到了，但既没有 finish_reason 也没有 [DONE]。旧代码
+//	   把已经收到的半截正文当结果返回，分类跳拿它去 json.Unmarshal，报出来的是
+//	   「模型输出不是合法json」（线上 raw_out="{\""），把用户和运维都带向错的病。
+//
+// 两条腿的判据都必须在**没有 5xx** 的情况下成立，否则等于没测。
+// ===========================================================================
+
+type hangSrv struct {
+	mu   sync.Mutex
+	reqs int
+	head string
+}
+
+// newHangSrv 起一个「把 head 吐完之后既不关连接、也不再给字节」的假上游，
+// 精确复刻线上那一轮 616.5s 的形态。等客户端自己断开（看门狗会替我们断开）。
+func newHangSrv(t *testing.T, s *hangSrv) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		s.reqs++
+		s.mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(s.head))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+}
+
+func (s *hangSrv) requests() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reqs
+}
+
+// R1-a：上游挂住 + 没有结束标记 ⇒ 必须在秒级（不是十分钟级）判故障，
+// 而且**绝不能**把已经收到的半截正文当结果返回。
+func TestStreamChatMarksStalledWhenUpstreamHangs(t *testing.T) {
+	t.Setenv("SKILLFORGE_STREAM_IDLE_SEC", "1")
+	srv := &hangSrv{head: strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"半截正文"}}]}`,
+		``,
+	}, "\n\n")}
+	ts := newHangSrv(t, srv)
+	defer ts.Close()
+
+	start := time.Now()
+	out, err := streamClient(t, ts).StreamChat(context.Background(), "sys", "user", StreamOpts{DisableThinking: true})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("上游挂住且没有结束标记时必须报错，绝不能把半截正文当结果（拿到 %q）", out)
+	}
+	if !IsStreamBroken(err) {
+		t.Fatalf("必须被标记成「流断在半路」，实际 %v", err)
+	}
+	var te *TransientError
+	if !errors.As(err, &te) {
+		t.Fatalf("应当是可重试的瞬时故障，实际 %v", err)
+	}
+	if elapsed > 8*time.Second {
+		t.Fatalf("看门狗 1s 就该动手，实际等了 %s —— 说明只剩 10 分钟整体超时在兜底（线上 600s 就是这么来的）", elapsed)
+	}
+	// 第一次挂住 → 当场重试一次 → 又挂住 → 放弃。两次，不多不少。
+	if n := srv.requests(); n != 2 {
+		t.Fatalf("流断在半路应当当场重试恰好一次（共 2 次请求），实际 %d 次", n)
+	}
+}
+
+// R1-b：上游挂住**但已经给了结束标记** ⇒ 回答本身是完整的，按成功返回。
+// 这一条防的是「修过头」：判据只看终止信号，不看连接有没有被好好关掉。
+func TestStreamChatReturnsContentWhenUpstreamStallsAfterDone(t *testing.T) {
+	t.Setenv("SKILLFORGE_STREAM_IDLE_SEC", "1")
+	for _, tc := range []struct {
+		name string
+		head string
+	}{
+		{"带 finish_reason", strings.Join([]string{
+			`data: {"choices":[{"delta":{"content":"完整正文"},"finish_reason":"stop"}]}`,
+			``,
+		}, "\n\n")},
+		{"带 DONE", strings.Join([]string{
+			`data: {"choices":[{"delta":{"content":"完整正文"}}]}`,
+			`data: [DONE]`,
+			``,
+		}, "\n\n")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := &hangSrv{head: tc.head}
+			ts := newHangSrv(t, srv)
+			defer ts.Close()
+
+			out, err := streamClient(t, ts).StreamChat(context.Background(), "sys", "user", StreamOpts{DisableThinking: true})
+			if err != nil {
+				t.Fatalf("已经给了结束标记，挂住的只是连接，不该判失败: %v", err)
+			}
+			if out != "完整正文" {
+				t.Fatalf("正文应当完整返回，实际 %q", out)
+			}
+			if n := srv.requests(); n != 1 {
+				t.Fatalf("这种情况下不需要重试，应当只有 1 次请求，实际 %d 次", n)
+			}
+		})
+	}
+}
+
+// R2-a：EOF 到了但没有结束标记 ⇒ 判不完整，半截正文绝不返回给调用方。
+func TestStreamChatRejectsTruncatedStream(t *testing.T) {
+	srv := &streamSrv{
+		frames: func(int, map[string]any) (int, string) {
+			// 注意：没有 finish_reason，也没有 [DONE]，然后连接就关了。
+			return http.StatusOK, strings.Join([]string{
+				`data: {"choices":[{"delta":{"content":"{\""}}]}`,
+				``,
+			}, "\n\n")
+		},
+	}
+	ts := newStreamSrv(t, srv)
+	defer ts.Close()
+
+	out, err := streamClient(t, ts).StreamChat(context.Background(), "sys", "user", StreamOpts{DisableThinking: true})
+	if err == nil {
+		t.Fatalf("没有结束标记的流必须判错，绝不能把半截正文（%q）交给 json.Unmarshal", out)
+	}
+	if !errors.Is(err, ErrStreamTruncated) {
+		t.Fatalf("应当判成「流不完整」，实际 %v", err)
+	}
+	if out != "" {
+		t.Fatalf("半截正文必须被丢弃，实际返回了 %q", out)
+	}
+	if n := len(srv.bodies); n != 2 {
+		t.Fatalf("截断应当当场重试恰好一次（共 2 次请求），实际 %d 次", n)
+	}
+}
+
+// R2-b：第一次被截断、第二次完整 ⇒ 用户拿到的是完整正文，不该因为一次抖动失败。
+func TestStreamChatRetriesTruncatedStreamOnce(t *testing.T) {
+	srv := &streamSrv{
+		frames: func(n int, _ map[string]any) (int, string) {
+			if n == 1 {
+				return http.StatusOK, `data: {"choices":[{"delta":{"content":"半截"}}]}` + "\n\n"
+			}
+			return http.StatusOK, defaultFrames()
+		},
+	}
+	ts := newStreamSrv(t, srv)
+	defer ts.Close()
+
+	out, err := streamClient(t, ts).StreamChat(context.Background(), "sys", "user", StreamOpts{DisableThinking: true})
+	if err != nil {
+		t.Fatalf("截断重试一次后应当成功，实际 %v", err)
+	}
+	if out != "关于开展数据治理的通知" {
+		t.Fatalf("应当返回第二次的完整正文，实际 %q", out)
+	}
+	if n := len(srv.bodies); n != 2 {
+		t.Fatalf("应当恰好两次请求，实际 %d 次", n)
+	}
+}
+
+// 关思考链时再带一道 thinking_budget：有的 provider 对 enable_thinking 和
+// reasoning_effort 都免疫（关了照想），那时预算就是唯一的闸。
+func TestStreamChatSendsDisabledThinkingBudget(t *testing.T) {
+	srv := &streamSrv{}
+	ts := newStreamSrv(t, srv)
+	defer ts.Close()
+
+	if _, err := streamClient(t, ts).StreamChat(context.Background(), "sys", "user", StreamOpts{DisableThinking: true}); err != nil {
+		t.Fatalf("StreamChat 失败: %v", err)
+	}
+	if v := srv.bodyAt(t, 0)["thinking_budget"]; v != float64(disabledThinkingBudget) {
+		t.Fatalf("关思考链时必须带 thinking_budget=%d，实际 %v", disabledThinkingBudget, v)
+	}
+}
+
+// 执笔跳（要思考链）默认不限预算，配了才掐上限——质量优先，提速靠显式配置。
+func TestStreamChatWritingThinkBudgetIsOptIn(t *testing.T) {
+	srv := &streamSrv{}
+	ts := newStreamSrv(t, srv)
+	defer ts.Close()
+	c := streamClient(t, ts)
+
+	if _, err := c.StreamChat(context.Background(), "sys", "user", StreamOpts{}); err != nil {
+		t.Fatalf("StreamChat 失败: %v", err)
+	}
+	if v, ok := srv.bodyAt(t, 0)["thinking_budget"]; ok {
+		t.Fatalf("没配 SKILLFORGE_THINK_BUDGET 时不该带 thinking_budget（执笔要保住思考链），实际 %v", v)
+	}
+
+	t.Setenv("SKILLFORGE_THINK_BUDGET", "1024")
+	if _, err := c.StreamChat(context.Background(), "sys", "user", StreamOpts{}); err != nil {
+		t.Fatalf("StreamChat 失败: %v", err)
+	}
+	if v := srv.bodyAt(t, 1)["thinking_budget"]; v != float64(1024) {
+		t.Fatalf("配了 SKILLFORGE_THINK_BUDGET=1024 就必须带上，实际 %v", v)
 	}
 }

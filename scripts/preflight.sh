@@ -262,6 +262,13 @@ if [ "$QUICK" = 0 ]; then
   # 文件名叫 *_mutation_check.py 是刻意的：preflight_parity.test.mjs 按后缀枚举，
   # 漏挂 CI/preflight 会直接红，往后不会腐烂成「0 引用的尺子」。
   selfcheck '前端 / A5 判据双向注入自证' python3 web/tests/judge_a5_double_injection_mutation_check.py
+  # 「屏幕上到底有没有东西在动」这把尺子（chat_material_e2e.py 里的 silent_gaps）的离线自证。
+  # 为什么必须有：用户的投诉原话就是「一直卡着计时，用户体验不佳」，而这条判据最初按**材料长度**
+  # 判变化 —— 材料是截尾滚动窗口、长度顶死在 163 字，于是「正在滚」被误报成 **39.8s 静默**，
+  # 差点带着人去修一个没坏的起草跳。改成按材料尾部原文判之后，必须有尺子钉住两个方向：
+  #   ① 滚动窗口不得报静默（防假红，否则又去修不存在的问题）；② 真静止必须报出来（防假绿，
+  #   否则流真挂住时 M7 会安静地绿）。case ③ 还反过来证明「只看长度的老尺子 = 假绿」。
+  selfcheck '前端 / 静默段判据自证'     python3 web/tests/silent_gaps_mutation_check.py
   # 解析服务（ocrd）的单测。它此前又是一把**游离尺子**：本机跑得动、0 引用，
   # 于是钉死的版本串 `ocrd-v5-quality` 一直没跟着真值改名而烂掉（2/15 红）。
   # 已改成「与部署门禁 scripts/deploy_ocrd.sh 对账」——不再抄字面量。
