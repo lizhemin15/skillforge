@@ -83,14 +83,22 @@ func (h *chatHandler) runManualWrite(
 	clock.Set(tb.Steps())
 
 	// ---- 第二段：按类执笔 ----
-	// 起草阶段**不流式下发**：后面还有审稿和改稿，先把初稿刷给用户、再刷一遍改稿，
-	// 屏幕上就是同一篇文章出现两次，用户会以为生成了两篇。中间状态由 trace 步骤
-	// 的心跳撑住（详情里带「已用 Ns」，看得见在动）。
+	// 起草**不把初稿刷进正文区**（后面还有审稿和改稿，刷两遍用户会以为生成了两篇），
+	// 但**必须把初稿当中间材料滚出来**：起草是整条链路最长的一跳，以前 onDelta 传 nil，
+	// 于是这一跳几十秒里屏幕上只有步骤详情里的「已用 Ns」在跳——正是用户抱怨的
+	// 「一直卡着计时」。材料挂在步骤面板里，不进正文，所以不会出现「两篇」的错觉。
 	draftIdx := tb.Active("generate", "④ 起草初稿", fmt.Sprintf("按《%s》的写作要求与本类范文起草…", catName))
 	clock.Set(tb.Steps())
 	// 起草前先把本会话前文（尤其是上一轮产物的原文）交给模型——续改类请求
 	// （「把语气改成公文」「在上一篇后面加一段」）全靠它，否则每轮都是重写。
-	draft, err := h.eng.GenerateWithPack(ctx, sc, pack, cat, args, h.eng.ContextBlock(ctx, sessionID, history), nil)
+	prior := h.eng.ContextBlock(ctx, sessionID, history)
+	// 本地事实先报：命中哪一类、几篇范文、有没有审稿清单、上文多少字。
+	// 模型侧的材料什么时候来不由我们决定（provider 不推 reasoning 时一片都没有）。
+	facts := noteFacts(sc, args, history)
+	facts.Category, facts.Examples = catName, len(cat.Examples)
+	facts.HasReview = strings.TrimSpace(pack.Reviewer) != ""
+	clock.Thinking(facts.note())
+	draft, err := h.eng.GenerateWithPack(ctx, sc, pack, cat, args, prior, clock.Thinking)
 	if err != nil {
 		write(evError, jsonSafe(map[string]string{"error": "生成失败: " + err.Error()}))
 		return true
@@ -183,7 +191,7 @@ func (h *chatHandler) reviewAndRevise(
 			tb.Close(rv, fmt.Sprintf("%d 条意见，已到审稿上限，最后一次修改（改完不再复审）", len(res.Issues)))
 			fx := tb.Active("generate", "修订 · 最后一次", "按审稿意见改，改完直接交付…")
 			clock.Set(tb.Steps())
-			fixed, rerr := h.eng.Revise(ctx, sc, pack, cat, cur, res.Issues, nil)
+			fixed, rerr := h.eng.Revise(ctx, sc, pack, cat, cur, res.Issues, clock.Thinking)
 			if rerr != nil {
 				fmt.Fprintf(os.Stderr, "[manual-write] 最终改稿失败: %v\n", rerr)
 				tb.Close(fx, "改稿未成功，以下为未修改的稿件")
@@ -199,7 +207,7 @@ func (h *chatHandler) reviewAndRevise(
 		tb.Close(rv, fmt.Sprintf("发现 %d 条问题，需要修改", len(res.Issues)))
 		fx := tb.Active("generate", fmt.Sprintf("修订 · 第 %d 轮", round), "按审稿意见改…")
 		clock.Set(tb.Steps())
-		fixed, rerr := h.eng.Revise(ctx, sc, pack, cat, cur, res.Issues, nil)
+		fixed, rerr := h.eng.Revise(ctx, sc, pack, cat, cur, res.Issues, clock.Thinking)
 		if rerr != nil {
 			// 改稿失败：把问题如实列给用户，别丢一句「改稿失败」就完了——
 			// 用户拿着一张问题清单至少能自己动手改。

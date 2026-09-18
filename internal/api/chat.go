@@ -261,6 +261,11 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// docgen skills produce an office file, not streamed text: drive the
 		// generator, cache the bytes, and hand the client a one-time download.
 		if sc.SkillType == model.SkillTypeDocGen {
+			// 这一跳跟起草一样是**无上界的阻塞**：线上实测关掉思考链后这一跳裸跑
+			// 16.8 秒（整轮 23.8s），期间屏幕上只有「已用 6s/9s/12s」在跳。
+			// 模型侧的材料要等它开始吐 JSON 才有（contentSink 从流式 JSON 里抽正文），
+			// 在那之前先把手里的事实报出去——这是本地事实，t≈0 就能发。
+			clock.Thinking(noteFacts(sc, args, fullHist).noteDoing("正在生成文档…"))
 			doc, derr := h.eng.GenerateDoc(ctx, req.SessionID, sc, args, req.Message, fullHist)
 			if derr != nil {
 				write(evError, jsonSafe(map[string]string{"error": "文档生成失败: " + derr.Error()}))
@@ -382,6 +387,10 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// 起草这一跳是几十秒的阻塞调用。模型侧不给材料时（线上实测 provider 不推
+		// reasoning，reasoning 片数=0）屏幕上只剩计时器在跳，所以先把「装进上下文的
+		// 是什么」报出去——这是本地事实，t≈0 就能发。
+		clock.Thinking(noteFacts(sc, args, history).note())
 		full, err = h.eng.Generate(ctx, sc, args, func(delta string) {
 			write(evDelta, jsonSafe(map[string]string{"t": delta}))
 		})
@@ -405,6 +414,9 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. plain chat (no skill) — stream a conversational reply
+	// 「没命中技能」这条路上，分类回来到首字之间同样是一次无上界的阻塞调用（线上实测
+	// 那 54.7 秒就发生在这条路上），所以材料同样先由本地事实顶上。
+	clock.Thinking(noteFacts(nil, nil, history).note())
 	full, err = h.eng.PlainChat(ctx, req.SessionID, req.Message, history, func(delta string) {
 		write(evDelta, jsonSafe(map[string]string{"t": delta}))
 	})

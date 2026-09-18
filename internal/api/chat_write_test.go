@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lizhemin15/skillforge/internal/agent"
 	"github.com/lizhemin15/skillforge/internal/llm"
@@ -81,6 +82,12 @@ type fakeLLM struct {
 	reqs  []fakeLLMReq
 	reply func(system, user string) string
 	srv   *httptest.Server
+	// chunkGap 是**流式分片之间**的间隔，默认 0（
+	// 绝大多数测试要的是「快」）。存在的唯一理由是中间材料那条链路：材料是
+	// 400ms 节流下发的，两片正文若在同一个节流窗口内到达，第二片就不会单独
+	// 发帧，「材料里看到了正文」会假红——那是测试的错，不是产品的错。
+	// 把间隔拉过节流窗口，测的才是材料挂接，而不是节流器恰好放行。
+	chunkGap time.Duration
 }
 
 type fakeLLMReq struct {
@@ -154,6 +161,9 @@ func newFakeLLM(t *testing.T, reply func(system, user string) string) *fakeLLM {
 			r := []rune(out)
 			half := len(r) / 2
 			emit(string(r[:half]))
+			if g := f.gap(); g > 0 {
+				time.Sleep(g)
+			}
 			emit(string(r[half:]))
 			fmt.Fprint(w, "data: [DONE]\n\n")
 			if fl != nil {
@@ -173,6 +183,13 @@ func newFakeLLM(t *testing.T, reply func(system, user string) string) *fakeLLM {
 	}))
 	t.Cleanup(f.srv.Close)
 	return f
+}
+
+// gap 返回分片间隔（带锁读：测试线程与 HTTP 处理线程都会碰它，-race 下裸读会红）。
+func (f *fakeLLM) gap() time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.chunkGap
 }
 
 // setReply 换掉作答函数（一个测试里要走多种模型行为时用）。
