@@ -211,6 +211,31 @@
       `<span class="file-tag">${esc(f.name)} <button onclick="removeFile(${i})">✕</button></span>`).join('');
   }
 
+  // ---------- train: 实况区「贴底」 ----------
+  // 为什么需要它（线上实测，2026-09-18）：
+  //   材料在流、计时器在跳，但用户看不见材料 —— 因为 `.modal` 自己就是滚动容器
+  //   （max-height:86vh; overflow-y:auto），长「写作要求」把 #tr-log 顶到了 modal 底线以下。
+  //   实测：modal 内容高 1130px / 可视 772px，scrollTop 停在 0，#tr-log 只露出 45px，
+  //   材料块在底线外 329px。用户原话「中间可以流式输出思考的一些中间材料，现在一直卡着计时」
+  //   说的就是这个 —— 只贴内层日志（下面那句 scrollTop）治不了「看不见」。
+  // 两条规矩：
+  //   ① 内层日志永远贴底（材料像终端一样滚）；
+  //   ② 外层 modal 也贴底，但**用户自己往上翻就松手**，不跟用户抢滚动条。
+  function makeLivePinner(modal, logEl) {
+    const NEAR = 40; // px：离底多少算「还在底部」
+    let on = true;
+    if (modal && modal.addEventListener) {
+      modal.addEventListener('scroll', () => {
+        on = modal.scrollHeight - modal.scrollTop - modal.clientHeight <= NEAR;
+      }, { passive: true });
+    }
+    return function pinLive() {
+      if (!modal || !logEl) return;
+      logEl.scrollTop = logEl.scrollHeight; // ①
+      if (on) modal.scrollTop = modal.scrollHeight; // ②
+    };
+  }
+
   // ---------- train: submit + SSE progress ----------
   $('train-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -219,6 +244,9 @@
     $('tr-log').style.display = 'block';
     $('tr-log').innerHTML = '';
     $('tr-result').style.display = 'none';
+    // 每场训练一份贴底器：把实况区拉进视野（上一场的手动翻页状态不该带到这一场）。
+    const pinLive = makeLivePinner($('skill-new'), $('tr-log'));
+    pinLive(); // 点「开始训练」就先把实况区拉进视野，而不是等第一帧材料
 
     const fd = new FormData();
     fd.append('name', $('tr-name').value);
@@ -248,7 +276,7 @@
       // 实况材料块始终贴在最下面：新阶段日志插在它前面，材料块跟着往下走。
       const live = $('tr-material');
       if (live) $('tr-log').appendChild(live);
-      $('tr-log').scrollTop = $('tr-log').scrollHeight;
+      pinLive();
     };
 
     try {
@@ -308,7 +336,7 @@
                 // 尾部截断：DOM 里只留最近这一段，历史材料没有回看需求（阶段边界会打点）。
                 if (mp.textContent.length > 700) mp.textContent = '… ' + mp.textContent.slice(-697);
                 lastEvAt = Date.now();
-                $('tr-log').scrollTop = $('tr-log').scrollHeight;
+                pinLive();
                 break;
               }
               case 'status': logLine('•', ev.data, ''); break;

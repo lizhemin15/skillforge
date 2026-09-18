@@ -41,6 +41,27 @@ function extractCase(js, name) {
   return null;
 }
 
+// 从出货文件里抠一个顶层函数声明（含花括号），做花括号配平 —— 与 extractCase 同一套手法。
+// 为什么必须有：case 'delta' 分支末尾调了 pinLive()（把材料拉进视野），而 pinLive 是
+// 训一场训练时由 makeLivePinner 造出来的闭包。抠出来的代码块单独跑时它不在作用域里，
+// 于是整条腿以「pinLive is not defined」崩掉 —— 崩掉的红不算红（2026-09-18 实测）。
+// 正确做法不是给个空桩糊过去，而是把**出货文件里的真函数**抠出来现造成真贴底器喂进去。
+function extractFn(js, name) {
+  const at = js.indexOf(`function ${name}(`);
+  if (at < 0) return null;
+  const open = js.indexOf('{', at);
+  if (open < 0) return null;
+  let depth = 0;
+  for (let i = open; i < js.length; i++) {
+    if (js[i] === '{') depth++;
+    else if (js[i] === '}') {
+      depth--;
+      if (depth === 0) return js.slice(at, i + 1);
+    }
+  }
+  return null;
+}
+
 // 极简 DOM：只需要支持「按 id 查得到」「建节点计数」「appendChild/remove」。
 // 建节点计数是关键判据 —— 「一片一节点」必然把它推到帧数量级。
 function makeDom() {
@@ -66,15 +87,34 @@ function makeDom() {
 
 const adminJS = read('web/js/admin.js');
 const block = extractCase(adminJS, 'delta');
+const pinnerSrc = extractFn(adminJS, 'makeLivePinner');
 const adminGo = read('internal/api/admin.go');
 
 // ---- ① 抠得出真代码 ----
 check('抠出 admin.js 里真正在跑的 case \'delta\' 分支', !!block, '抠不到说明前端没接 delta 帧，或写法变了导致配平失败');
+check('抠出真·贴底器 makeLivePinner（delta 帧里调的就是它）', !!pinnerSrc,
+  '抠不到 → 下面只能用桩糊，等于这条腿不再覆盖「材料进视野」');
+
+// 用真函数现造贴底器：几何只要 has-effect 的数值即可（贴底逻辑与具体数值无关，
+// 它只做「scrollTop = scrollHeight」和「离底 NEAR 内才跟随」）。
+function mkPin() {
+  const modal = {
+    scrollTop: 0, scrollHeight: 5000, clientHeight: 800,
+    addEventListener() { this._hasScrollListener = true; },
+  };
+  const log = { scrollTop: 0, scrollHeight: 3000 };
+  const makeLivePinner = new Function(`return (${pinnerSrc});`)();
+  let calls = 0;
+  const inner = makeLivePinner(modal, log);
+  return { modal, log, pinLive: () => { calls++; inner(); }, calls: () => calls };
+}
 
 // ---- ② 喂 500 帧，数节点 ----
 if (block) {
   const dom = makeDom();
-  const run = new Function('ev', '$', 'document', `let lastEvAt = 0; switch (ev.type) { ${block} } return lastEvAt;`);
+  const pin = pinnerSrc ? mkPin() : { pinLive: () => {}, calls: () => 0 };
+  const run = new Function('ev', '$', 'document', 'pinLive',
+    `let lastEvAt = 0; switch (ev.type) { ${block} } return lastEvAt;`);
 
   const FRAMES = 500;
   let lastAt = 0;
@@ -83,11 +123,13 @@ if (block) {
     try {
       lastAt = run(
         { type: 'delta', data: JSON.stringify({ kind: i % 2 ? 'think' : 'text', text: '片段' + i }) },
-        dom.$, dom.document,
+        dom.$, dom.document, pin.pinLive,
       );
     } catch (e) { threw = e; break; }
   }
   check(`${FRAMES} 帧材料喂进去不抛异常`, !threw, threw ? String(threw && threw.message) : '');
+  check('每帧材料都调了贴底器（材料流的同时把实况区拉进视野）',
+    pin.calls() === FRAMES, `只调了 ${pin.calls()} / ${FRAMES} 次`);
   check('实况块只建 1 个 DOM 节点（不是一片一个节点）',
     dom.created() === 1, `一共建了 ${dom.created()} 个节点 —— 一片一节点会随帧数线性增长，二十分钟下来把页面拖死`);
   check('实况块在日志容器里（不是飘在页面别处）', dom.log.children.length === 1 && dom.log.children[0].id === 'tr-material');
