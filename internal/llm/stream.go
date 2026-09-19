@@ -157,11 +157,17 @@ const (
 var (
 	ErrStreamStalled   = errors.New("上游流式响应卡住：连接没关但一直不给数据")
 	ErrStreamTruncated = errors.New("上游流式响应不完整：没有结束标记")
+	// ErrNoProgress：字节一直在来（保活帧），但连续没有一片正文/思考。
+	// 与 ErrStreamStalled 并列而不是合并：两者的现场完全不同（一个 Read 阻塞、
+	// 一个 Read 很活跃），排障时要能一眼分开；对上层处理方式则一致——都算
+	// 「请求成了但回答不完整」，当场重试一次。
+	ErrNoProgress = errors.New("上游流式响应卡住：连接活着、保活帧在滴，但一直不出正文/思考片段")
 )
 
 // IsStreamBroken 判断错误是不是「流断在半路」这一类。
 func IsStreamBroken(err error) bool {
-	return err != nil && (errors.Is(err, ErrStreamStalled) || errors.Is(err, ErrStreamTruncated))
+	return err != nil && (errors.Is(err, ErrStreamStalled) || errors.Is(err, ErrStreamTruncated) ||
+		errors.Is(err, ErrNoProgress))
 }
 
 // streamIdleLimit 是「读流期间连续多久没有任何字节」就判上游卡死。
@@ -290,6 +296,122 @@ func watchIdle(r *idleReader, idle time.Duration) func() bool {
 	}
 }
 
+// streamPieceGapLimit / streamFirstPieceLimit 是**片级**看门狗的两段阈值。
+//
+// 为什么字节看门狗不够：线上有一轮
+//
+//	[write-plain] hop=346.1s ttft=-1.00s reason=2 out_pieces=0 out=0
+//	[桩] …上游流式响应卡住（20s 没有新字节）—— 那一轮压根没触发，因为字节一直在来
+//
+// 上游一直在滴 SSE 保活帧：字节没断（20s 的字节看门狗看不见），却整整 346 秒没吐出
+// 一片正文，用户那边就是「一直卡着计时」+ 最终 0 字。**字节活着 ≠ 它在干活。**
+//
+// 两段分开是因为「还没开始吐字」与「吐到一半不动了」是两种东西：
+//   - 第一片之前：模型还在想、还在预填。健康样本首片最长 104.71s（hop=114.6s
+//     那一轮，正文照常出来了），所以给 150s（1.4 倍余量）；
+//   - 第一片之后：一旦开始吐字就该持续。健康样本里 5978 片跑了 163s（平均 27ms
+//     一片），60s 没一片已是病态 —— 上面那 346 秒的轮子在这里被抓住。
+//
+// 触发后返回 ErrNoProgress（算「流断在半路」），由 StreamChat 既有的
+// triedPartial 分支当场重试一次；0 表示关掉那一段。
+func streamFirstPieceLimit() time.Duration {
+	return streamSecKnob("SKILLFORGE_STREAM_FIRST_PIECE_SEC", 150)
+}
+
+func streamPieceGapLimit() time.Duration {
+	return streamSecKnob("SKILLFORGE_STREAM_PIECE_GAP_SEC", 60)
+}
+
+// streamSecKnob 是这几个「秒数旋钮」的统一解析：空/非法 → 默认值，0 → 关掉。
+func streamSecKnob(name string, def int) time.Duration {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return time.Duration(def) * time.Second
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return time.Duration(def) * time.Second
+	}
+	return time.Duration(n) * time.Second
+}
+
+// progressClock 记住「最近一片正文/思考」的时刻（0 = 一片都还没有）。
+// 与 idleReader 的区别：它只认**内容片**，不认保活字节。
+type progressClock struct {
+	last  atomic.Int64 // 最近一片的 UnixNano
+	count atomic.Int64
+}
+
+func (p *progressClock) mark() {
+	p.last.Store(time.Now().UnixNano())
+	p.count.Add(1)
+}
+
+// sinceLast 返回「距上一片多久」；第二值为 false 表示还没出过任何片。
+func (p *progressClock) sinceLast() (time.Duration, bool) {
+	n := p.last.Load()
+	if n == 0 {
+		return 0, false
+	}
+	return time.Since(time.Unix(0, n)), true
+}
+
+// watchProgress 起一个片级看门狗：连续没有新的正文/思考片段就**关掉连接**，让阻塞住
+// 的 Read 当场返回。返回的 stop 必须在读完流之后调用（可重复调用），它会给出
+// 「是不是看门狗动的手」以及原因——事后给用户/日志一个准确的说法，而不是把
+// 「我们自己关的连接」说成网络故障。
+func watchProgress(p *progressClock, rc io.Closer, first, gap time.Duration) func() (bool, string) {
+	if first <= 0 && gap <= 0 {
+		return func() (bool, string) { return false, "" }
+	}
+	var aborted atomic.Bool
+	var why atomic.Value
+	start := time.Now()
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(500 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case now := <-t.C:
+				if d, ok := p.sinceLast(); ok {
+					if gap > 0 && d >= gap {
+						why.Store(fmt.Sprintf("连续 %s 没有新的正文/思考片段（上限 %s；此前已收到 %d 片）",
+							d.Round(time.Second), gap, p.count.Load()))
+						aborted.Store(true)
+						_ = rc.Close() // 关连接 => 阻塞的 Read 立即返回
+						return
+					}
+					continue
+				}
+				if first > 0 && now.Sub(start) >= first {
+					why.Store(fmt.Sprintf("连第一片都没等到（等了 %s，上限 %s）",
+						now.Sub(start).Round(time.Second), first))
+					aborted.Store(true)
+					_ = rc.Close()
+					return
+				}
+			}
+		}
+	}()
+	stopped := false
+	return func() (bool, string) {
+		if !stopped {
+			stopped = true
+			close(done)
+		}
+		if !aborted.Load() {
+			return false, ""
+		}
+		if s, ok := why.Load().(string); ok {
+			return true, s
+		}
+		return true, "上游无进展"
+	}
+}
+
 // knobNone 表示不带任何关思考链的开关（正文执笔走这条）。
 const knobNone thinkKnob = -1
 
@@ -372,6 +494,12 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 	stopWatch := watchIdle(rc, streamIdleLimit())
 	defer func() { stopWatch() }()
 
+	// 片级看门狗：字节活着但不出片，同样要收手（见 streamFirstPieceLimit 的注释：
+	// 线上那一轮字节没断、346 秒没吐一片正文，字节看门狗根本看不见）。
+	pc := &progressClock{}
+	stopProgress := watchProgress(pc, rc, streamFirstPieceLimit(), streamPieceGapLimit())
+	defer func() { stopProgress() }()
+
 	var sb strings.Builder
 	// 空正文诊断用：思考链片数与 provider 报的 token 明细。片数 > 0 而正文 0 字，
 	// 就是「关了思考链的开关被无视、预算全花在想」的指纹。
@@ -428,12 +556,14 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 			}
 			if r := ch.Delta.ReasoningContent; r != "" {
 				reasonChunks++
+				pc.mark() // 思考片也是「它在干活」的凭据
 				if o.OnReasoning != nil {
 					o.OnReasoning(r)
 				}
 			}
 			if d := ch.Delta.Content; d != "" {
 				sb.WriteString(d)
+				pc.mark()
 				if o.OnContent != nil {
 					o.OnContent(d)
 				}
@@ -441,8 +571,9 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 		}
 	}
 	stalled := stopWatch()
-	if stalled {
-		// 上游把连接挂住：没关、也不再给字节。两种情形分开判，判据是**有没有终止信号**：
+	noProgress, progWhy := stopProgress()
+	if stalled || noProgress {
+		// 收手了：两种情形分开判，判据是**有没有终止信号**：
 		//  ① 已经收到终止信号（provider 说了 stop / 给了 [DONE]）⇒ 回答本身是完整的，
 		//     只是它没关连接。这是线上 616.5s 那一轮的形态：按成功返回最贴合事实，
 		//     也省掉一次「重跑一遍、再挂一遍」的无谓重试。
@@ -450,6 +581,11 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 		//     （半截 JSON 会让分类跳报「模型输出不是合法json」，把人带向错的病）。
 		if (sawDone || sawStop) && sb.Len() > 0 {
 			return sb.String(), resp.StatusCode, nil
+		}
+		if noProgress {
+			// 字节在来、片不来 —— 说清是这条，别让排障的人去查网络。
+			return "", resp.StatusCode, &TransientError{Err: fmt.Errorf(
+				"%w（%s）：已收到 %d 字节，按不完整丢弃", ErrNoProgress, progWhy, sb.Len())}
 		}
 		return "", resp.StatusCode, &TransientError{Err: fmt.Errorf(
 			"%w（等了 %s 没有新字节）：已收到 %d 字节，按不完整丢弃",

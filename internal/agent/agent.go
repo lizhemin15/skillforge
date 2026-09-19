@@ -1071,6 +1071,8 @@ func (e *Engine) generateWithExtraPlan(ctx context.Context, sc *SkillContent, ar
 		DisableThinking: !writeThinkingOn(),
 		OnContent:       st.content(onDelta),
 		OnReasoning:     st.reasoning(reasoningSink(ctx)),
+		// 同 write-plain：断流重试要让用户看见，别只让计时器在跳。
+		OnNote: func(s string) { ReportProgress(ctx, "· "+s) },
 	})
 	st.log("write-skill", out, err)
 	return out, err
@@ -2008,6 +2010,10 @@ func (e *Engine) plainChatWithPlan(ctx context.Context, id, user string, history
 		DisableThinking: false,
 		OnContent:       st.content(onDelta),
 		OnReasoning:     st.reasoning(reasoningSink(ctx)),
+		// 断流/空正文时的重试要说出来。这是**最常走的一条路**，而它过去不接 OnNote：
+		// 上游卡住 60s 后系统悄悄重试，用户屏幕上只有计时器在跳，
+		// 于是「一直卡着计时、体验不佳」里有一大截是我们没解释造成的。
+		OnNote: func(s string) { ReportProgress(ctx, "· "+s) },
 	})
 	st.log("write-plain", out, err)
 	return out, err
