@@ -14,6 +14,9 @@
   const switchBox = $('#ch-switch');
   const modeAuto = $('#mode-auto'), modeManual = $('#mode-manual');
   const thumb = $('#ch-switch-thumb');
+  // MCP 数据源勾选入口（输入框正上方那一行，JS 按服务端清单决定露不露）
+  const mcpBox = $('#mcp-box'), mcpBtn = $('#mcp-btn'), mcpLabel = $('#mcp-label');
+  const mcpLayer = $('#mcp-layer'), mcpList = $('#mcp-list'), mcpFoot = $('#mcp-foot');
 
   // —— 两种对话方式 ——
   // auto   : 让引擎自己理解意图，从技能库里挑（默认，适合"我也不知道该用哪个"）
@@ -775,8 +778,147 @@
       if (skOpen) renderSkLayer();
     });
     wireSkLayer();
+    wireMCP();
+    loadMCPServers();
   }
   let pendingSlug = '';
+
+  /* ============================================================
+     MCP 数据源勾选 · 20260919
+     ------------------------------------------------------------
+     产品默认 = 不调度任何 MCP。这不是"顺手填的默认值"，是**安全默认**：
+     内网业务系统（数据中台那类）没勾就能被模型捅到才是问题。
+     所以整条链上有四处都朝「关闭」倒：
+       ① 服务端清单空 → 按钮根本不出现（管理员没开，用户界面上不该多一个常驻按钮）
+       ② 勾选集空 → 请求体 mcp: []，后端闸门不开，一个 mcp_ 工具都不挂
+       ③ localStorage 里的 id 在服务端已不可选 → **发送前剔掉**（见 mcpPayloadIds）
+       ④ 清单拉取失败 → 保持空清单，按钮不出现，绝不"猜一个"
+
+     为什么 ③ 必须做：管理员停用/删掉一台 MCP 后，用户浏览器里还留着那个 id。
+     照发的话后端闸门被这个 id 打开（"用户选中了 MCP"），但工具表里一台都挂不上
+     → 模型空转到轮数上限 → 编一个答案给用户。剔掉之后退回完全默认态：
+     宁可少给（用户看得见、能反馈），绝不多给。
+     ============================================================ */
+  const MCP_KEY = 'skillforge.mcp';
+  let mcpServers = [];        // [{id,name,tool_count}] —— /api/mcp/servers 的原始清单
+  let mcpOpen = false;
+
+  // 读勾选集。写成「storage 当参数」是为了能被测试直接喂假 storage，不用真跑浏览器。
+  function readMCPPick(storage) {
+    try {
+      const raw = storage.getItem(MCP_KEY);
+      const arr = raw ? JSON.parse(raw) : [];
+      if (!Array.isArray(arr)) return [];
+      return arr.filter((x) => typeof x === 'string' && x);
+    } catch (e) { return []; }
+  }
+
+  function writeMCPPick(storage, ids) {
+    try { storage.setItem(MCP_KEY, JSON.stringify(ids)); } catch (e) {}
+  }
+
+  // ★ 勾选集 ∩ 服务端当前可选项。纯函数（不碰 DOM / 不碰 window）——
+  // 这是整条门控上最容易出错的一步，必须能被单测直接钉住（见 web/tests/chat_mcp.test.mjs）。
+  function mcpPayloadIds(picked, servers) {
+    const have = new Set(((servers || [])).map((s) => s && s.id).filter(Boolean));
+    return (picked || []).filter((id) => have.has(id));
+  }
+
+  // 按钮文案：勾了才显示台数，未勾时不带数字（避免"0"读起来像出了什么事）
+  function mcpBtnText(n) { return n > 0 ? 'MCP 数据源 · ' + n : 'MCP 数据源'; }
+
+  // 本轮真正要发出去的 id 列表 —— submit/stream 只认这一个口子，
+  // 免得别处再去读一遍 storage（读的地方一多，早晚有一处忘了对齐）。
+  function currentMCPIds() {
+    return mcpPayloadIds(readMCPPick(window.localStorage), mcpServers);
+  }
+
+  function toggleMCP(id) {
+    const picked = readMCPPick(window.localStorage);
+    const i = picked.indexOf(id);
+    if (i >= 0) picked.splice(i, 1); else picked.push(id);
+    writeMCPPick(window.localStorage, picked);
+    renderMCP();
+  }
+
+  function renderMCP() {
+    if (!mcpBox) return;
+    // 管理员一台都没开 / 一台都没连通：按钮不存在，别让用户点开一个空面板
+    if (!mcpServers.length) { mcpBox.hidden = true; closeMCPLayer(); return; }
+    mcpBox.hidden = false;
+    const on = currentMCPIds();
+    if (mcpBtn) mcpBtn.classList.toggle('is-on', on.length > 0);
+    if (mcpLabel) mcpLabel.textContent = mcpBtnText(on.length);
+    if (mcpList) {
+      mcpList.innerHTML = '';
+      mcpServers.forEach((s) => {
+        const isOn = on.indexOf(s.id) >= 0;
+        // 直接复用技能层的行样式（.ch-skrow / .ch-skbox 是全局类），不另造一套勾选框
+        const row = el('button', 'ch-skrow' + (isOn ? ' is-on' : ''));
+        row.type = 'button';
+        row.setAttribute('aria-pressed', isOn ? 'true' : 'false');
+        row.appendChild(el('span', 'ch-skbox'));
+        const main = el('span', 'ch-skmain');
+        main.appendChild(el('span', 'ch-skname', s.name || s.id));
+        if (s.tool_count) main.appendChild(el('span', 'ch-sktag', s.tool_count + ' 个工具'));
+        row.appendChild(main);
+        row.addEventListener('click', () => toggleMCP(s.id));
+        mcpList.appendChild(row);
+      });
+    }
+    if (mcpFoot) {
+      mcpFoot.textContent = on.length
+        ? '已选 ' + on.length + ' 台，这轮会带上它们的工具'
+        : '未选：这轮完全不调用 MCP';
+    }
+  }
+
+  function openMCPLayer() {
+    if (!mcpLayer || mcpOpen) return;
+    mcpOpen = true;
+    mcpLayer.hidden = false;                 // CSS 里有 [hidden] 守卫，见 style.css 的 ④
+    if (mcpBtn) mcpBtn.setAttribute('aria-expanded', 'true');
+    renderMCP();
+  }
+
+  function closeMCPLayer() {
+    if (!mcpLayer || !mcpOpen) return;
+    mcpOpen = false;
+    mcpLayer.hidden = true;
+    if (mcpBtn) mcpBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  function toggleMCPLayer() { if (mcpOpen) closeMCPLayer(); else openMCPLayer(); }
+
+  function wireMCP() {
+    if (!mcpBox) return;
+    if (mcpBtn) mcpBtn.addEventListener('click', toggleMCPLayer);
+    // 点层外关掉。走**捕获阶段**：与技能层同一个理由（层内按钮点了会重渲染，
+    // 冒泡到 document 时被点的节点已游离，白名单判断失效 → 层刚开又被自己关回）。
+    // 这里只排除 mcpBox 自己：点输入框其它地方应当关层，不会误伤 —— 与技能层不同，
+    // 没有任何流程会"自动打开"这一层，所以不存在 submit() 刚开就被关掉的风险。
+    document.addEventListener('click', (e) => {
+      if (!mcpOpen) return;
+      const t = e.target;
+      if (t && t.isConnected === false) return;
+      if (mcpBox.contains(t)) return;
+      closeMCPLayer();
+    }, true);
+    document.addEventListener('keydown', (e) => {
+      if (mcpOpen && e.key === 'Escape') closeMCPLayer();
+    });
+  }
+
+  function loadMCPServers() {
+    return fetch('/api/mcp/servers')
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
+      .then((data) => {
+        mcpServers = ((data && data.servers) || []).filter((s) => s && s.id);
+        renderMCP();
+        return mcpServers;
+      })
+      .catch(() => { mcpServers = []; renderMCP(); return mcpServers; });
+  }
 
   function loadSkillIndex() {
     if (skFetched) return Promise.resolve(allSkills);
@@ -1000,12 +1142,17 @@
   // 组装 /api/chat 的请求体。抽成独立纯函数是为了能被 web/tests 直接跑真代码：
   // 手动模式下 mode/skill 一旦漏发，后端会静默退回自动调度，
   // 用户"明明锁了技能"却拿到别的东西 —— 这种失败在界面上一点提示都没有。
-  function chatPayload(text) {
+  //
+  // mcp 参数：勾选的数据源 id 列表。**不勾就是 []**，不是省略字段 ——
+  // 显式发空数组，后端才不用去猜"没这个字段"是"用户没勾"还是"老版本前端"。
+  // 默认值兜成 [] 也是刻意的：调用方忘了传时行为必须落在"不调度"那一侧。
+  function chatPayload(text, mcpIds) {
     return JSON.stringify({
       session_id: sessionId,
       message: text,
       mode: chatMode,
       skill: (chatMode === 'manual' && pickedSkill) ? pickedSkill.slug : '',
+      mcp: Array.isArray(mcpIds) ? mcpIds : [],
     });
   }
 
@@ -1094,7 +1241,7 @@
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: chatPayload(text),
+      body: chatPayload(text, currentMCPIds()),
     });
     if (!res.ok || !res.body) {
       const t = await res.text().catch(() => '');

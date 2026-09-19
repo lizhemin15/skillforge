@@ -37,6 +37,11 @@ type chatReq struct {
 	Mode string `json:"mode"`
 	// Skill 是 mode=manual 时锁定的技能 slug。
 	Skill string `json:"skill"`
+	// MCP 是用户在本轮**勾选**使用的 MCP 服务器 id 列表。
+	//
+	// 空/缺省 = 不调度任何 MCP（这是默认值，也是产品的默认行为）。
+	// 取值必须是服务器配置主键，前端从 GET /api/mcp/servers 拿。
+	MCP []string `json:"mcp"`
 }
 
 // needsAnswer is a mid-generation event the engine emits when a skill has
@@ -74,6 +79,24 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 技能不存在（刚被删/被停用）或不给 slug 都退回自动调度 —— 悄悄换技能很糟，
 	// 所以原因会挂到 meta 事件上让前端提示一句。
 	manualSkill, mode, manualNote := resolveMode(mode, req.Skill, h.eng.LoadSkill)
+
+	// MCP 门控 —— 「默认不调度 MCP」的实现点，每个请求都算一次。
+	//
+	// 三个值必须**一起**算出来（勾选集 / 裁剪后的工具表 / 提示词段落）：
+	// 任何两个错配，模型都会去调一个它拿不到的工具，表现是空转到轮数上限、
+	// 又慢又最后编答案。三个值分开算就等于把这种错配写进代码结构里。
+	//
+	// 注意这里不是「勾了才过滤」而是「永远过滤」：默认关是结构性的，
+	// 就算后面有人把分类器的 NeedsTools 调成恒真，没勾的用户也拿不到 MCP 工具。
+	mcpSel := []string(nil)
+	if h.mcp != nil {
+		mcpSel = tools.AllowedMCPServers(h.mcp.Selectable(), req.MCP)
+	}
+	toolReg := tools.FilterMCP(h.tools, tools.MCPServerSet(mcpSel))
+	mcpHint := ""
+	if h.mcp != nil {
+		mcpHint = h.mcp.PromptHintFor(mcpSel)
+	}
 
 	// SSE plumbing
 	fl, ok := w.(http.Flusher)
@@ -152,6 +175,9 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	write(evMeta, jsonSafe(map[string]string{
 		"reason": eval.Reason, "skill": eval.SkillSlug, "intent": eval.Intent,
 		"mode": mode, "note": manualNote,
+		// 把「这一轮到底给了几个 MCP 工具」摊在明面上：用户投诉「勾了没用」时，
+		// 有这一行就能一眼分清是「没勾上」「服务没连上」还是「模型没用」。
+		"mcp": strings.Join(mcpSel, ","),
 	}))
 
 	// 把调度过程画给用户看。这里**不再**按意图过滤（闲聊也发）：过滤掉就等于
@@ -167,8 +193,15 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 2a. 工具循环优先：任务需要外部实时数据或真实计算时，交给 Agent 自己组合工具
 	//     （优先于技能快路径——否则模型会「凭记忆编数字」生成一份看着很像的文档）
-	if eval.NeedsTools {
-		if h.runAgentLoop(ctx, write, clock, req, *eval, history) {
+	//
+	// 勾了 MCP 时**必须**进循环，不能只等分类器点头：线上实测「用数据工具箱查一下
+	// 有哪些库表」被判成「未命中技能手册，走通用写作」，于是根本没进循环、0 次工具调用，
+	// 模型把库表名全编了一遍（crm_prod / erp_finance / …）还额外编了个 SQL。
+	// 分类器不认识 MCP（它的提示词里没有 MCP 概念），是个单点误判，
+	// 用户明确勾选属于「用户直接指令」，优先级高于分类器的猜测。
+	// 命中技能时仍然让位：技能快路径交付文件/模板，强进循环反而会把交付物弄丢。
+	if eval.NeedsTools || (len(mcpSel) > 0 && eval.SkillSlug == "") {
+		if h.runAgentLoop(ctx, write, clock, req, *eval, history, toolReg, mcpHint) {
 			return
 		}
 	}

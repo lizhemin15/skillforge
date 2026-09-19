@@ -97,20 +97,18 @@ func agentSystemPrompt(mcpHint string) string {
 今天是 ` + time.Now().Format("2006年1月2日") + `。` + mcpHint
 }
 
-// mcpPromptHint 生成 MCP 外部工具的提示段。
+// mcpPromptHintFrom 把「MCP 工具清单」包装成提示词段落。
 //
 // 为什么非要有这段：工具虽然已经在 tools 数组里，但模型对「mcp_dtb_execute_sql」
 // 这种名字没有任何先验，实测会绕过它去写 http_request 或干脆瞎猜答案。
 // 点名「哪台服务、什么场景优先用它」之后命中率才起来。
 //
-// 工具清单本身由 tools.MCPManager.PromptHint() 产出（那边带每个工具的简介），
+// 工具清单本身由 tools.MCPManager.PromptHintFor() 产出（那边带每个工具的简介），
 // 这里只负责加「怎么用」的路由指令——清单两处各写一份迟早对不上。
-// 返回空串表示没接任何 MCP 服务，此时提示词与改造前逐字一致（零回归）。
-func (h *chatHandler) mcpPromptHint() string {
-	if h.mcp == nil {
-		return ""
-	}
-	list := h.mcp.PromptHint()
+//
+// list 为空表示「用户没勾任何 MCP 或没有可用服务」，此时返回空串，
+// 提示词与 MCP 改造前逐字一致（零回归 + 默认不调度）。
+func mcpPromptHintFrom(list string) string {
 	if strings.TrimSpace(list) == "" {
 		return ""
 	}
@@ -125,6 +123,11 @@ func (h *chatHandler) mcpPromptHint() string {
 //
 // 只在「没命中技能 + 不是闲聊」时启用：命中技能走原有快路径（模板填充/docgen），
 // 闲聊走原有的流式纯文本，谁都不受改造影响。
+//
+// reg 是被门控裁剪过的工具表（用户没勾 MCP 时里面就没有 MCP 工具），
+// mcpHint 是与之同源的提示词段落。两者必须由调用方**一起**算出来再传进来：
+// 分开算迟早出现「工具表说没有、提示词说有」的错配，模型会去调一个不存在的工具，
+// 表现是空转到轮数上限然后编答案。
 func (h *chatHandler) runAgentLoop(
 	ctx context.Context,
 	write func(ev, data string),
@@ -132,8 +135,10 @@ func (h *chatHandler) runAgentLoop(
 	req chatReq,
 	eval agent.Eval,
 	history []agent.Message,
+	reg *tools.Registry,
+	mcpHint string,
 ) bool {
-	if h.tools == nil || len(h.tools.All()) == 0 {
+	if reg == nil || len(reg.All()) == 0 {
 		return false
 	}
 	if strings.TrimSpace(req.Message) == "" {
@@ -185,8 +190,8 @@ func (h *chatHandler) runAgentLoop(
 		}
 	}
 
-	loop := agent.NewLoop(h.eng, h.tools, h.maxRound)
-	out, err := loop.Run(ctx, agentSystemPrompt(h.mcpPromptHint()), toLLMMessages(history), req.Message, emit)
+	loop := agent.NewLoop(h.eng, reg, h.maxRound)
+	out, err := loop.Run(ctx, agentSystemPrompt(mcpPromptHintFrom(mcpHint)), toLLMMessages(history), req.Message, emit)
 	if err != nil {
 		// 循环失败：把错误交给前端，但不要静默变成空回答
 		steps[len(steps)-1].Status = "done"

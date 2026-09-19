@@ -237,6 +237,12 @@ if [ "$QUICK" = 0 ]; then
   selfcheck '前端 / 勾选层与点外关闭自证' python3 web/tests/chat_ui_mutation_check.py
   selfcheck '前端 / 输入区布局与贴底滚动自证' python3 web/tests/chat_composer_mutation_check.py
   selfcheck '前端 / 思考材料渲染自证'   python3 web/tests/chat_trace_mutation_check.py
+  # MCP 数据源勾选（用户级门控）。用户原话：「上方应当多一个 mcp 指定的按钮，可以勾选使用
+  # 管理员已经开启的 mcp，否则默认应当是不调度 mcp 的」「勾选以后，你要确认确实能调度 mcp」。
+  # 这条门控失灵的方向是**多给**：模型工具表里多挂一台内网业务系统，谁都看不见。
+  # 所以尺子朝「关闭」倒（不勾=空数组、已下架的 id 剔掉、清单空=按钮收回），
+  # 且 6 条注入必须各自精确打红它自己那条断言。
+  selfcheck '前端 / MCP 数据源勾选自证'  python3 web/tests/chat_mcp_mutation_check.py
   selfcheck '前端 / 线上验收 leg 接线自证' bash web/tests/live_e2e_roster_mutation_check.sh
   # 大模型输出 JSON 的「手抖容忍层」自证。线上真故障（2026-09-17）：模型把
   # input_params.options 写成对象数组 [{"label":"启用","value":"on"}]，Go 严格解 []string

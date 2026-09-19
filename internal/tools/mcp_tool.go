@@ -20,6 +20,7 @@ import (
 // 不用改任何 Go 代码。
 type MCPTool struct {
 	name      string // 本地工具名（mcp_<alias>_<remote>），已 sanitize
+	serverID  string // 归属服务器 id（用户勾选门控按它裁剪，必须与配置主键同源）
 	server    string // 服务器可读名（写进描述，帮模型判断该不该用）
 	remote    mcp.RemoteTool
 	callFn    func(ctx context.Context, args map[string]any) (mcp.CallResult, error)
@@ -28,9 +29,13 @@ type MCPTool struct {
 
 // NewMCPTool 构造适配器。callFn 抽成函数是为了单测能塞假服务器，
 // 不必真起一个 HTTP 服务。
-func NewMCPTool(serverName, alias string, remote mcp.RemoteTool, callFn func(context.Context, map[string]any) (mcp.CallResult, error)) *MCPTool {
+//
+// serverID 是配置表主键，也是「用户勾选」时前端的取值——三个环节（配置/门控/前端）
+// 必须同源，否则勾了等于没勾。serverName 只用人看/模型看，不参与匹配。
+func NewMCPTool(serverID, serverName, alias string, remote mcp.RemoteTool, callFn func(context.Context, map[string]any) (mcp.CallResult, error)) *MCPTool {
 	return &MCPTool{
 		name:      mcpLocalName(alias, remote.Name),
+		serverID:  serverID,
 		server:    serverName,
 		remote:    remote,
 		callFn:    callFn,
@@ -40,6 +45,13 @@ func NewMCPTool(serverName, alias string, remote mcp.RemoteTool, callFn func(con
 
 // Name 返回本地工具名。
 func (t *MCPTool) Name() string { return t.name }
+
+// ServerID 返回工具归属的 MCP 服务器 id。
+//
+// 存在的唯一理由是门控：注册表是全局长着一份的（管理员开着就有），
+// 而「谁勾了哪台」是每请求的事。没有归属信息就只能按名字前缀猜，
+// 服务器名是中文时前缀会退化成哈希，猜错就是「勾了 A 却调了 B」。
+func (t *MCPTool) ServerID() string { return t.serverID }
 
 // Description 拼「远端描述 + 归属说明」。
 //
@@ -208,6 +220,15 @@ type MCPManager struct {
 	mounted  []string // 上一轮挂进注册表的工具名
 	statuses []MCPServerStatus
 	hint     string // 给系统提示词用的工具清单摘要
+
+	// mountedByServer / hintByServer 是上面两份数据的「按服务器切片」。
+	//
+	// 为什么非要多存一份：注册表是全局的（管理员开着，所有请求都看得见），
+	// 而提示词段落是每请求生成的。用户只勾了 A 的时候，提示词里出现 B 的工具
+	// 就是在教模型去调一个它拿不到的工具——模型会连着几轮重试再放弃，
+	// 用户看到的就是「勾了也没用 / 更慢了」。切片必须与门控同源，不能事后过滤字符串。
+	mountedByServer map[string][]string
+	hintByServer    map[string]string
 }
 
 // NewMCPManager 构造管理器。reg 为 nil 时只做探测不注册（便于后台单独测连接）。
@@ -235,6 +256,8 @@ func (m *MCPManager) Refresh(ctx context.Context) []MCPServerStatus {
 	}
 
 	newly := map[string]Tool{}
+	owner := map[string]string{}   // 工具名 → 服务器 id
+	hintByServer := map[string]string{}
 	statuses := make([]MCPServerStatus, 0, len(cfgs))
 	var hintParts []string
 
@@ -271,10 +294,11 @@ func (m *MCPManager) Refresh(ctx context.Context) []MCPServerStatus {
 		remoteNames := make([]string, 0, len(remote))
 		var lines []string
 		for _, rt := range remote {
-			tool := NewMCPTool(cfg.Name, alias, rt, func(ctx context.Context, args map[string]any) (mcp.CallResult, error) {
+			tool := NewMCPTool(cfg.ID, cfg.Name, alias, rt, func(ctx context.Context, args map[string]any) (mcp.CallResult, error) {
 				return client.CallTool(ctx, rt.Name, args)
 			})
 			newly[tool.Name()] = tool
+			owner[tool.Name()] = cfg.ID
 			names = append(names, tool.Name())
 			remoteNames = append(remoteNames, rt.Name)
 			desc := strings.TrimSpace(rt.Description)
@@ -294,7 +318,9 @@ func (m *MCPManager) Refresh(ctx context.Context) []MCPServerStatus {
 		st.RemoteTools = remoteNames
 		statuses = append(statuses, st)
 		if len(lines) > 0 {
-			hintParts = append(hintParts, fmt.Sprintf("【%s】\n%s", cfg.Name, strings.Join(lines, "\n")))
+			part := fmt.Sprintf("【%s】\n%s", cfg.Name, strings.Join(lines, "\n"))
+			hintParts = append(hintParts, part)
+			hintByServer[cfg.ID] = part
 		}
 	}
 
@@ -312,9 +338,36 @@ func (m *MCPManager) Refresh(ctx context.Context) []MCPServerStatus {
 			mounted = append(mounted, k)
 		}
 		m.mounted = mounted
+		// 按服务器切片只在**真挂上**之后记录：被 Remove 掉的名字留在切片里，
+		// 会让「勾了这台」的提示词里出现一个注册表里并不存在的工具。
+		byServer := map[string][]string{}
+		for _, n := range mounted {
+			if sid := owner[n]; sid != "" {
+				byServer[sid] = append(byServer[sid], n)
+			}
+		}
+		for _, names := range byServer {
+			sort.Strings(names)
+		}
+		m.mountedByServer = byServer
+		m.hintByServer = hintByServer
 	}
 
 	m.statuses = statuses
+	if m.reg == nil {
+		// 只探测不注册（后台「测试连接」走的是 TestMCP，但单测会这么构造）：
+		// 门控无从谈起，可是提示词切片仍必须与 PromptHint 一致——
+		// 两条路给出不一样的世界，是后面最难查的那种 bug。
+		byServer := map[string][]string{}
+		for n, sid := range owner {
+			byServer[sid] = append(byServer[sid], n)
+		}
+		for _, names := range byServer {
+			sort.Strings(names)
+		}
+		m.mountedByServer = byServer
+		m.hintByServer = hintByServer
+	}
 	if len(hintParts) > 0 {
 		m.hint = strings.Join(hintParts, "\n")
 	} else {
@@ -350,6 +403,74 @@ func (m *MCPManager) PromptHint() string {
 		return ""
 	}
 	return "以下是已接入的外部系统工具（MCP），涉及这些系统的问题必须优先用它们，不要自己编数据：\n" + m.hint
+}
+
+// PromptHintFor 返回**只含指定服务器**的工具清单段落。
+//
+// ids 为空 → 空串（用户一个都没勾，提示词里就不该提 MCP）。这条是「默认不调度」
+// 在提示词层的落实：门控只拦工具表、不拦提示词的话，模型仍会满脑子想着去调
+// 一个不存在的工具，表现是绕圈、变慢、最后编答案。
+func (m *MCPManager) PromptHintFor(ids []string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(ids) == 0 {
+		return ""
+	}
+	// 用 ids 的顺序而不是 map 顺序：同一批勾选必须产出同一份提示词，
+	// 否则提示词缓存永远命中不了，每轮都是冷启动（已经吃过这个亏）。
+	seen := map[string]bool{}
+	var parts []string
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		if p := m.hintByServer[id]; strings.TrimSpace(p) != "" {
+			parts = append(parts, p)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "以下是已接入的外部系统工具（MCP），涉及这些系统的问题必须优先用它们，不要自己编数据：\n" + strings.Join(parts, "\n")
+}
+
+// ServerTools 返回某台服务器已挂进注册表的工具名（门控自证用）。
+func (m *MCPManager) ServerTools(id string) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, len(m.mountedByServer[id]))
+	copy(out, m.mountedByServer[id])
+	return out
+}
+
+// MCPServerChoice 是**能出到公开接口**的服务器信息，就这三个字段。
+//
+// 刻意与 MCPServerStatus 分开而不是复用它：那个结构带 URL / 错误原文 / 远端
+// 服务名，是给后台和有鉴权的自检用的。公开接口（站点访客可访问）一旦复用，
+// 只要有人往后加个字段、或者序列化时直接 return 了状态对象，内网地址就出去了。
+// 类型分开之后，这种事在编译期就被挡住——想漏也漏不出去。
+type MCPServerChoice struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	ToolCount int    `json:"tool_count"`
+}
+
+// Selectable 返回**用户可以勾选**的服务器：配置里启用、且本轮握手成功。
+//
+// 返回副本，调用方随便改；内网地址与报错原文在这里就被丢掉，不依赖调用方自觉。
+func (m *MCPManager) Selectable() []MCPServerChoice {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]MCPServerChoice, 0, len(m.statuses))
+	for _, st := range m.statuses {
+		if st.Enabled && st.OK {
+			out = append(out, MCPServerChoice{
+				ID: st.ID, Name: st.Name, ToolCount: st.ToolCount,
+			})
+		}
+	}
+	return out
 }
 
 // TestMCP 只做一次连接探测并返回状态，不碰注册表——后台「测试连接」用。

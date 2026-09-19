@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SkillForge — 智能写作工坊</title>
   <meta name="description" content="以 Skill 为核心的文章写作 AI 系统。像聊天一样，告诉它你想写什么，引擎自动调度最合适的写作技能帮你成文。">
-  <link rel="stylesheet" href="/assets/css/style.css?v=20260919B">
+  <link rel="stylesheet" href="/assets/css/style.css?v=20260919C">
   <link rel="preload" as="font" type="font/woff2" href="/assets/fonts/dm-sans-latin.woff2" crossorigin>
   <link rel="preload" as="font" type="font/woff2" href="/assets/fonts/montserrat-latin.woff2" crossorigin>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%234d6bfe'/><rect x='9' y='9' width='6' height='14' rx='2' fill='%23ffffff'/><rect x='17' y='9' width='6' height='14' rx='2' fill='%23c3d0ff'/></svg>">
@@ -88,6 +88,22 @@
             <button type="button" class="ch-switch-opt is-on" id="mode-auto" data-mode="auto" role="tab" aria-selected="true">自动调度</button>
             <button type="button" class="ch-switch-opt" id="mode-manual" data-mode="manual" role="tab" aria-selected="false">指定技能</button>
           </div>
+          <!-- MCP 数据源入口：只在管理员开了至少一台、且这台握手成功时出现（JS 控制 hidden）。
+               默认全部不勾 = 不调度任何 MCP —— 这是产品默认，也是安全默认：
+               没勾也能捅到内网业务系统才是问题。勾选存 localStorage，发送时按 id 计入请求体。
+               放在 .ch-mrow 而不是推荐行：推荐行每次 renderChips() 都会清空 innerHTML，
+               放那儿会导致按钮随着对话一闪一闪地消失。 -->
+          <div class="ch-mcp" id="mcp-box" hidden>
+            <button type="button" class="ch-mcp-btn" id="mcp-btn" aria-haspopup="true" aria-expanded="false" aria-controls="mcp-layer">
+              <span class="ch-mcp-dot" id="mcp-dot" aria-hidden="true"></span>
+              <span id="mcp-label">MCP 数据源</span>
+            </button>
+            <div class="ch-mcp-layer" id="mcp-layer" hidden role="group" aria-label="选择这轮要用的数据源">
+              <div class="ch-mcp-head">勾选后才调度，不勾则完全不调用</div>
+              <div class="ch-mcp-list" id="mcp-list"></div>
+              <div class="ch-mcp-foot" id="mcp-foot"></div>
+            </div>
+          </div>
         </div>
         <textarea id="chat-input" class="ch-input" rows="3" placeholder="说说你想写什么…（Enter 发送，Shift+Enter 换行）"></textarea>
         <button class="ch-send" id="chat-send" aria-label="发送">
@@ -100,6 +116,6 @@
 
 <script src="/assets/vendor/marked/marked.min.js?v=20260909I"></script>
 <script src="/assets/js/site.js?v=20260911M"></script>
-<script src="/assets/js/chat.js?v=20260917B"></script>
+<script src="/assets/js/chat.js?v=20260919C"></script>
 </body>
 </html>

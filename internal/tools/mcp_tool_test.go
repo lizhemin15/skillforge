@@ -109,7 +109,7 @@ func TestMCPTool_DifferentServersDoNotCollide(t *testing.T) {
 // 没写 inputSchema 的工具必须补成合法空对象 schema，
 // 否则模型端会因 schema 非法直接 400，整个对话都发不出去。
 func TestMCPTool_SchemaAlwaysValid(t *testing.T) {
-	tool := NewMCPTool("假服务", "dtb", mcp.RemoteTool{Name: "boom"}, func(context.Context, map[string]any) (mcp.CallResult, error) {
+	tool := NewMCPTool("srv-dtb", "假服务", "dtb", mcp.RemoteTool{Name: "boom"}, func(context.Context, map[string]any) (mcp.CallResult, error) {
 		return mcp.CallResult{}, nil
 	})
 	s := tool.Schema()
@@ -123,7 +123,7 @@ func TestMCPTool_SchemaAlwaysValid(t *testing.T) {
 
 // 模型要靠描述里点名的服务器名来判断该不该用这个工具。
 func TestMCPTool_DescriptionMentionsServer(t *testing.T) {
-	tool := NewMCPTool("数据工具箱", "dtb", mcp.RemoteTool{Name: "execute_sql", Description: "执行 SQL"},
+	tool := NewMCPTool("srv-dtb", "数据工具箱", "dtb", mcp.RemoteTool{Name: "execute_sql", Description: "执行 SQL"},
 		func(context.Context, map[string]any) (mcp.CallResult, error) { return mcp.CallResult{}, nil })
 	d := tool.Description()
 	if !strings.Contains(d, "数据工具箱") || !strings.Contains(d, "执行 SQL") {
@@ -133,7 +133,7 @@ func TestMCPTool_DescriptionMentionsServer(t *testing.T) {
 
 // 远端业务失败要变成 Go error，这样工具轨迹里会标红，模型也能读到原因。
 func TestMCPTool_RunSurfacesBusinessError(t *testing.T) {
-	tool := NewMCPTool("假服务", "dtb", mcp.RemoteTool{Name: "boom"},
+	tool := NewMCPTool("srv-dtb", "假服务", "dtb", mcp.RemoteTool{Name: "boom"},
 		func(context.Context, map[string]any) (mcp.CallResult, error) {
 			return mcp.CallResult{Text: "远端说：表不存在", IsError: true}, nil
 		})
@@ -147,7 +147,7 @@ func TestMCPTool_RunSurfacesBusinessError(t *testing.T) {
 }
 
 func TestMCPTool_RunReturnsText(t *testing.T) {
-	tool := NewMCPTool("假服务", "dtb", mcp.RemoteTool{Name: "execute_sql"},
+	tool := NewMCPTool("srv-dtb", "假服务", "dtb", mcp.RemoteTool{Name: "execute_sql"},
 		func(context.Context, map[string]any) (mcp.CallResult, error) {
 			return mcp.CallResult{Text: "RESULT-OF-execute_sql"}, nil
 		})

@@ -1858,6 +1858,89 @@ header.topbar {
 }
 
 /* ============================================================
+   MCP 数据源勾选入口 · 20260919
+   ------------------------------------------------------------
+   触发（用户原话）：「管理员确认开启 mcp 后，用户端在聊天界面使用的时候，
+   上方应当多一个 mcp 指定的按钮，可以勾选使用管理员已经开启的 mcp，
+   否则默认应当是不调度 mcp 的。」
+
+   设计约束（都是踩过坑的）：
+   ① 位置在 `.ch-mrow`（模式胶囊那一行 = 输入框正上方），**不能**放推荐行：
+      推荐行每次 renderChips() 清空 innerHTML，按钮会随对话一闪一闪消失。
+   ② 只在有可选项时才出现：`#mcp-box` 默认 hidden，JS 拿到非空清单才摘掉。
+      一个管理员没开任何 MCP 的部署，用户界面上不该多出一个常驻按钮。
+   ③ 弹出层向上弹（bottom: calc(100% + 6px)）而不是向下：它在页面底部，
+      往下弹会被视口切掉。
+   ④ `[hidden]` 守卫那一条不能省：下面写了 display:flex，
+      会盖掉浏览器默认的 [hidden]{display:none} —— 层设了 hidden 却还在屏幕上。
+      （技能层的 .ch-sklayer[hidden] 就是同一个坑的记录。）
+   ⑤ 行样式直接复用 .ch-skrow / .ch-skbox（全局类，未限定在技能层下），
+      不新造一套勾选框视觉。
+   ============================================================ */
+.ch-mcp { position: relative; flex: none; margin-left: auto; }
+.ch-mcp[hidden] { display: none; }
+
+.ch-mcp-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px;
+  font: inherit; font-size: 11.5px; font-weight: 500;
+  color: var(--ds-color-text-dim, #5b6b7f);
+  background: rgba(9,45,78,.05);
+  border: 1px solid var(--ds-glass-edge-cool);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background .13s ease, border-color .13s ease, color .13s ease;
+}
+.ch-mcp-btn:hover { background: rgba(9,45,78,.09); border-color: var(--ds-color-border-strong); }
+.ch-mcp-btn[aria-expanded="true"] { background: rgba(9,45,78,.09); border-color: var(--ds-color-border-strong); }
+/* 勾了至少一台 → 按钮变成"已生效"态，用户一眼能看出这轮会带数据源 */
+.ch-mcp-btn.is-on {
+  color: var(--ds-color-brand);
+  background: rgba(77,107,254,.10);
+  border-color: rgba(77,107,254,.42);
+}
+
+.ch-mcp-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--ds-color-text-faint, #9aa7b4);
+  transition: background .13s ease;
+}
+.ch-mcp-btn.is-on .ch-mcp-dot { background: var(--ds-color-brand); }
+
+.ch-mcp-layer {
+  position: absolute; z-index: 40;
+  bottom: calc(100% + 6px); right: 0;
+  width: 268px;
+  display: flex; flex-direction: column;
+  max-height: min(46vh, 320px);
+  padding: 8px;
+  border-radius: 14px;
+  background: var(--ds-glass-bg-panel);
+  border: 1px solid var(--ds-glass-edge-cool);
+  -webkit-backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  backdrop-filter: blur(var(--ds-glass-blur)) saturate(var(--ds-glass-sat));
+  box-shadow: var(--ds-shadow-card);
+  animation: ch-in .16s ease;
+}
+.ch-mcp-layer[hidden] { display: none; }   /* 见上面 ④，缺了它层关不掉 */
+
+.ch-mcp-head {
+  flex: none; margin: 0 0 6px; padding: 1px 3px 7px;
+  font-size: 11px; line-height: 1.4; color: var(--ds-color-text-faint);
+  border-bottom: 1px solid var(--ds-color-border-soft);
+}
+.ch-mcp-list { display: flex; flex-direction: column; gap: 2px; overflow-y: auto; overscroll-behavior: contain; }
+.ch-mcp-count {
+  flex: none; margin-left: auto; padding-left: 6px;
+  font-size: 10.5px; color: var(--ds-color-text-faint);
+}
+.ch-mcp-foot {
+  flex: none; margin-top: 6px; padding: 7px 3px 1px;
+  font-size: 11px; color: var(--ds-color-text-faint);
+  border-top: 1px solid var(--ds-color-border-soft);
+}
+
+/* ============================================================
    Composer 布局 + 贴底滚动 · 20260914
    ------------------------------------------------------------
    触发（用户原话）：「输入框被自动调度、指定技能挤到右边，应当占据所有的位置。

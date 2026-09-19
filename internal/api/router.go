@@ -180,6 +180,9 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/generate", h.Skills.Generate)
 	mux.HandleFunc("POST /api/chat", h.Chat.ServeHTTP)
 	mux.HandleFunc("GET /api/chat/attachment/{slug}", h.Chat.Attachment)
+	// 用户端 MCP 选择面板的数据源（无鉴权，与 /api/chat 同级）。
+	// 挂了这条前端才知道「有没有可勾的 MCP」，没有的话按钮根本不出现。
+	mux.HandleFunc("GET /api/mcp/servers", h.Chat.ListMCP)
 	mux.HandleFunc("GET /api/chat/gen/{token}", h.GenFile(h.gen))
 	// 推荐行（输入框上方的小胶囊）的模型侧：见 suggest.go 的包注释。
 	// 无鉴权（和 /api/chat 同级，面向首页访客），代价靠超时 + 并发闸门控制。
