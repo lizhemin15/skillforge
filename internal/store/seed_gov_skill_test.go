@@ -114,7 +114,7 @@ func TestGovTaskDevPromptKeepsDeliveryContract(t *testing.T) {
 	must := []string{
 		"只输出一个", "```javascript", // 输出形态：一段可粘贴的完整脚本
 		"INPUT_FILE", "INPUT_TEXT", "INPUT_FILES", "currentGovTask", // 全局变量
-		"await", // 异步语义
+		"await",                                                     // 异步语义
 		"gov.callAI", "gov.executeSQLForDb", "gov.fillWordTemplate", // 三条最容易被写错的 API 至少要有说明
 	}
 	for _, s := range must {
