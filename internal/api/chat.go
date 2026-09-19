@@ -444,7 +444,16 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		// 执笔那一跳保留思考链时首字实测要等 63 秒，而这段 provider 一片 reasoning 都不推。
 		// 所以先要一份「构思」：它关思考链、秒级出字，片段走 contentSink 变成中间材料。
+		//
+		// ★ 2026-09-20：旁白必须**先于**这一跳开。构思跳关思考链是有代价的——provider
+		// 在「关思考」这条上实测 reason=0（一片都不推），所以它自己的整段耗时全是静默：
+		// 线上实测这一跳 hop=50.0s / ttft=45.5s，整轮「最长无变化 49.2s」就是它。
+		// 旁白滚的是本地事实（装进上下文的是什么、几篇范文、上文多少字），t≈0 就能发，
+		// 正好填住这段——这也回答了「为什么不让旁白晚点开」：晚一秒就是多一秒死屏。
+		facts := noteFacts(sc, args, history).note()
+		stopPlanNarr := clock.Narrate(narrateLines("", facts))
 		plan, _ := h.eng.PlanEssay(ctx, sc, args, req.Message)
+		stopPlanNarr()
 		if plan != "" {
 			tb.Close(planIdx, "要点已定，按它落笔")
 		} else {
@@ -497,9 +506,14 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 见上一条注释：phase 只能用前端 AGENTS 表认识的四个键，构思挂 generate。
 	planIdx := tb.Active("generate", "③ 构思要点", "先把这一篇怎么写想清楚，要点会实时滚出来…")
 	clock.Set(tb.Steps())
-	clock.Thinking(noteFacts(nil, nil, history).note())
+	plainFacts := noteFacts(nil, nil, history).note()
+	clock.Thinking(plainFacts)
 
+	// 旁白先于构思跳开，理由同上面技能链路那条：构思跳关思考链 → provider reason=0
+	// → 这一跳全程静默（线上实测 50.0s / 首 token 45.5s）。
+	stopPlanNarr := clock.Narrate(narrateLines("", plainFacts))
 	plan, _ := h.eng.PlanEssay(ctx, nil, nil, req.Message)
+	stopPlanNarr()
 	if plan != "" {
 		tb.Close(planIdx, "要点已定，按它落笔")
 	} else {

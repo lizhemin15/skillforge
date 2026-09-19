@@ -173,6 +173,22 @@ def session_answer(sid, role="assistant"):
     return None
 
 
+# 本地事实行的开头：这些是**我们自己的代码**写进材料区的（静默旁白 / 装配事实 /
+# 要点回顾 / 构思条目），不是模型产出。B1 要守的性质是「用户还会不会看到模型的英文
+# 自我对话」，本地行不该被算进去——装配事实里本来就要列要素键名，而键名可以是英文
+# （company_name、core_event、date），那跟人名地名一样是**专名**，不是「在说英文」。
+# 线上实测（2026-09-20）B1 唯一那条「噪声帧」就是这行装配事实，是尺子误伤。
+LOCAL_LINE_PREFIXES = ("模型正在自检措辞",  # 旧版旁白前缀，留着重放老账本
+                       "模型思考中…",      # 现版旁白前缀（agent.narrationPrefix）
+                       "已装配：",          # assemblyFacts.note()
+                       "· ",                # narrateLines / clock.Thinking 的条目行
+                       "（要点回顾")
+
+
+def is_local_line(d):
+    return d.lstrip().startswith(LOCAL_LINE_PREFIXES)
+
+
 def check_material(round_dict, answer=None):
     mats = round_dict["mats"]
     r = round_dict
@@ -189,20 +205,23 @@ def check_material(round_dict, answer=None):
     except Exception as e:
         print(f"⚠ 材料 dump 失败（不影响判据）：{e}")
     deltas, noisy, times = [], [], []
+    local = 0
     prev = ""
     for t, m in mats:
         d = delta(prev, m)
         prev = m
         if not d.strip():
             continue
+        times.append(t)          # 本地行也是屏幕上的动静，B2（最长无变化）必须算它
+        if is_local_line(d):
+            local += 1
+            continue             # 但 B1 只管模型侧产出，本地事实行不进噪声判定
         deltas.append(d)
-        times.append(t)
-        if d.startswith("模型正在自检措辞"):
-            continue
         if latin_ratio(d) > NOISE_RATIO:
             noisy.append((t, d[:60]))
     ok("B1 材料里没有半英半中的噪声帧", len(noisy) == 0,
-       f"噪声帧 {len(noisy)}/{len(deltas)}" + (f"；首条 {noisy[0][1]!r}" if noisy else ""))
+       f"噪声帧 {len(noisy)}/{len(deltas)}（另 {local} 帧本地事实行不计）"
+       + (f"；首条 {noisy[0][1]!r}" if noisy else ""))
     # B2 = 「屏幕上还有没有东西在动」，**不是**「材料帧之间隔了多久」。
     #
     # 这两件事差别很大，而原版 B2 量的是后者 —— 于是正文正在一屏屏刷出来的时候，它照样

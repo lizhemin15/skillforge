@@ -913,6 +913,17 @@ func (e *Engine) PlanEssay(ctx context.Context, sc *SkillContent, args map[strin
 		"3) 不要开场白、不要解释、不要 markdown 标题；\n" +
 		"4) 全中文，总量控制在 300 字以内。"
 	st := &hopStat{t0: time.Now()}
+	// 构思跳必须自带**硬上限**。它关思考链（provider 实测 reason=0），自己一片材料都不推，
+	// 所以它整段耗时都是屏幕上的静默。线上实测（2026-09-20，siliconflow）这一跳跑出过
+	// hop=50.0s / ttft=45.5s，整轮「最长无变化 49.2s」就是它——而它存在的唯一目的恰恰是
+	// 让屏幕有东西在动（见 chat.go 的注释）。让一个「为了展示」的跳把展示冻住 50 秒是
+	// 本末倒置，所以给上限：超时按「没拿到要点」继续落笔。执笔那跳自己会流思考链
+	// （实测 thinking_budget=1024 时 0.8s 出首片思考、23.4s 出首正文），材料立刻就有。
+	if d := planDeadline(); d > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
+	}
 	out, err := e.llm.StreamChat(ctx, sys, ask, llm.StreamOpts{
 		DisableThinking: true,
 		OnReasoning:     st.reasoning(reasoningSink(ctx)),
@@ -935,6 +946,35 @@ func (e *Engine) GenerateWithPlan(ctx context.Context, sc *SkillContent, args ma
 // 换来的是执笔质量的自行承担），不是悄悄降质的默认值。
 func writeThinkingOn() bool {
 	return strings.TrimSpace(os.Getenv("SKILLFORGE_WRITE_THINKING")) != "0"
+}
+
+// planDeadline 是构思跳（PlanEssay）的硬上限，默认 20s，SKILLFORGE_PLAN_DEADLINE_MS 可调，
+// 显式设 0 = 不限制（给「这一轮我就要它慢慢想」留出口）。
+//
+// 定这条的账（线上实测，2026-09-20，siliconflow Qwen3.6-27B）：
+//
+//	plan 跳     hop=50.0s ttft=45.5s reason=0   ← 整轮「最长无变化 49.2s」就是它
+//	write 跳    hop=25.8s ttft=19.5s reason=1024
+//
+// 构思跳关思考链，所以它**一片材料都不推**（reason=0）：这 50 秒里屏幕上除了计时器
+// 什么都没有，而这一跳存在的唯一目的恰恰是让屏幕有东西在动（见 api/chat.go 的注释）——
+// 让一个「为了展示」的跳把展示冻住 50 秒是本末倒置。正常 provider 下这一跳全量返回
+// 约 7.7s，20s 只砍异常、不碰正常路径；真被砍了也不致命：拿不到要点就照旧直接落笔，
+// 而执笔跳自带思考链流（实测 0.8s 出首片思考），材料立刻接上。
+func planDeadline() time.Duration {
+	const def = 20 * time.Second
+	v := strings.TrimSpace(os.Getenv("SKILLFORGE_PLAN_DEADLINE_MS"))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	if n <= 0 {
+		return 0 // 显式不限
+	}
+	return time.Duration(n) * time.Millisecond
 }
 
 func (e *Engine) generateWithExtraPlan(ctx context.Context, sc *SkillContent, args map[string]string, extra, plan string, onDelta func(string)) (string, error) {

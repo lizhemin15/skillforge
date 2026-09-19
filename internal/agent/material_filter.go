@@ -64,6 +64,20 @@ type materialFilter struct {
 	lastShown time.Time // 最近一次**真的展示了**东西（含旁白）的时刻
 	seen      string    // 最近已展示片段的归一化尾窗（判重复用）
 	lastNorm  string    // 上一条已展示片段的归一化形式（判相似度用）
+
+	// pend 是「还没攒够、不敢展示」的尾巴（跨 Feed 累积）。
+	//
+	// 为什么非要它不可——线上账本（2026-09-20，siliconflow Qwen3.6-27B 执笔跳）：
+	// provider 的思考链是 **2.4~3 字一片** 流出来的（实测 1024 片 / 2447 字），
+	// 而这一版的判据是「**单片**里要有 ≥runMin 个连续汉字」。单片 3 个字永远凑不够，
+	// 于是整条思考链被静默丢掉：屏幕上只剩计时器在跳，正是用户投诉的那句
+	// 「现在一直卡着计时，用户体验不佳」；实测整轮 79.9s 只展示出 22 帧材料。
+	//
+	// 而那片思考链里装的是**整篇中文草稿**（120 字/行，逐段写出来）：
+	//	*(Para 1: 5Ws)* 2026年9月20日，专注于前沿计算架构…完成人民币X亿元B轮融资
+	// 所以正确做法不是放宽单片门槛（放宽了会把英文脚手架里的碎汉字也放出去），
+	// 而是**跨片攒、按边界吐**：攒到换行或句末标点才展示，读到的就是完整句子。
+	pend []rune
 }
 
 // newMaterialFilter 造一个过滤器。now 为 nil 时退回 time.Now。
@@ -99,16 +113,25 @@ func (f *materialFilter) Feed(chunk string) []string {
 	// 先记账再过滤：被挡掉的英文脚手架同样是「模型在动」的证据，旁白靠它给出真进度。
 	f.rawSeen += len([]rune(text))
 
-	if shown := f.displayText(text); shown != "" {
+	// 一次 Feed 可能吐出**多条**材料（抽出来的中文段各自成条）：不合并成一条是
+	// 踩过线上才定下的——把隔着英文脚手架的几段接起来，会粘出「更具韧性数字化底座」
+	// 这种谁都没说过的假话；而只挑最长的一段又会丢掉短的那段（真实料 45.9s
+	// 「模化商用交付阶段。数据中台」就是这么被吃掉的）。分开发，两条都不犯。
+	var out []string
+	for _, shown := range f.collect(text) {
 		norm := normalizeMaterial(shown)
-		if !f.duplicate(norm) {
-			f.seen = materialTail(f.seen+norm, f.seenWin)
-			f.lastNorm = norm
-			f.lastShown = now
-			return []string{shown}
+		if f.duplicate(norm) {
+			// 重复的片段按噪声处理：不给用户看第二遍，但它同样是「模型还在动」的证据，
+			// 所以下面的心跳逻辑照样管它。
+			continue
 		}
-		// 重复的片段按噪声处理：不给用户看第二遍，但它同样是「模型还在动」的证据，
-		// 所以下面的心跳逻辑照样管它。
+		f.seen = materialTail(f.seen+norm, f.seenWin)
+		f.lastNorm = norm
+		f.lastShown = now
+		out = append(out, shown)
+	}
+	if len(out) > 0 {
+		return out
 	}
 
 	if now.Sub(f.lastShown) >= f.silence {
@@ -116,6 +139,120 @@ func (f *materialFilter) Feed(chunk string) []string {
 		return []string{f.narration(now)}
 	}
 	return nil
+}
+
+// collect 把这一片接进尾巴，再按**边界**把能展示的中文段吐出来。
+//
+// 三条「敢吐」的判据（任一成立即可）：
+//
+//	① 尾巴里出现换行——思考链是按行组织的（草稿一行一段），行到齐就能整行读；
+//	② 尾巴里出现句末标点——句子写完了，边界安全（吐到最后一个句末标点为止，
+//	   后面没写完的那半句接着攒）；
+//	③ 这一片**自身**就有 ≥runMin 个汉字——说明它不是被 provider 切碎的 2~3 字小片，
+//	   而是当作完整单位送进来的（构思跳的中文条目「· 首段写五要素」、测试里的整句）。
+//	   线上思考链实测 2.4~3 字/片，永远走不到这条；踩不到它，就不会再漏出残句。
+//
+// 攒的边界为什么要卡死在「行/句」而不是「够长就吐」：碎句拼在一起是另一种困惑
+// （线上把「数字化底座」和「锚串」两块碎片粘成过一句假话），见文件头那段历史。
+func (f *materialFilter) collect(text string) []string {
+	f.pend = append(f.pend, []rune(text)...)
+
+	var out []string
+	// ① 完整行
+	for {
+		i := runeIndex(f.pend, '\n')
+		if i < 0 {
+			break
+		}
+		line := string(f.pend[:i])
+		f.pend = f.pend[i+1:]
+		out = append(out, f.materialOf(line)...)
+	}
+	// ② 行内的句末标点
+	if i := lastSentenceEnd(f.pend); i >= 0 {
+		head := string(f.pend[:i+1])
+		f.pend = f.pend[i+1:]
+		out = append(out, f.materialOf(head)...)
+	}
+	// ③ 整片送进来的够长内容
+	if len(out) == 0 && countCJK([]rune(text)) >= f.runMin && len(f.pend) > 0 {
+		whole := string(f.pend)
+		f.pend = f.pend[:0]
+		out = append(out, f.materialOf(whole)...)
+	}
+	if len(f.pend) > pendCap {
+		f.pend = f.pend[len(f.pend)-pendKeep:]
+	}
+	return out
+}
+
+// pendCap / pendKeep：尾巴的封顶与截留。只有「一直凑不出边界」的输入会碰到它
+// （纯英文长段落），此时丢掉最老的部分——留着它也只是等着被 overflow 掉。
+const (
+	pendCap  = 4096
+	pendKeep = 512
+)
+
+// runeIndex 是 []rune 版的 strings.IndexRune。
+func runeIndex(rs []rune, r rune) int {
+	for i, x := range rs {
+		if x == r {
+			return i
+		}
+	}
+	return -1
+}
+
+// lastSentenceEnd 返回尾巴里**最后一个**句末标点的下标（没有就 -1）。
+//
+// 只认句末标点（。！？；），不认逗号顿号：逗号是句内停顿，在逗号处切断还是残句。
+// 半角 `.!?;` 不收：思考链里它们几乎只出现在英文脚手架里（`Total: ~650.`），
+// 收进来会把英文句子误当成中文句子的边界。
+func lastSentenceEnd(rs []rune) int {
+	for i := len(rs) - 1; i >= 0; i-- {
+		switch rs[i] {
+		case '。', '！', '？', '；':
+			return i
+		}
+	}
+	return -1
+}
+
+// isAlnumASCII 判断一个字符是不是 ASCII 字母或数字（「连接件」的候选字符）。
+func isAlnumASCII(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+}
+
+// glueMax 是「连接件」的长度上限：夹在中文中间的短拉丁/数字串最长几个字符，
+// 还算这个中文段的一部分、不把段切开。
+//
+// 定这条是因为线上思考链草稿长这样（实测原文）：
+//
+//	*(Para 1: 5Ws)* 2026年9月20日，…圆满完成人民币X亿元B轮融资
+//
+// `2026`、`X`、`B` 都是**内容**，但按「连续汉字才算同一段」的判据，它们每一个
+// 都把句子断成两截，用户拿到的是「星澜科技成功完成数亿元」+「轮融资，加速推进」
+// 这种残句。取 4 是为了容下 `2026` 这种四位年份，同时把 `deadbeef`（8 位锚串）、
+// `chars`、`Total` 这类英文词挡在外面——它们比 4 长，照样是段边界。
+const glueMax = 4
+
+// markupRunes 是模型思考链里的 Markdown 排版符号：`**粗体**`、`# 标题`、“ `代码` “、
+// `| 表格 |`、`> 引用`。它们既不是内容也不是中文段边界（`**标题**：正文` 里的
+// `**` 会把「标题」和「正文」之间的段切碎），所以先抹成空格再抽段。
+func stripMarkup(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for _, r := range s {
+		switch r {
+		case '*', '#', '`', '_', '|', '>', '~':
+			b.WriteRune(' ')
+		case '	', '\r':
+			b.WriteRune(' ')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // displayText 从一片思考链里抽出**值得展示给用户的那部分**：这一片里所有
@@ -128,11 +265,87 @@ func (f *materialFilter) Feed(chunk string) []string {
 // 片内两段中文之间只隔着一个拉丁术语（十几个字符），接起来读得通；跨片不接
 // （每次 Feed 各自展示），所以不会把隔着几十秒的两句话拼成一句。
 func (f *materialFilter) displayText(text string) string {
-	runs := chineseRuns(text, f.runMin)
+	runs := f.materialOf(text)
 	if len(runs) == 0 {
 		return ""
 	}
-	return strings.Join(runs, "")
+	// 单值版本：只返回最长的一段，给「这一片里到底有没有值得展示的中文」这类
+	// 无状态断言用（见 material_filter_test.go 的噪声样本检查）。
+	// 真正展示走 materialOf（**逐段分别发**），理由见 Feed 里那段注释。
+	best := runs[0]
+	for _, r := range runs[1:] {
+		if countCJK([]rune(r)) > countCJK([]rune(best)) {
+			best = r
+		}
+	}
+	return best
+}
+
+// materialOf 抽出这段文本里**所有**值得展示的中文段，各自成条。
+//
+// 为什么不合成一条：段与段之间可能隔着几十个字符的英文脚手架，接起来就是粘假话
+// （真实料回归里当场粘出过「更具韧性数字化底座」）；为什么不只留最长的那条：
+// 会丢内容（同一份回归里吃掉了「模化商用交付阶段。数据中台」）。分成多条，
+// 两个坑都不踩——材料窗口本来就是「按条追加」的（见 chat_trace.go 的 appendMaterial）。
+func (f *materialFilter) materialOf(text string) []string {
+	return materialRuns(text, f.runMin, glueMax)
+}
+
+// materialRuns 抽出「值得展示的中文段」。与 chineseRuns 是同一套「段」的概念
+// （汉字 + 中文标点，标点只当连接件、不算长度、段首尾去掉），差别只有一条：
+//
+//	**夹在中文中间的短拉丁/数字串（≤ glueMax 个字符）算段内内容，不断段。**
+//
+// 判据为什么必须放宽这一条——线上思考链草稿（实测原文，汉字 33%）：
+//
+//	*(Para 1: 5Ws)* 2026年9月20日，专注于前沿计算架构…完成人民币X亿元B轮融资
+//
+// 严格版判据在这里切出四个残句（「年」「月」「日」各自成段，`X`、`B` 各断一刀），
+// 用户看到的是「轮融资，加速推进」这种没头没尾的碎片。放宽后这一行原样读得通。
+//
+// 放宽的**代价**被两道闸门限住：① 连接件最长 4 个字符，英文词（`chars`、`Total`、
+// `deadbeef`）依旧断段；② 段首尾的中文标点照旧去掉。所以「用户还会不会看到英文
+// 脚手架」这条性质没有被松掉——material_filter_test.go 的拉丁占比 ≤20% 断言照样守着。
+//
+// chineseRuns 留着不动：它是测试里的**尺子**（TestMaterialFilterRealLedger 用它
+// 声称「实现说要展示的段」），尺子和实现必须各写一份，共用就等于自己量自己。
+func materialRuns(text string, min, glue int) []string {
+	rs := []rune(stripMarkup(text))
+	var out []string
+	var cur []rune
+	flush := func() {
+		for len(cur) > 0 && isCJKPunct(cur[0]) {
+			cur = cur[1:]
+		}
+		for len(cur) > 0 && isCJKPunct(cur[len(cur)-1]) {
+			cur = cur[:len(cur)-1]
+		}
+		if countCJK(cur) >= min {
+			out = append(out, string(cur))
+		}
+		cur = cur[:0]
+	}
+	for i := 0; i < len(rs); {
+		if r := rs[i]; isCJK(r) || isCJKPunct(r) {
+			cur = append(cur, r)
+			i++
+			continue
+		}
+		// 非中文字符：先看它是不是「连接件」——一段短的字母数字，且前后都是中文。
+		j := i
+		for j < len(rs) && isAlnumASCII(rs[j]) {
+			j++
+		}
+		if j > i && j-i <= glue && countCJK(cur) > 0 && j < len(rs) && (isCJK(rs[j]) || isCJKPunct(rs[j])) {
+			cur = append(cur, rs[i:j]...)
+			i = j
+			continue
+		}
+		flush()
+		i++
+	}
+	flush()
+	return out
 }
 
 // chineseRuns 抽出文本里所有长度 ≥ min 个**汉字**的「连续中文段」。

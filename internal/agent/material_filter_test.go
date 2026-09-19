@@ -423,3 +423,60 @@ const runMinDefault = 6
 // enoughChinese 是「这一片抽得出可展示的中文吗」的无状态版本（阈值同 runMinDefault），
 // 只用于测试日志里区分「中文不够」与「重复」这两种丢弃原因。
 func enoughChinese(s string) bool { return len(chineseRuns(s, runMinDefault)) > 0 }
+
+// TestMaterialFilterAccumulatesSlicedReasoning 守的是一个**真实分片形态**：provider 把
+// 思考链切成 2~3 字一片送进来（线上实测执笔跳 1024 片 / 2447 字，平均 2.4 字/片）。
+//
+// 修之前的行为：判据是「**单片**里要有 ≥6 个连续汉字」，而单片只有 3 个字，永远凑不够，
+// 于是整条思考链被静默丢掉 —— 界面上一整轮（实测 79.9s）只有 22 帧材料，用户看到的
+// 就是「一直卡着计时」。变异自证：把 displayText 换回 `chineseRuns(text, f.runMin)`
+// （无跨片累积、无连接件），断言 1/2 立刻转红。
+//
+// fixture 是线上思考链原文（/tmp/reason_sample.txt 其中一行，与账本同一批）。
+func TestMaterialFilterAccumulatesSlicedReasoning(t *testing.T) {
+	const draft = "   *(Para 1: 5Ws)* 2026年9月20日，专注于前沿计算架构与人工智能底层系统研发的星澜科技正式宣布圆满完成人民币X亿元B轮融资。本轮融资由知名风险投资机构蓝石资本领投。"
+	rs := []rune(draft)
+	var chunks []string
+	for i := 0; i < len(rs); i += 3 { // 3 字一片，复刻线上分片粒度
+		end := i + 3
+		if end > len(rs) {
+			end = len(rs)
+		}
+		chunks = append(chunks, string(rs[i:end]))
+	}
+
+	clk := newFakeClock()
+	f := newMaterialFilter(clk.now)
+	shown, _ := feedMaterial(f, clk, chunks, 40*time.Millisecond)
+
+	var kept []string
+	for _, s := range shown {
+		if !isNarration(s) {
+			kept = append(kept, s)
+		}
+	}
+	// 断言 1：切片流里必须吐得出材料。旧实现这里是 0 条（这就是线上那个 bug）。
+	if len(kept) == 0 {
+		t.Fatalf("%d 片思考链（每片 3 字）一条材料都没展示出来——屏幕上只剩计时器", len(chunks))
+	}
+	// 断言 2：吐出来的得是读得通的整句，不是「轮融资，加速推进」这类残句。
+	// 比汉字序列：显示层丢标点属于预期行为。
+	stream := cjkOnly(strings.Join(kept, ""))
+	if want := cjkOnly("星澜科技正式宣布圆满完成人民币亿元轮融资"); !strings.Contains(stream, want) {
+		t.Errorf("展示流里读不到草稿原句（被切碎或漏了）：\n  展示=%q\n  期望含=%q", stream, want)
+	}
+	// 断言 3：夹在中文里的短连接件（X / B）不许被当边界切掉 —— 它们是内容（币种/轮次）。
+	if joined := strings.Join(kept, ""); !strings.Contains(joined, "人民币X亿元B轮融资") {
+		t.Errorf("中文段被拉丁连接件切碎了（币种/轮次丢了）：%q", joined)
+	}
+	// 断言 4：每条材料都得够长，不许把碎屑当材料发出去。
+	for _, s := range kept {
+		if cjk, _ := cjkStats(s); cjk < runMinDefault {
+			t.Errorf("展示了一条不足 %d 个汉字的碎屑：%q（CJK=%d）", runMinDefault, s, cjk)
+		}
+		if ratio := latinRuneRatio(s); ratio > 0.2 {
+			t.Errorf("展示的材料挂着英文脚手架（拉丁占比 %.0f%%）：%q", ratio*100, s)
+		}
+	}
+	t.Logf("喂 %d 片（每片 3 字）→ 展示 %d 条材料：%v", len(chunks), len(kept), kept)
+}

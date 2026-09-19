@@ -41,6 +41,10 @@ type fakeProvider struct {
 	hang bool
 	// hangFirst：只挂前 N 发，之后正常回答（见 server 里那段注释）。
 	hangFirst int
+	// hangMax：挂住的**自释放上限**（测试专用）。生产里 provider 是真的会一直挂，
+	// 但测试里必须留个出口：否则「超时没生效」的变异自证会把测试挂到框架超时才判死，
+	// 那种红分不清是守卫生效还是测试自己崩了。留出口后变异自证得到的是普通 FAIL。
+	hangMax time.Duration
 }
 
 func (f *fakeProvider) server(t *testing.T) *httptest.Server {
@@ -66,7 +70,16 @@ func (f *fakeProvider) server(t *testing.T) *httptest.Server {
 			if fl, ok := w.(http.Flusher); ok {
 				fl.Flush()
 			}
-			<-r.Context().Done()
+			// 挂住的自释放（见 hangMax 字段注释）：不给出口的话，变异自证会挂到
+			// 框架超时，那种红分不清是守卫生效还是测试自己崩了。
+			wait := f.hangMax
+			if wait <= 0 {
+				wait = 30 * time.Second
+			}
+			select {
+			case <-r.Context().Done():
+			case <-time.After(wait):
+			}
 			return
 		}
 		stream, _ := body["stream"].(bool)
@@ -643,5 +656,59 @@ func TestClassifyTimeoutTwiceSpeaksUpBeforeDegrading(t *testing.T) {
 	joined := strings.Join(materials, "")
 	if !strings.Contains(joined, "意图识别超时/失败") || !strings.Contains(joined, "没有按你的上文路由") {
 		t.Fatalf("两次都失败时必须把降级明说出去（用户才不会以为「它自己变笨了」），实际材料 %q", joined)
+	}
+}
+
+// TestPlanEssayGivesUpAtDeadline 守「构思跳不许把屏幕冻住」。
+//
+// 线上实测（2026-09-20）：构思跳关思考链 → provider reason=0 → 它整段耗时都是静默，
+// 慢的时候跑出 hop=50.0s / ttft=45.5s，整轮「最长无变化 49.2s」就是它。而这一跳存在的
+// 唯一目的恰恰是让屏幕有东西在动，所以它必须自带硬上限：超时按「没拿到要点」继续落笔，
+// 由执笔跳（自带思考链流）接上材料。
+//
+// 变异自证：把 PlanEssay 里那段 context.WithTimeout 删掉，这条会挂到 provider 一直
+// 不吐字节为止 —— 实测耗时远超断言里的 3s 界。
+func TestPlanEssayGivesUpAtDeadline(t *testing.T) {
+	t.Setenv("SKILLFORGE_PLAN_DEADLINE_MS", "300")
+	// hangMax 3s：挂住的上游 3 秒后自释放。这样「把 WithTimeout 删掉」的变异自证
+	// 得到的是一条普通 FAIL（耗时 ~3s > 2s 界），而不是把测试挂到框架超时。
+	fp := &fakeProvider{hang: true, hangMax: 3 * time.Second}
+	eng := newTestEngine(t, fp)
+
+	t0 := time.Now()
+	plan, err := eng.PlanEssay(context.Background(), nil, nil, "写一篇公司新闻稿")
+	spent := time.Since(t0)
+
+	if plan != "" {
+		t.Errorf("上游挂住时不该拿到要点，实际 %q", plan)
+	}
+	if err == nil {
+		t.Error("超时必须以错误返回 —— 否则 hopStat 的账本里看不出这一跳被砍过，等于把「静默 50s」藏起来")
+	}
+	if spent > 2*time.Second {
+		t.Errorf("构思跳没有在上限内放弃：耗时 %s（上限 300ms，上游自释放 3s）—— 屏幕又会被它冻住", spent)
+	}
+	t.Logf("挂住的上游：构思跳 %s 放弃（上限 300ms）", spent)
+}
+
+// TestPlanDeadlineKnob 守旋钮本身：默认 20s、显式 0 = 不限、非法值回落默认。
+// 与 thinking_budget 同一套约定（见 TestPlainWriteHopGetsThinkBudgetAndStreamsMaterial）：
+// 「不限」必须是显式选择，不能因为打错字就悄悄变成不限。
+func TestPlanDeadlineKnob(t *testing.T) {
+	cases := []struct {
+		env  string
+		want time.Duration
+	}{
+		{"", 20 * time.Second},
+		{"0", 0},
+		{"-1", 0},
+		{"5000", 5 * time.Second},
+		{"xyz", 20 * time.Second},
+	}
+	for _, c := range cases {
+		t.Setenv("SKILLFORGE_PLAN_DEADLINE_MS", c.env)
+		if got := planDeadline(); got != c.want {
+			t.Errorf("SKILLFORGE_PLAN_DEADLINE_MS=%q → %s，期望 %s", c.env, got, c.want)
+		}
 	}
 }
