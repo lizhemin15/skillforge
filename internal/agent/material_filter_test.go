@@ -376,7 +376,7 @@ func loadLedgerFixture(t *testing.T, name string) []ledgerRow {
 	return rows
 }
 
-func isNarration(s string) bool { return strings.HasPrefix(s, "模型思考中…") }
+func isNarration(s string) bool { return IsMaterialNarration(s) }
 
 // 这把尺子自己错过两次，所以给它留一组**负向对照**：报进度的中文句不算英文脚手架，
 // 真脚手架一个字也不许放过。少任何一半都会退化成坏尺子 ——

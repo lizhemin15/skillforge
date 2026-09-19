@@ -122,7 +122,7 @@ func (c *traceClock) Thinking(text string) {
 		c.mu.Unlock()
 		return
 	}
-	c.material = tailRunes(c.material+text, materialCap)
+	c.material = appendMaterial(c.material, text)
 	now := time.Now()
 	if !c.lastMat.IsZero() && now.Sub(c.lastMat) < materialThrottle {
 		c.mu.Unlock()
@@ -131,6 +131,52 @@ func (c *traceClock) Thinking(text string) {
 	c.lastMat = now
 	c.mu.Unlock()
 	c.emit()
+}
+
+// appendMaterial 是材料窗口**唯一**的写入规则。
+//
+// 抽成具名函数是为了让测试驱动出货代码：上一版测试自己手搭窗口（把旁白直接 += 上去），
+// 结果红在一个线上不可能出现的场景上 —— 测试里重写实现，测的就不是实现。
+//
+// 规则一句话：追加之前一律先摘掉尾巴上那条旧旁白。
+//
+//	· 新来的是旁白 → 摘旧的放新的，窗口里永远只剩 1 条旁白（不叠链）；
+//	· 新来的是真材料 → 摘掉那句兜底话术，别把「模型思考中…已产出 571 字」和
+//	  「· 取素材中具体企业…」黏成一句，读起来像模型在念叨自己的进度。
+//
+// 不摘老的会得到线上 dump /tmp/mat_dump_final.json 里那个样子：同一句话黏八遍。
+func appendMaterial(mat, text string) string {
+	return tailRunes(dropTrailingNarration(mat)+text, materialCap)
+}
+
+// visibleMaterial 从材料窗口里取出该给用户看的那一段。
+//
+// 材料窗口是「所有已展示文本的滚动尾巴」；旁白带前导换行（见 agent.materialFilter
+// 的 narration），于是窗口形如 `真材料\n旁白\n旁白\n旁白`。只取最后一个换行之后
+// 的内容，新旁白就**替换**旧的而不是叠成链 —— 线上 dump 实测没这一步时是这样：
+//
+//	模型思考中…已产出 239 字（已 2s）模型思考中…已产出 571 字（已 5s）模型思考中…
+//
+// 用户看到的是同一句话说八遍，而不是「进度在涨」。真材料（中文段）永不含换行。
+func visibleMaterial(mat string) string {
+	i := strings.LastIndex(mat, "\n")
+	if i >= 0 {
+		return mat[i+1:]
+	}
+	return mat
+}
+
+// dropTrailingNarration 摘掉窗口尾巴上的那条旁白（如果有）。
+// 返回值的**尾部**是最后一段真材料；窗口里只有旁白时返回空串。
+func dropTrailingNarration(mat string) string {
+	i := strings.LastIndex(mat, "\n")
+	if i < 0 {
+		return mat
+	}
+	if agent.IsMaterialNarration(mat[i+1:]) {
+		return mat[:i]
+	}
+	return mat
 }
 
 // tailRunes 取**尾部** n 个字符。按字符切而不是按字节：按字节切会把一个汉字
@@ -230,6 +276,10 @@ func (c *traceClock) snapshot(decorate bool) []agent.TraceStep {
 	out := cloneSteps(c.steps)
 	mat := c.material
 	c.mu.Unlock()
+	// 材料窗口是滚动尾巴，旁白（带前导换行）会黏在真材料后面。只把**最后一段**
+	// 给用户看：新旁白替换旧旁白，真材料照旧跟在后面。不这么做的话窗口会变成
+	// 一条不断变长的旁白链，看起来像复读而不是进度。
+	mat = visibleMaterial(mat)
 	if !decorate || len(out) == 0 {
 		return out
 	}

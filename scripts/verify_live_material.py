@@ -232,22 +232,22 @@ def check_material(round_dict, answer=None):
         print("⚠ B3 SKIP：拿不到该轮正文（既没读到会话文件、SSE 里也没有 delta）")
         return
     prompt_text = round_dict.get("prompt") or ""
-    terms = []
-    for w in re.findall(r"[\u4e00-\u9fff]{3,6}", prompt_text):
-        # 通用旁白词不算「贴内容」的证据
-        if w in ("素材如下", "背景素材", "写完直接", "标题自拟", "下面是公司"):
-            continue
-        if w not in terms:
-            terms.append(w)
-    # 取在素材里出现次数最高的一批实词：高频词才代表「这一轮在讲什么」
-    terms.sort(key=lambda w: -prompt_text.count(w))
-    picks = terms[:12]
-    hits = [w for w in picks if w in stream]
+    # 用 **4-gram** 而不是贪心的 3~6 字窗口：后者在中文里切出来的是「下面是公司的」
+    # 这种跨词垃圾，要求它在材料里逐字出现，等于拿错的串去对答案（线上真红过一次，
+    # 而当时材料里明明有「引述规范」「禁用词」这些本轮要求）。4-gram 短、稳、可自证。
+    grams = {}
+    txt = re.sub(r"[^\u4e00-\u9fff]", " ", prompt_text)
+    for run in txt.split():
+        for i in range(len(run) - 3):
+            g = run[i:i + 4]
+            grams[g] = grams.get(g, 0) + 1
+    picks = [g for g, n in sorted(grams.items(), key=lambda kv: -kv[1])[:40] if n >= 2]
     if not picks:
-        print("⚠ B3 SKIP：提示词里取不到中文实词，本判据无从下手")
+        print("⚠ B3 SKIP：提示词里取不到重复出现的 4-gram，本判据无从下手")
     else:
-        ok("B3 材料贴着本轮素材（出现本轮实词）", len(hits) >= 2,
-           f"{len(hits)}/{len(picks)} 个本轮实词出现在材料里" +
+        hits = [g for g in picks if g in stream]
+        ok("B3 材料贴着本轮素材（出现本轮 4-gram）", len(hits) >= 2,
+           f"{len(hits)}/{len(picks)} 个高频 4-gram 出现在材料里" +
            (f"；例 {'、'.join(hits[:4])}" if hits else "；一个都没出现，材料像是通用套话"))
 
     # ---- B4 速度账：这三行是「感受速度」的尺子 ----

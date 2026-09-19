@@ -177,8 +177,25 @@ func chineseRuns(text string, min int) []string {
 // 现在报的是**累计吃进来的思考字数**（rawSeen）：模型每吐一片它就涨，是真的进度，
 // 不是把时间换个说法再念一遍。秒数保留在括号里当辅助，不再是唯一变量。
 // 思考字数用截断而不是四舍五入：和秒数同一个理由（不让用户觉得被多算）。
+// narrationPrefix 是旁白的固定开头。**识别的唯一来源**：显示层要用它判断窗口尾巴
+// 是不是旁白（api.visibleMaterial / traceClock.Thinking），两处各写一份字符串迟早不齐。
+const narrationPrefix = "模型思考中…"
+
+// IsMaterialNarration 报告一段材料是不是「静默兜底旁白」（而不是模型产出的中文料）。
+// 带不带前导换行都算 —— 旁白本体带 \n 是为了在窗口里做分隔，识别时不该依赖它。
+func IsMaterialNarration(s string) bool {
+	return strings.HasPrefix(strings.TrimPrefix(s, "\n"), narrationPrefix)
+}
+
 func (f *materialFilter) narration(now time.Time) string {
-	return fmt.Sprintf("模型思考中…已产出 %d 字（已 %ds）",
+	// 开头这个 \n 是**旁白分隔符**，不是排版：材料窗口是「所有已展示文本的滚动尾巴」，
+	// 旁白要是不加分隔符就会和旧旁白叠成一条越来越长的链（线上 dump 实测：
+	// `已产出 239 字（已 2s）模型思考中…已产出 571 字（已 5s）…` 一直黏下去），
+	// 用户看到的是「同一句话说八遍」而不是「进度在涨」。显示层只取最后一段
+	// （见 chat_trace.go 的 snapshot），于是新旁白**替换**旧旁白，链条不会长。
+	// 思考链抽出来的中文段永远不含换行（displayText 遇非中文即 flush），
+	// 所以「换行 = 旁白」这条约定不会误伤真材料。
+	return fmt.Sprintf("\n"+narrationPrefix+"已产出 %d 字（已 %ds）",
 		f.rawSeen, int(now.Sub(f.started).Seconds()))
 }
 
