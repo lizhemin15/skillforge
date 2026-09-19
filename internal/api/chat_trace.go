@@ -46,6 +46,8 @@ const (
 type traceClock struct {
 	write func(ev, data string)
 	beat  time.Duration
+	// narrateEvery 是本地旁白的换行间隔（构造期定型，理由见 newTraceClockTuned）。
+	narrateEvery time.Duration
 
 	mu    sync.Mutex
 	steps []agent.TraceStep
@@ -70,11 +72,18 @@ func newTraceClock(write func(ev, data string), steps []agent.TraceStep) *traceC
 // c.beat，于是 loop() 读 c.beat 与测试写 c.beat 构成数据竞争——本地不带 -race
 // 全绿，CI 上 `go test -race` 当场红（真踩过）。参数注入比给 beat 加锁干净。
 func newTraceClockBeat(write func(ev, data string), steps []agent.TraceStep, beat time.Duration) *traceClock {
+	return newTraceClockTuned(write, steps, beat, narrateGap)
+}
+
+// newTraceClockTuned 让**心跳节奏与旁白节奏都可注入**。旁白节奏必须能在构造期定下来，
+// 理由同 beat：goroutine 起来之后再改字段就是数据竞争（CI 的 -race 会当场红）。
+func newTraceClockTuned(write func(ev, data string), steps []agent.TraceStep, beat, narrateEvery time.Duration) *traceClock {
 	c := &traceClock{
-		write: write,
-		beat:  beat,
-		start: time.Now(),
-		done:  make(chan struct{}),
+		write:        write,
+		beat:         beat,
+		narrateEvery: narrateEvery,
+		start:        time.Now(),
+		done:         make(chan struct{}),
 	}
 	c.mu.Lock()
 	c.steps = cloneSteps(steps)
@@ -247,6 +256,109 @@ func activePos(st []agent.TraceStep) int {
 		}
 	}
 	return -1
+}
+
+// narrateGap 是「本地旁白」的换行间隔。取 3s 与心跳同拍：屏幕上「已用 Ns」在跳的
+// 同时，材料区也换一行，用户读到的是「它在按要点推进」，而不是「卡住了」。
+const narrateGap = 3 * time.Second
+
+// Narrate 用**本地已知事实**当旁白，填满一段没有任何模型材料的阻塞跳。
+//
+// 为什么需要它：执笔那一跳（chat.go 的「按要点执笔」、chat_write.go 的「起草初稿」）
+// 是纯阻塞调用，而线上 provider 实测**一片 reasoning 都不推**（reasoning 片数=0），
+// 正文也要等整篇想完才来。于是那几十秒到几分钟里，屏幕上只有步骤标签和不断 +3 的
+// 「已用 Ns」——用户原话就是「一直卡着计时」。
+//
+// 修法不是造假流，而是把**已经在我们手里的事实**（构思要点、装配了什么上下文）
+// 定时滚出来：内容全部本地真值，模型没说话时也不会撒谎。
+// 走的是同一条 material 通道（Thinking），所以前端不用改、也不会和正文打架。
+//
+// 返回的 stop 必须被调用（否则 goroutine 会跨轮泄漏，继续往下一个会话的流里写字）。
+func (c *traceClock) Narrate(lines []string) (stop func()) {
+	clean := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		if s := strings.TrimSpace(ln); s != "" {
+			clean = append(clean, tailRunes(s, narrateLineCap))
+		}
+	}
+	if len(clean) == 0 {
+		return func() {}
+	}
+	done := make(chan struct{})
+	var once sync.Once
+	c.Thinking("· " + clean[0])
+	go func() {
+		gap := c.narrateEvery
+		if gap <= 0 {
+			gap = narrateGap
+		}
+		t := time.NewTicker(gap)
+		defer t.Stop()
+		i := 0
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				i++
+				// 一轮走完就从头再滚，并标上「第 N 遍」：重复的是真事实，
+				// 但要让人看出这是回顾而不是新进展（否则等于在骗人）。
+				if i%len(clean) == 0 {
+					c.Thinking(fmt.Sprintf("（要点回顾 %d/%d）· %s", len(clean), len(clean), clean[0]))
+					continue
+				}
+				c.Thinking("· " + clean[i%len(clean)])
+			}
+		}
+	}()
+	return func() { once.Do(func() { close(done) }) }
+}
+
+// narrateLineCap 是旁白单行上限。材料只留尾部 materialCap 字，一行太长会把
+// 别的行挤掉、只剩半句；48 字上下正好是「一眼读懂」的量。
+const narrateLineCap = 48
+
+// narrateLines 把「构思要点 / 装配事实」切成旁白行。
+// 要点文本是模型写的自由文本（带 -、1.、· 等前缀的短行混着长段），直接整段滚
+// 会变成一坨。这里优先取列表行；一条列表行都没有时（要点是一段话），按句号切。
+func narrateLines(plan, fallback string) []string {
+	var out []string
+	for _, ln := range strings.Split(plan, "\n") {
+		s := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(ln), "-*·•0123456789.、)（("))
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		// 列表行特征：原行以符号/编号开头，且去掉标记后仍然不长。
+		if len([]rune(s)) <= narrateLineCap && (strings.HasPrefix(strings.TrimSpace(ln), "-") ||
+			strings.HasPrefix(strings.TrimSpace(ln), "*") ||
+			strings.HasPrefix(strings.TrimSpace(ln), "·") ||
+			strings.HasPrefix(strings.TrimSpace(ln), "•") ||
+			(len(ln) > 0 && ln[0] >= '0' && ln[0] <= '9')) {
+			out = append(out, s)
+		}
+	}
+	if len(out) == 0 && strings.TrimSpace(plan) != "" {
+		for _, s := range strings.FieldsFunc(plan, func(r rune) bool { return r == '。' || r == '\n' }) {
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, tailRunes(s, narrateLineCap))
+			}
+		}
+	}
+	if len(out) == 0 && strings.TrimSpace(fallback) != "" {
+		// 装配事实是一整句（「技能：X｜要素 3 项｜上文 1.2k 字」这类），
+		// 按分隔符拆开才有多行可滚；拆不出来就整句重复（至少不等于静止）。
+		for _, s := range strings.FieldsFunc(fallback, func(r rune) bool {
+			return r == '；' || r == '｜' || r == ';'
+		}) {
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, tailRunes(s, narrateLineCap))
+			}
+		}
+	}
+	if len(out) > 8 { // 面板不是阅读器：超过 8 行一轮太久，等于没换过
+		out = out[:8]
+	}
+	return out
 }
 
 const (

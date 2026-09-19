@@ -414,9 +414,11 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// reasoning，reasoning 片数=0）屏幕上只剩计时器在跳，所以先把「装进上下文的
 		// 是什么」报出去——这是本地事实，t≈0 就能发。
 		clock.Thinking(noteFacts(sc, args, history).note())
+		stopNarr := clock.Narrate(narrateLines(plan, noteFacts(sc, args, history).note()))
 		full, err = h.eng.GenerateWithPlan(ctx, sc, args, plan, func(delta string) {
 			write(evDelta, jsonSafe(map[string]string{"t": delta}))
 		})
+		stopNarr()
 		if err != nil {
 			write(evError, jsonSafe(map[string]string{"error": "生成失败: " + err.Error()}))
 			return
@@ -462,9 +464,13 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	tb.Active("generate", "④ 按要点执笔", "按要点写正文，思考链片段会实时滚出来…")
 	clock.Set(tb.Steps())
 
+	// 这一跳实测能静默几分钟（provider 不推 reasoning、正文也要整篇想完才来），
+	// 所以本地旁白必须开：滚的是构思要点与上下文事实，不是编出来的进度。
+	stopNarr := clock.Narrate(narrateLines(plan, noteFacts(nil, nil, history).note()))
 	full, err = h.eng.PlainChatWithPlan(ctx, req.SessionID, req.Message, history, plan, func(delta string) {
 		write(evDelta, jsonSafe(map[string]string{"t": delta}))
 	})
+	stopNarr()
 	if err != nil {
 		write(evError, jsonSafe(map[string]string{"error": err.Error()}))
 		return
