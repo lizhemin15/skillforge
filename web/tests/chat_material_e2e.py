@@ -191,7 +191,7 @@ def report():
 # 在页面里起一个采样器：每 200ms 记录「材料尾部 / 材料长度 / 正文长度 / 有无 active 步」。
 # 采样必须在页面内部跑（Python 侧轮询会漏帧，200ms 的滚动窗口只有真 setInterval 抓得住）。
 SAMPLER_JS = """() => {
-  window.__mt = {samples: [], t0: Date.now(), errs: []};
+  window.__mt = {samples: [], t0: Date.now(), errs: [], maxLiving: 0, badNums: {}, numSeen: 0};
   window.addEventListener('error', e => window.__mt.errs.push(String(e.message).slice(0,120)));
   clearInterval(window.__iv);
   window.__iv = setInterval(() => {
@@ -199,6 +199,18 @@ SAMPLER_JS = """() => {
     const m = act ? act.querySelector('.ctk-mat') : null;
     const b = document.querySelector('.ch-msg.assistant .ch-bubble');
     const txt = m ? (m.innerText || '') : '';
+    // 同时「进行中」的格子数：正常恒 ≤1。两个一起转 = 板上出现了同名重复步骤
+    // （Carry 接管了 t≈0 那格之后又追加了一格同名，被接管那格永远转不完）。
+    const living = document.querySelectorAll('.ctk-step.active').length;
+    if (living > window.__mt.maxLiving) window.__mt.maxLiving = living;
+    const nseen = document.querySelectorAll('.ctk-num').length;
+    if (nseen > window.__mt.numSeen) window.__mt.numSeen = nseen;
+    // 编号栏只许是数字：前端拿不到 phase 的映射时会把 phase **原样**印上去
+    // （后端写 phase="plan" 的那版线上就显示英文单词 plan、角色徽标空白）。
+    document.querySelectorAll('.ctk-num').forEach(function (e) {
+      const v = (e.innerText || '').trim();
+      if (v && !/^[0-9]+$/.test(v)) window.__mt.badNums[v] = (window.__mt.badNums[v] || 0) + 1;
+    });
     window.__mt.samples.push([
       Date.now() - window.__mt.t0,
       txt.length,
@@ -215,7 +227,8 @@ SAMPLER_JS = """() => {
 READ_JS = """() => {
   const s = window.__mt || {samples: [], errs: []};
   const b = document.querySelector('.ch-msg.assistant .ch-bubble');
-  return {samples: s.samples, errs: s.errs,
+  return {samples: s.samples, errs: s.errs, maxLiving: s.maxLiving || 0, badNums: s.badNums || {},
+          numSeen: s.numSeen || 0,
           bubble: b ? (b.innerText || '').replace(/\\s+/g, '').length : 0,
           genfile: Array.from(document.querySelectorAll('a.atx-link .atx-hint'))
                      .some(e => (e.innerText || '').includes('已生成文档')),
@@ -374,6 +387,23 @@ def run_checks(pg):
               max((s[5] for s in samples), default=0) == 0, '')
 
     check('M6 真流式过程中页面无 JS 异常', not last['errs'], str(last['errs'][:2]))
+
+    # M8/M9 是**步骤板本身**的两条渲染契约（2026-09-19 加）。为什么必须挂到线上真页面：
+    # 步骤板是这一轮里用户唯一能看到的进展来源，而后端那两条缺陷在**单测里都是绿的**
+    # 才上的线（进程内真路由测出来才发现）：板上出现两个 ①、其中一个永远转不完
+    # （「一直卡着计时」的另一半就是这个），以及 phase 写了前端认不得的值 ——
+    # chat.js:1371 的 `(agent.n || s.phase)` 会把 phase 原样印在编号栏上，
+    # 那格里显示一个英文单词，角色徽标空白。所以这两条只在**真浏览器渲染出的 DOM** 上量。
+    # 先断前提，再断不变量：整轮一个 active 格都没出现过 / 一个编号栏都没渲染出来时，
+    # 下面的「≤1」「没有英文字面量」是**空跑绿**（尺子没量到东西，不许读成通过）。
+    check('M8a 前提：整轮真出现过「进行中」的格子（否则 M8 是空跑）',
+          last.get('maxLiving', 0) >= 1, f"峰值 {last.get('maxLiving')} 格 active")
+    check('M9a 前提：步骤板真渲染出编号栏（否则 M9 是空跑）',
+          last.get('numSeen', 0) >= 1, f"编号栏元素峰值 {last.get('numSeen')} 个")
+    check('M8 步骤板同时「进行中」的格子数 ≤1（两个一起转 = 板上出现了同名重复步骤）',
+          last.get('maxLiving', 0) <= 1, f"峰值 {last.get('maxLiving')} 格同时 active")
+    check('M9 步骤板编号栏全是数字（出现英文字面量 = 后端 phase 前端认不得）',
+          not last.get('badNums'), f"非数字编号栏：{last.get('badNums')}")
 
     # M7 是「用户到底卡了多久」的硬闸。M1~M4 只要整轮**曾经**有过材料就算绿，
     # 所以它们放得过这种形态：材料在两秒内滚完、之后四十秒屏幕一个字都不动

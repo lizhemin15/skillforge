@@ -249,6 +249,14 @@ jobs:
           go test ./internal/api/ -run 'TestRouteFileIntent|TestRouteWriteIntent' -count=1
           bash internal/api/chat_route_file_intent_mutation_check.sh
 
+      # 写作链路的步骤板是用户在这一轮里唯一能看到的进展来源：板上出现两个 ①、
+      # 其中一个永远在转，或者编号栏印出前端认不得的英文 phase，用户读到的都是「卡住」。
+      # 契约断言挂在出货的前端 chat.js 上（AGENTS 表的键就是后端 phase 的合法取值集合）。
+      - name: 后端回归（步骤板渲染契约 + 断言自证）
+        run: |
+          go test ./internal/api/ -run 'TestWriteSkillBoardShowsPlanThenDraft|TestPlainPathBoardShowsPlanThenDraft' -count=1
+          bash internal/api/chat_board_contract_mutation_check.sh
+
       # 这两条 .py 自证脚本此前**没有任何地方调用**：CI 里没有 step、本地也没跑。
       # 后果是可预测的 —— category_guard_inject.py 的一条锚点早就跟实现脱钩
       # （categoryErrStatus 里 ErrNotManualSkill 被有意删掉），脚本自己在那行
@@ -283,6 +291,19 @@ jobs:
       # 现在根目录从脚本自身位置推导，本地与 CI 同一份逻辑（连带守 gofmt：它用 sed 改 Go 源码）。
       - name: 前端断言自证（漏接流式守卫）
         run: bash web/tests/stage_streaming_guard_mutation_check.sh
+
+      # 内置「数据治理任务开发」技能：出货提示词里「## 六、完整示例」那两个示例脚本
+      # 是**教模型怎么写脚本的范本**。它们一旦跟 gov-runner 的 API 脱钩（改名、改返回
+      # 形状），模型照着写出来的东西在客户现场就是运行期报错 —— 而提示词文本、Go 单测、
+      # 示例代码块本身都不会红。所以这道尺子不查文本，它起一个假 AI 桩、调**真 runner**
+      # 执行示例脚本，验 Excel/Word 产物内容（含模板样式指纹：表头底色 C6D9F1、
+      # 双线 double sz=8、列宽 2400 有没有真传进产出）。
+      # CI 上 gov-runner 必然缺席：它是 DataToolbox 编译出的外部产物，不在本仓库。
+      # 缺席时脚本会打**醒目 SKIP 横幅**并明说「本项不算 PASS、这块无人看守」——不装绿。
+      # 真跑的腿在 scripts/preflight.sh（那边加 GOV_RUNNER_REQUIRED=1，把 SKIP 直接
+      # 升级成 FAIL，不给「永远 SKIP 的尺子」留活路），连同 INJECT=1/2 两路负向自证。
+      - name: 内置技能示例脚本真跑（无 runner 则醒目 SKIP，不算 PASS）
+        run: python3 web/tests/gov_examples_mutation_check.py
 
       # 解析服务（ocrd）的纯单测。它们是**第三个免疫区**：本机能跑、0 引用，
       # 于是 test_ocrd_quality.py 里钉死的版本串 `ocrd-v5-quality` 跟真值

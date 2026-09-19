@@ -393,10 +393,14 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// 阶段推进，也看不到材料。这里补上它（手册链路的 chat_write.go 早有同样的板）。
 		tb := newTraceBoard()
 		tb.Carry(clock.Steps())
-		tb.Done("analyze", "① 意图分析", "已判断出本轮要做什么")
+		tb.CloseCarried(analyzeCarriedDetail(manualSkill))
 		tb.Done("match", "② 技能匹配", "命中技能《"+sc.Name+"》")
 		tb.Done("params", "③ 要素提炼", noteFacts(sc, args, history).note())
-		planIdx := tb.Active("plan", "④ 构思要点", "先把这一篇怎么写想清楚，要点会实时滚出来…")
+		// 构思那一跳挂 generate，不新造 phase：前端 [web/js/chat.js] 的 AGENTS 表只认
+		// analyze/match/params/generate 四个键，取不到就把 phase 原样印在编号栏上
+		// （那格里会显示英文单词 "plan"、角色徽标空白）。同一阶段的多跳靠 label 区分，
+		// 起草初稿/审稿/修订/交付也都是这么挂在 generate 上的。
+		planIdx := tb.Active("generate", "④ 构思要点", "先把这一篇怎么写想清楚，要点会实时滚出来…")
 		clock.Set(tb.Steps())
 
 		// 执笔那一跳保留思考链时首字实测要等 63 秒，而这段 provider 一片 reasoning 都不推。
@@ -449,9 +453,10 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 构思跳（关思考链、秒级出字，把「这一篇怎么写」当 content 流出来当材料）。
 	tb := newTraceBoard()
 	tb.Carry(clock.Steps())
-	tb.Done("analyze", "① 意图分析", "已判断出本轮要做什么")
+	tb.CloseCarried(analyzeCarriedDetail(manualSkill))
 	tb.Done("params", "② 上下文装配", noteFacts(nil, nil, history).note())
-	planIdx := tb.Active("plan", "③ 构思要点", "先把这一篇怎么写想清楚，要点会实时滚出来…")
+	// 见上一条注释：phase 只能用前端 AGENTS 表认识的四个键，构思挂 generate。
+	planIdx := tb.Active("generate", "③ 构思要点", "先把这一篇怎么写想清楚，要点会实时滚出来…")
 	clock.Set(tb.Steps())
 	clock.Thinking(noteFacts(nil, nil, history).note())
 

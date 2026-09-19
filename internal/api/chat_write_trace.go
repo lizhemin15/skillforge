@@ -52,6 +52,39 @@ func (b *traceBoard) Active(phase, label, detail string) int {
 	return len(b.steps) - 1
 }
 
+// CloseCarried 定格**已经被 Carry 接过的那一格**，而不是再追加一格同名步骤。
+//
+// 为什么必须单独有它：Carry 的本意是「把 t≈0 就下发、用户已经在看的那一格接着用」，
+// 但调用方照后续步骤的写法调 Done(同 phase、同名 label) 就会**又追加一格**。线上真帧
+// 取证（internal/api/chat_board_contract_test.go 的 R2/R4）长这样：
+//
+//	0>active  ① 意图分析  正在理解你的问题…     ← 被 Carry 接过来的那格，永远停在 active
+//	1 done    ① 意图分析  已判断出本轮要做什么    ← 新追加的
+//
+// 用户看到的是同一序号两格、其中一个圈转不完 —— 这就是「一直卡着计时」的一部分。
+//
+// detail 传空 = 保留原文案。手动档的首格是「① 指定技能 / 已选定《X》，跳过意图分析」，
+// 改写成「已判断出本轮要做什么」等于跟同一句里的「跳过意图分析」自相矛盾。
+func (b *traceBoard) CloseCarried(detail string) {
+	if len(b.steps) == 0 {
+		// 骨架为空时退回追加，保证板子不会少这一格（调用方都是写作路，标签就是① 意图分析）。
+		if strings.TrimSpace(detail) != "" {
+			b.Done("analyze", "① 意图分析", detail)
+		}
+		return
+	}
+	b.Close(0, detail)
+}
+
+// analyzeCarriedDetail 给出「被 Carry 的首格」该补什么结论：
+// 自动档补一句分类结论；手动档首格自带准确文案（已选定《X》，跳过意图分析），原样留着。
+func analyzeCarriedDetail(manual *agent.SkillContent) string {
+	if manual != nil {
+		return ""
+	}
+	return "已判断出本轮要做什么"
+}
+
 // Done 追加一格已完成的步骤（不需要经过「进行中」的瞬态就用它）。
 func (b *traceBoard) Done(phase, label, detail string) {
 	i := b.Active(phase, label, detail)

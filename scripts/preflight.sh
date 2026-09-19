@@ -285,6 +285,19 @@ if [ "$QUICK" = 0 ]; then
   # 第 5 路是它抓出来的真洞：分类断言原来写成 `sk.Category != govTaskDevCategory`，
   # 拿常量跟自己比，注入把常量改掉后左右一起变、恒真 —— 尺子假绿。
   selfcheck '后端 / 内置业务技能自证'   python3 scripts/seed_gov_skill_inject.py
+  # 上面那条是**文本**断言（提示词里有没有五条硬约束）；下面这条是**真跑**：
+  # 拿真 gov-runner + 假 AI 桩，把出货提示词里「## 六、完整示例」的两个示例脚本
+  # 抠出来执行，验产出文件内容（示例1 的四行抽取结果逐字、示例2 的模板样式指纹
+  # 表头底色 C6D9F1 / 双线 double sz=8 / 列宽 2400 真传进产出）。
+  # 为什么必须真跑：示例脚本是**教模型怎么写脚本的范本**，它一旦跟 runner 的 API
+  # 脱钩（改名 / 改返回形状），模型照着写出来的脚本在客户现场就是运行期报错 ——
+  # 而提示词本身、示例文本、Go 单测全都不会红。文本断言抓不到这一层。
+  # 三态：真机（本机有 runner）必须真跑 → GOV_RUNNER_REQUIRED=1 把「找不到 runner」
+  # 从 SKIP 升级成 FAIL，不给「永远 SKIP 的尺子」留活路；CI 上没有 runner，会以
+  # 醒目的 SKIP 横幅说明「本项不算 PASS、这块无人看守」，不装作绿。
+  selfcheck '后端 / 内置技能示例脚本真跑' env GOV_RUNNER_REQUIRED=1 python3 web/tests/gov_examples_mutation_check.py
+  selfcheck '后端 / 内置技能示例脚本·注入1（AI 返废话）' env GOV_RUNNER_REQUIRED=1 INJECT=1 python3 web/tests/gov_examples_mutation_check.py
+  selfcheck '后端 / 内置技能示例脚本·注入2（素材缺规格）' env GOV_RUNNER_REQUIRED=1 INJECT=2 python3 web/tests/gov_examples_mutation_check.py
   # 上面那条是文本断言；这条真跑：遮蔽候选路径后看探测段认不认 $PATH 上的解释器
   # （用户报的现场就是「python3 在 PATH 上、却被说没有」）。带自证。
   selfcheck '安装脚本 / 解释器探测真跑' python3 web/tests/install_python_probe_live_check.py
@@ -293,6 +306,11 @@ if [ "$QUICK" = 0 ]; then
   # 「要文件却被路由到写作技能」的纠偏闸门：失败形态是**静默降级成写正文** ——
   # 用户点「生成 Word」拿到一段文字，页面上没有任何报错。
   selfcheck '后端 / 文件意图纠偏自证'   bash internal/api/chat_route_file_intent_mutation_check.sh
+  # 写作链路的步骤板（① 意图分析 → 构思要点 → 按要点执笔）是用户盯着看的唯一东西：
+  # 「卡着计时」有一半是板上那格永远停在 active（Carry 接过首格后又追加同名步骤），
+  # 另一半是 phase 写了前端认不得的值（编号栏印出英文单词 "plan"、角色徽标空白）。
+  # 两条都在线上真帧里取过证，所以断言挂到**出货的前端文件**上（尺子不许对着抄来的表量）。
+  selfcheck '后端 / 步骤板渲染契约自证' bash internal/api/chat_board_contract_mutation_check.sh
   selfcheck '后端 / 分类结构管理自证'   python3 scripts/category_guard_inject.py
   selfcheck '后端 / 思考开关矩阵自证'   python3 scripts/fastjson_knob_inject.py
   selfcheck '后端 / 提速与中间材料自证' python3 scripts/thinking_knob_inject.py
