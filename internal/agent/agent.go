@@ -400,11 +400,38 @@ action 必须根据上面「意图→动作」映射严格输出，不要省略�
 	// Ask the classifier; if the first attempt comes back unusable (malformed
 	// JSON or empty intent), retry once with a stricter one-line-JSON nudge so a
 	// single flaky completion doesn't silently degrade the route.
-	eval, retry := e.classify(ctx, id, sys, history, user)
+	eval, retry, ctxRunes := e.classify(ctx, id, sys, history, user)
 	if retry {
-		eval, _ = e.classify(ctx, id, sys, history, user)
+		eval, _, _ = e.classify(ctx, id, sys, history, user)
 	}
 	if eval == nil {
+		// 超时 / 上游报错走的是 retry=false 那条路，过去**直接静默降级**：意图丢空、
+		// skill 为空，整轮当成通用写作。线上 2026-09-20 第 2 轮「把上面那篇整理成 Word」
+		// 就是这么变成 0 交付物的——用户看到的是「它不管我上文」，真因是分类跳
+		// `hop=60.0s ttft=-1.00 … context deadline exceeded`。
+		//
+		// 兜底重试，但**只在这一发真的能变小时才打**：失败那一发的 in=2311 token，
+		// 涨上去的原因是 ContextBlock 把上一轮产物逐字注入（docgen 需要，不能砍），
+		// 而意图识别只需要知道用户在指代什么。同类请求在 352 token 量级只要 2.3s。
+		// 如果本来就没有历史可裁（裁剪后没显著变小），重试只是把等待翻倍——
+		// 那正是 TestEvalTurnBoundsClassifierHop 守着的事，所以这里必须带这个判据。
+		clipped := clipForClassify(history)
+		clipRunes := len([]rune(clipped))
+		if ctxRunes > 0 && clipRunes*2 < ctxRunes {
+			eval, _, _ = e.classifyWith(ctx, sys, user, func(context.Context) string { return clipped },
+				classifyRetryLimit())
+			if eval != nil {
+				ReportProgress(ctx, "· 意图识别首次超时，已用精简上下文重试成功")
+			} else {
+				fmt.Fprintf(os.Stderr, "[classify-retry] clipped hop 仍失败（原 ctx=%d 字 → 裁剪后 %d 字）\n",
+					ctxRunes, clipRunes)
+			}
+		}
+	}
+	if eval == nil {
+		// 两次都失败：降级可以，但**必须出声**。用户看到的材料会写明「本轮没按你的上文
+		// 路由」，而不是产出一份看起来正常、其实走错链的东西。
+		ReportProgress(ctx, "· 意图识别超时/失败：本轮按通用写作处理（没有按你的上文路由到对应能力）")
 		return &Eval{SkillSlug: "", Reason: "意图识别异常，按普通对话处理"}, nil
 	}
 	eval.SkillSlug = strings.TrimSpace(eval.SkillSlug)
@@ -438,16 +465,28 @@ func classifyHopLimit() time.Duration {
 //     而它挡在用户第一句话后面，是「点了发送几十秒没反应」的最大一笔账。
 //   - 流式：万一 provider 忽略开关照旧产思考链（astron 就会静默忽略
 //     enable_thinking），思考片段能当中间材料流出去，用户至少看得见它在干活。
-func (e *Engine) classify(ctx context.Context, id, sys string, history []Message, user string) (*Eval, bool) {
+func (e *Engine) classify(ctx context.Context, id, sys string, history []Message, user string) (*Eval, bool, int) {
+	return e.classifyWith(ctx, sys, user, func(hctx context.Context) string {
+		return e.ContextBlock(hctx, id, history)
+	}, classifyHopLimit())
+}
+
+// classifyWith 是 classify 的本体：上下文块的构造方式与这一跳的时间预算由调用方给。
+//
+// 拆出这一层是为了让兜底重试能换上下文（且换一个更短的预算），同时**保持原有行为
+// 不变**：ContextBlock 仍在同一个 hop 预算内构造（它内部可能触发一次压缩调用，
+// 那笔账本来就记在这一跳上）。第三个返回值是上下文块的字符数——调用方靠它判断
+// 「换裁剪上下文到底能不能让输入显著变小」，不然重试只是把等待翻倍。
+func (e *Engine) classifyWith(ctx context.Context, sys, user string, buildBlock func(context.Context) string, limit time.Duration) (*Eval, bool, int) {
 	// hop 级预算：这一跳挡在用户**第一句话**后面，正常 6s 就流完（线上实测），
 	// 所以绝不能拿整轮级别的 ctx 陪着等——传进来的 ctx 覆盖整个请求（几十秒到
 	// 几分钟）。线上曾有一整轮 616.5s，就是这一跳挂住 600s 造成的（见 R1）。
 	// 超时后按「识别失败」走兜底：宁可退化成普通对话，也不让用户对着计时器干等。
-	ctx, cancel := context.WithTimeout(ctx, classifyHopLimit())
+	ctx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
 	// 意图识别也吃上下文：用户说「整理成 word」时，识别「这是承接上一轮新闻稿」
 	// 才能路由到正确的技能，而不是当成一句没头没尾的新指令。
-	ctxBlk := e.ContextBlock(ctx, id, history)
+	ctxBlk := buildBlock(ctx)
 	prompt := "对话历史（供参考，重点回应最新消息）：\n" + ctxBlk + "\n\n用户最新消息：\n" + user
 	// 这一跳的耗时观测：ttft（预填/排队）与总时长（吐字）拆开，输出字数记下来。
 	// 线上实测（2026-09-19）生效的是 siliconflow/Qwen3.6-27B，吐字 ~50 tok/s，
@@ -487,23 +526,49 @@ func (e *Engine) classify(ctx context.Context, id, sys string, history []Message
 	}
 	if err != nil {
 		logHop(nil, false, "err="+err.Error())
-		return nil, false
+		return nil, false, len([]rune(ctxBlk))
 	}
 	eval := &Eval{}
 	if err := json.Unmarshal([]byte(extractJSON(out)), eval); err != nil {
 		fmt.Fprintf(os.Stderr, "[classify-retry] unmarshal err=%v raw_out=%q\n", err, out)
 		logHop(nil, true, "unmarshal")
-		return nil, true
+		return nil, true, len([]rune(ctxBlk))
 	}
 	if strings.TrimSpace(eval.Intent) == "" && strings.TrimSpace(eval.SkillSlug) == "" {
 		// empty intent AND no skill — the model dodged. Only retryable when it
 		// truly produced nothing usable.
 		fmt.Fprintf(os.Stderr, "[classify-retry] empty intent raw_out=%q\n", out)
 		logHop(eval, true, "empty-intent")
-		return nil, true
+		return nil, true, len([]rune(ctxBlk))
 	}
 	logHop(eval, false, "")
-	return eval, false
+	return eval, false, len([]rune(ctxBlk))
+}
+
+// classifyRetryLimit 是**兜底重试**那一发的预算：输入已被裁到几百 token，实测那一量级
+// 2~3 秒就回来（线上 352 token 的那发 8.1s，含吐字），15s 是五倍余量。
+//
+// 为什么不能沿用 classifyHopLimit（60s）：超时后再等一个 60s 就是「等待翻倍」，
+// 用户体感比直接降级更差。上限仍夹在 classifyHopLimit() 之内，保证「兜底比首发更短」
+// 这条性质恒成立（有人把 SKILLFORGE_CLASSIFY_TIMEOUT_SEC 设成 5s 时，兜底也是 5s）。
+func classifyRetryLimit() time.Duration {
+	base := classifyHopLimit()
+	v := strings.TrimSpace(os.Getenv("SKILLFORGE_CLASSIFY_RETRY_SEC"))
+	if v == "" {
+		if base < 15*time.Second {
+			return base
+		}
+		return 15 * time.Second
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 15 * time.Second
+	}
+	d := time.Duration(n) * time.Second
+	if d > base {
+		return base
+	}
+	return d
 }
 
 // classifyMaxTokens 第一跳的输出上限，0 = 不限（默认，保持原行为）。

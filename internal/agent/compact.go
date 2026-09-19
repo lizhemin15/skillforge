@@ -180,6 +180,51 @@ func (e *Engine) ContextBlock(ctx context.Context, id string, history []Message)
 	return out
 }
 
+// clipForClassify 渲染一份**给意图识别用的极简上下文**：每一轮只留头部若干字。
+//
+// 为什么需要它（2026-09-20 线上账本）：
+//
+//	[classify] hop=8.1s  ttft=0.79s in=352 (sys=8538 ctx=15   user=255) out=348  ✓
+//	[classify] hop=60.0s ttft=-1.00 in=2311(sys=8538 ctx=2124 user=105) out=0  ✗ 超时
+//
+// 两次的开关完全一样，差别只有输入规模——而 ctx 之所以涨到 2124 token，是因为
+// ContextBlock 会把上一轮的产物**逐字**注入（那是 docgen 需要的，不能砍）。
+// 但意图识别只需要知道「用户在指代什么」，不需要那篇正文的每一个字：把每轮压到
+// 头部 clipForClassifyRunes 字，输入就回到几百 token 量级（实测那条量级是 2~3 秒）。
+// 因此这份裁剪版**只用于分类跳超时后的兜底重试**，绝不用于执笔/文档生成。
+func clipForClassify(history []Message) string {
+	var b strings.Builder
+	for _, m := range history {
+		role := "用户"
+		if m.Role != "user" {
+			role = "助手"
+		}
+		text := strings.TrimSpace(m.Content)
+		if text == "" {
+			continue
+		}
+		r := []rune(text)
+		clipped := false
+		if len(r) > clipForClassifyRunes {
+			r = r[:clipForClassifyRunes]
+			clipped = true
+		}
+		b.WriteString(role + "：" + string(r))
+		if clipped {
+			b.WriteString("……（后文略，仅用于判断用户在指代什么）")
+		}
+		b.WriteString("\n")
+	}
+	if b.Len() == 0 {
+		return "（无历史）"
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// clipForClassifyRunes 是兜底重试里每轮的保留字数。取 200：够认出「上面那篇新闻稿」
+// 这类指代（开头就是标题/首段），又让整块稳定在几百 token。
+const clipForClassifyRunes = 200
+
 // ---------------------------------------------------------------------------
 // A. 产物层
 // ---------------------------------------------------------------------------

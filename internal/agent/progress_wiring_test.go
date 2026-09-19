@@ -39,6 +39,8 @@ type fakeProvider struct {
 	// hang 为真时：只回响应头，然后一直不给字节也不关连接——复刻线上
 	// 「上游把连接挂住」的形态（那一轮整轮 616.5s）。
 	hang bool
+	// hangFirst：只挂前 N 发，之后正常回答（见 server 里那段注释）。
+	hangFirst int
 }
 
 func (f *fakeProvider) server(t *testing.T) *httptest.Server {
@@ -50,6 +52,12 @@ func (f *fakeProvider) server(t *testing.T) *httptest.Server {
 		f.mu.Lock()
 		f.bodies = append(f.bodies, body)
 		content, reasoning, hang := f.content, f.reasoning, f.hang
+		// hangFirst：只让**前 N 发**挂住，之后的照常回答。测「超时后换裁剪上下文兜底重试」
+		// 必须造出「第一发挂、第二发好」这个前提，否则测的是「两发都挂」那条路。
+		if f.hangFirst > 0 {
+			f.hangFirst--
+			hang = true
+		}
 		f.mu.Unlock()
 
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -92,6 +100,14 @@ func (f *fakeProvider) bodyAt(t *testing.T, i int) map[string]any {
 func jsonStr(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+// callCount 返回这一轮一共打了几发——用来断言「超时后确实多打了一发裁剪重试」，
+// 以及「正常路径没有多打」（多打一发就是白花几十秒）。
+func (f *fakeProvider) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.bodies)
 }
 
 // splitChunks 把一段文本切成 2 个字符一片，模拟真实 token 级推流。
@@ -478,5 +494,104 @@ func TestPlainWriteHopGetsThinkBudgetAndStreamsMaterial(t *testing.T) {
 				t.Errorf("正文不对: %q", out)
 			}
 		})
+	}
+}
+
+// userContentOf 取请求体里最后一条消息（= user 侧提示词）。
+func userContentOf(t *testing.T, body map[string]any) string {
+	t.Helper()
+	msgs, _ := body["messages"].([]any)
+	if len(msgs) == 0 {
+		return ""
+	}
+	m, _ := msgs[len(msgs)-1].(map[string]any)
+	s, _ := m["content"].(string)
+	return s
+}
+
+// 分类跳超时后必须换**裁剪过的上下文**再试一次，而不是静默降级。
+//
+// 线上原文（2026-09-20 第 2 轮「把上面那篇整理成 Word」）：
+//
+//	[classify] hop=60.0s ttft=-1.00 in=2311(sys=8538 ctx=2124 user=105) out=0
+//	           err=… context deadline exceeded
+//
+// 意图丢空 → 整轮被当成通用写作 → docgen 没跑 → 用户看到「它不管我上文」。
+// 这一跳的输入之所以涨到 2124 token，是 ContextBlock 把上一轮产物**逐字**注入
+// （docgen 需要，不能砍），而意图识别只需要知道用户在指代什么。
+func TestClassifyTimeoutFallsBackToClippedContext(t *testing.T) {
+	t.Setenv("SKILLFORGE_CLASSIFY_TIMEOUT_SEC", "1")
+
+	// 上一轮的产物：长到足以让「完整上下文」和「裁剪上下文」在长度上分得开。
+	// 判别用**尾部标记**而不是开头——裁剪版保留的就是开头，拿开头比对必然两边都有
+	// （这行注释是踩过的：第一版断言写成 strings.Contains(second, long[:120])，
+	// 于是「裁剪成功」和「根本没裁剪」长得一模一样，测试恒红）。
+	const tailMark = "【尾部标记TAILMARK】"
+	long := strings.Repeat("星禾科技今日发布数据中台 3.0，此次升级覆盖数据治理全过程。", 40) + tailMark
+	evalJSON := `{"intent":"docgen","action":"gen","skill_slug":"办公文档管家","needs_tools":false,` +
+		`"reason":"承接上文整理成文档","params":{},"needs":[],"steps":[]}`
+
+	fp := &fakeProvider{hangFirst: 1, content: evalJSON}
+	eng := newTestEngine(t, fp)
+
+	var materials []string
+	ctx := WithProgress(context.Background(), func(s string) { materials = append(materials, s) })
+	history := []Message{
+		{Role: "user", Content: "写一篇关于星禾科技的新闻稿"},
+		{Role: "assistant", Content: long},
+	}
+
+	ev, err := eng.EvalTurn(ctx, "s1", "把上面那篇新闻稿原样整理成 Word 文档", history)
+	if err != nil {
+		t.Fatalf("EvalTurn 失败: %v", err)
+	}
+	if ev.SkillSlug != "办公文档管家" {
+		t.Fatalf("超时兜底重试必须照常路由到技能（拿不到就是又一次静默降级），实际 slug=%q reason=%q",
+			ev.SkillSlug, ev.Reason)
+	}
+	if n := fp.callCount(); n != 2 {
+		t.Fatalf("期望「首发超时 + 裁剪重试」共 2 次请求，实际 %d 次", n)
+	}
+	// 前提自证：第一发必须真的带上了完整产物，否则「第二发更短」是空跑绿。
+	first := userContentOf(t, fp.bodyAt(t, 0))
+	second := userContentOf(t, fp.bodyAt(t, 1))
+	if !strings.Contains(first, tailMark) {
+		t.Fatalf("前提不成立：首发应当带上完整产物原文（含尾部标记），否则证明不了第二发真的裁剪过")
+	}
+	if strings.Contains(second, tailMark) {
+		t.Fatalf("兜底重试必须换裁剪上下文，实际第二发仍带着产物末尾（说明发的还是完整上下文）")
+	}
+	if len([]rune(second)) >= len([]rune(first))/2 {
+		t.Fatalf("兜底重试的输入没变小：首发 %d 字、第二发 %d 字", len([]rune(first)), len([]rune(second)))
+	}
+	if joined := strings.Join(materials, ""); !strings.Contains(joined, "精简上下文重试成功") {
+		t.Fatalf("重试成功这件事要说出来，实际材料 %q", joined)
+	}
+}
+
+// 两次都失败时：降级可以，但必须**出声**（说清「没按你的上文路由」），不能静默出错链。
+// 负向自证：这条测试在「静默降级」那版实现上会红——那版 Response 里一个字都没有。
+func TestClassifyTimeoutTwiceSpeaksUpBeforeDegrading(t *testing.T) {
+	t.Setenv("SKILLFORGE_CLASSIFY_TIMEOUT_SEC", "1")
+
+	fp := &fakeProvider{hang: true}
+	eng := newTestEngine(t, fp)
+
+	var materials []string
+	ctx := WithProgress(context.Background(), func(s string) { materials = append(materials, s) })
+
+	ev, err := eng.EvalTurn(ctx, "s1", "把上面那篇新闻稿原样整理成 Word 文档", []Message{
+		{Role: "user", Content: "写一篇关于星禾科技的新闻稿"},
+		{Role: "assistant", Content: "星禾科技今日发布数据中台 3.0。"},
+	})
+	if err != nil {
+		t.Fatalf("降级路径不该返回硬错误（会让用户看到报错而不是兜底结果）: %v", err)
+	}
+	if ev == nil {
+		t.Fatal("降级后仍要返回一个可用的 Eval")
+	}
+	joined := strings.Join(materials, "")
+	if !strings.Contains(joined, "意图识别超时/失败") || !strings.Contains(joined, "没有按你的上文路由") {
+		t.Fatalf("两次都失败时必须把降级明说出去（用户才不会以为「它自己变笨了」），实际材料 %q", joined)
 	}
 }
