@@ -267,3 +267,54 @@ func shouldPassthrough(prevText string, model docgen.Doc, userMsg string) (bool,
 	}
 	return true, cov, docPassthroughNote(cov)
 }
+
+// ---------------------------------------------------------------------------
+// 意图识别彻底失败时的本地救生圈
+//
+// 与上面的直通兜底是**同一套判据的两个位置**，别当成两套标准：
+//   - shouldPassthrough 管「搬运**会不会走形**」（已经路由到 docgen，怕模型重写）；
+//   - rescueDecision   管「搬运**请求还在不在**」（连 docgen 都没路由上，怕整轮丢掉）。
+// 两者共用 wantsCarryOver 词表、lastArtifactText 与 passthroughMinArtifactRunes。
+// ---------------------------------------------------------------------------
+
+// rescueDecision 判断「这一轮该不该由本地规则直接判成出文件」。
+//
+// 为什么需要：意图识别是一场网络调用。上游一抖（实测一分钟内同一上游
+// 「40s 超时 / 2.3s 成功 / 0.6s 成功」三种结果），分类跳就 60s 超时；两次都挂
+// 就退化成「按普通对话处理」——于是一句「把上面那篇整理成 Word」被当成新话题，
+// 用户看到的是「它不管我上文、也不给我文件」，而这一轮本该产出一份 Word
+// （线上 2026-09-20 第 2 轮就是这么变成 0 交付物的）。
+//
+// 两条本地事实同时成立才认（缺一不猜，宁可老实降级）：
+//  1. 本轮是搬运/转格式意图 —— 词表只收「内容不动、只换形式」的说法；
+//  2. 历史里确有长文产物 —— 去空白后 ≥ passthroughMinArtifactRunes，与直通兜底
+//     同一门槛。没有可搬运的正文时，「整理成 Word」无从谈起（搬运什么？）。
+//
+// 只看词面 + 历史结构，不问模型：这条路的触发条件就是「模型已经不可用了」，
+// 此时任何依赖模型的判据都可能跟着一起不可用。
+func rescueDecision(user string, history []Message) bool {
+	if !wantsCarryOver(user) {
+		return false
+	}
+	prev := lastArtifactText(history)
+	return len([]rune(stripAllWS(prev))) >= passthroughMinArtifactRunes
+}
+
+// localRescueRoute 在 rescueDecision 成立时给出**确定性的**路由结果：命中一个能出
+// 文件的技能（skill_type=docgen 且提示词带 DOCJSON 契约），action=gen。
+//
+// 技能选择交给 PickDocGenSkill（同一套候选口径：只有带契约的技能才可能渲染出文件，
+// 没契约的凑上去只会在 parseDocJSON 那里失败）。一个可用技能都没有时返回 nil ——
+// 那就照旧降级，并让上层出声说明，而不是硬塞一个出不了文件的技能。
+func (e *Engine) localRescueRoute(user string, history []Message) *Eval {
+	if !rescueDecision(user, history) {
+		return nil
+	}
+	dsc := e.PickDocGenSkill(user)
+	if dsc == nil {
+		return nil
+	}
+	ev := ManualEval(dsc)
+	ev.Reason = "意图识别超时，按本地规则承接上一轮产物出文件"
+	return ev
+}
