@@ -257,6 +257,16 @@ jobs:
           go test ./internal/api/ -run 'TestWriteSkillBoardShowsPlanThenDraft|TestPlainPathBoardShowsPlanThenDraft' -count=1
           bash internal/api/chat_board_contract_mutation_check.sh
 
+      # Eval 是每轮对话的**第一跳**：它的解析失败不是少一个字段，而是整包分类丢失
+      # 加一次重试。线上 2026-09-19 实测模型判断完全正确，只有 params 被双重编码成
+      # 字符串（对象被序列化进字符串里），Go 严格解就 `cannot unmarshal string into
+      # Go struct field Eval.params` —— 整包丢掉、白跑一次模型调用，用户看到的是
+      # 「卡着的计时」。容忍层只宽容形状不宽容语法，这条尺子同时守着两边。
+      - name: 后端回归（Eval 手抖容忍 + 断言自证）
+        run: |
+          go test ./internal/agent/ -run 'TestEval' -count=1
+          bash internal/agent/eval_flex_mutation_check.sh
+
       # 这两条 .py 自证脚本此前**没有任何地方调用**：CI 里没有 step、本地也没跑。
       # 后果是可预测的 —— category_guard_inject.py 的一条锚点早就跟实现脱钩
       # （categoryErrStatus 里 ErrNotManualSkill 被有意删掉），脚本自己在那行

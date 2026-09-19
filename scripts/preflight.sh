@@ -243,6 +243,10 @@ if [ "$QUICK" = 0 ]; then
   # 当场报错 → 整轮训练在第 2 步 18 秒中断（用户看到「训练失败」，且这正是
   # 「生成的技能跟我给的东西没关系」的一个隐性来源）。
   selfcheck '后端 / 模型输出手抖容忍自证' bash internal/model/param_flex_mutation_check.sh
+  # Eval（每轮对话第一跳）的手抖容忍自证。与上一条同族：线上 2026-09-19 模型把
+  # params 双重编码成字符串，Go 严格解整包报错 → 分类全丢 + 白跑一次重试 ——
+  # 用户看到的就是「卡着的计时」。杀伤半径比 Param 那条更大（第一跳，每轮都走）。
+  selfcheck '后端 / Eval 手抖容忍自证' bash internal/agent/eval_flex_mutation_check.sh
   # 「模型链路偷偷不走流式」的守卫自证（线上 353 秒零帧的原发现场）。
   # 它此前是一把**游离尺子**：仓库里有、本机能跑，但没人调用；而且仓库根写死成
   # /root/skillforge，CI 里想接也接不上（已改成从脚本自身位置推导）。
