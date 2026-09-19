@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-# LIVE-LEGS: mcp_gate TIMEOUT_S=1500 | mcp_gate_inject TIMEOUT_S=1500 INJECT_MCP_OFF=1
+# LIVE-LEGS: mcp_gate TIMEOUT_S=1500
+# ↑ 这里**故意只声明正跑那一条**。负向 leg（INJECT_MCP_OFF=1）挂不上名册：
+#   scripts/acceptance-live.sh:143 要求 `--- a/b ok ---` 里 a==b 才算 PASS，而负向 leg 的
+#   **意图就是有一条红**，挂进去必然常年 FAIL，然后被人 ALLOW_SKIP=1 糊掉。
+#   它的正确位置是「本地闸门」——scripts/preflight.sh 里同 MCP 自证那一段（能起活服务、
+#   有 playwright 的地方）。**退出码语义（注意别再抄错）**：负向 leg 在「注入后 B1 精确转红、
+#   且红名单全在预期级联内」时**打 `✓ 负向自证成立` 并 rc=0**；只有「B1 没红 / 红了无关断言 /
+#   出现游离红」才 rc=1。所以 preflight 的 selfcheck 认 rc=0 是对的 —— 它同时还要带上
+#   REQUIRE_LIVE=1，否则下面的环境性 SKIP 会被 selfcheck 读成 ✓（见 REQUIRE_LIVE 处注释）。
+#   不挂 CI 是因为 CI 没有活服务与模型。防它腐烂的机制是名册元守卫
+#   （web/tests/live_e2e_roster.test.mjs 要求本文件有合法 LIVE-LEGS 声明）+ preflight 那行真调它。
+#   改本文件时别把这一行补回去。
 """MCP 用户级门控的线上真浏览器终验：「默认不调度、勾了才调度、勾了必须真能用」。
 
 为什么必须是真浏览器 + 真模型，而不是单测：
@@ -31,8 +42,12 @@
 脚本自己判红（否则就是尺子假绿，比不挂尺子更坏）。
 
 用法：
-    BASE=https://... python3 web/tests/chat_mcp_gate_e2e.py            # 正跑（期望全绿）
-    BASE=https://... INJECT_MCP_OFF=1 python3 web/tests/chat_mcp_gate_e2e.py  # 负向自证（期望 B1 红）
+    BASE=http://127.0.0.1:8092 python3 web/tests/chat_mcp_gate_e2e.py        # 正跑（期望全绿）
+    BASE=http://127.0.0.1:8092 INJECT_MCP_OFF=1 python3 web/tests/chat_mcp_gate_e2e.py
+                                                                           # 负向自证（期望 rc=0
+                                                                           #  + `✓ 负向自证成立`）
+    # 本地闸门（preflight）必须再加 REQUIRE_LIVE=1：环境不足时 SKIP→FAIL，
+    # 免得「服务没起 / playwright 没装」被 selfcheck 的 rc=0 读成 ✓。
 """
 import json
 import os
@@ -50,6 +65,14 @@ DTD_DB = os.environ.get('DTD_DB', '/opt/datatoolbox/data/data-store.db')
 DUMP_TIMELINE = os.environ.get('DUMP_TIMELINE') == '1'
 # 网络层注入：让「勾了也没带上」这个故障成真（见文件头负向自证）
 INJECT_MCP_OFF = os.environ.get('INJECT_MCP_OFF') == '1'
+# REQUIRE_LIVE=1：把「真·环境性跳过」升级成 FAIL（rc=1）。
+# 动机（2026-09-19 实测踩到）：本脚本在 playwright 缺失 / 页面打不开 / 库里没启用 MCP 这些
+# **环境不足**的情况下按设计打 `SKIP` 并 rc=0 —— 名册 runner 会把 `^SKIP` 判成「未验证=FAIL」，
+# 那个语义是对的；但 **preflight 的 selfcheck 只认 rc**，于是同一份 SKIP 在本地闸门里会被
+# 印成 ✓。后果：本机服务没起、或 playwright 没装时，这把尺子「看着挂着、其实一次都没验」，
+# 正是我们最怕的假绿。所以本地闸门调用时必须带 REQUIRE_LIVE=1：跑不成=红，要么去把环境弄好，
+# 要么承认这条腿没验。名册 / CI 不设这个变量，语义不变。
+REQUIRE_LIVE = os.environ.get('REQUIRE_LIVE') == '1'
 
 # 提示词：必须**逼出工具调用**，否则这条 leg 是空跑（没工具调用时 B2 恒红/恒绿，两种都不算证据）。
 # 这条预设放文件里而不是 runner 的命令行里：中文长提示词塞进 leg 的 env 会被空格切碎，
@@ -73,6 +96,19 @@ fails = []
 checks = 0
 
 
+def env_skip(msg):
+    """真·环境性跳过（playwright 缺失 / 页面打不开 / 库里没启用 MCP / 真值源取不到）。
+
+    默认：打 `SKIP` 行 + rc=0 —— 名册 runner（scripts/acceptance-live.sh:128）据此判「未验证」，
+    SKIP≠PASS。REQUIRE_LIVE=1：改成打 FAIL 行 + rc=1（同 SystemExit 退出，免得调用方
+    忘了传返回值、把红当绿继续往下印小结）。"""
+    if REQUIRE_LIVE:
+        print(f'FAIL 环境不足以真验（REQUIRE_LIVE=1，否则这个 SKIP 会被 preflight 的 rc 判成 ✓）：{msg}')
+        sys.exit(1)
+    print(f'SKIP {msg}')
+    return 0
+
+
 def check(name, ok, extra=''):
     global checks
     checks += 1
@@ -84,7 +120,17 @@ def check(name, ok, extra=''):
     return bool(ok)
 
 
+# skip() 于 2026-09-19 移除：它的唯一调用者是 A2 的前提判定，而那条路在健康系统上
+# 高频触发 SKIP，会被名册 runner 直接判 FAIL（scripts/acceptance-live.sh:127 把 `^SKIP`
+# 当未验证），最终只会被 ALLOW_SKIP=1 糊过去 → 尺子腐烂。详见 A2 处的改判说明。
+# 真·环境性跳过（playwright 缺失 / 页面打不开）仍打 `SKIP` 行并 rc=0 —— 那是 runner
+# 想要的语义（跑不了 = 这条腿失败），与「前提式 SKIP」是两件事。
+
+
 def report():
+    # ★ 小结行必须原样打 `--- N/M ok ---`：runner 拿它抠断言数（scripts/acceptance-live.sh:123），
+    #   格式一动这条腿「绿了也会被判红」。SKIP 之类的说明**另起一行**，不许并进来
+    #   （web/tests/live_e2e_roster.test.mjs 有专门的元守卫盯住这件事，2026-09-19 实测撞到过）。
     print(f'--- {checks - len(fails)}/{checks} ok ---')
     if fails:
         print('FAILED: ' + '; '.join(fails))
@@ -333,15 +379,18 @@ def run_checks(pg, prefix, tool_names, truth_apis):
         pg.wait_for_selector('.ch-scroll', timeout=15000)
         pg.wait_for_selector('textarea', timeout=15000)
     except Exception as e:
-        print(f'SKIP 刷新后页面没起来：{str(e)[:100]}')
-        return 0
+        return env_skip(f'刷新后页面没起来（{BASE}）：{str(e)[:100]}')
     pg.evaluate(INIT_JS)
     time.sleep(1.0)
     st = pg.evaluate(READ_JS)
     if not st['mcpVisible']:
-        print('SKIP 页面上没有 MCP 数据源按钮（管理员没开/没连通任何 MCP）——'
-              '这条 leg 的前提不成立，SKIP≠PASS')
-        return 0
+        # 前提式 SKIP 已废弃（铁律，2026-09-19）：库里明明有 enabled=1 的服务器（main 里刚断过），
+        # 界面却没渲染出这个按钮 —— 要么是公开接口没把它透出来、要么是前端渲染挂了，两种都该有人去看。
+        # 打成 SKIP 只会被 ALLOW_SKIP=1 糊掉，尺子就烂了。所以这里判红，并把两种可能都写在证据里。
+        check('A0 前提：聊天界面真渲染出 MCP 数据源按钮（库里 enabled=1 才该有）', False,
+              f"mcpVisible=False；按钮文案「{st['mcpLabel']}」/ 可选项 {st['mcpRows']} 台 —— "
+              f'要么公开状态接口没透出、要么前端没渲染，去看一眼再决定是环境还是 bug')
+        return report()
     print(f"[A 轮] 不勾：按钮文案「{st['mcpLabel']}」/ 可选项 {st['mcpRows']} 台 / pick={st['pick']!r}")
 
     consumed = 0
@@ -363,9 +412,29 @@ def run_checks(pg, prefix, tool_names, truth_apis):
     else:
         check('A1 未勾选：请求体 mcp 字段是空数组（默认不调度 MCP）', False, '没抓到请求')
     a_names, a_labels, a_events = tool_calls(a_recs[0]['sse'] if a_recs else '')
-    print(f"[A 轮] SSE 事件 {a_events} 条 / 工具步骤 {[l for l in a_labels if l.startswith('工具')][:3]}")
+    # ★ 按标记认人：判的是「有没有 mcp_ 前缀的工具」，不是「工具全集是否为空」。
+    #   内置工具（http_request / run_python）与门控无关，拿全集当判据必假红
+    #   （2026-09-19 实测踩到：未勾那轮调了 http_request → A2 假红）。
+    a_mcp = sorted(n for n in a_names if n.startswith('mcp_'))
+    a_builtin = sorted(n for n in a_names if not n.startswith('mcp_'))
+    print(f"[A 轮] SSE 事件 {a_events} 条 / 工具步骤 {[l for l in a_labels if l.startswith('工具')][:3]}"
+          f" / 内置工具 {a_builtin}")
+    # ★ 2026-09-19 改判：这一条**不再走前提式 SKIP**，改成无条件的不变式 + 空样本自曝。
+    #   原因不是「放宽」，是被名册的两条硬约束逼出来的正确形状：
+    #     a. scripts/acceptance-live.sh:127 用 `grep -qE '^SKIP'` 判「未验证」→ 打 SKIP 行
+    #        这条腿在名册里直接算 FAIL（SKIP≠PASS，这是对的）；
+    #     b. 而同一条腿在**健康系统**上跑，模型有相当概率压根不调工具 → 前提式 SKIP 会
+    #        在健康系统上高频触发 → 这条腿常年飘红 → 很快就被 ALLOW_SKIP=1 糊过去 → 尺子死掉。
+    #   空样本下这条不变式**依然是真判断，不是空跑绿**：它判的是「整轮里有没有 mcp_ 调用」，
+    #   而门控泄漏的必要条件是「MCP 工具真的被交给模型并被调用」；一整轮一个工具都没调，
+    #   等于没有任何东西被交出去，泄漏通道根本不成立。
+    #   确定性证据不靠这条：未勾选那轮的请求体必须是 mcp=[]（A1，纯网络层，与模型行为无关），
+    #   加上后端 FilterMCP 的 9 条单测。A2/A4 是**旁证**，样本为空时由下面这行 INFO 自曝。
+    if not a_names:
+        print('INFO A 轮模型没调任何工具：A2/A4 本次样本为空（不变式仍成立，'
+              '确定性证据由 A1 请求体 mcp=[] + 后端 FilterMCP 单测承担）')
     check('A2 未勾选：整轮 SSE 里 0 个 mcp_ 工具调用（多给 = 内网系统被无声挂上）',
-          len(a_names) == 0, f'出现了 {sorted(a_names)}')
+          not a_mcp, f'出现了 {a_mcp}（内置 {a_builtin} 不算 MCP）')
     check('A3 前提：未勾那轮真跑完（正文 ≥60 字 + 真有 trace 事件），否则 A2/A4 是空跑',
           a_done and len(a_txt) >= 60 and a_events > 0,
           f"done={a_done} 正文 {len(a_txt)} 字 事件 {a_events} 条")
@@ -410,12 +479,16 @@ def run_checks(pg, prefix, tool_names, truth_apis):
         check('B1 已勾选：请求体 mcp 真带上了那台的 id（勾了不生效 = 用户报的那个 bug）',
               False, '没抓到请求')
     b_names, b_labels, b_events = tool_calls(b_recs[0]['sse'] if b_recs else '')
+    # 同样按标记认人：只看 mcp_ 工具与「直连 tools/list 真名集」的包含关系，
+    # 内置工具（run_python / http_request）不参与判定（它们与门控无关）。
+    b_mcp = {n for n in b_names if n.startswith('mcp_')}
+    b_builtin = sorted(n for n in b_names if not n.startswith('mcp_'))
     print(f"[B 轮] SSE 事件 {b_events} 条 / 工具步骤 "
-          f"{[l for l in b_labels if l.startswith('工具')][:4]}")
+          f"{[l for l in b_labels if l.startswith('工具')][:4]} / 内置工具 {b_builtin}")
     check('B2 已勾选：SSE 里真出现 mcp_ 工具调用，且工具名 ∈ 直连 tools/list 的真名集',
-          bool(b_names) and b_names <= tool_names,
-          f'调用 {sorted(b_names)} / 真名集 {len(tool_names)} 个'
-          + (f'；不在真名集里的：{sorted(b_names - tool_names)}' if b_names - tool_names else ''))
+          bool(b_mcp) and b_mcp <= tool_names,
+          f'调用 {sorted(b_mcp)} / 真名集 {len(tool_names)} 个'
+          + (f'；不在真名集里的：{sorted(b_mcp - tool_names)}' if b_mcp - tool_names else ''))
     check('B3 前提：已勾那轮真跑完（正文 ≥60 字），否则 B3 是空跑',
           b_done and len(b_txt) >= 60, f'done={b_done} 正文 {len(b_txt)} 字')
     b_hits = sorted(x for x in truth_apis if x and x in b_txt)
@@ -431,15 +504,26 @@ def main():
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:  # pragma: no cover
-        print(f'SKIP playwright 不可用：{e}')
-        return 0
+        # 真·环境性跳过（本机没装 playwright）。REQUIRE_LIVE=1 时转红：本地闸门里
+        # 「跑不起来」必须等于红，不能等于 ✓。
+        return env_skip(f'playwright 不可用：{e}')
 
     servers = db_servers()
     if not servers:
-        print('SKIP 库里没有 enabled=1 的 MCP 服务器 —— 这条 leg 的前提不成立（SKIP≠PASS）')
-        return 0
+        # 前提式 SKIP 已废弃（铁律，2026-09-19）：没有启用中的 MCP = 这条腿没验。
+        # 打成 SKIP 会被 runner/selfcheck 一路糊成绿，所以显式判红并指名道姓。
+        check('A0 前提：库里至少有一台 enabled=1 的 MCP 服务器（管理员真开过门控）', False,
+              f'{SF_DB} 里没有启用中的 MCP 服务器 —— 门控无从验起')
+        return report()
     prefix, tool_names, truth_apis = truth_for(servers[0])
     print(f'[配置] leg 超时 {TIMEOUT_S}s / 单轮窗口 {MAXW}s / 注入={INJECT_MCP_OFF}')
+    # 前提：正跑 leg 的 B2/B4 都要拿「直连真值」当靶子。真值源连不上（真名集空、真接口识别为空）
+    # 时还往下跑，会把「靶子没了」判成「门控坏了」—— 那是假红。负向 leg 只判 B1（不依赖真值），照跑。
+    if not INJECT_MCP_OFF and (not tool_names or not truth_apis):
+        check('B2/B4 前提：直连 MCP 端点真取到靶子（真工具名 + 真接口标识）', False,
+              f'工具 {len(tool_names)} 个 / 真接口标识 {len(truth_apis)} 条'
+              f'（直连 {servers[0]["url"]} 失败？没有靶子就判不了 B2/B4）')
+        return report()
 
     with sync_playwright() as p:
         br = p.chromium.launch()
@@ -466,8 +550,8 @@ def main():
             try:
                 pg.goto(BASE, wait_until='domcontentloaded', timeout=15000)
             except Exception as e:
-                print(f'SKIP 打不开 {BASE}（服务没起？）：{str(e)[:120]}')
-                return 0
+                # 真·环境性跳过（服务没起 / 地址不通）。REQUIRE_LIVE=1 时转红。
+                return env_skip(f'打不开 {BASE}（服务没起？）：{str(e)[:120]}')
             pg.wait_for_selector('.ch-scroll', timeout=10000)
             if INJECT_MCP_OFF:
                 info = pg.evaluate("""() => fetch('/assets/js/chat.js').then(r => r.text()).then(t => {
@@ -487,6 +571,10 @@ def main():
                 # 反例（把 B1 写成恒真、或注入没落到位）会让这条判红 —— 尺子必须能抓到假绿。
                 got_red = [f for f in fails if f.startswith('B1 ')]
                 side_red = [f for f in fails if f.startswith('A1 ') or f.startswith('A2 ')]
+                # 收严：注入「勾了也不带上」只应级联到 B1/B2/B4（都依赖 MCP 真被调度）；
+                # 红名单里出现别的断言 = 注入打到了不相干的地方，证据是脏的，不能算成立。
+                allowed = ('B1 ', 'B2 ', 'B4 ')
+                stray = [f for f in fails if not f.startswith(allowed)]
                 if not got_red:
                     print('✗ 负向自证失败：注入「勾了也不带上」之后 B1 竟然还是绿的 —— '
                           '这把尺子量不到真故障（假绿）')
@@ -494,7 +582,12 @@ def main():
                 if side_red:
                     print(f'✗ 负向自证失败：注入把无关断言也弄红了 {side_red}，证据是脏的')
                     return 1
-                print(f'✓ 负向自证成立：注入后 B1 精确转红，A1/A2 仍绿（共 {len(fails)} 条红）')
+                if stray:
+                    print(f'✗ 负向自证失败：红名单里出现预期之外的断言 {stray}（只允许 {list(allowed)} 级联），'
+                          f'注入打到不相干的地方了')
+                    return 1
+                print(f'✓ 负向自证成立：注入后 B1 精确转红（红名单 {fails}，全在预期级联内），'
+                      f'A1/A2 仍绿')
                 return 0
             return rc
         finally:

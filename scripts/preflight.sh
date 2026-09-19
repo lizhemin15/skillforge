@@ -243,6 +243,27 @@ if [ "$QUICK" = 0 ]; then
   # 所以尺子朝「关闭」倒（不勾=空数组、已下架的 id 剔掉、清单空=按钮收回），
   # 且 6 条注入必须各自精确打红它自己那条断言。
   selfcheck '前端 / MCP 数据源勾选自证'  python3 web/tests/chat_mcp_mutation_check.py
+  # ↑ 上面这条是**静态**自证（抠出货 JS + 假 DOM）。它证明不了「勾选集真的上了网线」——
+  # 那一段只有真浏览器 + 真服务 + 真模型量得到，脚本是 web/tests/chat_mcp_gate_e2e.py。
+  # 它的正跑那条 leg 在名册里（LIVE-LEGS: mcp_gate），注入那条**只能挂这里**：
+  #   · 名册挂不了 —— runner 要 `--- a/b ok ---` 里 a==b 才算 PASS，而注入 leg 的意图
+  #     就是「B1 精确转红」，挂进去必然常年 FAIL，最后被 ALLOW_SKIP=1 糊掉；
+  #   · CI 挂不了 —— runner 上没有活服务、没有模型（同 *_e2e.py 全体）。
+  # 判据：rc=0 且打印「负向自证成立」（B1 必须精确转红，A1/A2 必须还绿 —— 即用户报的
+  # 「界面勾了、网线没带」那个 bug 复刻出来时，尺子真的会响）。
+  # ★ 必须带 REQUIRE_LIVE=1：脚本遇「真·环境性跳过」（playwright 没装 / 页面打不开 / 连不上
+  #   服务）默认打 SKIP + rc=0 —— 那个语义是给名册 runner 用的（它把 ^SKIP 判成未验证），
+  #   但 selfcheck **只认 rc**，同一份 SKIP 在这里会被印成 ✓ = 一把没验过却挂着绿的尺子
+  #   （2026-09-19 实测踩到）。带 REQUIRE_LIVE=1 后：跑不成 = 红，逼人把环境弄好或承认没验。
+  #   注意 REQUIRE_LIVE 只影响「环境性跳过」；「前提不成立」（库里无启用 MCP / 真值源连不上 /
+  #   界面没渲染出按钮）已经改成显式断言打红，跟 REQUIRE_LIVE 无关。
+  # BASE 用本机回环：公网域名在这台机器上解不出（DNS），会把真跑变成 SKIP。
+  # ★ 千万别在这行末尾接 `| tail -5`：管道会把 selfcheck 收到的 rc 换成 tail 的 rc（恒 0），
+  #   脚本死活都打 ✓ —— 2026-09-19 我写过一次，读 selfcheck 定义时才发现（selfcheck.sh:227
+  #   `out=$("$@")` 只认命令自己的 rc）。selfcheck 失败时本来就会自己打末 12 行，不需要管道。
+  selfcheck '前端 / MCP 门控双向自证（真浏览器·注入）' \
+    env INJECT_MCP_OFF=1 REQUIRE_LIVE=1 BASE="${BASE:-http://127.0.0.1:8092}" \
+    python3 web/tests/chat_mcp_gate_e2e.py
   selfcheck '前端 / 线上验收 leg 接线自证' bash web/tests/live_e2e_roster_mutation_check.sh
   # 大模型输出 JSON 的「手抖容忍层」自证。线上真故障（2026-09-17）：模型把
   # input_params.options 写成对象数组 [{"label":"启用","value":"on"}]，Go 严格解 []string
