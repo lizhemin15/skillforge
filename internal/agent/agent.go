@@ -400,9 +400,14 @@ action 必须根据上面「意图→动作」映射严格输出，不要省略�
 	// Ask the classifier; if the first attempt comes back unusable (malformed
 	// JSON or empty intent), retry once with a stricter one-line-JSON nudge so a
 	// single flaky completion doesn't silently degrade the route.
-	eval, retry, ctxRunes := e.classify(ctx, id, sys, history, user)
+	// 整个意图识别阶段共享一个总预算：首发 + JSON 重试 + 兜底重试全算在里面。
+	// 只罩在 classify 这几发上，后面的执笔/渲染照旧用整轮 ctx（它们本来就该跑很久）。
+	pctx, pcancel := context.WithTimeout(ctx, classifyPhaseLimit())
+	defer pcancel()
+
+	eval, retry, ctxRunes, ctxBlk := e.classify(pctx, id, sys, history, user)
 	if retry {
-		eval, _, _ = e.classify(ctx, id, sys, history, user)
+		eval, _, _, _ = e.classify(pctx, id, sys, history, user)
 	}
 	if eval == nil {
 		// 超时 / 上游报错走的是 retry=false 那条路，过去**直接静默降级**：意图丢空、
@@ -418,13 +423,29 @@ action 必须根据上面「意图→动作」映射严格输出，不要省略�
 		clipped := clipForClassify(history)
 		clipRunes := len([]rune(clipped))
 		if ctxRunes > 0 && clipRunes*2 < ctxRunes {
-			eval, _, _ = e.classifyWith(ctx, sys, user, func(context.Context) string { return clipped },
+			eval, _, _, _ = e.classifyWith(pctx, sys, user, func(context.Context) string { return clipped },
 				classifyRetryLimit())
 			if eval != nil {
 				ReportProgress(ctx, "· 意图识别首次超时，已用精简上下文重试成功")
 			} else {
 				fmt.Fprintf(os.Stderr, "[classify-retry] clipped hop 仍失败（原 ctx=%d 字 → 裁剪后 %d 字）\n",
 					ctxRunes, clipRunes)
+			}
+		} else {
+			// 没有可裁的历史：整条消息就是用户这一句，ctx 本来就小（线上有一发
+			// ctx=15 字 / user=29294 字节），裁剪一分钱也省不下来。旧实现在这个
+			// 分支里**一次重试都不打**，直接降级——那 60 秒白等，路由也丢了。
+			//
+			// 但挂死是**瞬时**的：同一形态输入直连上游实测 1.7/1.8/2.0s，而同一分钟
+			// 里也能 60s 不给一个字节。所以同输入原样快问一发（不能重跑 buildBlock：
+			// 它可能有副作用，重发已构造好的那份字符串）；总等待由
+			// classifyPhaseLimit() 兜着，默认 25+15=40s，仍短于旧默认的单发 60s。
+			eval, _, _, _ = e.classifyWith(pctx, sys, user, func(context.Context) string { return ctxBlk },
+				classifyRetryLimit())
+			if eval != nil {
+				ReportProgress(ctx, "· 意图识别首次超时，已原样重试成功")
+			} else {
+				fmt.Fprintf(os.Stderr, "[classify-retry] 同输入快问仍失败（ctx=%d 字）\n", ctxRunes)
 			}
 		}
 	}
@@ -450,19 +471,36 @@ action 必须根据上面「意图→动作」映射严格输出，不要省略�
 // classifyHopLimit 是意图识别这一跳的独立时间预算。
 //
 // 为什么单独给：它挡在用户第一句话后面，拿的是整轮 ctx，一旦上游挂住就会把
-// 整轮一起拖下去（线上 616.5s 那一轮，600s 全耗在这一跳）。正常流完只要 6s
-// （线上实测，关思考链），60s 是十倍余量——够慢的 provider 冷启动，又远小于
-// 让用户觉得「卡死」的量级。超时按识别失败兜底，退化成普通对话。
+// 整轮一起拖下去（线上 616.5s 那一轮，600s 全耗在这一跳）。超时按识别失败兜底。
+//
+// 默认值从 60s 收到 25s（2026-09-20 实测重定）：
+//   - 健康样本 45 发，耗时 4.1~14.3s（最慢 14.3s），25s 仍有约 1.7 倍余量；
+//   - 同一形态输入（1 万字素材原文 + 关思考 + json_object）直连上游实测
+//     1.7/1.8/2.0s —— 输入规模**不是**慢的原因，裁输入省不出时间；
+//   - 而同一分钟里上游能 60s 不给一个字节：24h 内 56 发里 11 发撞满 60s，
+//     20% 的失败率，每一发都把用户按在计时器前 60 秒，救回来的概率又极低。
+// 所以这里选：**宁可早收手换一发重试，也不陪上游静坐**。
 func classifyHopLimit() time.Duration {
+	const def = 25 * time.Second
 	v := strings.TrimSpace(os.Getenv("SKILLFORGE_CLASSIFY_TIMEOUT_SEC"))
 	if v == "" {
-		return 60 * time.Second
+		return def
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
-		return 60 * time.Second
+		return def
 	}
 	return time.Duration(n) * time.Second
+}
+
+// classifyPhaseLimit 是整个意图识别阶段（首发 + JSON 重试 + 兜底重试）的**总**预算。
+//
+// 为什么必须有总预算：单跳预算管不住总和。三发各 25s 就是 75s，比旧默认的**单发**
+// 60s 还差——「每一跳都调小了」不等于「用户等得更短」。用户体感只认「从点发送到看见
+// 路由」这一段，所以这里给一个硬顶：默认 25+15=40s，短于旧默认的 60s，且无论走哪条
+// 兜底分支都不会超（阶段 deadline 一到期，后续那发直接失败，不再新起等待）。
+func classifyPhaseLimit() time.Duration {
+	return classifyHopLimit() + classifyRetryLimit()
 }
 
 // classify runs one classifier completion. Returns (eval, retry) where retry
@@ -474,7 +512,7 @@ func classifyHopLimit() time.Duration {
 //     而它挡在用户第一句话后面，是「点了发送几十秒没反应」的最大一笔账。
 //   - 流式：万一 provider 忽略开关照旧产思考链（astron 就会静默忽略
 //     enable_thinking），思考片段能当中间材料流出去，用户至少看得见它在干活。
-func (e *Engine) classify(ctx context.Context, id, sys string, history []Message, user string) (*Eval, bool, int) {
+func (e *Engine) classify(ctx context.Context, id, sys string, history []Message, user string) (*Eval, bool, int, string) {
 	return e.classifyWith(ctx, sys, user, func(hctx context.Context) string {
 		return e.ContextBlock(hctx, id, history)
 	}, classifyHopLimit())
@@ -486,7 +524,10 @@ func (e *Engine) classify(ctx context.Context, id, sys string, history []Message
 // 不变**：ContextBlock 仍在同一个 hop 预算内构造（它内部可能触发一次压缩调用，
 // 那笔账本来就记在这一跳上）。第三个返回值是上下文块的字符数——调用方靠它判断
 // 「换裁剪上下文到底能不能让输入显著变小」，不然重试只是把等待翻倍。
-func (e *Engine) classifyWith(ctx context.Context, sys, user string, buildBlock func(context.Context) string, limit time.Duration) (*Eval, bool, int) {
+// 第四个返回值是**构造好的上下文块本身**，供「同输入快问一次」原样重发：那条路不能
+// 重跑 buildBlock——它可能有副作用（压缩会真的花掉一次模型调用），重发一份字符串才是
+// 「同样的请求再来一发」。
+func (e *Engine) classifyWith(ctx context.Context, sys, user string, buildBlock func(context.Context) string, limit time.Duration) (*Eval, bool, int, string) {
 	// hop 级预算：这一跳挡在用户**第一句话**后面，正常 6s 就流完（线上实测），
 	// 所以绝不能拿整轮级别的 ctx 陪着等——传进来的 ctx 覆盖整个请求（几十秒到
 	// 几分钟）。线上曾有一整轮 616.5s，就是这一跳挂住 600s 造成的（见 R1）。
@@ -535,23 +576,23 @@ func (e *Engine) classifyWith(ctx context.Context, sys, user string, buildBlock 
 	}
 	if err != nil {
 		logHop(nil, false, "err="+err.Error())
-		return nil, false, len([]rune(ctxBlk))
+		return nil, false, len([]rune(ctxBlk)), ctxBlk
 	}
 	eval := &Eval{}
 	if err := json.Unmarshal([]byte(extractJSON(out)), eval); err != nil {
 		fmt.Fprintf(os.Stderr, "[classify-retry] unmarshal err=%v raw_out=%q\n", err, out)
 		logHop(nil, true, "unmarshal")
-		return nil, true, len([]rune(ctxBlk))
+		return nil, true, len([]rune(ctxBlk)), ctxBlk
 	}
 	if strings.TrimSpace(eval.Intent) == "" && strings.TrimSpace(eval.SkillSlug) == "" {
 		// empty intent AND no skill — the model dodged. Only retryable when it
 		// truly produced nothing usable.
 		fmt.Fprintf(os.Stderr, "[classify-retry] empty intent raw_out=%q\n", out)
 		logHop(eval, true, "empty-intent")
-		return nil, true, len([]rune(ctxBlk))
+		return nil, true, len([]rune(ctxBlk)), ctxBlk
 	}
 	logHop(eval, false, "")
-	return eval, false, len([]rune(ctxBlk))
+	return eval, false, len([]rune(ctxBlk)), ctxBlk
 }
 
 // classifyRetryLimit 是**兜底重试**那一发的预算：输入已被裁到几百 token，实测那一量级

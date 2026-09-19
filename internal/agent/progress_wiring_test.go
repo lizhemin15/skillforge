@@ -359,12 +359,19 @@ func TestEvalTurnBoundsClassifierHop(t *testing.T) {
 	if elapsed > 6*time.Second {
 		t.Fatalf("分类预算 1s 就该收手，实际等了 %s —— 说明这一跳还在靠整轮 ctx 兜底（线上 600s 就是这么来的）", elapsed)
 	}
-	// 超时不是「结果不好」，不该再重试一次把用户等待翻倍。
+	// 新不变量：**整个意图识别阶段的等待有硬顶** = classifyPhaseLimit()
+	// = 单跳 + 兜底重试（这里 1s + 1s = 2s）。
+	// 旧实现靠「超时后一次都不重试」来防等待翻倍，代价是「没有历史可裁的那些轮
+	// 白等满 60s、路由还丢了」；现在改成阶段 deadline 封顶——同输入快问一发是允许的，
+	// 但每发各等一个满预算的链式叠加绝不允许。
+	if elapsed > 3*time.Second {
+		t.Fatalf("阶段预算 1+1=2s 就该收手，实际等了 %s —— 后续那些发没被阶段 deadline 掐住", elapsed)
+	}
 	fp.mu.Lock()
 	n := len(fp.bodies)
 	fp.mu.Unlock()
-	if n != 1 {
-		t.Fatalf("超时后不该重试（等待会翻倍），实际发生 %d 次请求", n)
+	if n > 2 {
+		t.Fatalf("挂死时最多只该打 2 发（首发 + 同输入快问），实际 %d 发——兜底链在叠加等待", n)
 	}
 }
 
@@ -710,5 +717,73 @@ func TestPlanDeadlineKnob(t *testing.T) {
 		if got := planDeadline(); got != c.want {
 			t.Errorf("SKILLFORGE_PLAN_DEADLINE_MS=%q → %s，期望 %s", c.env, got, c.want)
 		}
+	}
+}
+
+// 「首发超时 → 同输入快问一发救回路由」这条路必须真的被走到。
+//
+// 为什么不能省：线上真实故障形态恰恰是「整条消息就是用户这一句、ctx 只有 15 字、
+// 没有任何历史可裁」（`[classify] hop=60.0s … in=29391(sys=8538 ctx=15 user=29294)`）。
+// 那条路上旧实现一次重试都不打，直接降级成通用写作，用户看到的是「它不管我上文」。
+// 负向自证：把 else 分支删掉（退回「没有可裁历史就降级」），这条会红——slug 为空、
+// 请求数只有 1。
+func TestClassifyTimeoutRetriesSameInputWhenNoHistoryToClip(t *testing.T) {
+	t.Setenv("SKILLFORGE_CLASSIFY_TIMEOUT_SEC", "1")
+	evalJSON := `{"intent":"docgen","action":"gen","skill_slug":"办公文档管家","needs_tools":false,` +
+		`"reason":"承接上文整理成文档","params":{},"needs":[],"steps":[]}`
+
+	fp := &fakeProvider{hangFirst: 1, content: evalJSON}
+	eng := newTestEngine(t, fp)
+
+	var materials []string
+	ctx := WithProgress(context.Background(), func(s string) { materials = append(materials, s) })
+	// history 传 nil：复刻线上那一发（ctx=15 字，裁剪一分钱也省不下来）。
+	ev, err := eng.EvalTurn(ctx, "s1", "写一篇关于星禾科技的新闻稿", nil)
+	if err != nil {
+		t.Fatalf("EvalTurn 失败: %v", err)
+	}
+	if ev.SkillSlug != "办公文档管家" {
+		t.Fatalf("首发超时后必须靠同输入快问把路由救回来（拿不到就是又一次静默降级），实际 slug=%q reason=%q",
+			ev.SkillSlug, ev.Reason)
+	}
+	if n := fp.callCount(); n != 2 {
+		t.Fatalf("期望「首发超时 + 同输入快问」共 2 次请求，实际 %d 次", n)
+	}
+	// 前提自证：第二发必须是**原样的同一份输入**（不是裁剪版、也不是空上下文），
+	// 否则「重试成功」证明的是别的东西。
+	first := userContentOf(t, fp.bodyAt(t, 0))
+	second := userContentOf(t, fp.bodyAt(t, 1))
+	if first == "" {
+		t.Fatal("前提不成立：首发没带上用户消息")
+	}
+	if first != second {
+		t.Fatalf("同输入快问必须原样重发，实际首发 %d 字、第二发 %d 字", len([]rune(first)), len([]rune(second)))
+	}
+	if joined := strings.Join(materials, ""); !strings.Contains(joined, "原样重试成功") {
+		t.Fatalf("重试成功这件事要说出来，实际材料 %q", joined)
+	}
+}
+
+// 默认值必须**双向**站得住：太松（阶段总预算超过旧默认的单发 60s）是红，
+// 太紧（紧到会砍掉实测最慢的健康样本）也是红。
+//
+// 为什么锁算术而不锁行为：用户能感觉到的只有「从点发送到看见路由」这一段的总等待，
+// 而它是几发预算的和——「每一跳都调小了、总和反而更大」是这类多级兜底最容易犯的错
+// （三发各 25s = 75s > 旧默认的单发 60s）。
+func TestClassifyPhaseDefaultBudgetIsTwoSided(t *testing.T) {
+	t.Setenv("SKILLFORGE_CLASSIFY_TIMEOUT_SEC", "")
+	t.Setenv("SKILLFORGE_CLASSIFY_RETRY_SEC", "")
+	const (
+		oldDefaultHop = 60 * time.Second
+		// 24h 内 45 发成功样本里最慢的一发（其余 4.1~11.3s）。预算低于它就不是
+		// 「超时保护」，而是拿误杀健康请求换速度。
+		slowestHealthy = 14300 * time.Millisecond
+	)
+	hop, phase := classifyHopLimit(), classifyPhaseLimit()
+	if hop <= slowestHealthy {
+		t.Fatalf("单跳默认 %s 会砍掉实测最慢的健康样本 %s（那是误杀，不是超时保护）", hop, slowestHealthy)
+	}
+	if phase > oldDefaultHop {
+		t.Fatalf("阶段总预算 %s 超过旧默认的单发预算 %s —— 兜底链叠加后必须比旧行为更短", phase, oldDefaultHop)
 	}
 }
