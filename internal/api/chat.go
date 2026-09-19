@@ -137,7 +137,13 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			eval.Action = a
 		}
 	} else {
+		// 分类这一跳必须自带旁白：它是用户按下发送后的**第一跳**，而它的两个材料
+		// 来源都可能一片都没有（思考链被关 / provider 整段缓冲）。线上实测这一跳
+		// 静默 54.0s，屏幕上只有计时在跳（用户原话「一直卡着计时」）。
+		// 旁白内容全是本地真值，模型一开口就让路（Narrate 内部判断）。
+		stopNarrate := clock.Narrate(classifyNarration(req.Message, history))
 		eval, err = h.eng.EvalTurn(ctx, req.SessionID, req.Message, history)
+		stopNarrate()
 	}
 	if err != nil {
 		write(evError, jsonSafe(map[string]string{"error": "调度失败: " + err.Error()}))

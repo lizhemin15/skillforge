@@ -247,6 +247,10 @@ if [ "$QUICK" = 0 ]; then
   # params 双重编码成字符串，Go 严格解整包报错 → 分类全丢 + 白跑一次重试 ——
   # 用户看到的就是「卡着的计时」。杀伤半径比 Param 那条更大（第一跳，每轮都走）。
   selfcheck '后端 / Eval 手抖容忍自证' bash internal/agent/eval_flex_mutation_check.sh
+  # 分类跳静默破冰自证。用户投诉原话「中间可以流式输出思考的一些中间材料，现在一直
+  # 卡着计时」——线上实测分类跳静默 54.0s（模型不吐字时屏幕上只有秒数在跳）。这条
+  # 尺子守三件事：旁白接线被摘、冷启动编上下文、行首自带「· 」和 Narrate 叠成双点。
+  selfcheck '后端 / 分类跳旁白自证' bash internal/api/classify_narration_mutation_check.sh
   # 「模型链路偷偷不走流式」的守卫自证（线上 353 秒零帧的原发现场）。
   # 它此前是一把**游离尺子**：仓库里有、本机能跑，但没人调用；而且仓库根写死成
   # /root/skillforge，CI 里想接也接不上（已改成从脚本自身位置推导）。
