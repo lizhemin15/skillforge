@@ -76,9 +76,14 @@ MUTATIONS = [
         "开关没进请求体 → 模型继续吐几十秒思考，提速归零。",
     ),
     (
+        # 锚点跟着实现走（2026-09-19 漂过一次）：分类跳的 StreamOpts 从「直接写在
+        # StreamChat 调用里」改成了先建 `opts` 变量（为了给 OnContent 挂埋点），
+        # 老锚点整段不存在了 → 脚本按规矩判「注入点没找到」→ CI 红。
+        # 那次红是对的：锚点漂了就等于这把尺子不再量任何东西。
+        # 现在锚在 `MaxTokens: classifyMaxTokens(),` 这一行上 —— 它是这一跳独有的。
         "M3 分类那一跳不再请求关思考链", "internal/agent/agent.go",
-        "\t\tDisableThinking: true,\n\t\tJSONMode:        true,\n\t\tOnReasoning:     reasoningSink(ctx),\n\t\tOnContent:       contentSink(ctx),\n\t})\n\tif err != nil {\n\t\treturn nil, false\n\t}",
-        "\t\tDisableThinking: false,\n\t\tJSONMode:        true,\n\t\tOnReasoning:     reasoningSink(ctx),\n\t\tOnContent:       contentSink(ctx),\n\t})\n\tif err != nil {\n\t\treturn nil, false\n\t}",
+        "\t\tDisableThinking: true,\n\t\tJSONMode:        true,\n\t\tMaxTokens:       classifyMaxTokens(),\n\t\tOnReasoning:     reasoningSink(ctx),\n\t}",
+        "\t\tDisableThinking: false,\n\t\tJSONMode:        true,\n\t\tMaxTokens:       classifyMaxTokens(),\n\t\tOnReasoning:     reasoningSink(ctx),\n\t}",
         [GO_MARK, "test", "-v", "./internal/agent/", "-run", "TestEvalTurn", "-count=1"],
         "TestEvalTurnAsksProviderToDisableThinking",
         "接线回归：分类那一跳又把思考链打开了 —— 单元/SSE 全绿，线上慢回 40s。",
