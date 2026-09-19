@@ -93,6 +93,8 @@ def stream_round(tok, session_id, message, label):
                         if first_text is None:
                             first_text = now
                         text_len += len(txt)
+                        # 正文增量帧 = 用户在屏幕上真的看到字在变，必须计入可见变化。
+                        seen.setdefault("marks", []).append((now - t0, "正文 " + txt[:24]))
                     mat = ev.get("material")
                     if mat and first_mat is None:
                         first_mat = now
@@ -103,9 +105,15 @@ def stream_round(tok, session_id, message, label):
                         lab = str(ev.get("label") or "")
                         det = re.sub(r"（已用 \d+s）", "", str(ev.get("detail") or ""))
                         m2 = str(mat or "")
-                        key = (lab, det, m2[:60])
+                        # 判「可见内容有没有变」必须看**尾部原文**：中间材料是截尾滚动
+                        # 窗口（长度恒定、头部被挤掉、只有尾部在动）。用头部 m2[:60] 当 key，
+                        # 滚动中的材料会被判成「没变化」→ 正在滚被记成静默，尺子自己造出
+                        # 一个不存在的卡顿（2026-09-18 已经为这个形状付过一次代价：
+                        # 39.8s 假静默）。
+                        key = (lab, det, m2[-80:])
                         if key != seen.get("last"):
                             seen["last"] = key
+                            seen.setdefault("marks", []).append((now - t0, f"{lab}｜{str(mat or '')[-30:]}"))
                             phases.setdefault(lab, now - t0)
                             print(f"[{now-t0:6.1f}s] ⏱ {lab}｜{det[:70]}"
                                   + (f"｜材料：{m2[:70]}" if m2 else ""))
@@ -125,6 +133,21 @@ def stream_round(tok, session_id, message, label):
           f"｜首正文 {('%.1f' % (first_text-t0)) if first_text else '-'}s｜正文 {text_len} 字"
           f"｜交付物 {('%.1f' % (doc-t0)) if doc else '未出现'}s")
     print(f"    帧类型分布：{kinds}")
+    # 真实静默账：可见变化 = trace 内容变化（尾部原文）+ 正文增量帧。
+    marks = seen.get("marks") or []
+    if len(marks) >= 2:
+        gaps = sorted(((marks[i][0] - marks[i-1][0], marks[i-1], marks[i])
+                       for i in range(1, len(marks))), key=lambda x: -x[0])
+        g, a, b = gaps[0]
+        print(f"    最大静默 {g:.1f}s（{a[0]:.1f}s «{a[1][:26]}» → {b[0]:.1f}s «{b[1][:26]}»）｜可见变化 {len(marks)} 次")
+        for g2, a2, b2 in gaps[1:3]:
+            print(f"    次大静默 {g2:.1f}s（{a2[0]:.1f}s «{a2[1][:26]}» → {b2[0]:.1f}s）")
+        if os.environ.get("DUMP"):
+            with open(f"/tmp/marks_{int(t0)}.jsonl", "w") as f:
+                for t, s2 in marks:
+                    f.write(json.dumps([round(t, 2), s2], ensure_ascii=False) + "\n")
+    else:
+        print(f"    ⚠ 可见变化只有 {len(marks)} 次，静默账算不出来 —— 先怀疑尺子")
     if phases:
         print("    各步首次出现时刻：" + "｜".join(f"{k}@{v:.1f}s" for k, v in phases.items()))
     return total, doc, text_len

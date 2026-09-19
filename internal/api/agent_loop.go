@@ -68,7 +68,7 @@ func splitList(s string) []string {
 // 关键约束来自实战教训：
 //   - 明确「联网取数」与「本地计算」分工，否则模型会写 requests 代码（沙箱内必失败）
 //   - 禁止输出工具调用语法（前端不渲染）+ 禁止编造工具未返回的数据
-func agentSystemPrompt() string {
+func agentSystemPrompt(mcpHint string) string {
 	return `你是 SkillForge 的办公智能助手，可以用工具替用户把事情办完。
 
 工具使用原则：
@@ -94,7 +94,31 @@ func agentSystemPrompt() string {
 - 绝不要编造工具没有返回的数据；拿不到就如实说明。
 - 如果产出了文件，告诉用户文件名和用途。
 
-今天是 ` + time.Now().Format("2006年1月2日") + `。`
+今天是 ` + time.Now().Format("2006年1月2日") + `。` + mcpHint
+}
+
+// mcpPromptHint 生成 MCP 外部工具的提示段。
+//
+// 为什么非要有这段：工具虽然已经在 tools 数组里，但模型对「mcp_dtb_execute_sql」
+// 这种名字没有任何先验，实测会绕过它去写 http_request 或干脆瞎猜答案。
+// 点名「哪台服务、什么场景优先用它」之后命中率才起来。
+//
+// 工具清单本身由 tools.MCPManager.PromptHint() 产出（那边带每个工具的简介），
+// 这里只负责加「怎么用」的路由指令——清单两处各写一份迟早对不上。
+// 返回空串表示没接任何 MCP 服务，此时提示词与改造前逐字一致（零回归）。
+func (h *chatHandler) mcpPromptHint() string {
+	if h.mcp == nil {
+		return ""
+	}
+	list := h.mcp.PromptHint()
+	if strings.TrimSpace(list) == "" {
+		return ""
+	}
+	return "\n\n" + list + `
+上面这些工具连的是公司内部业务系统（不是公网接口）。凡是问题涉及这些系统里的数据，
+必须调用它们取真实数据，**不要用 http_request 去猜地址，也不要凭记忆编数据**。
+同一台服务的工具通常要配合使用：先查清单/表结构，再执行实际取数或写入操作。
+`
 }
 
 // runAgentLoop 执行「工具循环」。返回 true 表示本轮已由循环处理完毕。
@@ -162,7 +186,7 @@ func (h *chatHandler) runAgentLoop(
 	}
 
 	loop := agent.NewLoop(h.eng, h.tools, h.maxRound)
-	out, err := loop.Run(ctx, agentSystemPrompt(), toLLMMessages(history), req.Message, emit)
+	out, err := loop.Run(ctx, agentSystemPrompt(h.mcpPromptHint()), toLLMMessages(history), req.Message, emit)
 	if err != nil {
 		// 循环失败：把错误交给前端，但不要静默变成空回答
 		steps[len(steps)-1].Status = "done"

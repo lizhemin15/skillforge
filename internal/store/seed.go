@@ -25,33 +25,65 @@ func (s *SkillStore) seedCoreSkills() {
 		"",
 		coreSkillStudioSystemPrompt,
 	)
+	// 内置业务技能：安装即有，但默认停用（见 seed_gov_skill.go 的说明）。
+	s.seedGovTaskDevSkill()
 }
 
-// ensureCoreSkill creates (if missing) a single built-in skill: its metadata
+// builtinSkillSpec 描述一个「安装即有」的技能：SQLite 元信息行 + 磁盘上的系统提示词。
+type builtinSkillSpec struct {
+	Slug         string
+	Name         string
+	Description  string
+	Category     string
+	SkillType    string
+	Attachment   string
+	SystemPrompt string
+	Enabled      bool
+	IsCore       bool
+}
+
+// ensureCoreSkill creates (if missing) a single core (通用能力) built-in skill.
+func (s *SkillStore) ensureCoreSkill(slug, name, description, skillType, attachment, systemPrompt string) {
+	s.ensureBuiltinSkill(builtinSkillSpec{
+		Slug:         slug,
+		Name:         name,
+		Description:  description,
+		Category:     "通用",
+		SkillType:    skillType,
+		Attachment:   attachment,
+		SystemPrompt: systemPrompt,
+		Enabled:      true,
+		IsCore:       true,
+	})
+}
+
+// ensureBuiltinSkill creates (if missing) a single built-in skill: its metadata
 // row in SQLite plus its system_prompt.md on disk under the skills dir.
 // No required params are registered so docgen-style skills never block on the
 // `needs` path — they always generate (blank template or filled doc).
-func (s *SkillStore) ensureCoreSkill(slug, name, description, skillType, attachment, systemPrompt string) {
+//
+// 只插不改：已存在的行与文件一律不动，管理员改过的分类/开关/提示词在重启后依然生效。
+func (s *SkillStore) ensureBuiltinSkill(spec builtinSkillSpec) {
 	var exists int
-	if err := s.db.QueryRow(`SELECT COUNT(1) FROM skills WHERE slug=?`, slug).Scan(&exists); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(1) FROM skills WHERE slug=?`, spec.Slug).Scan(&exists); err != nil {
 		return
 	}
 	if exists == 0 {
 		_, err := s.db.Exec(
 			`INSERT INTO skills(slug,name,description,category,version,enabled,is_core,skill_type,attachment)
-			 VALUES(?,?,?,?,1,1,1,?,?)`,
-			slug, name, description, "通用", skillType, attachment,
+			 VALUES(?,?,?,?,1,?,?,?,?)`,
+			spec.Slug, spec.Name, spec.Description, spec.Category, bool2int(spec.Enabled), bool2int(spec.IsCore), spec.SkillType, spec.Attachment,
 		)
 		_ = err
 	}
 	// ensure the system prompt file exists on disk
-	dir := filepath.Join(s.skillsDir, slug)
+	dir := filepath.Join(s.skillsDir, spec.Slug)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
 	}
 	sp := filepath.Join(dir, "system_prompt.md")
 	if _, err := os.Stat(sp); os.IsNotExist(err) {
-		_ = os.WriteFile(sp, []byte(systemPrompt), 0o644)
+		_ = os.WriteFile(sp, []byte(spec.SystemPrompt), 0o644)
 	}
 }
 

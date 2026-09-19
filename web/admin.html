@@ -45,6 +45,7 @@
     <div class="container admin-shell hidden" id="shell" style="display:none">
       <div class="admin-tabs">
         <button class="active" data-tab="llm">LLM 服务</button>
+        <button data-tab="mcp">MCP 连接</button>
         <button data-tab="skills">技能管理</button>
         <button data-tab="site">站点设置</button>
         <button data-tab="account">账号</button>
@@ -80,6 +81,53 @@
               <button type="button" class="btn ghost" id="llm-cancel" style="display:none">取消</button>
               <div class="msg" id="llm-msg"></div>
             </form>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab: MCP -->
+      <!-- 一个入口管所有外部工具：配置、开关、测试连接都在这里。 -->
+      <div class="tab-pane hidden" id="tab-mcp" style="display:none">
+        <div class="admin-grid">
+          <div class="card">
+            <h3>已接入的 MCP 服务</h3>
+            <p class="card-sub">开关立即生效：关掉后对话里立刻不再出现这台服务提供的工具</p>
+            <div id="mcp-list"></div>
+            <div style="display:flex;gap:8px;margin-top:10px">
+              <button type="button" class="btn ghost" id="mcp-reload">重新连接全部</button>
+            </div>
+            <div class="msg" id="mcp-list-msg"></div>
+          </div>
+          <div class="card">
+            <h3>添加 / 编辑 MCP 服务</h3>
+            <p class="card-sub">填 MCP 的 Streamable HTTP 地址，例如数据工具箱的 http://127.0.0.1:8080/mcp</p>
+            <form id="mcp-form" autocomplete="off">
+              <div class="field">
+                <label>标识</label>
+                <input type="text" id="mcp-id" placeholder="datatoolbox" required pattern="[A-Za-z0-9_-]{1,32}">
+                <p class="dim" style="margin:6px 0 0;font-size:12px">英文短标识，会变成工具名前缀，如 mcp_datatoolbox_execute_sql</p>
+              </div>
+              <div class="field"><label>名称</label><input type="text" id="mcp-name" placeholder="数据工具箱" required></div>
+              <div class="field"><label>MCP 地址</label><input type="url" id="mcp-url" placeholder="http://127.0.0.1:8080/mcp" required></div>
+              <div class="field">
+                <label>API Key</label>
+                <input type="password" id="mcp-key" placeholder="没有鉴权就留空">
+                <p class="dim" style="margin:6px 0 0;font-size:12px">编辑时留空 = 沿用原密钥，不会清空</p>
+              </div>
+              <div class="field">
+                <label>超时（秒）</label>
+                <input type="number" id="mcp-timeout" min="1" max="120" value="30">
+              </div>
+              <div class="field" style="display:flex;align-items:center;gap:8px">
+                <input type="checkbox" id="mcp-enabled" style="width:auto;margin:0">
+                <label for="mcp-enabled" style="margin:0">启用（开启后其工具对智能助手可见）</label>
+              </div>
+              <button type="submit" class="btn primary" id="mcp-save">保存</button>
+              <button type="button" class="btn ghost" id="mcp-test">测试连接</button>
+              <button type="button" class="btn ghost" id="mcp-cancel" style="display:none">取消</button>
+              <div class="msg" id="mcp-msg"></div>
+            </form>
+            <div id="mcp-test-out" style="margin-top:12px"></div>
           </div>
         </div>
       </div>

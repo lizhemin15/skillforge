@@ -24,7 +24,8 @@ type chatHandler struct {
 	eng      *agent.Engine
 	gen      *genCache       // generates one-time download URLs for docgen skills
 	tools    *tools.Registry // 工具注册表；nil = 工具能力关闭
-	maxRound int             // 工具循环轮数上限
+	mcp      *tools.MCPManager
+	maxRound int // 工具循环轮数上限
 }
 
 type chatReq struct {
@@ -387,11 +388,33 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// 技能链路以前**没有步骤板**：全程挂着启动骨架「① 意图分析」，于是「正在执笔」
+		// 这件事在界面上读作「① 意图分析（已用 63s）」——标签本身就是错的，用户既看不到
+		// 阶段推进，也看不到材料。这里补上它（手册链路的 chat_write.go 早有同样的板）。
+		tb := newTraceBoard()
+		tb.Carry(clock.Steps())
+		tb.Done("analyze", "① 意图分析", "已判断出本轮要做什么")
+		tb.Done("match", "② 技能匹配", "命中技能《"+sc.Name+"》")
+		tb.Done("params", "③ 要素提炼", noteFacts(sc, args, history).note())
+		planIdx := tb.Active("plan", "④ 构思要点", "先把这一篇怎么写想清楚，要点会实时滚出来…")
+		clock.Set(tb.Steps())
+
+		// 执笔那一跳保留思考链时首字实测要等 63 秒，而这段 provider 一片 reasoning 都不推。
+		// 所以先要一份「构思」：它关思考链、秒级出字，片段走 contentSink 变成中间材料。
+		plan, _ := h.eng.PlanEssay(ctx, sc, args, req.Message)
+		if plan != "" {
+			tb.Close(planIdx, "要点已定，按它落笔")
+		} else {
+			tb.Close(planIdx, "没拿到要点，直接落笔")
+		}
+		tb.Active("generate", "⑤ 按要点执笔", "按要点写正文，思考链片段会实时滚出来…")
+		clock.Set(tb.Steps())
+
 		// 起草这一跳是几十秒的阻塞调用。模型侧不给材料时（线上实测 provider 不推
 		// reasoning，reasoning 片数=0）屏幕上只剩计时器在跳，所以先把「装进上下文的
 		// 是什么」报出去——这是本地事实，t≈0 就能发。
 		clock.Thinking(noteFacts(sc, args, history).note())
-		full, err = h.eng.Generate(ctx, sc, args, func(delta string) {
+		full, err = h.eng.GenerateWithPlan(ctx, sc, args, plan, func(delta string) {
 			write(evDelta, jsonSafe(map[string]string{"t": delta}))
 		})
 		if err != nil {
@@ -416,8 +439,30 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 3. plain chat (no skill) — stream a conversational reply
 	// 「没命中技能」这条路上，分类回来到首字之间同样是一次无上界的阻塞调用（线上实测
 	// 那 54.7 秒就发生在这条路上），所以材料同样先由本地事实顶上。
+	//
+	// 但「本地事实」是**一次性**的：报出去之后到首字之间仍然是死寂。2026-09-19 的账本
+	// 就是这么抓到的——第 1 轮走的正是这条道（分类判「通用写作、不生成文件」），
+	// 首字 71.7s、**最大静默 60.3s**，材料停在装配那句上不动，屏幕上只有「已用 Ns」在跳。
+	// 所以这里补两块：步骤板（标签跟着真实阶段走，不再全程挂着「① 意图分析」）＋
+	// 构思跳（关思考链、秒级出字，把「这一篇怎么写」当 content 流出来当材料）。
+	tb := newTraceBoard()
+	tb.Carry(clock.Steps())
+	tb.Done("analyze", "① 意图分析", "已判断出本轮要做什么")
+	tb.Done("params", "② 上下文装配", noteFacts(nil, nil, history).note())
+	planIdx := tb.Active("plan", "③ 构思要点", "先把这一篇怎么写想清楚，要点会实时滚出来…")
+	clock.Set(tb.Steps())
 	clock.Thinking(noteFacts(nil, nil, history).note())
-	full, err = h.eng.PlainChat(ctx, req.SessionID, req.Message, history, func(delta string) {
+
+	plan, _ := h.eng.PlanEssay(ctx, nil, nil, req.Message)
+	if plan != "" {
+		tb.Close(planIdx, "要点已定，按它落笔")
+	} else {
+		tb.Close(planIdx, "没拿到要点，直接落笔")
+	}
+	tb.Active("generate", "④ 按要点执笔", "按要点写正文，思考链片段会实时滚出来…")
+	clock.Set(tb.Steps())
+
+	full, err = h.eng.PlainChatWithPlan(ctx, req.SessionID, req.Message, history, plan, func(delta string) {
 		write(evDelta, jsonSafe(map[string]string{"t": delta}))
 	})
 	if err != nil {

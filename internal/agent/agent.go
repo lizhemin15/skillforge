@@ -695,9 +695,70 @@ func (e *Engine) Generate(ctx context.Context, sc *SkillContent, args map[string
 // 技能说明冲淡——手册要求是硬约束，不能被当成背景介绍。
 // extra 留空即普通生成，与原实现逐字等价。
 func (e *Engine) generateWithExtra(ctx context.Context, sc *SkillContent, args map[string]string, extra string, onDelta func(string)) (string, error) {
+	return e.generateWithExtraPlan(ctx, sc, args, extra, "", onDelta)
+}
+
+// PlanEssay 先把「这一篇怎么写」的构思**当正文要出来**，而不是等模型藏在思考链里。
+//
+// 为什么需要这一跳（线上账本，不是推测）：技能链路执笔跳保留思考链时，首字实测等到
+// 72.8s，其中 63.2s 屏幕上零可见变化——账本按帧时间戳算出来的最大静默就是它。而
+// internal/llm/stream.go 自己记着同一台模型的对照：带思考 63.0s / 关思考 4.8s。
+// 也就是说这 63 秒就是思考链，而 provider 在长文执笔这段**一片 reasoning 都不推**
+// （reasoningSink 接了、收不到），所以屏幕上只剩计时器在跳——用户原话「一直卡着计时」。
+//
+// 这一跳把构思变成 content：关思考链（与分类/抽取同类，几秒级），OnContent 走
+// contentSink → ProgressOf → 步骤面板，材料因此在秒级就开始滚，而且滚的是真内容。
+// 它**不碰执笔那一跳**：执笔仍保留思考链（质量优先，见 progress_wiring_test.go 的守卫）。
+// 失败不致命：拿不到要点就照旧直接落笔（返回空串，由调用方决定怎么显示）。
+func (e *Engine) PlanEssay(ctx context.Context, sc *SkillContent, args map[string]string, userMsg string) (string, error) {
+	if e == nil || e.llm == nil {
+		return "", nil
+	}
+	// 两条道都要能用：命中技能时按技能提示词构思；没命中技能（线上第 1 轮就是这条）
+	// 时没有技能可依，就用一个轻量写作身份 + 用户原话起头。
+	sys := "你是一名中文写作助手，先帮用户把这一篇的写法想清楚。"
+	lead := ""
+	if sc != nil {
+		sys = e.generateSys(sc)
+		lead = argBlockOf(sc, args)
+	} else {
+		lead = "用户本轮需求：\n" + strings.TrimSpace(userMsg)
+	}
+	ask := lead + "\n\n# 本轮任务\n先只写这一篇的构思要点，不要写正文：\n" +
+		"1) 3~6 条，每条一行，以「· 」开头；\n" +
+		"2) 每条写清：写什么、按什么结构写、必须带哪些要素、要避开什么；\n" +
+		"3) 不要开场白、不要解释、不要 markdown 标题；\n" +
+		"4) 全中文，总量控制在 300 字以内。"
+	out, err := e.llm.StreamChat(ctx, sys, ask, llm.StreamOpts{
+		DisableThinking: true,
+		OnReasoning:     reasoningSink(ctx),
+		OnContent:       contentSink(ctx),
+	})
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// GenerateWithPlan 同 Generate，额外把本轮构思要点并进 system prompt 末尾。
+func (e *Engine) GenerateWithPlan(ctx context.Context, sc *SkillContent, args map[string]string, plan string, onDelta func(string)) (string, error) {
+	return e.generateWithExtraPlan(ctx, sc, args, "", plan, onDelta)
+}
+
+// writeThinkingOn 执笔跳是否保留思考链。**默认保留**（质量优先）。
+// 只有显式设 SKILLFORGE_WRITE_THINKING=0 才关：那是明示的取舍（首字 63s → 4.8s，
+// 换来的是执笔质量的自行承担），不是悄悄降质的默认值。
+func writeThinkingOn() bool {
+	return strings.TrimSpace(os.Getenv("SKILLFORGE_WRITE_THINKING")) != "0"
+}
+
+func (e *Engine) generateWithExtraPlan(ctx context.Context, sc *SkillContent, args map[string]string, extra, plan string, onDelta func(string)) (string, error) {
 	sys := e.generateSys(sc)
 	if strings.TrimSpace(extra) != "" {
 		sys += "\n\n" + extra
+	}
+	if strings.TrimSpace(plan) != "" {
+		sys += "\n\n==== 本轮构思要点（按它落笔，不要再写成两篇）====\n" + plan
 	}
 	var done string
 	if sc.SkillType == model.SkillTypeWrite {
@@ -707,7 +768,13 @@ func (e *Engine) generateWithExtra(ctx context.Context, sc *SkillContent, args m
 	}
 	// 执笔这一跳**保留思考链**（质量优先），但把思考片段当中间材料流出去：
 	// 思考链期间正文一个字都没有，不流的话用户看到的就是「一直卡着计时」。
-	return e.llm.CompleteEx(ctx, sys, argBlockOf(sc, args)+"\n"+done, onDelta, reasoningSink(ctx))
+	if writeThinkingOn() {
+		return e.llm.CompleteEx(ctx, sys, argBlockOf(sc, args)+"\n"+done, onDelta, reasoningSink(ctx))
+	}
+	return e.llm.StreamChat(ctx, sys, argBlockOf(sc, args)+"\n"+done, llm.StreamOpts{
+		OnContent:   onDelta,
+		OnReasoning: reasoningSink(ctx),
+	})
 }
 
 // generateSys 拼出技能的 system prompt（身份 + 技能提示词 + 骨架模板 + 附件提示）。
@@ -1584,6 +1651,16 @@ func (e *Engine) Push(id string, m Message) {
 // recent history so the assistant can hold multi-turn context (greetings,
 // small talk, general questions, or follow-ups on a prior skillless turn).
 func (e *Engine) PlainChat(ctx context.Context, id, user string, history []Message, onDelta func(string)) (string, error) {
+	return e.plainChatWithPlan(ctx, id, user, history, "", onDelta)
+}
+
+// PlainChatWithPlan 同 PlainChat，额外把本轮构思要点（见 PlanEssay）并进 system prompt，
+// 让这一跳按已经想清楚的要点落笔，而不是从零开始。
+func (e *Engine) PlainChatWithPlan(ctx context.Context, id, user string, history []Message, plan string, onDelta func(string)) (string, error) {
+	return e.plainChatWithPlan(ctx, id, user, history, plan, onDelta)
+}
+
+func (e *Engine) plainChatWithPlan(ctx context.Context, id, user string, history []Message, plan string, onDelta func(string)) (string, error) {
 	rosterStr, _, err := e.buildRoster()
 	if err != nil {
 		return "", err
@@ -1602,6 +1679,9 @@ func (e *Engine) PlainChat(ctx context.Context, id, user string, history []Messa
 	combined := user
 	if len(history) > 0 {
 		combined = "对话历史（供参考，你只需回应最新用户消息）：\n" + histBlock + "\n\n最新用户消息：\n" + user
+	}
+	if strings.TrimSpace(plan) != "" {
+		sys += "\n\n==== 本轮构思要点（按它落笔）====\n" + plan
 	}
 	return e.llm.CompleteEx(ctx, sys, combined, onDelta, reasoningSink(ctx))
 }

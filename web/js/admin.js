@@ -45,6 +45,7 @@
     $('shell').style.display = 'block';
     $('shell').classList.remove('hidden');
     loadProviders();
+    loadMCP();
     loadManageSkills();
     loadSite();
     loadAccount();
@@ -1483,6 +1484,190 @@
         showAccMsg('已保存（' + what + '已更新）', '');
         toast('账号已更新', 'ok');
       } catch (err) { showAccMsg('网络错误', 'err'); }
+    });
+  }
+
+  // ---------- MCP 服务（管理员统一配置 + 开关）----------
+  // 三条要点：
+  //  1. 编辑态密钥框留空 = 沿用原值（后端 isMaskedKey 认空串，库里取原值回填）。
+  //  2. 开关走 toggle 接口即时落库并重连，不用再点保存。
+  //  3. 测试连接不落库——先探通路再保存，避免存一堆连不上的配置。
+  function showMCPMsg(text, cls) {
+    const m = $('mcp-msg');
+    if (!m) return;
+    m.className = 'msg ' + (cls || '');
+    m.textContent = text;
+  }
+  function showMCPListMsg(text, cls) {
+    const m = $('mcp-list-msg');
+    if (!m) return;
+    m.className = 'msg ' + (cls || '');
+    m.textContent = text;
+  }
+
+  function mcpStateText(s) {
+    if (!s.enabled) return '未启用';
+    const st = s.status || {};
+    if (st.ok) return '已连接 ' + (st.server || '') + (st.version ? ' v' + st.version : '') + ' · ' + st.tool_count + ' 个工具';
+    if (st.error) return '连接失败：' + st.error;
+    return '尚未连接（点右侧「测试」）';
+  }
+
+  async function loadMCP() {
+    if (!$('mcp-list')) return;
+    try {
+      const r = await fetch('/api/admin/mcp', { headers: authHdr() });
+      if (r.status === 401) { logout(); return; }
+      const j = await r.json();
+      const list = j.servers || [];
+      const box = $('mcp-list');
+      if (!list.length) {
+        box.innerHTML = '<div class="empty" style="padding:30px 0"><h3>还没有接入 MCP 服务</h3>' +
+          '<p class="dim">接入后，智能助手就能直接查数据库、调内部接口，而不是瞎猜</p></div>';
+        return;
+      }
+      box.innerHTML = list.map(s => {
+        const st = s.status || {};
+        const tools = (st.tools || []).map(n => '<code style="font-size:11px">' + esc(n) + '</code>').join(' ');
+        return `
+        <div class="prov-row">
+          <div class="inf" style="min-width:0">
+            <div class="nm">${esc(s.name)} ${s.enabled ? '<span class="pill-active">已启用</span>' : ''}</div>
+            <div class="dt">${esc(s.id)} · ${esc(s.url)} · 超时 ${s.timeout_sec}s · 密钥 ${s.has_key ? esc(s.key_mask) : '未设置'}</div>
+            <div class="dt" style="${st.ok ? '' : 'color:#b45309'}">${esc(mcpStateText(s))}</div>
+            ${tools ? '<div class="dt" style="margin-top:4px;line-height:1.7">' + tools + '</div>' : ''}
+          </div>
+          <div class="row-actions" style="display:flex;align-items:center;gap:8px">
+            <label style="display:flex;align-items:center;gap:4px;font-size:12px;white-space:nowrap;margin:0">
+              <input type="checkbox" style="width:auto;margin:0" ${s.enabled ? 'checked' : ''}
+                onchange="window.mcpToggle('${esc(s.id)}', this.checked)">启用
+            </label>
+            <button class="btn ghost" style="padding:4px 8px;font-size:12px" onclick="window.mcpEdit('${esc(s.id)}')">编辑</button>
+            <button class="btn ghost" style="padding:4px 8px;font-size:12px" onclick="window.mcpProbe('${esc(s.id)}')">测试</button>
+            <button class="icon-btn danger" title="删除" onclick="window.mcpDel('${esc(s.id)}')">✕</button>
+          </div>
+        </div>`;
+      }).join('');
+    } catch (err) { showMCPListMsg('加载失败', 'err'); }
+  }
+
+  window.mcpToggle = async (id, enabled) => {
+    showMCPListMsg('正在' + (enabled ? '启用' : '停用') + '并重连…');
+    try {
+      const r = await fetch('/api/admin/mcp/toggle', {
+        method: 'POST', headers: authHdr(), body: JSON.stringify({ id, enabled }),
+      });
+      const j = await r.json();
+      if (!r.ok) { showMCPListMsg(j.error || '操作失败', 'err'); loadMCP(); return; }
+      showMCPListMsg(enabled ? '已启用，工具已挂上' : '已停用，工具已摘除', 'ok');
+      // 重连是后台异步做的，稍等一下再拉状态，否则看到的还是上一轮结果。
+      setTimeout(loadMCP, 900);
+    } catch (err) { showMCPListMsg('网络错误', 'err'); }
+  };
+
+  window.mcpEdit = async (id) => {
+    const r = await fetch('/api/admin/mcp', { headers: authHdr() });
+    const j = await r.json();
+    const s = (j.servers || []).find(x => x.id === id);
+    if (!s) return;
+    $('mcp-id').value = s.id;
+    $('mcp-id').readOnly = true; // 标识是工具名前缀，改了等于换一套工具名，不允许中途改
+    $('mcp-name').value = s.name || '';
+    $('mcp-url').value = s.url || '';
+    $('mcp-key').value = ''; // 留空 = 沿用原密钥
+    $('mcp-key').placeholder = s.has_key ? '留空 = 沿用原密钥（' + s.key_mask + '）' : '没有鉴权就留空';
+    $('mcp-timeout').value = s.timeout_sec || 30;
+    $('mcp-enabled').checked = !!s.enabled;
+    $('mcp-cancel').style.display = 'inline-flex';
+    $('mcp-test-out').innerHTML = '';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  function resetMCPForm() {
+    $('mcp-form').reset();
+    $('mcp-id').readOnly = false;
+    $('mcp-timeout').value = '30';
+    $('mcp-key').placeholder = '没有鉴权就留空';
+    $('mcp-cancel').style.display = 'none';
+    $('mcp-test-out').innerHTML = '';
+  }
+  window.mcpCancel = resetMCPForm;
+  $('mcp-cancel') && $('mcp-cancel').addEventListener('click', resetMCPForm);
+
+  // 表单构造集中在这一处：保存与测试连接共用，避免两边字段不一致
+  // （少了字段 → 后端 DisallowUnknownFields 回 400「请求体无效」，报错还不提字段名）。
+  function mcpFormPayload() {
+    const mcpPayload = {
+      id: $('mcp-id').value.trim(),
+      name: $('mcp-name').value.trim(),
+      url: $('mcp-url').value.trim(),
+      api_key: $('mcp-key').value.trim(),
+      enabled: $('mcp-enabled').checked,
+      timeout_sec: parseInt($('mcp-timeout').value || '30', 10) || 30,
+    };
+    return mcpPayload;
+  }
+
+  window.mcpProbe = async (id) => {
+    // 从列表点「测试」：把该行配置填进表单再探，复用同一条链路
+    if (id) await window.mcpEdit(id);
+    showMCPMsg('正在连接…');
+    $('mcp-test-out').innerHTML = '';
+    try {
+      const r = await fetch('/api/admin/mcp/test', {
+        method: 'POST', headers: authHdr(), body: JSON.stringify(mcpFormPayload()),
+      });
+      const j = await r.json();
+      if (!r.ok) { showMCPMsg(j.error || '探测失败', 'err'); return; }
+      if (!j.ok) {
+        showMCPMsg('连接失败', 'err');
+        $('mcp-test-out').innerHTML = '<div class="msg err" style="display:block">' + esc(j.error || '未知错误') + '</div>';
+        return;
+      }
+      showMCPMsg('连接成功', 'ok');
+      const names = (j.remote_tools || []).map(n => '<code style="font-size:11px">' + esc(n) + '</code>').join(' ');
+      $('mcp-test-out').innerHTML =
+        '<div class="msg ok" style="display:block">服务器：' + esc(j.server || '') +
+        (j.version ? ' v' + esc(j.version) : '') + ' · 工具 ' + (j.tool_count || 0) + ' 个</div>' +
+        '<div class="dt" style="margin-top:6px;line-height:1.8">' + names + '</div>';
+    } catch (err) { showMCPMsg('网络错误', 'err'); }
+  };
+
+  $('mcp-test') && $('mcp-test').addEventListener('click', () => window.mcpProbe(null));
+
+  $('mcp-reload') && $('mcp-reload').addEventListener('click', async () => {
+    showMCPListMsg('正在重新连接…');
+    try {
+      const r = await fetch('/api/admin/mcp/refresh', { method: 'POST', headers: authHdr() });
+      const j = await r.json();
+      if (!r.ok) { showMCPListMsg(j.error || '重连失败', 'err'); return; }
+      showMCPListMsg('已重连', 'ok');
+      loadMCP();
+    } catch (err) { showMCPListMsg('网络错误', 'err'); }
+  });
+
+  window.mcpDel = async (id) => {
+    if (!confirm('删除这个 MCP 服务？其工具会立刻从对话中摘除。')) return;
+    const r = await fetch('/api/admin/mcp/' + encodeURIComponent(id), { method: 'DELETE', headers: authHdr() });
+    const j = await r.json();
+    if (r.ok) { toast('已删除', 'ok'); loadMCP(); } else toast(j.error || '删除失败', 'err');
+  };
+
+  const mcpForm = $('mcp-form');
+  if (mcpForm) {
+    mcpForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      showMCPMsg('保存并重连中…');
+      try {
+        const r = await fetch('/api/admin/mcp', {
+          method: 'POST', headers: authHdr(), body: JSON.stringify(mcpFormPayload()),
+        });
+        const j = await r.json();
+        if (!r.ok) { showMCPMsg(j.error || '保存失败', 'err'); return; }
+        showMCPMsg('已保存，正在后台重连…', 'ok');
+        resetMCPForm();
+        loadMCP();
+      } catch (err) { showMCPMsg('网络错误', 'err'); }
     });
   }
 

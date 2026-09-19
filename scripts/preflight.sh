@@ -280,6 +280,11 @@ if [ "$QUICK" = 0 ]; then
   selfcheck '前端 / 停用技能列表自证'   python3 web/tests/skill_disabled_admin_ui_mutation_check.py
   # Bug O「误报目标机没有 python3」的自证：候选名单漂移 / 写死单路径 / 不探活。
   selfcheck '前端 / 解释器探测自证'     python3 web/tests/python_resolve_mutation_check.py
+  # 内置「数据治理任务开发」技能：提示词无编译期约束，5 路真故障注入（杜撰 API /
+  # 漏 await / 清单少项 / 默认打开 / 分类漂移）必须逐条红在对应断言上。
+  # 第 5 路是它抓出来的真洞：分类断言原来写成 `sk.Category != govTaskDevCategory`，
+  # 拿常量跟自己比，注入把常量改掉后左右一起变、恒真 —— 尺子假绿。
+  selfcheck '后端 / 内置业务技能自证'   python3 scripts/seed_gov_skill_inject.py
   # 上面那条是文本断言；这条真跑：遮蔽候选路径后看探测段认不认 $PATH 上的解释器
   # （用户报的现场就是「python3 在 PATH 上、却被说没有」）。带自证。
   selfcheck '安装脚本 / 解释器探测真跑' python3 web/tests/install_python_probe_live_check.py
@@ -291,6 +296,12 @@ if [ "$QUICK" = 0 ]; then
   selfcheck '后端 / 分类结构管理自证'   python3 scripts/category_guard_inject.py
   selfcheck '后端 / 思考开关矩阵自证'   python3 scripts/fastjson_knob_inject.py
   selfcheck '后端 / 提速与中间材料自证' python3 scripts/thinking_knob_inject.py
+  # MCP 接入（后台统一配置 + 开关）：28 路真故障注入 —— 传输层（握手头 / SSE / 翻页 /
+  # 传参 / 会话 / 超时）、适配层（工具名 sanitize、schema、isError、僵尸工具、提示词清单、
+  # 一台坏不拖垮全部）、HTTP 契约（明文掩码、掩码回存覆盖真 key、开关/删除落库、探测用真
+  # key、刷新真重连）、跨层（前端 payload 字段名 ↔ 后端 json tag）。
+  # 客户内网里这些退化的共同形态是「后台显示一切正常，对话里却调不到工具」——必须让尺子会红。
+  selfcheck '后端 / MCP 接入自证'       python3 scripts/mcp_inject.py
   # 后端 / 沙箱限额：客户现场真阻碍（agents 写个解析脚本一碰大文件就被 cgroup OOM 秒杀，
   # 报成没有信息量的「退出码 -1」；而 MemoryMax=256M 硬编码，单机离线客户无从调）。
   # 正向（四旋钮可覆盖 / 非法值退回默认 / -1 分类成人话）由上面 `go test ./...` 覆盖；

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -16,6 +17,7 @@ import (
 	"github.com/lizhemin15/skillforge/internal/ocrsvc"
 	"github.com/lizhemin15/skillforge/internal/skillgen"
 	"github.com/lizhemin15/skillforge/internal/store"
+	"github.com/lizhemin15/skillforge/internal/tools"
 	"github.com/lizhemin15/skillforge/internal/version"
 	"github.com/lizhemin15/skillforge/web"
 )
@@ -51,9 +53,35 @@ func NewHandler(s *store.SkillStore, l *llm.Client, secret string) (*Handler, er
 	genCache := newGenCache()
 	// 工具能力：按环境变量装配（默认开，SKILLFORGE_TOOLS=off 可回退纯对话）
 	toolReg := buildToolRegistry(s)
+
+	// MCP：后台配置的外部工具来源，挂进同一个注册表，工具循环原样复用。
+	// 工具关闭时不给管理器注册表（nil），此时后台仍可配置和测试连接——
+	// 「能配」和「能调」是两件事，配置界面不该被工具开关连坐。
+	var mcpMgr *tools.MCPManager
+	if toolReg != nil {
+		mcpMgr = tools.NewMCPManager(s, toolReg)
+	}
+	admin.SetMCP(mcpMgr)
+	if mcpMgr != nil {
+		// 异步首次连接：内网 MCP 服务慢或没起来时，不能拖着启动流程一起等。
+		// 连上后工具自动出现在注册表里，对话当场可用。
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			for _, st := range mcpMgr.Refresh(ctx) {
+				if st.Enabled && !st.OK {
+					fmt.Fprintf(os.Stderr, "[mcp] %s(%s) 连接失败：%s\n", st.Name, st.URL, st.Error)
+				} else if st.OK {
+					fmt.Fprintf(os.Stderr, "[mcp] %s 已连接 %s v%s，工具 %d 个\n",
+						st.Name, st.Server, st.Version, st.ToolCount)
+				}
+			}
+		}()
+	}
+
 	return &Handler{
 		Skills: skills, Admin: admin, Auth: auth, Acc: NewAccount(s, auth), Site: NewSite(s),
-		Chat: &chatHandler{eng: eng, gen: genCache, tools: toolReg, maxRound: toolMaxRounds()}, Eng: eng,
+		Chat: &chatHandler{eng: eng, gen: genCache, tools: toolReg, mcp: mcpMgr, maxRound: toolMaxRounds()}, Eng: eng,
 		gen: genCache,
 	}, nil
 }
@@ -178,6 +206,15 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/admin/llms", h.Auth.Middleware(h.Admin.UpsertLLM))
 	mux.HandleFunc("POST /api/admin/llms/active", h.Auth.Middleware(h.Admin.SetActiveLLM))
 	mux.HandleFunc("DELETE /api/admin/llms/{id}", h.Auth.Middleware(h.Admin.DeleteLLM))
+
+	// ---- MCP 连接（管理员后台统一配置 + 开关）----
+	// 测试连接是 POST 而非 GET：body 里要塞 API Key，放进 URL 会进日志和浏览器历史。
+	mux.HandleFunc("GET /api/admin/mcp", h.Auth.Middleware(h.Admin.ListMCP))
+	mux.HandleFunc("POST /api/admin/mcp", h.Auth.Middleware(h.Admin.UpsertMCP))
+	mux.HandleFunc("POST /api/admin/mcp/toggle", h.Auth.Middleware(h.Admin.ToggleMCP))
+	mux.HandleFunc("POST /api/admin/mcp/test", h.Auth.Middleware(h.Admin.TestMCPConn))
+	mux.HandleFunc("POST /api/admin/mcp/refresh", h.Auth.Middleware(h.Admin.RefreshMCP))
+	mux.HandleFunc("DELETE /api/admin/mcp/{id}", h.Auth.Middleware(h.Admin.DeleteMCP))
 	mux.HandleFunc("POST /api/admin/train", h.Auth.Middleware(h.Admin.Train))
 	mux.HandleFunc("POST /api/admin/skills/toggle", h.Auth.Middleware(h.Admin.ToggleSkill))
 	mux.HandleFunc("POST /api/admin/skills/core", h.Auth.Middleware(h.Admin.SetSkillCore))

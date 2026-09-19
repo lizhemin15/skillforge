@@ -152,6 +152,14 @@ jobs:
           # 后端行为（go test 真停用一个技能再看全量列表）。它内部会跑 go test，
           # 所以必须排在本 step 之后的 Go 环境里 —— setup-go 在上面，照跑。
           python3 web/tests/skill_disabled_admin_ui_mutation_check.py
+          # 内置「数据治理任务开发」技能的自证：提示词是纯文本，没有任何编译期
+          # 约束 —— 少个 await、示例调了清单外的 API、播种默认打开，全是 go build
+          # 看得见、断言看不见的退化，而用户的感受就是「生成的技能跟我给的没关系」。
+          python3 scripts/seed_gov_skill_inject.py
+          # MCP 接入自证：28 路真故障注入（传输层 / 适配层 / HTTP 契约 / 前端字段名跨层）。
+          # 退化的共同形态是「后台显示一切正常，对话里却调不到工具」——单测全绿也照样发生，
+          # 所以必须让尺子自己会红。内部跑 go test，本 step 已有 Go 环境。
+          python3 scripts/mcp_inject.py
 
       # 离线包 install.sh 的「装后服务探测」：正向场景 + 两路注入自证。
       #

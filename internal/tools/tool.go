@@ -56,6 +56,21 @@ func (r *Registry) Register(t Tool) {
 	r.items[t.Name()] = t
 }
 
+// Remove 注销工具（名字不存在时静默忽略）。
+//
+// 存在的意义是「热更新」：MCP 配置改了要先把上一轮挂的摘掉再挂新的。
+// 没有它就只能全量重建注册表，而注册表里还挂着内置工具，重建容易漏。
+func (r *Registry) Remove(names ...string) {
+	if len(names) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, n := range names {
+		delete(r.items, n)
+	}
+}
+
 // Get 按名取工具。
 func (r *Registry) Get(name string) (Tool, bool) {
 	r.mu.RLock()

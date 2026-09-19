@@ -78,6 +78,19 @@ func migrate(db *sql.DB) error {
 			val        TEXT NOT NULL DEFAULT '',
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
+		// MCP 服务器：管理员在后台统一配置/开关的外部工具来源。
+		// api_key 存明文（与 llm_config 一致，整库本就等于凭据本体）；
+		// 但**接口层永不回传明文**，只回掩码，见 internal/api/admin_mcp.go。
+		`CREATE TABLE IF NOT EXISTS mcp_servers (
+			id          TEXT PRIMARY KEY,
+			name        TEXT NOT NULL DEFAULT '',
+			url         TEXT NOT NULL DEFAULT '',
+			api_key     TEXT NOT NULL DEFAULT '',
+			enabled     INTEGER NOT NULL DEFAULT 0,
+			timeout_sec INTEGER NOT NULL DEFAULT 30,
+			created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {

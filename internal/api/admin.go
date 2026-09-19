@@ -18,6 +18,7 @@ import (
 	"github.com/lizhemin15/skillforge/internal/model"
 	"github.com/lizhemin15/skillforge/internal/skillgen"
 	"github.com/lizhemin15/skillforge/internal/store"
+	"github.com/lizhemin15/skillforge/internal/tools"
 )
 
 func atoi(s string) (int, error) { return strconv.Atoi(s) }
@@ -72,6 +73,12 @@ type Admin struct {
 	// toolAllow 是拉取模型清单时的内网白名单，与 http_request 工具同源同策略
 	// （同一个 SKILLFORGE_TOOL_HTTP_ALLOW）。两处各写一套规则迟早会不一致。
 	toolAllow []string
+
+	// mcp 是 MCP 服务管理器（管理员后台统一配置/开关的外部工具来源）。
+	mcp *tools.MCPManager
+	// mcpRefreshMu 保证同一时刻只有一次重连在跑：连点保存不该叠出多次握手。
+	// 与 mcp 内部的锁分工不同——那把锁保护状态，这把锁保护「别重复干活」。
+	mcpRefreshMu sync.Mutex
 }
 
 func NewAdmin(s *store.SkillStore, g *skillgen.Generator) *Admin {
@@ -91,6 +98,9 @@ func (a *Admin) SetOCR(url string) { a.ocrURL = url }
 
 // SetOCRTimeout 注入上传解析的客户端超时（<=0 = 用 skillgen.DefaultOCRTimeout）。
 func (a *Admin) SetOCRTimeout(d time.Duration) { a.ocrTimeout = d }
+
+// SetMCP 注入 MCP 服务管理器（nil = 关闭 MCP 管理能力）。
+func (a *Admin) SetMCP(m *tools.MCPManager) { a.mcp = m }
 
 // ocrTimeoutOrDefault 返回生效的上传解析超时；与训练通道共用同一个默认值，
 // 免得两条通道各写一个数字、改一条忘一条。
