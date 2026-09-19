@@ -184,8 +184,12 @@ func (e *Engine) ContextBlock(ctx context.Context, id string, history []Message)
 //
 // 为什么需要它（2026-09-20 线上账本）：
 //
-//	[classify] hop=8.1s  ttft=0.79s in=352 (sys=8538 ctx=15   user=255) out=348  ✓
-//	[classify] hop=60.0s ttft=-1.00 in=2311(sys=8538 ctx=2124 user=105) out=0  ✗ 超时
+//	[classify] hop=8.1s  ttft=0.79s in=352字/1302B(sys=8538字 ctx=15字   user=255字) out=348  ✓
+//	[classify] hop=60.0s ttft=-1.00 in=2311字/9506B(sys=8538字 ctx=2124字 user=105字) out=0  ✗ 超时
+//
+// （日志里的数字单位是**字**（rune）；早先这里只打 len()，那是字节数，于是同一份
+// 1 万字素材会显示成 29294，读的人第一反应是「输入被谁放大了 2.8 倍」——实测就
+// 有人照着这个假象追了一轮不存在的膨胀。现在两个单位都打，别再让单位骗人。）
 //
 // 两次的开关完全一样，差别只有输入规模——而 ctx 之所以涨到 2124 token，是因为
 // ContextBlock 会把上一轮的产物**逐字**注入（那是 docgen 需要的，不能砍）。

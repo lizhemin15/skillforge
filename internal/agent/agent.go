@@ -529,8 +529,8 @@ func (e *Engine) classifyWith(ctx context.Context, sys, user string, buildBlock 
 			intent, action, skill = ev.Intent, ev.Action, ev.SkillSlug
 			needN, paramN, stepN = len(ev.Needs), len(ev.Params), len(ev.Steps)
 		}
-		fmt.Fprintf(os.Stderr, "[classify] hop=%.1fs ttft=%.2fs in=%d(sys=%d ctx=%d user=%d) out=%d intent=%s action=%s skill=%s needs=%d params=%d steps=%d retry=%v %s\n",
-			hop.Seconds(), ttft, len(prompt), len(sys), len(ctxBlk), len(user), len(out),
+		fmt.Fprintf(os.Stderr, "[classify] hop=%.1fs ttft=%.2fs in=%d字/%dB(sys=%d字 ctx=%d字 user=%d字) out=%d intent=%s action=%s skill=%s needs=%d params=%d steps=%d retry=%v %s\n",
+			hop.Seconds(), ttft, len([]rune(prompt)), len(prompt), len([]rune(sys)), len([]rune(ctxBlk)), len([]rune(user)), len(out),
 			intent, action, skillshort(skill), needN, paramN, stepN, retry, why)
 	}
 	if err != nil {
