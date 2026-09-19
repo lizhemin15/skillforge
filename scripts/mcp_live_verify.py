@@ -97,7 +97,7 @@ def dt_api_key():
     try:
         row = con.execute(
             "SELECT username, api_key FROM users WHERE api_key IS NOT NULL AND api_key != '' "
-            "ORDER BY id LIMIT 1").fetchone()
+            "ORDER BY rowid LIMIT 1").fetchone()
     finally:
         con.close()
     if not row:
