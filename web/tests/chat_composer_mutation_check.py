@@ -55,22 +55,19 @@ INJECTIONS = [
     #    HTML 改了、CSS 没跟上。
     ('2) index.html 的 .ch-mrow 类名漂移（CSS 落不到它头上）',
      HTML, 'class="ch-mrow"', 'class="ch-mrow-x"', '直系子元素'),
-    # ③ ★ 把当年级的 DOM 原样搬回来（胶囊直接做 .ch-input-box 的直系子元素、
-    #    与 textarea 同行）—— 这就是本次修复本身，等于「回滚修复」这条最硬的注入。
+    # ③ ★ DOM 层对应那条：把 .ch-mrow 包裹拆掉 → 胶囊退回"和 textarea 同行"。
+    #    （改前就是这个 DOM 形状：胶囊直接做 .ch-input-box 的直系子元素）
+    #    ⚠️ 2026-09-19 这里曾经断过（注入点找不到就被判不合格，CI 直接红）：
+    #    原来是把「.ch-mrow 开标签 … 到它自己的闭标签」整块当 old，MCP 数据源入口
+    #    落进同一个包裹之后，这段就不再连续了。**不要把 MCP 那段抄进 old** ——
+    #    那会让注入点跟着 MCP 的 HTML 一起脆掉，以后谁动一下 MCP 按钮就把这条自证弄红。
+    #    改成只注射**包裹的开标签**：包裹没了，胶囊就成了 .ch-input-box 的直系子元素，
+    #    正是改前那个"输入框被推到右边"的根因，断言（直系子元素必须 3 个）照样逮得住。
     ('3) 胶囊行包裹被拆掉（回滚修复：胶囊又和输入框同行）',
      HTML,
      '        <div class="ch-mrow">\n'
-     '          <div class="ch-switch" id="ch-switch" data-mode="auto">\n'
-     '            <span class="ch-switch-thumb" id="ch-switch-thumb" aria-hidden="true"></span>\n'
-     '            <button type="button" class="ch-switch-opt is-on" id="mode-auto" data-mode="auto" role="tab" aria-selected="true">自动调度</button>\n'
-     '            <button type="button" class="ch-switch-opt" id="mode-manual" data-mode="manual" role="tab" aria-selected="false">指定技能</button>\n'
-     '          </div>\n'
-     '        </div>\n',
-     '        <div class="ch-switch" id="ch-switch" data-mode="auto">\n'
-     '          <span class="ch-switch-thumb" id="ch-switch-thumb" aria-hidden="true"></span>\n'
-     '          <button type="button" class="ch-switch-opt is-on" id="mode-auto" data-mode="auto" role="tab" aria-selected="true">自动调度</button>\n'
-     '          <button type="button" class="ch-switch-opt" id="mode-manual" data-mode="manual" role="tab" aria-selected="false">指定技能</button>\n'
-     '        </div>\n',
+     '          <div class="ch-switch" id="ch-switch" data-mode="auto">\n',
+     '        <div class="ch-switch" id="ch-switch" data-mode="auto">\n',
      '直系子元素'),
     # ④ 全局 textarea{min-height:96px} 重新漏回输入框。
     #    改前 .ch-input 显式写 min-height:0（为了压掉全局 96）；20260917 起改成显式 3 行 88px。

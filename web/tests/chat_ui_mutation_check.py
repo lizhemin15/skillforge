@@ -7,6 +7,8 @@
   比没测试更危险，因为它让人以为有防线。
 
 判据（三重，缺一不可）：
+  0. 注入点必须**唯一**（出现 2 次以上 = replace(...,1) 会静默命中别处 = 等于没测。
+     2026-09-19 补：技能层 / MCP 层同形监听器就是这么骗过注入 15 的）
   1. 注入点必须存在（找不到 = 注入无效 = 等于没测，直接 exit 2）
   2. 注入后**必须出现 FAIL 行**。「红在崩溃上不算红」：rc!=0 但没有 FAIL 行，
      说明注入把代码改到跑不起来了，那种红证明不了任何断言有效。
@@ -91,13 +93,25 @@ INJECTIONS = [
     # 退回冒泡阶段 —— 线上实测过的真故障：点「选择技能 ▾」时 openSkLayer() 里
     # renderChips() 重建整行，被点的那颗 button 当场变游离节点，冒泡到 document 时
     # chipsWrap.contains(t) 全 false（白名单源码里明明写着），层刚打开就被自己关掉。
-    # ★ 这条静态断言抓不住，只有真 DOM（chat_layer_e2e.py）抓得住 —— 它同时是
-    #   "读源码的断言不够用"的活证据，别删。
+    # ★ 静态断言钉的是**源码形状**（那个会关层的监听器注册在捕获阶段），真行为
+    #   由 web/tests/chat_layer_e2e.py 在真 DOM 里钉 —— 两边都要有证据。
     ('14) 点外关闭退回冒泡阶段（层自己关掉自己）',
      JS, "      closeSkLayer();\n    }, true);", "      closeSkLayer();\n    });"),
     # 删掉游离节点兜底：重渲染留下的旧按钮 isConnected=false，没这行会被误判成"点层外"。
+    # ★ 注入串必须自带**归属上下文**（带上下一行 skLayer.contains），否则它和 MCP 层
+    #   同形的那行一模一样，replace(...,1) 会静默命中别处 → 判红变假绿。见本文件
+    #   新增的「注入点必须唯一」前置校验。
     ('15) 删掉游离节点兜底（isConnected 放行）',
-     JS, "      if (t && t.isConnected === false) return;\n", ""),
+     JS,
+     "      if (t && t.isConnected === false) return;\n      if (skLayer.contains(t)) return;\n",
+     "      if (skLayer.contains(t)) return;\n"),
+    # —— 本轮新契约 D：MCP 层同一类故障（层内按钮点了会重渲染，同形写法同形风险）——
+    ('16) MCP 层点外关闭退回冒泡阶段（勾选层自己关掉自己）',
+     JS, "      closeMCPLayer();\n    }, true);", "      closeMCPLayer();\n    });"),
+    ('17) MCP 层删掉游离节点兜底（isConnected 放行）',
+     JS,
+     "      if (t && t.isConnected === false) return;\n      if (mcpBox.contains(t)) return;\n",
+     "      if (mcpBox.contains(t)) return;\n"),
 ]
 
 bad = 0
@@ -111,8 +125,17 @@ try:
 
     for name, path, old, new in INJECTIONS:
         src = open(path, encoding='utf-8').read()
-        if old not in src:
+        n = src.count(old)
+        if n == 0:
             print(f'\n!! 注入点没找到，注入无效（等于没测）：{name}')
+            bad += 1
+            continue
+        # ★ 2026-09-19 新增：注入点必须**唯一**。replace(...,1) 命中第一个，
+        #   若同一段代码在文件里出现多次（技能层 / MCP 层同形监听器就是），
+        #   注入会静默改到别处 —— 于是"改坏了还是绿的"，而其实是压根没改到要改的地方。
+        #   这种假绿最难查：脚本看着像在自证，其实一个字都没注入到目标上。
+        if n != 1:
+            print(f'\n!! 注入点不唯一（出现 {n} 次），会静默命中别处：{name}')
             bad += 1
             continue
         open(path, 'w', encoding='utf-8').write(src.replace(old, new, 1))

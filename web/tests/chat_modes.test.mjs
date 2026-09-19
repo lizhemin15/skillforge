@@ -55,6 +55,34 @@ function bind(src, signature, deps = [], values = []) {
   return new Function(...deps, 'return ' + fn)(...(values || []));
 }
 
+// extractClickListener：抽出**真的会关那一层**的文档级 click 监听器（按函数体里的
+// marker 认人，如 closeSkLayer() / closeMCPLayer()），并带出它注册在哪个阶段。
+//
+// 为什么不"取第一个 / 全文搜"：同一个仓库里这类监听器会长出好几个（技能层、MCP 层…），
+// 先加的那个会把断言喂饱，后加的那个怎么坏都不响 —— 2026-09-19 真的发生了：
+// MCP 层一加，技能层的「捕获阶段」「isConnected 兜底」两条断言当场变假绿
+// （chat_ui_mutation_check.py 注入 14/15 报出来的）。
+function extractClickListener(src, marker) {
+  const out = [];
+  let from = 0;
+  for (;;) {
+    const i = src.indexOf("document.addEventListener('click'", from);
+    if (i < 0) break;
+    const open = src.indexOf('{', i);
+    if (open < 0) break;
+    let depth = 0, end = -1;
+    for (let k = open; k < src.length; k++) {
+      if (src[k] === '{') depth++;
+      else if (src[k] === '}') { depth--; if (depth === 0) { end = k; break; } }
+    }
+    if (end < 0) break;
+    const body = src.slice(i, end + 1);
+    out.push({ body, capture: /^\s*,\s*true\s*\)/.test(src.slice(end + 1, end + 14)) });
+    from = end + 1;
+  }
+  return out.filter((x) => x.body.includes(marker));
+}
+
 // ---------- 真实的依赖（从出货文件里抠，避免测试自带一份"理想实现"）----------
 const CHIP_HINT = (() => {
   const m = CHAT_JS.match(/const\s+CHIP_HINT\s*=\s*\{[\s\S]*?\n\s*\};/);
@@ -406,11 +434,23 @@ console.log('技能勾选层 · 接线（层会不会被清掉 / 关掉）');
   //   关回 true。用户看到"点一下闪一下就没了"，而静态断言（白名单写着呢）全绿。
   //   捕获阶段在事件往下走时判归属，那时 DOM 还没被重渲染。真 DOM 兜底见
   //   web/tests/chat_layer_e2e.py —— 这条改动必须两边都有证据。
-  check('★ 点外关闭用捕获阶段（冒泡阶段会因重渲染丢白名单，层自己关掉自己）',
-    /document\.addEventListener\('click',\s*\(e\)\s*=>\s*\{[\s\S]{0,1200}?\}\s*,\s*true\s*\)/
-      .test(CHAT_JS.slice(CHAT_JS.indexOf("document.addEventListener('click'"))));
-  check('★ 点外关闭放行游离节点（isConnected 兜底）',
-    /if \(t && t\.isConnected === false\) return;/.test(CHAT_JS));
+  //
+  // ★★ 2026-09-19 抓到这两条断言本身长成假绿（chat_ui_mutation_check.py 注入
+  //   14/15 报「改坏了还是绿的」）：原来的写法一条是「取文件里**第一个**文档级
+  //   click 监听器再找 }, true)」，一条是「全文搜 isConnected 那一行」。加了 MCP
+  //   那一层之后，它俩同形的监听器排在前面 —— 先加的那层把断言喂饱，后加的那层
+  //   怎么坏都不响。教训：**按标记认人是断言的义务**，"第几个 / 全文有没有"这类
+  //   判据会被后来者静默顶替。现在改成按层抽出**那个真的会关层的监听器**再验形状。
+  const skClick = extractClickListener(CHAT_JS, 'closeSkLayer()');
+  const mcpClick = extractClickListener(CHAT_JS, 'closeMCPLayer()');
+  check('★ 技能层点外关闭用捕获阶段（冒泡阶段会因重渲染丢白名单，层自己关掉自己）',
+    skClick.length === 1 && skClick[0].capture, `命中 ${skClick.length} 个监听器`);
+  check('★ 技能层点外关闭放行游离节点（isConnected 兜底）',
+    skClick.length === 1 && /if \(t && t\.isConnected === false\) return;/.test(skClick[0].body));
+  check('★ MCP 层点外关闭用捕获阶段（同一类故障：层内按钮点了会重渲染）',
+    mcpClick.length === 1 && mcpClick[0].capture, `命中 ${mcpClick.length} 个监听器`);
+  check('★ MCP 层点外关闭放行游离节点（isConnected 兜底）',
+    mcpClick.length === 1 && /if \(t && t\.isConnected === false\) return;/.test(mcpClick[0].body));
   check('Esc 能关层', /Escape[\s\S]{0,200}?closeSkLayer\(\)/.test(CHAT_JS));
   check('搜索框回车直接勾第一个（搜到就回车是最快路径）',
     /skQ\.addEventListener\('keydown'[\s\S]{0,400}?filterSkills\(allSkills, skQ\.value\)\[0\]/.test(CHAT_JS));

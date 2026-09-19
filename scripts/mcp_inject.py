@@ -159,9 +159,23 @@ TOOL_INJECTIONS = [
     ),
     (
         "系统提示词不列 MCP 工具清单（模型不知道有这些工具，改去写 http_request）",
-        '\t\t\thintParts = append(hintParts, fmt.Sprintf("【%s】\\n%s", cfg.Name, strings.Join(lines, "\\n")))',
-        "\t\t\t_ = lines",
+        # 锚点跟着实现走：提示词段落现在由 `part` 一个变量产出，同时喂给
+        # PromptHint()（全局）与 hintByServer→PromptHintFor()（按勾选裁剪）。
+        # 把 part 打空 = 两条路一起失明，这才是用户看得见的那个故障：
+        # 勾了服务器，模型却不知道有工具，于是绕圈、变慢、最后自己编数据。
+        '\t\t\tpart := fmt.Sprintf("【%s】\\n%s", cfg.Name, strings.Join(lines, "\\n"))\n'
+        "\t\t\thintParts = append(hintParts, part)",
+        '\t\t\tpart := ""\n'
+        "\t\t\thintParts = append(hintParts, part)",
         "TestMCPManager_MountsAndUnmounts",
+    ),
+    (
+        "勾了服务器也不给提示词清单（勾选形同虚设：门控只拦工具表、没拦提示词）",
+        "\t\tif p := m.hintByServer[id]; strings.TrimSpace(p) != \"\" {\n"
+        "\t\t\tparts = append(parts, p)\n"
+        "\t\t}",
+        "\t\t_ = m.hintByServer",
+        "TestPromptHint_DefaultEmptyAndScopedToSelection",
     ),
     (
         "一台服务器失败就中断刷新（内网里一台没起来，整片工具全废）",
@@ -259,7 +273,40 @@ ADMIN_INJECTIONS = [
     ),
 ]
 
-# ── D. 跨层契约（前端字段名 ↔ 后端 json tag）────────────────────────────────
+# ── D. 用户级门控（默认不调度 / 勾选才调度 / 勾了必须真给）──────────────────
+# 这一层是「MCP 只在用户勾选时才对模型可见」的实现本体。故障方向分两边：
+#   放太宽 → 没勾也调得到内网业务系统（安全底线）；
+#   收太死 → 勾了跟没勾一样（用户点着按钮却什么都没发生，会一直以为是坏了）。
+FILTER_INJECTIONS = [
+    (
+        "没勾选也放行 MCP 工具（默认就调度内网工具 —— 门控朝危险方向倒）",
+        '\t\tif sid != "" && allow[sid] {\n'
+        "\t\t\tout.Register(t)\n"
+        "\t\t}",
+        '\t\tif sid != "" {\n'
+        "\t\t\tout.Register(t)\n"
+        "\t\t}",
+        "TestGate_DefaultNoMCPTools",
+    ),
+    (
+        "勾选集合不过滤不可用服务器（脏 id 直通：已删/已关的服务器照样进 allow）",
+        '\t\tif id == "" || seen[id] || !ok[id] {',
+        '\t\tif id == "" || seen[id] {',
+        "TestAllowedServers_DropsStaleAndDupes",
+    ),
+    (
+        "无归属的 MCP 工具当内置放行（fail-closed 失守：认不出来就放过去）",
+        '\tif strings.HasPrefix(t.Name(), "mcp_") {\n'
+        '\t\treturn "", true\n'
+        "\t}",
+        '\tif false && strings.HasPrefix(t.Name(), "mcp_") {\n'
+        '\t\treturn "", true\n'
+        "\t}",
+        "TestGate_UnlabeledMCPNameFailsClosed",
+    ),
+]
+
+# ── E. 跨层契约（前端字段名 ↔ 后端 json tag）────────────────────────────────
 JS_INJECTIONS = [
     (
         "前端 payload 字段名与后端 json tag 分家（每次保存 400「请求体无效」）",
@@ -269,11 +316,14 @@ JS_INJECTIONS = [
     ),
 ]
 
-MCP_ALL = "MCP|Initialize|ListTools|CallTool|Auth|Session|NewClient|Config|ParseSSE"
+MCP_ALL = "MCP|Initialize|ListTools|CallTool|Auth|Session|NewClient|Config|ParseSSE|Gate|FilterMCP|PromptHint|AllowedServers|Selectable|ServerTools"
+
+FILTER_SRC = os.path.join(REPO, "internal", "tools", "mcp_filter.go")
 
 TARGETS = [
     ("mcp", CLIENT_SRC, "./internal/mcp/", CLIENT_INJECTIONS, ""),
     ("tools", TOOL_SRC, "./internal/tools/", TOOL_INJECTIONS, MCP_ALL),
+    ("gate", FILTER_SRC, "./internal/tools/", FILTER_INJECTIONS, MCP_ALL),
     ("api", ADMIN_SRC, "./internal/api/", ADMIN_INJECTIONS, "MCP"),
     ("admin.js", ADMIN_JS, "./internal/api/", JS_INJECTIONS, "TestAdminMCPPayloadMatchesTags"),
 ]
