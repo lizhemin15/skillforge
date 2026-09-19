@@ -57,7 +57,10 @@ type materialFilter struct {
 	silence time.Duration // 静默多久没展示就给一句旁白（活性保证）
 	seenWin int           // 「最近已展示内容」的归一化窗口长度
 
-	started   time.Time // 第一次 Feed 的时刻，旁白里的「已约 Ns」用它算
+	started time.Time // 第一次 Feed 的时刻，旁白里的「已约 Ns」用它算
+	// rawSeen = 累计吃进来的思考字数（含被挡掉的英文脚手架）。旁白报的是它，不是秒数：
+	// 「秒」是墙钟，用户明确说过跳秒不算动；这个数字随模型每吐一片就涨，是真的进度。
+	rawSeen   int
 	lastShown time.Time // 最近一次**真的展示了**东西（含旁白）的时刻
 	seen      string    // 最近已展示片段的归一化尾窗（判重复用）
 	lastNorm  string    // 上一条已展示片段的归一化形式（判相似度用）
@@ -93,6 +96,8 @@ func (f *materialFilter) Feed(chunk string) []string {
 		f.started = now
 		f.lastShown = now
 	}
+	// 先记账再过滤：被挡掉的英文脚手架同样是「模型在动」的证据，旁白靠它给出真进度。
+	f.rawSeen += len([]rune(text))
 
 	if shown := f.displayText(text); shown != "" {
 		norm := normalizeMaterial(shown)
@@ -162,11 +167,19 @@ func chineseRuns(text string, min int) []string {
 	return out
 }
 
-// narration 静默太久时的那句短中文旁白。带进度（已约 Ns），让用户知道
-// 不是卡死，只是模型在自检。N 用截断而不是四舍五入：45.9s 说「已约 45s」
-// 不会让用户觉得被多算了。
+// narration 静默太久时的那句短中文旁白。
+//
+// 它必须带上**真的在变的数字**，否则用户看到的就只是「跳秒」。用户原话：
+// 「中间可以流式输出思考的一些中间材料，现在一直卡着计时，用户体验不佳」——
+// 旧版这句是 `模型正在自检措辞…（已约 Ns）`，从 22s 到 48s 连续 8 帧只换秒数，
+// 界面上除了墙钟没有一处变化，读起来就是卡死。线上实测那段空窗有 26 秒。
+//
+// 现在报的是**累计吃进来的思考字数**（rawSeen）：模型每吐一片它就涨，是真的进度，
+// 不是把时间换个说法再念一遍。秒数保留在括号里当辅助，不再是唯一变量。
+// 思考字数用截断而不是四舍五入：和秒数同一个理由（不让用户觉得被多算）。
 func (f *materialFilter) narration(now time.Time) string {
-	return fmt.Sprintf("模型正在自检措辞…（已约 %ds）", int(now.Sub(f.started).Seconds()))
+	return fmt.Sprintf("模型思考中…已产出 %d 字（已 %ds）",
+		f.rawSeen, int(now.Sub(f.started).Seconds()))
 }
 
 // duplicate 判定这一片是不是「刚说过的话」。
@@ -249,13 +262,26 @@ func cjkOnly(text string) string {
 	return b.String()
 }
 
-// latinRuneRatio 数拉丁字符（ASCII 区，中文标点除外）在整条文本里占的 rune 比例。断言「展示的文本不许是半英半中」用它当尺子：汉字 10 个、
-// 英文 40 个的脚手架帧，比例 0.8，直接判红。
+// latinRuneRatio 数**拉丁字母**（a-z A-Z）在整条文本里占的 rune 比例。断言「展示的文本
+// 不许是半英半中」用它当尺子：汉字 10 个、英文 40 个的脚手架帧，比例 0.8，直接判红。
+//
+// 为什么只数字母、不数数字与英文标点 —— 这两次都是**真的踩到的假红**，不是假想：
+//
+//	· 收到你的需求（本轮 10408 字）          → 旧口径 0.25，判「噪声帧」
+//	模型思考中…已产出 399 字（已 2s）        → 旧口径 0.38，判「挂着英文脚手架」
+//
+// 两条都是纯中文进度句，唯一的「非汉字」是阿拉伯数字。用户要守的性质是「还会不会看到
+// **英文**自我对话」，而「10408」「399」是内容本身，不是英文。把数字算进拉丁，尺子就
+// 会把「我在报进度」判成「我在说英文」——弱/错尺子比没尺子更毒。
+//
+// 收敛口径后仍然抓得住真脚手架：`Here's a thinking process:` / `(178 chars) Total: ~650
+// Chinese characters` 这类帧字母依旧压倒性多数，比例远高于 0.2。负向对照见
+// material_filter_test.go 的 TestLatinRuneRatioCountsLettersNotDigits。
 func latinRuneRatio(text string) float64 {
 	total, latin := 0, 0
 	for _, r := range text {
 		total++
-		if r < 0x250 && !isCJKPunct(r) {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
 			latin++
 		}
 	}

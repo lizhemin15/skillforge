@@ -376,7 +376,45 @@ func loadLedgerFixture(t *testing.T, name string) []ledgerRow {
 	return rows
 }
 
-func isNarration(s string) bool { return strings.HasPrefix(s, "模型正在自检措辞…") }
+func isNarration(s string) bool { return strings.HasPrefix(s, "模型思考中…") }
+
+// 这把尺子自己错过两次，所以给它留一组**负向对照**：报进度的中文句不算英文脚手架，
+// 真脚手架一个字也不许放过。少任何一半都会退化成坏尺子 ——
+// 只留前一半 → 尺子太松，半英半中的帧重新漏给用户看；
+// 只留后一半 → 尺子太紧，把「已产出 399 字」判成英文，产品明明在报进度却天天红。
+func TestLatinRuneRatioCountsLettersNotDigits(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want float64 // 判据阈值 0.2
+		over bool    // true = 期望 > 0.2（判成脚手架）
+	}{
+		{"进度旁白带数字", "模型思考中…已产出 399 字（已 2s）", 0.2, false},
+		{"收到需求带数字", "· 收到你的需求（本轮 10408 字）", 0.2, false},
+		{"要点回顾带数字", "· 引述规范：领导讲话必须使用直接引号且内容源自素材，严禁编造；机构首次出现用全称。", 0.2, false},
+		{"英文自我对话", "Here's a thinking process: Analyze User Input:", 0.2, true},
+		{"英文脚手架带数字", "(178 chars) Total: ~650 Chinese characters. Well over 400.", 0.2, true},
+		{"半英半中帧（线上原样）", "t Check:* \"直接输出正文，不要任何解释。\" -> Will output only the text.", 0.2, true},
+	}
+	for _, c := range cases {
+		got := latinRuneRatio(c.text)
+		if c.over && got <= c.want {
+			t.Errorf("%s：拉丁占比 %.2f，期望 > %.2f —— 真脚手架漏过去了，尺子太松：%q",
+				c.name, got, c.want, c.text)
+		}
+		if !c.over && got > c.want {
+			t.Errorf("%s：拉丁占比 %.2f，期望 ≤ %.2f —— 纯中文进度句被判成英文，尺子太紧：%q",
+				c.name, got, c.want, c.text)
+		}
+	}
+}
+
+// 空串不该除零，也不该被判成「全是英文」。
+func TestLatinRuneRatioEmptyIsZero(t *testing.T) {
+	if got := latinRuneRatio(""); got != 0 {
+		t.Errorf("空串的拉丁占比应为 0，实际 %v", got)
+	}
+}
 
 // runMinDefault 与 newMaterialFilter 的默认 runMin 对齐。断言里凡是「中文够不够」
 // 的地方都用它：测试里写死一个数、实现改成另一个数却两边都绿，是典型的假绿。

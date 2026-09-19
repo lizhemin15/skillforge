@@ -193,17 +193,33 @@ const (
 
 // writingThinkBudget 是起草/审稿这类**要**思考链的调用可以配的上限。
 //
-// 默认 0 = 不限（质量优先）。配了就掐上限：实测同一段提示词 thinking_budget=512
-// 把首片正文从 37.8s 提到 21.1s，思考链仍在想（512 片）。
-// 长文档位的实测结论见 scripts/probe_think_budget_article.py 的输出。
+// 默认 1024，**不是**不限。这条默认值是线上实测拍出来的，不是拍的脑袋：
+// 线上生效配置 provider=siliconflow model=Qwen/Qwen3.6-27B，同一段「1 万字素材 +
+// 写 1500 字新闻稿」提示词，只改 thinking_budget：
+//
+//	不限    → 首片正文 226.7s｜正文 1216 字
+//	1024    → 首片正文  22.76s｜正文  855 字   （探针档）
+//	1024    → 首片正文  26.1s ｜正文 1974 字   （复测档，比「不限」还长）
+//	2048    → 总 1909.8s｜正文 256583 字       （退化：模型刹不住车，会撑爆客户端超时）
+//
+// 所以「掐预算 = 掉质量」这个假设在线上**不成立**：1024 又快又长，瓶颈是首片
+// 正文前那 200 秒空转；而 2048 反而是灾难档。用户原话「现在速度过于慢了…一直卡着
+// 计时，用户体验不佳」——默认不设上限就是让每一位新部署的人踩同一个 226 秒。
+//
+// 0（或负数）= **显式**要「不限」，给「这一轮我就要它使劲想」的场合留出口；
+// 非法值一律回落到默认，不静默变成不限。
 func writingThinkBudget() int {
+	const def = 1024
 	v := strings.TrimSpace(os.Getenv("SKILLFORGE_THINK_BUDGET"))
 	if v == "" {
-		return 0
+		return def
 	}
 	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
-		return 0
+	if err != nil {
+		return def
+	}
+	if n <= 0 {
+		return 0 // 显式不限
 	}
 	return n
 }

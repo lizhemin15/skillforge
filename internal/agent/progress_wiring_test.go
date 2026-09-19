@@ -406,17 +406,23 @@ func TestWriteHopKnobActuallyReachesProvider(t *testing.T) {
 // 上是个摆设（线上实测：1 万字素材执笔段跨 97s、217 片思考材料、首段正文 98s 才出现）。
 //
 // 断言同样钉在**真发出去的请求体**上，不钉耗时：
-//   - 默认（不设预算）= 一个思考参数都不带 → 这是「改造零风险」这句话能被验的部分，
-//     与改造前 SDK 发出的 model/messages/stream:true 逐字一致；
-//   - 设 1024 = 真带上 thinking_budget=1024，且**不**夹带关思考的开关（思考仍保留）。
+//   - 默认（不设预算）= 真带 thinking_budget=1024。2026-09-20 改：原来这里要求「默认
+//     一个思考参数都不带」，理由是「改造零风险」。但线上实测把这个理由打掉了——不带
+//     预算的代价是首片正文前空转 226.7s，而 1024 这一档又快又长。零风险的正确形式是
+//     「默认值有实测背书」，不是「默认什么都不做」。
+//   - 显式 0 = 一个思考参数都不带（要「不限」必须自己写 0）；
+//   - 设 1024/2048 = 真带上该数字，且**不**夹带关思考的开关（思考仍保留）。
 func TestWriteHopThinkBudgetReachesProvider(t *testing.T) {
 	cases := []struct {
 		name       string
 		env        string
 		wantBudget int
 	}{
-		{"默认（不设）= 不限预算，请求体不带任何思考参数", "", 0},
+		{"默认（不设）= 真带默认预算 1024", "", 1024},
+		{"显式 0 = 不限预算，请求体不带任何思考参数", "0", 0},
 		{"设 1024 = 真带上 thinking_budget", "1024", 1024},
+		{"设 2048 = 原样带上", "2048", 2048},
+		{"非法值 = 回落到默认 1024（不静默变不限）", "abc", 1024},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -482,14 +488,20 @@ func TestPlanEssayStreamsOutlineAsMaterial(t *testing.T) {
 // 通用写作路（没命中技能时走这条）与大跳同等待遇：预算旋钮必须真生效、思考链必须
 // 当材料流出去。两件事都曾是坏的——这条路上的执笔走的是 go-openai SDK，SDK 既不认
 // SKILLFORGE_THINK_BUDGET 也没有空闲看门狗，线上实测首正文 347.8s、最大静默 297.7s。
+//
+// 2026-09-20：默认档从「不带参数」翻成「带 1024」。原来那条「默认与改造前逐字一致 =
+// 零风险」的判据看着稳，实际是把最坏档（线上 226.7s 首正文空转）设成出厂默认。
+// 现在默认值本身有线上实测背书，要「不限」得显式写 0 —— 见 docs/slow-why-20260918.md。
 func TestPlainWriteHopGetsThinkBudgetAndStreamsMaterial(t *testing.T) {
 	cases := []struct {
 		name       string
 		env        string
 		wantBudget int
 	}{
-		{"默认（不设）= 请求体不带任何思考参数，与改造前逐字一致", "", 0},
+		{"默认（不设）= 真带默认预算 1024", "", 1024},
+		{"显式 0 = 请求体不带任何思考参数", "0", 0},
 		{"设 1024 = 真带上 thinking_budget", "1024", 1024},
+		{"非法值 = 回落到默认 1024（不静默变不限）", "xyz", 1024},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -509,7 +521,7 @@ func TestPlainWriteHopGetsThinkBudgetAndStreamsMaterial(t *testing.T) {
 			got, has := body["thinking_budget"]
 			if c.wantBudget == 0 {
 				if has {
-					t.Errorf("默认配置下通用写作的请求体不该带 thinking_budget，实际 %v —— 默认行为必须与改造前逐字一致", got)
+					t.Errorf("显式设 0（要「不限」）时通用写作的请求体不该带 thinking_budget，实际 %v", got)
 				}
 			} else {
 				n, ok := got.(float64)

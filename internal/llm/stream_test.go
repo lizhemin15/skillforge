@@ -420,25 +420,47 @@ func TestStreamChatSendsDisabledThinkingBudget(t *testing.T) {
 	}
 }
 
-// 执笔跳（要思考链）默认不限预算，配了才掐上限——质量优先，提速靠显式配置。
-func TestStreamChatWritingThinkBudgetIsOptIn(t *testing.T) {
+// 执笔跳（要思考链）的思考预算：**默认就掐**（1024），要「不限」得显式写 0。
+//
+// 这条测试守的是默认值的**方向**，不是某个数字。方向搞反的代价线上实测过：
+// 默认不掐 = 首片正文前空转 226.7s（用户投诉「一直卡着计时」就是这么来的）。
+func TestStreamChatWritingThinkBudgetDefaultIsBounded(t *testing.T) {
 	srv := &streamSrv{}
 	ts := newStreamSrv(t, srv)
 	defer ts.Close()
 	c := streamClient(t, ts)
 
+	// 默认（不设环境变量）= 真带 1024，而不是「什么都不带」。
 	if _, err := c.StreamChat(context.Background(), "sys", "user", StreamOpts{}); err != nil {
 		t.Fatalf("StreamChat 失败: %v", err)
 	}
-	if v, ok := srv.bodyAt(t, 0)["thinking_budget"]; ok {
-		t.Fatalf("没配 SKILLFORGE_THINK_BUDGET 时不该带 thinking_budget（执笔要保住思考链），实际 %v", v)
+	if v := srv.bodyAt(t, 0)["thinking_budget"]; v != float64(1024) {
+		t.Fatalf("不设 SKILLFORGE_THINK_BUDGET 时该用默认 1024（线上实测这一档又快又长），实际 %v", v)
 	}
 
-	t.Setenv("SKILLFORGE_THINK_BUDGET", "1024")
+	// 显式 0 = 不限，且必须是**真不带参数**（不是带 0 —— 有些网关会把它当非法值报错）
+	t.Setenv("SKILLFORGE_THINK_BUDGET", "0")
 	if _, err := c.StreamChat(context.Background(), "sys", "user", StreamOpts{}); err != nil {
 		t.Fatalf("StreamChat 失败: %v", err)
 	}
-	if v := srv.bodyAt(t, 1)["thinking_budget"]; v != float64(1024) {
-		t.Fatalf("配了 SKILLFORGE_THINK_BUDGET=1024 就必须带上，实际 %v", v)
+	if v, ok := srv.bodyAt(t, 1)["thinking_budget"]; ok {
+		t.Fatalf("显式设 0 是「我要不限」的意思，请求体不该带 thinking_budget，实际 %v", v)
+	}
+
+	// 非法值回落到默认，不静默变成「不限」——静默变不限就是把 226 秒又还回去了
+	t.Setenv("SKILLFORGE_THINK_BUDGET", "不是数字")
+	if _, err := c.StreamChat(context.Background(), "sys", "user", StreamOpts{}); err != nil {
+		t.Fatalf("StreamChat 失败: %v", err)
+	}
+	if v := srv.bodyAt(t, 2)["thinking_budget"]; v != float64(1024) {
+		t.Fatalf("非法值必须回落到默认 1024，实际 %v（回落成「不限」是最坏的静默降级）", v)
+	}
+
+	t.Setenv("SKILLFORGE_THINK_BUDGET", "2048")
+	if _, err := c.StreamChat(context.Background(), "sys", "user", StreamOpts{}); err != nil {
+		t.Fatalf("StreamChat 失败: %v", err)
+	}
+	if v := srv.bodyAt(t, 3)["thinking_budget"]; v != float64(2048) {
+		t.Fatalf("配了 SKILLFORGE_THINK_BUDGET=2048 就必须带上，实际 %v", v)
 	}
 }
