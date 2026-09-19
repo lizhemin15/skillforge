@@ -93,6 +93,47 @@ func TestNarrateStopsQuietly(t *testing.T) {
 	}
 }
 
+// 模型自己在推材料时旁白必须让路：抢话会把读者正在看的思考片段挤掉。
+// 反过来说，这条测试也钉住了「旁白只在真静默时出现」的判据。
+func TestNarrateYieldsToModel(t *testing.T) {
+	w := &capWriter{}
+	steps := []agent.TraceStep{{Phase: "generate", Label: "④ 按要点执笔", Status: "active"}}
+	c := newTraceClockTuned(w.write, steps, time.Hour, 450*time.Millisecond)
+	defer c.stop()
+
+	// 先造前提：进跳时模型已经在推材料（真实场景里 ③构思要点 的材料就在材料区里）。
+	// 不先写这一笔的话，「第一行该不该补」取决于 goroutine 调度，测试会飘。
+	c.Thinking("模型正在写这一段…")
+	time.Sleep(50 * time.Millisecond)
+
+	stopBusy := make(chan struct{})
+	go func() { // 扮演模型：一直在推材料（不带旁白的「· 」前缀）
+		for {
+			select {
+			case <-stopBusy:
+				return
+			default:
+				c.Thinking("模型正在写这一段…")
+				time.Sleep(120 * time.Millisecond)
+			}
+		}
+	}()
+	stop := c.Narrate([]string{"点一", "点二"})
+	time.Sleep(1500 * time.Millisecond)
+	stop()
+	close(stopBusy)
+
+	mats := w.materials()
+	if len(mats) == 0 {
+		t.Fatal("模型材料一帧都没下发，说明测试前提没成立（不是旁白职责问题）")
+	}
+	for _, m := range mats {
+		if strings.Contains(m, "· ") || strings.Contains(m, "要点回顾") {
+			t.Fatalf("模型在说话时旁白还抢话：%q", m)
+		}
+	}
+}
+
 // 没有旁白行时不能空转：没内容也要保证不 panic、不影响主流程。
 func TestNarrateNoLinesIsNoop(t *testing.T) {
 	w := &capWriter{}

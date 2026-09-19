@@ -262,6 +262,14 @@ func activePos(st []agent.TraceStep) int {
 // 同时，材料区也换一行，用户读到的是「它在按要点推进」，而不是「卡住了」。
 const narrateGap = 3 * time.Second
 
+// materialNow 取当前材料区内容。旁白靠它判断「模型刚才有没有在说话」：
+// 模型在推材料时旁白让路，别去挤掉读者正在看的那段。
+func (c *traceClock) materialNow() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.material
+}
+
 // Narrate 用**本地已知事实**当旁白，填满一段没有任何模型材料的阻塞跳。
 //
 // 为什么需要它：执笔那一跳（chat.go 的「按要点执笔」、chat_write.go 的「起草初稿」）
@@ -286,7 +294,11 @@ func (c *traceClock) Narrate(lines []string) (stop func()) {
 	}
 	done := make(chan struct{})
 	var once sync.Once
-	c.Thinking("· " + clean[0])
+	// 进跳第一行：只有在材料区还空着（模型确实什么都没推）时才立刻补，
+	// 否则等于把读者正在看的那段挤掉。剩下交给 tick 的让路判断。
+	if c.materialNow() == "" {
+		c.Thinking("· " + clean[0])
+	}
 	go func() {
 		gap := c.narrateEvery
 		if gap <= 0 {
@@ -295,19 +307,28 @@ func (c *traceClock) Narrate(lines []string) (stop func()) {
 		t := time.NewTicker(gap)
 		defer t.Stop()
 		i := 0
+		seen := c.materialNow()
 		for {
 			select {
 			case <-done:
 				return
 			case <-t.C:
+				// 让路：材料区自上次旁白以来被模型写过，就这一拍不插话。
+				// 只有真静默（模型一片都不推）时，旁白才顶上——它本来就是为了填静默。
+				if cur := c.materialNow(); cur != seen {
+					seen = cur
+					continue
+				}
 				i++
 				// 一轮走完就从头再滚，并标上「第 N 遍」：重复的是真事实，
 				// 但要让人看出这是回顾而不是新进展（否则等于在骗人）。
 				if i%len(clean) == 0 {
 					c.Thinking(fmt.Sprintf("（要点回顾 %d/%d）· %s", len(clean), len(clean), clean[0]))
+					seen = c.materialNow()
 					continue
 				}
 				c.Thinking("· " + clean[i%len(clean)])
+				seen = c.materialNow()
 			}
 		}
 	}()
