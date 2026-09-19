@@ -1,6 +1,9 @@
 package agent
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // ProgressSink 收「中间材料」——模型侧正在流出来的思考链 / 分析片段。
 //
@@ -44,12 +47,27 @@ func ReportProgress(ctx context.Context, text string) {
 
 // reasoningSink 返回可直接当 llm 回调用的闭包；没挂接收器时返回 nil，
 // 让 LLM 层省掉每片一次的函数调用。
+//
+// 思考链不再原样转发：先过一遍 materialFilter（见 material_filter.go）。
+// 线上账本 /tmp/ledger_leg2.log 第 100~152 行记着原样转发的后果——执笔那 50 秒里
+// 界面上滚的是 `Word count: ~660. Meets all criteria.`、`Self-Correction/Verification
+// during drafting)*:`、`*(Done.)*` 这些英文自我对话，加上反复重发的中文正文，
+// 用户看着像程序卡死/乱说。**只改显示**：发往模型的内容（system prompt、user
+// message、请求参数）一个字都不动。
+//
+// 每调用一次生成一个独立的 materialFilter：它是有状态的（最近展示窗口 / 静默计时），
+// 跨 LLM 调用复用会把上一跳的「刚说过的话」带进下一跳，把新内容误判成重复。
 func reasoningSink(ctx context.Context) func(string) {
 	sink := ProgressOf(ctx)
 	if sink == nil {
 		return nil
 	}
-	return func(s string) { sink(s) }
+	f := newMaterialFilter(time.Now)
+	return func(s string) {
+		for _, text := range f.Feed(s) {
+			sink(text)
+		}
+	}
 }
 
 // contentSink 返回可直接当 llm 的 OnContent 用的闭包：把流式 JSON 正文里
@@ -85,6 +103,13 @@ func contentSink(ctx context.Context) func(string) {
 // 等于挂了个黑洞。构思跳（PlanEssay）就是这种：它吐的是「· 首段写五要素」这类纯文本
 // 条目，挂了 contentSink 的结果是材料恒为空——设计意图（关掉思考链后，构思就是这一跳
 // 全部的可见产出）被静默吃掉，而外面看只像是「模型没吐东西」。
+//
+// 现在它就是 reasoningSink，所以自动跟着过 materialFilter。判断标准是「这一片
+// 抽得出连续 ≥runMin（6）个汉字的中文段」——构思条目正好卡在门槛上（「· 首段写五要素」
+// 是 6 个汉字，`·` 作为中文标点被去掉、不算长度），所以它活得下来。
+// 这层过滤加进来时特意守住了这条：任何只看「整片汉字数够不够 8」或「只留最长段」的
+// 实现都会把它静默吃掉，又一次退回到上面那个坑。material_filter_test.go 里有两个
+// 专门的用例盯着它（NeverEatsChinese / RealLedger）。
 func rawSink(ctx context.Context) func(string) {
 	return reasoningSink(ctx)
 }

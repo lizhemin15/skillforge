@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -50,7 +51,12 @@ func NewHandler(s *store.SkillStore, l *llm.Client, secret string) (*Handler, er
 	admin.SetOCRTimeout(ocrTmo)
 	gen.SetOCR(ocrURL)
 	gen.SetOCRTimeout(ocrTmo)
-	genCache := newGenCache()
+	// 交付物缓存必须**只有这一个实例**：SSE 生成时 put 进的 token，下载接口必须在
+	// 同一个缓存里找到（各自 new 一份 = 发给用户的链接永远 404，踩过）。
+	// 落盘目录跟 DataDir 走（store 就是用 cfg.DataDir 建的，dataDirFor 把它还原出来），
+	// 即 filepath.Join(cfg.DataDir, "gen")：重启后内存空了，靠这些文件让链接继续可用
+	// （线上证据：部署重启后 /api/chat/gen/{token} 一律 404）。
+	genCache := newGenCacheWithDir(filepath.Join(dataDirFor(s), "gen"))
 	// 工具能力：按环境变量装配（默认开，SKILLFORGE_TOOLS=off 可回退纯对话）
 	toolReg := buildToolRegistry(s)
 

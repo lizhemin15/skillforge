@@ -110,22 +110,52 @@ func (f *fakeProvider) callCount() int {
 	return len(f.bodies)
 }
 
-// splitChunks 把一段文本切成 2 个字符一片，模拟真实 token 级推流。
+// splitChunks 把一段推流文本切成「一片一片」，模拟真实 token 级推流。
+//
+// 两条硬约束（都是踩出来的）：
+//
+//  1. **一个字符都不许丢**。这个函数同时用在 reasoning 和 content 上，而 content
+//     是正文/JSON 本体——把 ASCII 当分隔符丢掉，会把 `"星禾科技发布数据中台 3.0。"`
+//     啃成 `"星禾科技发布数据中台。"`、把 JSON 的引号括号啃光（测试里直接表现为
+//     「正文原样转发」和「分类兜底重试 unmarshal 失败」同时转红）。
+//  2. 刀口只落在**非中文**字符上，且这一片已经攒够 splitPieceCJK 个汉字才落刀。
+//     显示层（materialFilter）的门槛是「连续 ≥6 个汉字」，切点落进中文段里就会
+//     造出注定被丢的碎片，那时候测的是显示层的门槛、不是接线。
+//
+// 于是切片粒度是「攒够 8 个汉字后，在下一次遇到非中文字符处分片」——不是早先的
+// 「每 2 个字符一片」。真实 reasoning 模型的推流片段是十几个字符一片（线上账本
+// 实测 10~40 字/片），这样切反而更接近真实。
 func splitChunks(s string) []string {
 	if s == "" {
 		return nil
 	}
-	r := []rune(s)
 	var out []string
-	for i := 0; i < len(r); i += 2 {
-		end := i + 2
-		if end > len(r) {
-			end = len(r)
+	var cur []rune
+	cjkIn := func() int {
+		n := 0
+		for _, r := range cur {
+			if isCJK(r) {
+				n++
+			}
 		}
-		out = append(out, string(r[i:end]))
+		return n
+	}
+	for _, r := range s {
+		cur = append(cur, r)
+		if !isCJK(r) && !isCJKPunct(r) && cjkIn() >= splitPieceCJK {
+			out = append(out, string(cur))
+			cur = cur[:0]
+		}
+	}
+	if len(cur) > 0 {
+		out = append(out, string(cur))
 	}
 	return out
 }
+
+// splitPieceCJK 是假 provider 分片时「攒够多少汉字才落刀」的门槛，必须高于显示层
+// 的 runMin（6），否则每片的中文都卡在门槛上，测试会误报成「材料没流出去」。
+const splitPieceCJK = 8
 
 func newTestEngine(t *testing.T, fp *fakeProvider) *Engine {
 	t.Helper()
@@ -182,10 +212,15 @@ func TestEvalTurnReportsMaterialEvenWhenKnobIgnored(t *testing.T) {
 		t.Fatalf("EvalTurn 失败: %v", err)
 	}
 	joined := strings.Join(got, "")
-	if !strings.Contains(joined, fp.reasoning) {
+	// 断言落点是「思考链的中文一字不少」，不是逐字相等：reasoningSink 现在会过
+	// materialFilter（纯显示层过滤，见 material_filter.go），它有意丢掉的是英文
+	// 脚手架和标点（标点不是内容），**汉字一个都不许丢**——所以两边都先折成汉字
+	// 序列再比。为什么不把标点从期望串里手删：手删等于把「哪些标点会被丢」这个
+	// 实现细节抄进测试，实现一变测试就跟着假绿。
+	if !strings.Contains(cjkOnly(joined), cjkOnly("用户在延续上一轮的新闻稿，要把正文整理成")) {
 		t.Fatalf("被忽略的思考链没当材料流出去，实际 %q", joined)
 	}
-	if !strings.Contains(joined, "整理成文档") {
+	if !strings.Contains(cjkOnly(joined), cjkOnly("整理成文档")) {
 		t.Fatalf("JSON 的 reason 没当材料流出去（provider 关掉思考链时这是唯一的材料来源），实际 %q", joined)
 	}
 	for _, noise := range []string{`{`, `}`, `"intent"`, `"params"`, `"skill_slug"`, `[`} {
@@ -252,7 +287,10 @@ func TestGenerateKeepsThinkingButStreamsItAsMaterial(t *testing.T) {
 	if _, ok := body["reasoning_effort"]; ok {
 		t.Fatal("执笔这一跳不得关思考链（那是质量来源）")
 	}
-	if joined := strings.Join(materials, ""); joined != fp.reasoning {
+	// 同上：思考链必须流出去，落点从「逐字相等」改成「汉字一字不少」（标点会被
+	// 显示层丢掉，那不影响「发往模型的内容一个字没动」这件事）。假 provider 的分片
+	// 规则见 splitChunks 的注释。
+	if joined := strings.Join(materials, ""); !strings.Contains(cjkOnly(joined), cjkOnly("先看手册要求：通知要有标题、正文、落款，语气庄重")) {
 		t.Fatalf("执笔的思考链必须当材料流出去，实际 %q", joined)
 	}
 	if strings.Contains(out, "先看手册要求") {
