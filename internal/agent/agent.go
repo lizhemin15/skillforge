@@ -374,15 +374,15 @@ func (e *Engine) EvalTurn(ctx context.Context, id, user string, history []Messag
 需求要点：
 1. 若命中某个技能，返回它的 slug，并在 params 里提取用户已提及的关键参数（键名用技能参数名）。needs 的判定**必须严格**：只把技能参数中标记为 [必填]、且用户这次消息**确实没有提供**的参数列进 needs（name 用技能参数名，label 用中文提示）。判定"有没有提供"时**必须把上下文块【用户提供的要求与素材】整段算进去**：那里写明的信息就是用户已经给过的，一律不得列进 needs，也不得在 reason/steps 里说"待用户补充"。只有素材层和最近对话里都找不到的参数，才算没提供。[可选] 参数一律不追问——用户没给就自行推断合理占位或省略，直接进入生成。action="fill" 时绝不需要 params/needs（填充阶段会解析字段并让后续环节补全/编造值），needs 留空。docgen 类技能（含 fill）没有任何必填参数：用户给了详情就填进文档，用户只要模板/没给详情就编造合理示例数据填充或下发模板。
 2. 用户可能在延续话题（如"再写一遍但改短点""把手机号改成139…"）——结合历史判断是否沿用之前的技能并继续 action（延续填充用 action="fill"）；延续时写 reason 说明。
-3. 无论什么情况，都在 steps 里输出 4 阶段拆解执行路径，让用户看到多智能体怎么处理：
-   - {phase:"analyze", label:"① 意图分析", detail:"识别出的意图与 action：<intent>/<action>（如 docgen/fill、write/write、query/answer）", status:"done"}
-   - {phase:"match",   label:"② 工具匹配", detail:"决定调用工具。<命中技能名>（为什么） 或 未命中技能（write/query 用通用能力，chat 直接回答）", status:"done"}
-   - {phase:"params",  label:"③ 参数提取", detail:"<命中时列出已提取/还需追问参数；未命中 write/query 说明将提炼用户内容；chat 省略>", status:"done"}
-   - {phase:"generate",label:"④ 执行中",  detail:"<说明将执行的动作：填充模板/生成新文档/下发空白模板/通用写作/直接回答>", status:"active"}
-   detail 用一句话，面向用户，别用内部术语。
+3. 无论什么情况，都在 steps 里输出 4 阶段拆解执行路径，让用户看到多智能体怎么处理。每项**只给两个字段**：
+   {"phase":"analyze|match|params|generate","detail":"≤10字"}
+   - **不要写 label / status**：那是固定文案，服务端按 phase 补齐（写它只是白等——这一跳的输出速度就是线上吐字速度）。
+   - analyze 写识别出的 intent/action（如 "write/write"）；match 写命中的技能名，未命中写 "通用能力"；params 写已提取/还需追问的参数名，未命中写 "提炼用户内容"；generate 写将执行的动作（如 "通用写作"、"填充模板"）。
+   - detail 一句话、面向用户，别用内部术语。
 
-只输出一个 JSON 对象，不要任何其他文字：
-{"intent":"write|docgen|query|chat","action":"fill|template_only|gen|write|answer","skill_slug":"<slug 或空>","needs_tools":true|false,"reason":"<一句话说明这次要不要技能、用什么动作>","params":{...},"needs":[],"steps":[...]}
+只输出一个 JSON 对象，不要任何其他文字。照下面这个长度写，全篇 ≤220 字：
+{"intent":"docgen","action":"fill","skill_slug":"采购合同","needs_tools":false,"reason":"命中模板，开始填充","params":{"party":"星禾科技"},"needs":[],"steps":[{"phase":"analyze","detail":"docgen/fill"},{"phase":"match","detail":"命中 采购合同"},{"phase":"params","detail":"已提取 1 项"},{"phase":"generate","detail":"填充模板"}]}
+（字段说明：intent=write|docgen|query|chat，action=fill|template_only|gen|write|answer，skill_slug=<slug 或空>，reason ≤12 字；params 是对象、needs 是数组，没有内容就给 {} / []，不要写占位话术。）
 
 needs_tools 判断（很重要，判错会导致答案里的数字是编的）：
 - true：任务必须先拿到**外部实时数据**（查接口/API、抓网页、查实时行情、查仓库/订单/库存等外部系统数据），或需要对数据做**真实计算/统计**（求和、占比、同比、排序汇总）才能给出正确答案。
@@ -447,27 +447,91 @@ func (e *Engine) classify(ctx context.Context, id, sys string, history []Message
 	defer cancel()
 	// 意图识别也吃上下文：用户说「整理成 word」时，识别「这是承接上一轮新闻稿」
 	// 才能路由到正确的技能，而不是当成一句没头没尾的新指令。
-	out, err := e.llm.StreamChat(ctx, sys, "对话历史（供参考，重点回应最新消息）：\n"+e.ContextBlock(ctx, id, history)+"\n\n用户最新消息：\n"+user, llm.StreamOpts{
+	ctxBlk := e.ContextBlock(ctx, id, history)
+	prompt := "对话历史（供参考，重点回应最新消息）：\n" + ctxBlk + "\n\n用户最新消息：\n" + user
+	// 这一跳的耗时观测：ttft（预填/排队）与总时长（吐字）拆开，输出字数记下来。
+	// 线上实测（2026-09-19）生效的是 siliconflow/Qwen3.6-27B，吐字 ~50 tok/s，
+	// 所以「让它少写固定文案」直接把这一跳从 10.3s 压到 2.9s。没有这行日志，
+	// 「意图分析为什么慢」只能靠猜 provider。
+	t0 := time.Now()
+	var firstTok time.Time
+	opts := llm.StreamOpts{
 		DisableThinking: true,
 		JSONMode:        true,
+		MaxTokens:       classifyMaxTokens(),
 		OnReasoning:     reasoningSink(ctx),
-		OnContent:       contentSink(ctx),
-	})
+	}
+	if sink := contentSink(ctx); sink != nil {
+		opts.OnContent = func(s string) {
+			if firstTok.IsZero() {
+				firstTok = time.Now()
+			}
+			sink(s)
+		}
+	}
+	out, err := e.llm.StreamChat(ctx, sys, prompt, opts)
+	hop := time.Since(t0)
+	ttft := -1.0
+	if !firstTok.IsZero() {
+		ttft = firstTok.Sub(t0).Seconds()
+	}
+	logHop := func(ev *Eval, retry bool, why string) {
+		intent, action, skill, needN, paramN, stepN := "", "", "", 0, 0, 0
+		if ev != nil {
+			intent, action, skill = ev.Intent, ev.Action, ev.SkillSlug
+			needN, paramN, stepN = len(ev.Needs), len(ev.Params), len(ev.Steps)
+		}
+		fmt.Fprintf(os.Stderr, "[classify] hop=%.1fs ttft=%.2fs in=%d(sys=%d ctx=%d user=%d) out=%d intent=%s action=%s skill=%s needs=%d params=%d steps=%d retry=%v %s\n",
+			hop.Seconds(), ttft, len(prompt), len(sys), len(ctxBlk), len(user), len(out),
+			intent, action, skillshort(skill), needN, paramN, stepN, retry, why)
+	}
 	if err != nil {
+		logHop(nil, false, "err="+err.Error())
 		return nil, false
 	}
 	eval := &Eval{}
 	if err := json.Unmarshal([]byte(extractJSON(out)), eval); err != nil {
 		fmt.Fprintf(os.Stderr, "[classify-retry] unmarshal err=%v raw_out=%q\n", err, out)
+		logHop(nil, true, "unmarshal")
 		return nil, true
 	}
 	if strings.TrimSpace(eval.Intent) == "" && strings.TrimSpace(eval.SkillSlug) == "" {
 		// empty intent AND no skill — the model dodged. Only retryable when it
 		// truly produced nothing usable.
 		fmt.Fprintf(os.Stderr, "[classify-retry] empty intent raw_out=%q\n", out)
+		logHop(eval, true, "empty-intent")
 		return nil, true
 	}
+	logHop(eval, false, "")
 	return eval, false
+}
+
+// classifyMaxTokens 第一跳的输出上限，0 = 不限（默认，保持原行为）。
+// 留这个旋钮是为了能在不重新编译的前提下做线上 A/B：这一跳的耗时 ≈ 输出字数 ÷
+// provider 吐字速度，掐上限是唯一能立刻验证「是不是输出太长」的手段。
+func classifyMaxTokens() int {
+	v := strings.TrimSpace(os.Getenv("SKILLFORGE_CLASSIFY_MAXTOK"))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// skillshort 日志里只留技能名的前 24 字，避免把长 slug 灌进日志。
+func skillshort(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "-"
+	}
+	r := []rune(s)
+	if len(r) > 24 {
+		return string(r[:24]) + "…"
+	}
+	return s
 }
 
 // SkillContent bundles everything needed to generate with a skill.

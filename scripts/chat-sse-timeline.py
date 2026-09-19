@@ -13,20 +13,24 @@
 （internal/agent.TraceStep.Material，json:"material,omitempty"）；只挂进行中那一步，
 尾部 160 字、400ms 节流。**材料不会进顶部状态条**，所以必须单独判定。
 
-判据 A1~A5（任何一条 FAIL 就非零退出，否则这把尺子在 CI 里等于不存在）：
+判据 A1~A6（任何一条 FAIL 就非零退出，否则这把尺子在 CI 里等于不存在）：
   A1 首帧 trace < 1s
   A2 首段正文之前就有 trace 帧
   A3 首段正文之前就出现中间材料  ← 这条直接对应「一直卡着计时」
   A4 最大静默 < 8s（正文 delta 与材料帧都算「屏幕上有新东西」，量两次之间最长的空白）
   A5 整轮「有东西在动」占比 ≥ 50%
+  A6 「① 意图分析」占屏 ≤ SF_STEP1_BUDGET_MS（默认 8s）← 对应用户「意图分析那步花太久」
+     这一跳的耗时 ≈ 输出字数 ÷ provider 吐字速度，所以它同时守着「分类契约别偷偷变肥」。
+     线上实测：契约里让模型抄 label/status = 8867~15171ms；模型只写 phase+detail = ~3s。
 
 最强的一条是 A4/A5：修前那段空白就是 33s / 40s 的纯跳秒。
-实测对照见 SILENT_BUDGET_MS 的注释。
+实测对照见 SILENT_BUDGET_MS / STEP1_BUDGET_MS 的注释。
 
-用法: python3 chat-sse-timeline.py <base_url> "<问题>" [--label 名字]
+用法: python3 chat-sse-timeline.py <base_url> "<问题>" [--label 名字] [--sid 会话id]
 退出码: 0 = 全 PASS；1 = 有 FAIL（负向自证靠它，别改成恒 0）。
 """
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -48,11 +52,18 @@ SILENT_BUDGET_MS = 12000
 # 实测：修复后 88% / 90% / 90% vs 基线 19%（基线里 73.85s 全静默，只剩正文那 17.6s）。
 # 间隙 <1s 的不算「卡」——材料节流 400ms、token 之间本来就稀疏。
 COVER_MIN = 0.5
+# 第一跳（① 意图分析）在屏幕上的占屏预算。线上实测（2026-09-19，siliconflow/Qwen3.6-27B）：
+#   契约让模型写 label/status 时 8867~15171ms（带素材那轮 15.2s）；改成「模型只写
+#   phase+detail、label 服务端补」后 ~3s。8s 这条线卡在两者之间：契约再变肥就会红。
+STEP1_BUDGET_MS = int(os.environ.get("SF_STEP1_BUDGET_MS", "8000"))
 
 
-def run(base, question, label=""):
+def run(base, question, label="", sid=None):
     url = base.rstrip("/") + "/api/chat"
-    body = json.dumps({"session_id": "tl-%d" % int(time.time()), "message": question}).encode()
+    # sid 可传入：多轮场景（先贴素材、再提要求）必须共用同一个 session，
+    # 否则每跑一次都是新会话，量不到「带素材那一轮的 ① 意图分析有多慢」。
+    sid = sid or ("tl-%d" % int(time.time()))
+    body = json.dumps({"session_id": sid, "message": question}).encode()
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "Accept": "text/event-stream"})
     t0 = time.time()
     marks = []          # (ms, ev, note)
@@ -63,6 +74,9 @@ def run(base, question, label=""):
     last_mat = ""
     mat_chars = 0
     content_ms = []     # 每一次「屏幕上有新内容」的时刻（正文 delta 或材料帧）
+    active_track = []   # (ms, active_label)：屏幕上计时器正挂在哪一步
+    labels = set()      # 服务端下发的步骤 label（空 label = 步骤板会出现空格子）
+    blank_labels = set()  # 有 label 却为空的 phase —— 瘦身契约漏补 label 时会在这里冒头
     steps_seen = 0
     buf = b""
     with urllib.request.urlopen(req, timeout=180) as resp:
@@ -87,9 +101,16 @@ def run(base, question, label=""):
                     try:
                         st = json.loads(data)
                         steps_seen = max(steps_seen, len(st))
+                        for s in st:
+                            lab = (s.get("label") or "").strip()
+                            if lab:
+                                labels.add(lab)
+                            else:
+                                blank_labels.add((s.get("phase") or "?"))
                         act = [s for s in st if s.get("status") == "active"]
                         if act:
                             note = act[0].get("label", "") + " | " + act[0].get("detail", "")
+                            active_track.append((ms, act[0].get("label", "")))
                             mat = act[0].get("material", "") or ""
                             if mat:
                                 mat_frames += 1
@@ -148,6 +169,21 @@ def run(base, question, label=""):
     print("最大静默        : %d ms (起于 %d ms)" % (gap_max, gap_at))
     print("整轮耗时        : %d ms" % total)
 
+    # 「① 意图分析」在屏幕上挂了多久 —— 用户嘴里「意图分析花了太多时间」量的就是它：
+    # 计时器挂在 ① 上，直到 active 步换成别的（模型给的 steps 上屏 / 骨架被替换）。
+    if active_track:
+        first_lab = active_track[0][1]
+        switch = next(((m, l) for m, l in active_track if l != first_lab), None)
+        end_ms = switch[0] if switch else total
+        print("首步占屏        : «%s» %d ms → %s" % (
+            first_lab, end_ms, ("换成 «%s»" % switch[1]) if switch else "整轮都没换过（按整轮算）"))
+    else:
+        end_ms = None
+        print("首步占屏        : 没量到（全程没有带 active 的 trace 帧）")
+    print("步骤 label      : %s%s" % (
+        ("、".join(sorted(labels)) if labels else "（一个都没有）"),
+        ("  ⚠️ 空 label 的 phase: " + "、".join(sorted(blank_labels))) if blank_labels else ""))
+
     # 整轮「有东西在动」占比：把 >1s 的间隙都算成空转，其余算在动。
     holes = 0
     prev_c = 0
@@ -165,22 +201,33 @@ def run(base, question, label=""):
     c3 = first_mat_ms is not None and (first_delta_ms is None or first_mat_ms < first_delta_ms)
     c4 = gap_max < SILENT_BUDGET_MS
     c5 = cover >= COVER_MIN
+    # A6：第一跳「① 意图分析」在屏幕上挂了多久。用户投诉「意图分析那步花了太久」量的就是它。
+    # 第一跳的耗时 ≈ 输出字数 ÷ provider 吐字速度，所以它同时是「契约有没有悄悄变肥」的哨兵。
+    step1_ms = (end_ms if active_track else None)
+    c6 = step1_ms is not None and step1_ms <= STEP1_BUDGET_MS
     print("结论:")
     print("  A1 首帧<1000ms                 -> %s" % ("PASS" if c1 else "FAIL"))
     print("  A2 首正文前有 trace            -> %s" % ("PASS" if c2 else "FAIL"))
     print("  A3 首正文前有中间材料（非跳秒）-> %s" % ("PASS" if c3 else "FAIL"))
     print("  A4 最大静默<%dms             -> %s" % (SILENT_BUDGET_MS, "PASS" if c4 else "FAIL"))
     print("  A5 有内容在动占比>=%.0f%%        -> %s" % (COVER_MIN * 100, "PASS" if c5 else "FAIL"))
-    ok = c1 and c2 and c3 and c4 and c5
+    print("  A6 ① 意图分析占屏<=%dms        -> %s" % (
+        STEP1_BUDGET_MS, "PASS" if c6 else ("FAIL (%dms)" % step1_ms if step1_ms else "FAIL (没量到)")))
+    ok = c1 and c2 and c3 and c4 and c5 and c6
     print("  => %s" % ("ALL PASS" if ok else "HAS FAIL"))
     return ok, dict(first_trace=first_trace, trace_frames=trace_frames, mat_frames=mat_frames,
                     first_mat_ms=first_mat_ms, first_delta_ms=first_delta_ms,
-                    gap_max=gap_max, total=total, cover=cover)
+                    gap_max=gap_max, total=total, cover=cover,
+                    first_step_ms=step1_ms, steps_seen=steps_seen,
+                    labels=sorted(labels), blank_label_phases=sorted(blank_labels))
 
 
 if __name__ == "__main__":
     base = sys.argv[1]
     q = sys.argv[2]
     label = sys.argv[4] if len(sys.argv) > 4 and sys.argv[3] == "--label" else ""
-    ok, _ = run(base, q, label)
+    sid = None
+    if "--sid" in sys.argv:
+        sid = sys.argv[sys.argv.index("--sid") + 1]   # 多轮复现：同一 session 连跑几轮
+    ok, _ = run(base, q, label, sid)
     sys.exit(0 if ok else 1)

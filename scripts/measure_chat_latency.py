@@ -27,6 +27,68 @@ NEWS = (
 )
 
 
+def pick_active_step(steps):
+    """从一帧 trace 的 steps 数组里挑出「计时器此刻那一步」+ 它的材料。
+
+    返回 (step, all_labels)：step 是 dict（可能为空），all_labels 是全部 label。
+
+    ★ 千万别写成 steps[0]（2026-09-19 的坑，代价是一次错误的根因结论）：
+    数组第 0 位永远是**最早那一步**（① 意图分析，已经 done、没有 material），
+    而「计时器挂在哪一步」和「中间材料」都挂在 **active** 那步上。取第 0 位的后果：
+    尺子既看不见步骤推进、也看不见材料帧 → 把「屏幕一直在滚材料」误报成静默。
+    实测真值最大静默 3.6s 被报成 66.3s，我照着这份假账去追「服务端没发材料」，
+    白追一轮；真实情况是材料从 0.0s 一直滚到 69.0s。
+    守着这条的是 web/tests/measure_latency_parser_mutation_check.py（确定性、不用真跑）。
+    """
+    steps = [s for s in (steps or []) if isinstance(s, dict)]
+    all_labels = [(s.get("label") or "").strip() for s in steps]
+    act = [s for s in steps if s.get("status") == "active"]
+    if act:
+        step = dict(act[0])
+    elif steps:
+        # 切步那一瞬间数组里可能一个 active 都没有。此时回落到**最后一步**
+        # 而不是空 dict —— 空 dict 会把 label 弄丢，账本上就会出现「无标签的可见变化」，
+        # 打印出来是「⏱ ｜…」这种看不出挂在哪一步的行。
+        step = dict(steps[-1])
+    else:
+        step = {}
+    if not (step.get("material") or ""):
+        # 材料有时还挂在「刚做完」那一步上（切步瞬间 active 那格还没拿到材料），
+        # 从后往前找最后一条带 material 的 —— 别把切步那一刻记成静默。
+        holder = next((s for s in reversed(steps) if s.get("material")), None)
+        if holder is not None:
+            step["material"] = holder["material"]
+    return step, all_labels
+
+
+def trace_visible_key(step):
+    """trace 帧的「屏幕可见变化」键 + 供打印用的 (label, detail, material)。
+
+    判「可见内容有没有变」必须看**尾部原文**：中间材料是截尾滚动窗口（长度恒定、
+    头部被挤掉、只有尾部在动）。拿头部当 key，滚动中的材料会被判成「没变化」
+    → 正在滚被记成静默，尺子自己造出一个不存在的卡顿（2026-09-18 为这个形状
+    付过一次代价：39.8s 假静默）。detail 里的「（已用 Ns）」是心跳秒数，必须剥掉，
+    否则每秒都算「可见变化」，静默账会被心跳填满、等于没量。
+    """
+    lab = str(step.get("label") or "")
+    det = re.sub(r"（已用 \d+s）", "", str(step.get("detail") or ""))
+    mat = str(step.get("material") or "")
+    return (lab, det, mat[-80:]), lab, det, mat
+
+
+def top_silences(marks, n=3):
+    """把「可见变化」序列折成最大的 n 段静默：[(秒数, 前一笔, 后一笔), ...]。
+
+    marks 是 [(相对秒, 描述), ...]。只给 1 笔时算不出来 —— 调用方必须把这种情况
+    当「尺子可疑」报出来，不能静默当成 0 秒静默（那正是 0 秒静默的假绿）。
+    """
+    if len(marks) < 2:
+        return []
+    gaps = sorted(((marks[i][0] - marks[i - 1][0], marks[i - 1], marks[i])
+                   for i in range(1, len(marks))), key=lambda x: -x[0])
+    return gaps[:n]
+
+
 def login():
     body = json.dumps({"username": U, "password": P}).encode()
     req = urllib.request.Request(BASE + "/api/login", method="POST", data=body)
@@ -82,12 +144,17 @@ def stream_round(tok, session_id, message, label):
                         ev = json.loads(payload)
                     except Exception:
                         continue
-                    if isinstance(ev, list):      # trace 帧是数组
-                        ev = ev[0] if ev else {}
+                    all_labels = None
+                    if isinstance(ev, list):      # trace 帧是数组：一步一个元素
+                        ev, all_labels = pick_active_step(ev)
                         k = ev_name or "trace"
                     else:
                         k = ev.get("type") or ev.get("kind") or ev_name or "?"
                     kinds[k] = kinds.get(k, 0) + 1
+                    if all_labels:                # 全量步骤都要进「各步首次出现时刻」
+                        for lab0 in all_labels:   # （只记 active 会漏掉已经走完的步）
+                            if lab0:
+                                phases.setdefault(lab0, now - t0)
                     txt = ev.get("delta") or ev.get("text") or ev.get("content") or ev.get("t") or ""
                     if isinstance(txt, str) and txt:
                         if first_text is None:
@@ -102,15 +169,7 @@ def stream_round(tok, session_id, message, label):
                     if k == "trace":
                         # 全量步骤时间线：每次「可见内容变化」打一行（心跳帧只有秒数变化，
                         # 不算变化）。这张表就是「慢在哪一步」的账，别再靠猜。
-                        lab = str(ev.get("label") or "")
-                        det = re.sub(r"（已用 \d+s）", "", str(ev.get("detail") or ""))
-                        m2 = str(mat or "")
-                        # 判「可见内容有没有变」必须看**尾部原文**：中间材料是截尾滚动
-                        # 窗口（长度恒定、头部被挤掉、只有尾部在动）。用头部 m2[:60] 当 key，
-                        # 滚动中的材料会被判成「没变化」→ 正在滚被记成静默，尺子自己造出
-                        # 一个不存在的卡顿（2026-09-18 已经为这个形状付过一次代价：
-                        # 39.8s 假静默）。
-                        key = (lab, det, m2[-80:])
+                        key, lab, det, m2 = trace_visible_key(ev)
                         if key != seen.get("last"):
                             seen["last"] = key
                             seen.setdefault("marks", []).append((now - t0, f"{lab}｜{str(mat or '')[-30:]}"))
@@ -135,9 +194,8 @@ def stream_round(tok, session_id, message, label):
     print(f"    帧类型分布：{kinds}")
     # 真实静默账：可见变化 = trace 内容变化（尾部原文）+ 正文增量帧。
     marks = seen.get("marks") or []
-    if len(marks) >= 2:
-        gaps = sorted(((marks[i][0] - marks[i-1][0], marks[i-1], marks[i])
-                       for i in range(1, len(marks))), key=lambda x: -x[0])
+    gaps = top_silences(marks, 3)
+    if gaps:
         g, a, b = gaps[0]
         print(f"    最大静默 {g:.1f}s（{a[0]:.1f}s «{a[1][:26]}» → {b[0]:.1f}s «{b[1][:26]}»）｜可见变化 {len(marks)} 次")
         for g2, a2, b2 in gaps[1:3]:

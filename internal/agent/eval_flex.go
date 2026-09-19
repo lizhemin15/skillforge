@@ -199,6 +199,22 @@ func flexParams(raw json.RawMessage) []model.Param {
 	return out
 }
 
+// phaseLabel 步骤板四个阶段的固定文案。
+//
+// 为什么 label 由服务端补而不是让模型写：label 是**纯固定文案**，模型每轮把它抄一遍
+// 要花掉这一跳最贵的东西——输出 tokens。线上生效那家 provider（siliconflow/
+// Qwen3.6-27B）实测吐字 ~50 tok/s：契约里让模型写 label+status 时全篇输出 811 字、
+// 这一跳 10.3s；改成只写 phase+detail 后输出 290 字、2.9s，路由结论逐条一致。
+// 所以「固定文案」一律留在服务端，模型只写它真正独有的信息（detail）。
+//
+// 与 internal/api 的 fallbackSteps 是同一套文案（那边按意图再细分，这里是通用版）。
+var phaseLabel = map[string]string{
+	"analyze":  "① 意图分析",
+	"match":    "② 工具匹配",
+	"params":   "③ 参数提取",
+	"generate": "④ 执行中",
+}
+
 // flexSteps 宽容解析步骤板：phase/status 缺失或为空时补默认值，否则前端会因为
 // 认不出阶段而整块不渲染 —— 用户就又看到「只有一个跳秒的计时」。
 func flexSteps(raw json.RawMessage) []TraceStep {
@@ -216,6 +232,11 @@ func flexSteps(raw json.RawMessage) []TraceStep {
 		s.Label = strings.TrimSpace(s.Label)
 		s.Detail = strings.TrimSpace(s.Detail)
 		s.Status = strings.ToLower(strings.TrimSpace(s.Status))
+		if s.Label == "" {
+			// 模型按瘦身契约只给 phase+detail，label 在这里补齐（认不出 phase 就留空，
+			// 由前端按 phase 兜底，绝不因为「label 缺失」把整条步骤丢掉）。
+			s.Label = phaseLabel[s.Phase]
+		}
 		if s.Phase == "" && s.Label == "" && s.Detail == "" {
 			continue
 		}

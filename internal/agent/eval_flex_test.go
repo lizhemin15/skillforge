@@ -154,6 +154,55 @@ func TestEvalOddShapesStillUsable(t *testing.T) {
 
 // TestEvalStepsDefaultStatus 步骤板相位/状态缺失时不能整段丢：
 // 前端认不出 phase/status 就不渲染，用户看到的就是「只有一个跳秒的计时」。
+// TestEvalLeanStepsGetLabels 守住「瘦身契约」的另一半：
+//
+// 线上生效那家 provider 吐字 ~50 tok/s，让模型每轮把 label/status 这些**固定文案**
+// 抄一遍要花掉这一跳最贵的东西 —— 实测全篇 811 字/10.3s vs 290 字/2.9s（路由结论逐条一致）。
+// 所以契约改成「模型只给 phase+detail，label/status 服务端补」。
+//
+// 这条断言的承重面：**补 label 这一半没做，步骤板就会变成空格子**（前端按 label 显示
+// ①~④ 阶段名，空了就等于回到「只有一个跳秒的计时」）。所以这里钉死四个阶段的具体文案，
+// 而不是只断言「label 非空」——文案漂了，用户看到的阶段名就漂了。
+func TestEvalLeanStepsGetLabels(t *testing.T) {
+	// 瘦身契约下模型的真实输出形态：只有 phase + detail，没有 label / status。
+	const lean = `{"intent":"write","action":"write","skill_slug":"公司新闻通稿","needs_tools":false,` +
+		`"reason":"通用写作","params":{},"needs":[],"steps":[` +
+		`{"phase":"analyze","detail":"write/write"},` +
+		`{"phase":"match","detail":"命中 公司新闻通稿"},` +
+		`{"phase":"params","detail":"提炼用户内容"},` +
+		`{"phase":"generate","detail":"通用写作"}]}`
+	var e Eval
+	if err := json.Unmarshal([]byte(lean), &e); err != nil {
+		t.Fatalf("瘦身契约的输出应当能解析，却报：%v", err)
+	}
+	if len(e.Steps) != 4 {
+		t.Fatalf("4 个阶段都该留下，实际 %d 个：%+v", len(e.Steps), e.Steps)
+	}
+	want := []string{"① 意图分析", "② 工具匹配", "③ 参数提取", "④ 执行中"}
+	for i, s := range e.Steps {
+		if s.Label != want[i] {
+			t.Errorf("第 %d 步的 label 应由服务端按 phase 补齐成 %q，实际 %q", i+1, want[i], s.Label)
+		}
+		if s.Detail == "" {
+			t.Errorf("第 %d 步 detail 是模型真正独有的信息，不该丢", i+1)
+		}
+	}
+	// detail 必须原样保留：模型写的是「命中了哪个技能」，这才是用户要看的调度过程。
+	if !strings.Contains(e.Steps[1].Detail, "公司新闻通稿") {
+		t.Errorf("② 的 detail 应保留模型给的技能名，实际 %q", e.Steps[1].Detail)
+	}
+	// 认不出的 phase 不许连坐丢掉整条步骤（宁可 label 空着让前端按 phase 兜底）。
+	var odd Eval
+	if err := json.Unmarshal([]byte(`{"intent":"chat","steps":[{"phase":"unknown","detail":"x"}]}`), &odd); err != nil {
+		t.Fatalf("未知 phase 不该让整包失败：%v", err)
+	}
+	if len(odd.Steps) != 1 {
+		t.Fatalf("未知 phase 的步骤也该保留，实际 %d 条", len(odd.Steps))
+	}
+}
+
+// TestEvalStepsDefaultStatus 步骤板 status 缺失时补 done，
+// 否则前端会因为认不出状态而不给这一步画格子。
 func TestEvalStepsDefaultStatus(t *testing.T) {
 	var e Eval
 	src := `{"intent":"write","action":"write","steps":[{"label":"① 意图分析"},{"phase":"match","status":"奇怪的词"}]}`

@@ -297,6 +297,12 @@ if [ "$QUICK" = 0 ]; then
   # 文件名叫 *_mutation_check.py 是刻意的：preflight_parity.test.mjs 按后缀枚举，
   # 漏挂 CI/preflight 会直接红，往后不会腐烂成「0 引用的尺子」。
   selfcheck '前端 / A5 判据双向注入自证' python3 web/tests/judge_a5_double_injection_mutation_check.py
+  # 账本脚本（scripts/measure_chat_latency.py）**解析层**的自证。
+  # 为什么必须有：2026-09-19 这把尺子自己撒谎了一次 —— trace 帧是数组，脚本写的是 `ev[0]`，
+  # 而第 0 位永远是「① 意图分析(done)、没有 material」，真材料挂在 active 那格上。
+  # 后果：真值最大静默 3.6s 被报成 66.3s，我照着假账去追「服务端没发材料」，白追一轮。
+  # 尺子撒谎时指向的永远是别人，所以它自己也得有尺子量着。
+  selfcheck '账本脚本 / 解析层变异自证' python3 web/tests/measure_latency_parser_mutation_check.py
   # 「屏幕上到底有没有东西在动」这把尺子（chat_material_e2e.py 里的 silent_gaps）的离线自证。
   # 为什么必须有：用户的投诉原话就是「一直卡着计时，用户体验不佳」，而这条判据最初按**材料长度**
   # 判变化 —— 材料是截尾滚动窗口、长度顶死在 163 字，于是「正在滚」被误报成 **39.8s 静默**，
