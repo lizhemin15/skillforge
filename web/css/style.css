@@ -334,6 +334,10 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
 .prov-row .dt { color: var(--text-faint); font-size: 11.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 /* 挂载工具名清单要点两行以上：单行 ellipsis 会让人以为「只挂上了 2 个工具」。 */
 .prov-row .dt.dt-wrap { white-space: normal; overflow: visible; text-overflow: clip; word-break: break-all; }
+/* 工具清单有 13 行高，动作按钮默认 align-items:center 会悬在清单中间，
+   看起来像浮层压住工具名（实测无相交，但观感是坏的）。只作用于 MCP 面板。 */
+#mcp-list .prov-row { align-items: flex-start; }
+#mcp-list .prov-row .row-actions { margin-top: 2px; }
 .pill-active { font-size:10.5px; padding:2px 7px; border-radius:999px; background:rgba(18,161,80,.12); color:var(--ok); border:1px solid rgba(18,161,80,.3); white-space:nowrap; }
 .pill-inactive { font-size:10.5px; padding:2px 7px; border-radius:999px; background:var(--panel-2); color:var(--text-faint); border:1px solid var(--line); }
 .row-actions { display:flex; gap:6px; }

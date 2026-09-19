@@ -199,6 +199,49 @@ def main():
                 j.get("server", "?"), j.get("version", "?"),
                 len(j.get("remote_tools") or []), len(j.get("mounted") or [])))
 
+    # ---------- 3b. 开关真生效（用户要的就是这个「开关」） ----------
+    # 光看接口 200 不算数：要看到「关掉 → 挂载工具归零、状态变未启用」，
+    # 「再打开 → 25 个工具回来」。这才是开关在对话里真的摘掉/挂上工具。
+    step("3b. 开关：关掉 → 工具必须归零；再打开 → 工具回来")
+
+    def wait_tools(expect_enabled, seconds=90):
+        """轮询列表等异步重连收敛，返回 (enabled, tool_count, state)。"""
+        deadline = time.time() + seconds
+        last = (None, None, "")
+        while time.time() < deadline:
+            st, raw = http("GET", "/api/admin/mcp", token=token)
+            if st == 200:
+                views = json.loads(raw).get("servers", [])
+                me = [v for v in views if v.get("id") == MCP_ID]
+                if me:
+                    v = me[0]
+                    stt = v.get("status") or {}
+                    last = (v.get("enabled"), len(stt.get("tools") or []), stt.get("error", ""))
+                    if v.get("enabled") == expect_enabled and (not expect_enabled or (last[1] or 0) > 0):
+                        return last
+            time.sleep(3)
+        return last
+
+    st, raw = http("POST", "/api/admin/mcp/toggle", {"id": MCP_ID, "enabled": False}, token=token, timeout=120)
+    if st != 200:
+        fail("关开关 HTTP %d：%s" % (st, raw[:200]))
+    else:
+        en, n, err = wait_tools(False)
+        if en is False and n == 0:
+            ok("关掉后：已停用、挂载工具 0 个（对话里立刻调不到了）")
+        else:
+            fail("关掉后状态不对：enabled=%s tools=%d err=%s" % (en, n, err))
+
+    st, raw = http("POST", "/api/admin/mcp/toggle", {"id": MCP_ID, "enabled": True}, token=token, timeout=120)
+    if st != 200:
+        fail("开开关 HTTP %d：%s" % (st, raw[:200]))
+    else:
+        en, n, err = wait_tools(True)
+        if en is True and n > 0:
+            ok("再打开：工具回到 %d 个" % n)
+        else:
+            fail("打开后没挂上工具：enabled=%s tools=%d err=%s" % (en, n, err))
+
     # ---------- 4. 刷新 → 工具必须真挂上 ----------
     step("4. 刷新（重连 + 挂工具）")
     st, raw = http("POST", "/api/admin/mcp/refresh", {}, token=token, timeout=300)

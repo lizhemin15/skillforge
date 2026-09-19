@@ -6,7 +6,9 @@ import json, re, sys, time, urllib.request
 
 BASE = "http://127.0.0.1:8092"
 sess = "mcp-evidence-%d" % int(time.time())
-msg = ("用已接入的 DataToolbox MCP 工具查：数据库里有哪些表、各有多少行。"
+# 故意只要 1~2 次工具调用：要的是「轨迹证据」，不是压力测试。
+# 之前让它「逐个表查行数」会触发十几次工具调用，跑十几分钟（用户明确嫌慢）。
+msg = ("用已接入的 DataToolbox MCP 工具列出数据库里的表名，一次调用拿到即可。"
        "必须真调 MCP 工具，不要用 http_request，不要编。")
 body = json.dumps({"session_id": sess, "message": msg}).encode()
 req = urllib.request.Request(BASE + "/api/chat", data=body,

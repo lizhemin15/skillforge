@@ -41,6 +41,16 @@ JS = r"""
     mountLine: q('#mcp-list .prov-row .dt:has(code)').map(box),
     codeCount: q('#mcp-list .prov-row .dt code').length,
     actions: q('#mcp-list .prov-row .row-actions').map(box),
+    rects: (() => {
+      const r = e => e.getBoundingClientRect();
+      const row = q('#mcp-list .prov-row')[0];
+      if (!row) return null;
+      const inf = row.querySelector('.inf'), ra = row.querySelector('.row-actions'),
+            wrap = row.querySelector('.dt-wrap');
+      const inter = (a, c) => !(a.right <= c.left || c.right <= a.left || a.bottom <= c.top || c.bottom <= a.top);
+      return {infTop: Math.round(r(inf).top), raTop: Math.round(r(ra).top),
+              overlap: inter(r(inf), r(ra)), overlapWrap: wrap ? inter(r(wrap), r(ra)) : false};
+    })(),
   };
 }
 """
@@ -81,6 +91,17 @@ for x in d["mountLine"]:
     print("  挂载工具行: w=%d sw=%d 截断=%s 行数=%s | %s" % (x["w"], x["sw"], x["clipped"], x["lines"], x["text"][:56]))
     if x["clipped"] and d["codeCount"] > 3:
         fails.append("挂载工具行被 ellipsis 砍成一行：25 个工具名只看得见前几个（sw=%d > w=%d）" % (x["sw"], x["w"]))
+
+if d["rects"]:
+    rr = d["rects"]
+    print("  动作区: infTop=%d raTop=%d 相对偏移=%d 相交(inf×动作)=%s 相交(工具清单×动作)=%s"
+          % (rr["infTop"], rr["raTop"], rr["raTop"] - rr["infTop"], rr["overlap"], rr["overlapWrap"]))
+    if rr["overlap"] or rr["overlapWrap"]:
+        fails.append("动作按钮与文字区域矩形相交（浮层压字）")
+    if abs(rr["raTop"] - rr["infTop"]) > 24:
+        fails.append("动作按钮没和标题顶对齐（偏移 %dpx，会悬在清单中间）" % (rr["raTop"] - rr["infTop"]))
+else:
+    fails.append("取不到矩形——尺子坏了")
 
 print("\n失败 %d 项" % len(fails))
 for f in fails:

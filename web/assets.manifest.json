@@ -2,8 +2,8 @@
   "_comment": "由 web/tests/gen-asset-manifest.mjs 生成；勿手改，改了会被 asset_version 测试抓住",
   "assets": {
     "/assets/css/style.css": {
-      "v": "20260919A",
-      "sha256": "34b306f659e65a213da9f28e70e5e6d38b78eff0571b5603d4cf06bdd4e6153f",
+      "v": "20260919B",
+      "sha256": "8949c0e5ec0b2047f850bebbc50cff4ef7bfe274f028e6828698e047ae2cdb51",
       "in": [
         "index.html",
         "admin.html"
