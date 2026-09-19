@@ -344,7 +344,139 @@ func TestWriteHopKnobActuallyReachesProvider(t *testing.T) {
 	}
 }
 
+// TestWriteHopThinkBudgetReachesProvider 守「保留思考 + 掐思考预算」这条中间路真通到 provider。
+//
+// 为什么必须有这条：`SKILLFORGE_THINK_BUDGET` 只在 StreamChat 的 knobNone 分支生效，
+// 而执笔跳的「保留思考」分支过去走的是 CompleteEx（go-openai SDK）——预算压根发不出去。
+// 结果就是唯一一个「既留住思考材料、又不让思考把时间吃光」的旋钮，在**最慢的那一跳**
+// 上是个摆设（线上实测：1 万字素材执笔段跨 97s、217 片思考材料、首段正文 98s 才出现）。
+//
+// 断言同样钉在**真发出去的请求体**上，不钉耗时：
+//   - 默认（不设预算）= 一个思考参数都不带 → 这是「改造零风险」这句话能被验的部分，
+//     与改造前 SDK 发出的 model/messages/stream:true 逐字一致；
+//   - 设 1024 = 真带上 thinking_budget=1024，且**不**夹带关思考的开关（思考仍保留）。
+func TestWriteHopThinkBudgetReachesProvider(t *testing.T) {
+	cases := []struct {
+		name       string
+		env        string
+		wantBudget int
+	}{
+		{"默认（不设）= 不限预算，请求体不带任何思考参数", "", 0},
+		{"设 1024 = 真带上 thinking_budget", "1024", 1024},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("SKILLFORGE_THINK_BUDGET", c.env)
+			fp := &fakeProvider{content: "正文一两句，够断言用。"}
+			eng := newTestEngine(t, fp)
+			sc := agentSkillContent("公司新闻通稿")
+			if _, err := eng.GenerateWithPlan(context.Background(), sc, nil, "要点：首段写五要素", func(string) {}); err != nil {
+				t.Fatalf("GenerateWithPlan 失败: %v", err)
+			}
+			body := fp.bodyAt(t, 0)
+			got, has := body["thinking_budget"]
+			if c.wantBudget == 0 {
+				if has {
+					t.Errorf("默认配置下请求体不该带 thinking_budget，实际 %v —— 默认行为必须与改造前逐字一致，否则这次改造就不是零风险", got)
+				}
+			} else {
+				n, ok := got.(float64) // JSON 数字解出来是 float64
+				if !has || !ok || int(n) != c.wantBudget {
+					t.Errorf("thinking_budget = %v（存在=%v），期望 %d —— 设了预算却没发出去，等于这个旋钮还是死的", got, has, c.wantBudget)
+				}
+			}
+			if body["enable_thinking"] == false || body["reasoning_effort"] == "none" {
+				t.Errorf("「保留思考 + 限预算」这臂不该夹带关思考的开关（enable_thinking=%v reasoning_effort=%v）—— 那就成关思考了，用户要看的中间材料会整段消失",
+					body["enable_thinking"], body["reasoning_effort"])
+			}
+		})
+	}
+}
+
 // agentSkillContent 造一个最小可用的写作技能（只给执笔跳要的字段）。
 func agentSkillContent(name string) *SkillContent {
 	return &SkillContent{Name: name, SkillType: "write", SystemPrompt: "你是" + name + "的执行者。"}
+}
+
+// 构思跳（PlanEssay）吐的是**纯文本要点**，不是 JSON。它的材料必须原样滚出去。
+//
+// 为什么这条要有独立测试：这一跳的设计目的就是把「藏在思考链里的构思」变成屏幕上
+// 滚动的真内容——它关掉了思考链，所以思维链材料一片都不会有，构思的正文就是它
+// 全部的可见产出。线上账本实测：8.1s 起屏幕零帧 297.7s，理由不能是「构思没接 sink」。
+// 守着它的是「要点必须逐字出现在材料里」这条断言，不是「material 非空」那种弱断言。
+func TestPlanEssayStreamsOutlineAsMaterial(t *testing.T) {
+	outline := "· 首段写五要素：时间、地点、主体、事件、意义\n· 第二段写技术亮点，避开营销形容词"
+	fp := &fakeProvider{content: outline}
+	eng := newTestEngine(t, fp)
+
+	var materials []string
+	ctx := WithProgress(context.Background(), func(s string) { materials = append(materials, s) })
+
+	plan, err := eng.PlanEssay(ctx, nil, nil, "写一篇数据中台 3.0 新闻稿")
+	if err != nil {
+		t.Fatalf("PlanEssay 失败: %v", err)
+	}
+	if plan != outline {
+		t.Fatalf("构思要点本身不对: %q", plan)
+	}
+	if joined := strings.Join(materials, ""); !strings.Contains(joined, "首段写五要素") {
+		t.Fatalf("构思要点必须当中间材料滚出去（用户在执笔那几十秒里就靠它知道模型在干什么），"+
+			"实际材料 %q —— sink 挂错了：内容不是 JSON 就不能走只认 JSON 字符串的预览器", joined)
+	}
+}
+
+// 通用写作路（没命中技能时走这条）与大跳同等待遇：预算旋钮必须真生效、思考链必须
+// 当材料流出去。两件事都曾是坏的——这条路上的执笔走的是 go-openai SDK，SDK 既不认
+// SKILLFORGE_THINK_BUDGET 也没有空闲看门狗，线上实测首正文 347.8s、最大静默 297.7s。
+func TestPlainWriteHopGetsThinkBudgetAndStreamsMaterial(t *testing.T) {
+	cases := []struct {
+		name       string
+		env        string
+		wantBudget int
+	}{
+		{"默认（不设）= 请求体不带任何思考参数，与改造前逐字一致", "", 0},
+		{"设 1024 = 真带上 thinking_budget", "1024", 1024},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("SKILLFORGE_THINK_BUDGET", c.env)
+			fp := &fakeProvider{reasoning: "先想结构：导语—亮点—引语", content: "星禾科技发布数据中台 3.0。"}
+			eng := newTestEngine(t, fp)
+
+			var materials, deltas []string
+			ctx := WithProgress(context.Background(), func(s string) { materials = append(materials, s) })
+
+			out, err := eng.PlainChatWithPlan(ctx, "s1", "写一篇新闻稿", nil, "要点：先导语后亮点",
+				func(d string) { deltas = append(deltas, d) })
+			if err != nil {
+				t.Fatalf("PlainChatWithPlan 失败: %v", err)
+			}
+			body := fp.bodyAt(t, 0)
+			got, has := body["thinking_budget"]
+			if c.wantBudget == 0 {
+				if has {
+					t.Errorf("默认配置下通用写作的请求体不该带 thinking_budget，实际 %v —— 默认行为必须与改造前逐字一致", got)
+				}
+			} else {
+				n, ok := got.(float64)
+				if !has || !ok || int(n) != c.wantBudget {
+					t.Errorf("通用写作路的 thinking_budget = %v（存在=%v），期望 %d —— 最慢的一跳吃不到预算，这个旋钮等于还是死的",
+						got, has, c.wantBudget)
+				}
+			}
+			if body["enable_thinking"] == false || body["reasoning_effort"] == "none" {
+				t.Errorf("通用写作路不该夹带关思考的开关（enable_thinking=%v reasoning_effort=%v）—— 那是它质量的来源",
+					body["enable_thinking"], body["reasoning_effort"])
+			}
+			if joined := strings.Join(materials, ""); joined != fp.reasoning {
+				t.Errorf("通用写作路的思考链必须当材料流出去，实际 %q", joined)
+			}
+			if strings.Join(deltas, "") != fp.content {
+				t.Errorf("正文必须原样转发给前端，实际 %q", strings.Join(deltas, ""))
+			}
+			if out != fp.content {
+				t.Errorf("正文不对: %q", out)
+			}
+		})
+	}
 }

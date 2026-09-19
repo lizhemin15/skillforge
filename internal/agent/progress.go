@@ -77,3 +77,14 @@ func contentSink(ctx context.Context) func(string) {
 		}
 	}
 }
+
+// rawSink 返回可直接当 llm 的 OnContent 用的闭包：把模型吐的人话**原样**当材料转发。
+//
+// 与 contentSink 的分工按「这一跳吐的是不是 JSON」划：contentSink 只从 JSON 字符串里
+// 抽字（jsonPreview 遇到未加引号的裸文本一个字都不吐），所以**本来就是人话**的跳挂它
+// 等于挂了个黑洞。构思跳（PlanEssay）就是这种：它吐的是「· 首段写五要素」这类纯文本
+// 条目，挂了 contentSink 的结果是材料恒为空——设计意图（关掉思考链后，构思就是这一跳
+// 全部的可见产出）被静默吃掉，而外面看只像是「模型没吐东西」。
+func rawSink(ctx context.Context) func(string) {
+	return reasoningSink(ctx)
+}

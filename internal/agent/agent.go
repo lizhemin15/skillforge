@@ -762,6 +762,60 @@ func (e *Engine) generateWithExtra(ctx context.Context, sc *SkillContent, args m
 	return e.generateWithExtraPlan(ctx, sc, args, extra, "", onDelta)
 }
 
+// hopStat 给「执笔/构思」这类长跳记账：总时长、首字时刻、思考片数、正文片数。
+//
+// 为什么需要它（2026-09-20 线上账本）：整轮 353.0s、**首正文 347.8s**、最大静默
+// 297.7s，而同一时间窗口里 stderr 只有一条 [classify] ——「慢在哪一跳」全靠人肉推理。
+// 执笔是整轮最长的一跳，没有这行日志就只能靠猜 provider（前几次就是这么猜错的）。
+// 它也是判断「中间材料到底流没流」的唯一硬证据：reason=0 就是一片都没拿到，
+// 跟「前端没显示」是两件事。
+type hopStat struct {
+	t0       time.Time
+	firstTok time.Time
+	nReason  int
+	nContent int
+}
+
+// content 把正文片段记一笔并原样转发给下游（onDelta 可为 nil）。
+func (s *hopStat) content(onDelta func(string)) func(string) {
+	return func(d string) {
+		if s.firstTok.IsZero() {
+			s.firstTok = time.Now()
+		}
+		s.nContent++
+		if onDelta != nil {
+			onDelta(d)
+		}
+	}
+}
+
+// reasoning 把思考链片段记一笔并转发给材料面板；没挂接收器就返回 nil，
+// 让 LLM 层省掉每片一次的函数调用（与 reasoningSink 的分工一致）。
+func (s *hopStat) reasoning(sink func(string)) func(string) {
+	if sink == nil {
+		return nil
+	}
+	return func(r string) {
+		s.nReason++
+		sink(r)
+	}
+}
+
+// log 输出一行跳级账本。ttft=-1 表示整跳一个 token 都没收到——那是「上游挂住」
+// 的确诊信号，跟「模型写得多」必须分得开。
+func (s *hopStat) log(kind, out string, err error) {
+	ttft := -1.0
+	if !s.firstTok.IsZero() {
+		ttft = s.firstTok.Sub(s.t0).Seconds()
+	}
+	why := ""
+	if err != nil {
+		why = " err=" + err.Error()
+	}
+	fmt.Fprintf(os.Stderr, "[%s] hop=%.1fs ttft=%.2fs reason=%d out_pieces=%d out=%d%s\n",
+		kind, time.Since(s.t0).Seconds(), ttft, s.nReason, s.nContent, len([]rune(out)), why)
+}
+
 // PlanEssay 先把「这一篇怎么写」的构思**当正文要出来**，而不是等模型藏在思考链里。
 //
 // 为什么需要这一跳（线上账本，不是推测）：技能链路执笔跳保留思考链时，首字实测等到
@@ -793,11 +847,13 @@ func (e *Engine) PlanEssay(ctx context.Context, sc *SkillContent, args map[strin
 		"2) 每条写清：写什么、按什么结构写、必须带哪些要素、要避开什么；\n" +
 		"3) 不要开场白、不要解释、不要 markdown 标题；\n" +
 		"4) 全中文，总量控制在 300 字以内。"
+	st := &hopStat{t0: time.Now()}
 	out, err := e.llm.StreamChat(ctx, sys, ask, llm.StreamOpts{
 		DisableThinking: true,
-		OnReasoning:     reasoningSink(ctx),
-		OnContent:       contentSink(ctx),
+		OnReasoning:     st.reasoning(reasoningSink(ctx)),
+		OnContent:       st.content(rawSink(ctx)),
 	})
+	st.log("plan", out, err)
 	if err != nil {
 		return "", err
 	}
@@ -832,22 +888,27 @@ func (e *Engine) generateWithExtraPlan(ctx context.Context, sc *SkillContent, ar
 	}
 	// 执笔这一跳**默认保留思考链**（质量优先），但把思考片段当中间材料流出去：
 	// 思考链期间正文一个字都没有，不流的话用户看到的就是「一直卡着计时」。
-	if writeThinkingOn() {
-		return e.llm.CompleteEx(ctx, sys, argBlockOf(sc, args)+"\n"+done, onDelta, reasoningSink(ctx))
-	}
-	// ★ 2026-09-19 修：`DisableThinking: true` 是这个开关的**全部意义**，而它从
-	// b1a431a 引入时就漏在这一行了 —— 于是 SKILLFORGE_WRITE_THINKING=0 只是把调用
-	// 从 CompleteEx 换成 StreamChat，思考链照旧开着（stream.go 里 DisableThinking=false
-	// 就是「不带关思考的开关」，等于 provider 默认=开）。也就是文档里写的
-	// 「首字 63s → 4.8s」从来没有兑现过：线上 A/B 实测两臂 186s vs 138s，那 48s
-	// 全是模型方差，因为「关掉」那一臂根本没关。
-	// 守着这一行的是 TestWriteHopKnobActuallyReachesProvider（默认臂必须**不带**开关，
+	//
+	// ★ 2026-09-20 改：原来「保留思考」这条分支走 CompleteEx（go-openai SDK），而 SDK
+	// 那条隧道不认 SKILLFORGE_THINK_BUDGET —— 于是「保留思考 + 掐思考预算」这条中间路
+	// 在**执笔跳上是死的**，只有审稿跳（writing.go 的 Revise）吃得到预算，而最慢、
+	// 最需要它的一跳恰恰是执笔。等价性论证见 plainChatWithPlan 里的同款注释。
+	//
+	// ★ 2026-09-19 修：`DisableThinking` 必须**逐字**跟着 writeThinkingOn() 走。它从
+	// b1a431a 引入时漏在那一行上，于是 SKILLFORGE_WRITE_THINKING=0 只是把调用从
+	// CompleteEx 换成 StreamChat，思考链照旧开着（DisableThinking=false 走 knobNone
+	// = 不带关思考的开关 = provider 默认开），文档里写的「首字 63s → 4.8s」从来没兑现过：
+	// 线上 A/B 实测两臂 186s vs 138s，那 48s 全是模型方差，因为「关掉」那一臂根本没关。
+	// 守着这两行的是 TestWriteHopKnobActuallyReachesProvider（默认臂必须**不带**开关，
 	// =0 臂必须**真带** enable_thinking=false + reasoning_effort=none）。
-	return e.llm.StreamChat(ctx, sys, argBlockOf(sc, args)+"\n"+done, llm.StreamOpts{
-		DisableThinking: true,
-		OnContent:       onDelta,
-		OnReasoning:     reasoningSink(ctx),
+	st := &hopStat{t0: time.Now()}
+	out, err := e.llm.StreamChat(ctx, sys, argBlockOf(sc, args)+"\n"+done, llm.StreamOpts{
+		DisableThinking: !writeThinkingOn(),
+		OnContent:       st.content(onDelta),
+		OnReasoning:     st.reasoning(reasoningSink(ctx)),
 	})
+	st.log("write-skill", out, err)
+	return out, err
 }
 
 // generateSys 拼出技能的 system prompt（身份 + 技能提示词 + 骨架模板 + 附件提示）。
@@ -1756,7 +1817,24 @@ func (e *Engine) plainChatWithPlan(ctx context.Context, id, user string, history
 	if strings.TrimSpace(plan) != "" {
 		sys += "\n\n==== 本轮构思要点（按它落笔）====\n" + plan
 	}
-	return e.llm.CompleteEx(ctx, sys, combined, onDelta, reasoningSink(ctx))
+	// ★ 2026-09-20 改：这条分支原来走 CompleteEx（go-openai SDK）。SDK 那条隧道
+	// 有两个洞，而**这是线上最常走的一条路**（用户直接提写作需求、没命中技能时：
+	// 线上账本第 1 轮 `[classify] ... skill=-` 就是它）：
+	//   ① 不认 SKILLFORGE_THINK_BUDGET —— 上游一慢就无限期干等；
+	//   ② 没有 idle 看门狗（StreamChat 有：20s 无字节即断连接、触发空正文重试）。
+	//   实测代价：整轮 353.0s、首正文 347.8s、最大静默 297.7s——那 297.7s 里屏幕上
+	//   只有计时器在跳，正是用户说的「一直卡着计时」。
+	// 换 StreamChat 的等价性：`DisableThinking=false` 走 streamOnce 的 knobNone 分支，
+	// 请求体仍是 model/messages/stream:true（只有配了预算才多一个 thinking_budget），
+	// 也就是默认配置下这次改造**行为零变化**，纯粹把预算与看门狗这两条路接通。
+	st := &hopStat{t0: time.Now()}
+	out, err := e.llm.StreamChat(ctx, sys, combined, llm.StreamOpts{
+		DisableThinking: false,
+		OnContent:       st.content(onDelta),
+		OnReasoning:     st.reasoning(reasoningSink(ctx)),
+	})
+	st.log("write-plain", out, err)
+	return out, err
 }
 
 // ---------------------------------------------------------------------------
