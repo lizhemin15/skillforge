@@ -94,6 +94,7 @@ def round_stream(tok, session_id, message, label, collect_material=True):
     t0 = time.time()
     mats = []          # [(t, material_text)]
     body_ts = []       # 正文片的到达时刻（B2 要拿它算「屏幕还在动吗」）
+    errs = []          # error 帧原文（红的时候必须能直接读原因，不能只留个计数）
     first_text = None
     texts = []
     gen_urls = []
@@ -132,6 +133,13 @@ def round_stream(tok, session_id, message, label, collect_material=True):
                         continue
                     k = st.get("kind") or st.get("type") or ev_name or "?"
                     kinds[k] = kinds.get(k, 0) + 1
+                    # error 帧必须**留原文**。过去这里只数帧类型，于是线上第2轮
+                    # （整理成 Word）失败时，尺子只喊「❌ A0 没有产出链接」，
+                    # 说不出到底哪一步炸了、炸的什么 —— 一行 only-counts 的尺子
+                    # 把唯一的证据扔掉了，排查只能靠再跑一轮赌复现（实测那次
+                    # 复现时反而成功了，白烧 160s）。红的时候要能直接读原因。
+                    if k == "error" or st.get("error"):
+                        errs.append((now, json.dumps(st, ensure_ascii=False)))
                     if collect_material and st.get("material"):
                         mats.append((now, str(st["material"])))
                     # 正文片的字段名是 **"t"**（internal/api/chat_write.go: `write(evDelta,
@@ -150,8 +158,10 @@ def round_stream(tok, session_id, message, label, collect_material=True):
     print(f"[{time.time()-t0:6.1f}s] 结束：正文 {len(body_text)} 字，首正文 "
           f"{('%.1fs' % first_text) if first_text else '未出现'}，材料帧 {len(mats)}，"
           f"帧类型 {kinds}")
+    for et, etext in errs:
+        print(f"[{et:6.1f}s] ⛔ error 帧：{etext[:300]}")
     return {"mats": mats, "body": body_text, "gen": gen_urls, "first_text": first_text,
-            "body_ts": body_ts, "prompt": message,
+            "body_ts": body_ts, "prompt": message, "errs": errs,
             # first_body / secs 是给 B4 速度账用的：拿「首片可见正文」和「整轮耗时」
             # 当两个独立数字。只报总时长看不出用户到底在哪一段干等 —— 线上那次
             # 190s 里有 174s 是「首段正文之前」，两者必须分开报。
@@ -327,6 +337,82 @@ def wait_ready(timeout=90):
     return None
 
 
+# 素材有两种用法，判据必须跟着走：
+#   ① 事实型（素材就是「要报的事实」）—— 正文必须引用素材里的数字锚，否则那数字是编的；
+#   ② 规格型（素材是「【写作要求】+ 参考范文」）—— 正文必须遵守那些硬约束（篇幅/禁用词/人称）。
+# 线上那份 1 万字料实测是 ②（【写作要求】9 条 + 范文二/三交替几十遍堆到 10341 字）。
+# 老 B3 拿「正文/旁白有没有引用素材文本」去判 ②，是**结构性必红**：范文是风格样例，
+# 不是待报事实，引用它反而不该。红得对（产出确实没照素材办）、红得不是地方（指错了罪证）。
+# 所以这里按素材形态自动分型，把「贴着本轮素材」翻译成各形态下真正可证伪的判据。
+NUMBER_ANCHOR = re.compile(r"\d+(?:\.\d+)?\s*(?:%|％|万元|亿元|万|亿|倍|人次|平方米)")
+
+
+def spec_of(prompt):
+    """从素材里抽【写作要求】的可机检硬约束；抽不到 ⇒ 不是规格型素材，返回 None。"""
+    i = prompt.find("【写作要求】")
+    if i < 0:
+        return None
+    blk = prompt[i:i + 1500]  # 要求区在素材最前面（实测 62 字起、600 字内写完）
+    spec = {"min_chars": None, "paras": None, "ban_words": [], "subjective": []}
+    if m := re.search(r"不少于\s*(\d+)\s*字", blk):
+        spec["min_chars"] = int(m.group(1))
+    if m := re.search(r"分\s*(\d+)\s*段左右", blk):
+        spec["paras"] = int(m.group(1))
+    if m := re.search(r"禁用词[：:]\s*([^\n]+)", blk):
+        # 要求行以「。」收尾，按 、拆分会把句号粘进最后一项（'再上新台阶。'）——
+        # 那样正文里真写了「再上新台阶」也判不出来（假绿）。剥掉尾部的标点与「等」。
+        spec["ban_words"] = [w.strip().rstrip("。．.；;、,，等") for w in re.split(r"[、,，]", m.group(1))]
+        spec["ban_words"] = [w for w in spec["ban_words"] if w]
+    if m := re.search(r"不得出现([^\n]+?主观措辞)", blk):
+        spec["subjective"] = re.findall(r"[“\"]([^”\"]+)[”\"]", m.group(1))
+    return spec
+
+
+def check_spec(prompt, answer):
+    """B5：正文必须遵守素材【写作要求】里的硬约束 —— 这才是「它有没有看我的要求」的判据。"""
+    if not answer:
+        ok("B5 正文遵守素材【写作要求】", False, "第1轮没有正文可比")
+        return
+    spec = spec_of(prompt)
+    if not spec:
+        print("    ℹ️  素材里没有【写作要求】区（事实型素材），B5 不适用；事实侧看 B3")
+        return
+    jian = len(re.findall(r"[\u4e00-\u9fff]", answer))
+    rows, bad = [], []
+    if spec["min_chars"]:
+        good = jian >= spec["min_chars"]
+        # 两个口径都报：汉字数（只数 CJK）与字符数（含标点换行）。只报一个必然扯皮 ——
+        # 线上 SSE 那行按「字符」报 769，这里按「汉字」算出 602，同一份正文两个数字。
+        rows.append(("篇幅", f"汉字 {jian} / 字符 {len(answer)}（要求 ≥{spec['min_chars']} 字）", good))
+        if not good:
+            bad.append("篇幅")
+    if spec["paras"]:
+        n = len([x for x in answer.split("\n") if x.strip()])
+        good = abs(n - spec["paras"]) <= 2
+        rows.append(("段落", f"{n} 段（要求 {spec['paras']} 段左右）", good))
+        if not good:
+            bad.append("段落")
+    if spec["ban_words"]:
+        hit = [w for w in spec["ban_words"] if w in answer]
+        rows.append(("禁用词", f"命中 {len(hit)}/{len(spec['ban_words'])}"
+                     + (f"：{'、'.join(hit)}" if hit else " ✓"), not hit))
+        if hit:
+            bad.append("禁用词")
+    if spec["subjective"]:
+        hit = [w for w in spec["subjective"] if w in answer]
+        rows.append(("主观措辞", f"命中 {len(hit)}/{len(spec['subjective'])}"
+                     + (f"：{'、'.join(hit)}" if hit else " ✓"), not hit))
+        if hit:
+            bad.append("主观措辞")
+    if not rows:
+        print("    ⚠️  【写作要求】在，但没解析出可机检的硬约束 —— 尺子没长眼睛，别当成绿")
+        return
+    for name, detail, good in rows:
+        print(f"    {'✅' if good else '❌'} {name}：{detail}")
+    ok("B5 正文遵守素材【写作要求】的硬约束", not bad,
+       "；".join(f"{n} 不合规" for n in bad) if bad else f"{len(rows)} 项全合规")
+
+
 def main():
     tok = login()
     sid = "liveverify-%d" % int(time.time())
@@ -335,12 +421,15 @@ def main():
           f"1500 字左右的公司新闻稿，标题自拟，写完直接给正文。\n\n素材如下：\n{material}")
     r1 = round_stream(tok, sid, p1, "第1轮：1万字素材 → 写新闻稿")
     check_material(r1, session_answer(sid))
+    check_spec(p1, session_answer(sid))
 
     tok2 = login()
     r2 = round_stream(tok2, sid, "把上面这篇新闻稿原样整理成 Word 文档（.docx），正文一字不改。",
                       "第2轮：整理成 Word", collect_material=False)
     if not r2["gen"]:
-        ok("A0 拿到交付物链接", False, "第2轮没有产出 /api/chat/gen 链接")
+        # 红的时候必须带上 error 帧原文：只写「没有链接」等于把唯一的证据留在现场不带回来。
+        reason = "；error 帧：" + r2["errs"][0][1][:220] if r2.get("errs") else ""
+        ok("A0 拿到交付物链接", False, "第2轮没有产出 /api/chat/gen 链接" + reason)
         print("\n红项：" + ", ".join(fails)); sys.exit(1)
     gid = r2["gen"][0]
     url = "/api/chat/gen/" + gid

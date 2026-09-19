@@ -881,6 +881,16 @@ func (s *hopStat) log(kind, out string, err error) {
 		kind, time.Since(s.t0).Seconds(), ttft, s.nReason, s.nContent, len([]rune(out)), why)
 }
 
+// headRunes 取前 n 个 rune 用于日志留痕。
+// 为什么不用 s[:n]：中文按下标切会切碎 UTF-8，日志里会出现乱码，读起来像另一个 bug。
+func headRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+
 // PlanEssay 先把「这一篇怎么写」的构思**当正文要出来**，而不是等模型藏在思考链里。
 //
 // 为什么需要这一跳（线上账本，不是推测）：技能链路执笔跳保留思考链时，首字实测等到
@@ -1203,6 +1213,11 @@ func (e *Engine) GenerateDoc(ctx context.Context, id string, sc *SkillContent, a
 	// 关思考链：这一步是「把用户说的话填进给定的 JSON 契约」，规则全在提示词里，
 	// 思考链只是把几十秒的等待摊在用户面前；真要产思考链（provider 忽略开关）时，
 	// 片段会被当成中间材料流出去。
+	// docgen 这一跳过去**不留任何痕**：失败只在 SSE 里吐一个 error 帧，stderr 一个字没有。
+	// 线上实测（2026-09-20 04:35 轮）这一跳跑了 159.9s 然后抛错，journalctl 里干干净净 ——
+	// 结果「为什么失败」只能靠猜 provider。失败必须留得下证据，成功也必须有自己的耗时数字
+	// （它跟 [plan]/[write-skill] 一个量级，是这一轮里最贵的一跳）。
+	docT0 := time.Now()
 	out, err := e.llm.StreamChat(ctx, sys, argBlock.String(), llm.StreamOpts{
 		DisableThinking: true,
 		JSONMode:        true,
@@ -1210,12 +1225,18 @@ func (e *Engine) GenerateDoc(ctx context.Context, id string, sc *SkillContent, a
 		OnContent:       contentSink(ctx),
 	})
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[docgen] 失败 hop=%.1fs err=%v\n",
+			time.Since(docT0).Seconds(), err)
 		return nil, err
 	}
 	doc, err := parseDocJSON(out)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[docgen] 规格解析失败 hop=%.1fs out=%d 字节 out_head=%q\n",
+			time.Since(docT0).Seconds(), len([]rune(out)), headRunes(out, 200))
 		return nil, fmt.Errorf("解析文档规格失败: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "[docgen] ok hop=%.1fs out=%d 字节 format=%s\n",
+		time.Since(docT0).Seconds(), len([]rune(out)), doc.Format)
 	// Normalise format alias to canonical extension for the filename.
 	if doc.Format != "" {
 		switch strings.ToLower(doc.Format) {
