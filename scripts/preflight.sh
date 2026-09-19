@@ -303,6 +303,10 @@ if [ "$QUICK" = 0 ]; then
   # 后果：真值最大静默 3.6s 被报成 66.3s，我照着假账去追「服务端没发材料」，白追一轮。
   # 尺子撒谎时指向的永远是别人，所以它自己也得有尺子量着。
   selfcheck '账本脚本 / 解析层变异自证' python3 web/tests/measure_latency_parser_mutation_check.py
+  # MCP 连接处显示（用户投诉「堆在一起不是很好看」）的注入自证。
+  # 守的是三种「看着整洁其实坏了」的形态：砍掉几个工具名 / 长名字被折断 /
+  # 「折叠」是假的（display:flex 盖掉 [hidden] 的默认 display:none）。
+  selfcheck 'MCP 面板 / 显示变异自证' python3 web/tests/admin_mcp_mutation_check.py
   # 「屏幕上到底有没有东西在动」这把尺子（chat_material_e2e.py 里的 silent_gaps）的离线自证。
   # 为什么必须有：用户的投诉原话就是「一直卡着计时，用户体验不佳」，而这条判据最初按**材料长度**
   # 判变化 —— 材料是截尾滚动窗口、长度顶死在 163 字，于是「正在滚」被误报成 **39.8s 静默**，

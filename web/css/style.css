@@ -332,15 +332,57 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
 .prov-row .inf { flex: 1; min-width:0; }
 .prov-row .nm { font-weight:600; font-size:13.5px; }
 .prov-row .dt { color: var(--text-faint); font-size: 11.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-/* 挂载工具名清单要点两行以上：单行 ellipsis 会让人以为「只挂上了 2 个工具」。 */
-.prov-row .dt.dt-wrap { white-space: normal; overflow: visible; text-overflow: clip; word-break: break-all; }
-/* 工具清单有 13 行高，动作按钮默认 align-items:center 会悬在清单中间，
-   看起来像浮层压住工具名（实测无相交，但观感是坏的）。只作用于 MCP 面板。 */
+/* 这里曾经挂过一段 `.dt.dt-wrap { word-break: break-all }` 的工具名清单：25 个名字
+   被从词中间切断（`mcp_datato` / `olbox_call_platform_api`），整块占 256px、占满一行的
+   74%。2026-09-19 换成下面的 .mcp-tools（前缀只显示一次 + 整词不折断的 chip 墙）。 */
 #mcp-list .prov-row { align-items: flex-start; }
 #mcp-list .prov-row .row-actions { margin-top: 2px; }
 .pill-active { font-size:10.5px; padding:2px 7px; border-radius:999px; background:rgba(18,161,80,.12); color:var(--ok); border:1px solid rgba(18,161,80,.3); white-space:nowrap; }
 .pill-inactive { font-size:10.5px; padding:2px 7px; border-radius:999px; background:var(--panel-2); color:var(--text-faint); border:1px solid var(--line); }
+.pill-idle { font-size:10.5px; padding:2px 7px; border-radius:999px; background:var(--panel-2); color:var(--text-faint); border:1px solid var(--line); white-space:nowrap; }
+/* 连接状态徽标：中性胶囊 + 一个小圆点表状态。
+   原来是一整行彩色文字，跟上面的 URL 行糊成一片；改版时一度用整颗绿胶囊，
+   但那一行里已经有「已启用」是绿的了 —— 两个绿胶囊是卡片上唯一的彩色，
+   抢服务名的视线。状态用点表达足够，颜色只留一点点。 */
+.pill-conn { display:inline-flex; align-items:center; gap:5px; font-size:10.5px; padding:2px 8px; border-radius:999px; border:1px solid var(--line); background:transparent; color:var(--text-faint); white-space:nowrap; }
+.pill-conn::before { content:''; width:5px; height:5px; border-radius:50%; background:var(--text-faint); }
+.pill-conn.ok::before { background:var(--ok); }
+.pill-conn.err::before { background:#b45309; }
+.pill-conn.err { color:#b45309; }
+
+/* ---- MCP 工具区 ---- */
+.mcp-tools { margin-top: 6px; }
+.mcp-tools-head {
+  display:inline-flex; align-items:center; gap:8px; padding:3px 9px; cursor:pointer;
+  border:1px solid var(--line); border-radius:999px; background:transparent;
+  font-size:11.5px; color:var(--text-faint); font-family:inherit; line-height:1.5;
+}
+.mcp-tools-head:hover { border-color: var(--line-strong); color: var(--text); }
+.mcp-tools-head b { color: var(--text); font-weight:600; }
+.mcp-tools-srv { color:var(--text-faint); opacity:.85; }
+.mcp-tools-caret { color: var(--text-faint); }
+.mcp-tools-body {
+  display:flex; flex-wrap:wrap; gap:5px; margin-top:7px;
+  /* 整词不折断：chip 内是 `create_app_from_template` 这种长下划线标识符，
+     一旦允许 break-all 就会被从词中间切开，读起来像两个不同的工具。 */
+  word-break: keep-all; overflow-wrap: normal;
+}
+/* `display:flex` 会盖掉浏览器对 [hidden] 的默认 `display:none`（技能层/MCP 层都踩过
+   这个坑），所以必须显式补一条守卫，否则「折叠」只是把内容藏了个寂寞。 */
+.mcp-tools-body[hidden] { display: none; }
+.mcp-tools-pref {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px;
+  color: var(--text-faint); padding:2px 8px; border:1px dashed var(--line); border-radius:999px;
+}
+.tchip {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; line-height:1.6;
+  padding:2px 8px; border:1px solid var(--line); border-radius:999px; background:var(--panel-2);
+  color:var(--text); white-space:nowrap; transition: border-color .14s, background .14s;
+}
+.tchip:hover { border-color: var(--line-strong); background: var(--bg-soft); }
+.mcp-err { color:#b45309; font-size:11.5px; margin-top:4px; }
 .row-actions { display:flex; gap:6px; }
+
 .icon-btn {
   width:30px; height:30px; border-radius:var(--radius-sm); border:1px solid var(--line);
   background:transparent; color:var(--text-dim); cursor:pointer; display:grid; place-items:center; font-size:14px;

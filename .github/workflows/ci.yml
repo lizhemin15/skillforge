@@ -373,6 +373,12 @@ jobs:
       - name: 账本脚本解析层变异自证
         run: python3 web/tests/measure_latency_parser_mutation_check.py
 
+      # MCP 连接处显示（用户投诉「堆在一起不是很好看」）的注入自证。
+      # 三种「看着整洁其实坏了」的形态：砍掉几个工具名 / 长名字被折断 /
+      # 「折叠」是假的（display:flex 盖掉 [hidden] 的默认 display:none）。
+      - name: MCP 面板显示变异自证
+        run: python3 web/tests/admin_mcp_mutation_check.py
+
       # 「屏幕上有没有东西在动」那把尺子（chat_material_e2e.py 的 silent_gaps）的离线自证。
       # 用户投诉原话：「一直卡着计时，用户体验不佳」。这条判据最初按**材料长度**判变化，
       # 而材料是截尾滚动窗口（长度顶死 163 字），于是「正在滚」被误报成 **39.8s 静默** ——

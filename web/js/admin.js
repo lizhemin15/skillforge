@@ -1505,12 +1505,109 @@
     m.textContent = text;
   }
 
-  function mcpStateText(s) {
-    if (!s.enabled) return '未启用';
+  // ---- MCP 工具名的显示 ----
+  //
+  // 用户原话：「mcp 连接处请优化显示，目前堆在一起不是很好看」。
+  // 现场实测（1440 宽、卡片行宽 611px）：25 个工具名当成 `<code>` 用空格串成一段，
+  // 那一块占 **256px**（整行 344px 的 74%），字号 11px、无边框无底色，全靠 `break-all`
+  // 硬折行 —— 名字被从词中间切断（`mcp_datato` / `olbox_call_platform_api`），
+  // 25 行的信息被压成一坨灰。
+  //
+  // 改法三条，都是「不减信息、只减噪声」：
+  //   ① 公共前缀只显示一次（25 个名字全都以 `mcp_datatoolbox_` 开头，逐个重复它没有信息量）；
+  //   ② 每个工具名一个 chip（有边框/底色/圆角），`white-space:nowrap` **整词不折断**；
+  //   ③ 默认折叠，需要时一键展开，展开状态记在 localStorage。
+  const MCP_TOOLS_KEY = 'skillforge.mcpToolsOpen';
+
+  // mcpToolPrefix 取所有工具名的公共前缀，且**必须切在 `_` 上**：
+  // 切在词中间会造出一个不存在的名字（`mcp_datatoolbox_ask` + `_user`），比不拆更糟。
+  // 拆不出（前缀为空、或只有一个名字）就返回 ''，chips 照旧显示全名。
+  function mcpToolPrefix(names) {
+    const list = (names || []).filter(n => typeof n === 'string' && n);
+    if (list.length < 2) return '';
+    let p = list[0];
+    for (const n of list) {
+      let i = 0;
+      while (i < p.length && i < n.length && p[i] === n[i]) i++;
+      p = p.slice(0, i);
+    }
+    const cut = p.lastIndexOf('_');
+    return cut > 0 ? p.slice(0, cut + 1) : '';
+  }
+
+  function mcpToolsOpen() {
+    try { return localStorage.getItem(MCP_TOOLS_KEY) === '1'; } catch (e) { return false; }
+  }
+
+  // mcpToolsHTML 渲染工具区：一行头（数量 + 前缀 + 展开/收起）+ 折叠的 chip 墙。
+  function mcpToolsHTML(st) {
+    const names = ((st || {}).tools || []).filter(n => typeof n === 'string' && n);
+    if (!names.length) return '';
+    const pref = mcpToolPrefix(names);
+    const open = mcpToolsOpen();
+    const chips = names.map(n => {
+      const short = pref && n.indexOf(pref) === 0 ? n.slice(pref.length) : n;
+      // title 留全名：chip 上显示短名是为了扫读，复制/核对时还得有全名可依。
+      return `<span class="tchip" title="${esc(n)}">${esc(short)}</span>`;
+    }).join('');
+    const srv = ((st || {}).server || '') + (st && st.version ? ' v' + st.version : '');
+    return `
+      <div class="mcp-tools">
+        <button type="button" class="mcp-tools-head" aria-expanded="${open ? 'true' : 'false'}"
+                onclick="window.mcpToggleTools(this)">
+          <span class="mcp-tools-n">工具 <b>${names.length}</b> 个</span>
+          ${pref ? `<span class="mcp-tools-pref">${esc(pref)}*</span>` : ''}
+          ${srv ? `<span class="mcp-tools-srv">${esc(srv)}</span>` : ''}
+          <span class="mcp-tools-caret">${open ? '收起' : '展开'}</span>
+        </button>
+        <div class="mcp-tools-body"${open ? '' : ' hidden'}>${chips}</div>
+      </div>`;
+  }
+
+  // mcpStatePill 把连接状态做成徽标（原来是带内联颜色的纯文字，和上面几行糊在一起）。
+  function mcpStatePill(st) {
+    st = st || {};
+    if (st.ok) return '<span class="pill-conn ok">已连接</span>';
+    if (st.error) return '<span class="pill-conn err" title="' + esc(st.error) + '">连接失败</span>';
+    return '<span class="pill-conn idle">未连接</span>';
+  }
+
+  window.mcpToggleTools = (btn) => {
+    const wrap = btn && btn.closest ? btn.closest('.mcp-tools') : null;
+    const body = wrap ? wrap.querySelector('.mcp-tools-body') : null;
+    if (!body) return;
+    const toOpen = body.hasAttribute('hidden');   // 现在收着 → 这一下要展开
+    if (toOpen) body.removeAttribute('hidden'); else body.setAttribute('hidden', '');
+    btn.setAttribute('aria-expanded', toOpen ? 'true' : 'false');
+    const caret = wrap.querySelector('.mcp-tools-caret');
+    if (caret) caret.textContent = toOpen ? '收起' : '展开';
+    try { localStorage.setItem(MCP_TOOLS_KEY, toOpen ? '1' : '0'); } catch (e) {}
+  };
+
+  // mcpRowHTML 渲染一台 MCP 服务的一行。抽成独立函数是为了让前端回归能**跑真代码**：
+  // 它没有 DOM 依赖（只读 status），可在 node 沙箱里直接喂料断言。
+  function mcpRowHTML(s) {
     const st = s.status || {};
-    if (st.ok) return '已连接 ' + (st.server || '') + (st.version ? ' v' + st.version : '') + ' · ' + st.tool_count + ' 个工具';
-    if (st.error) return '连接失败：' + st.error;
-    return '尚未连接（点右侧「测试」）';
+    return `
+        <div class="prov-row">
+          <div class="inf" style="min-width:0">
+            <div class="nm"><span class="mcp-nm">${esc(s.name)}</span>
+              ${s.enabled ? '<span class="pill-active">已启用</span>' : '<span class="pill-idle">未启用</span>'}
+              ${mcpStatePill(st)}</div>
+            <div class="dt">${esc(s.id)} · ${esc(s.url)} · 超时 ${s.timeout_sec}s · 密钥 ${s.has_key ? esc(s.key_mask) : '未设置'}</div>
+            ${mcpToolsHTML(st)}
+            ${st.error ? `<div class="mcp-err">${esc(st.error)}</div>` : ''}
+          </div>
+          <div class="row-actions" style="display:flex;align-items:center;gap:8px">
+            <label style="display:flex;align-items:center;gap:4px;font-size:12px;white-space:nowrap;margin:0">
+              <input type="checkbox" style="width:auto;margin:0" ${s.enabled ? 'checked' : ''}
+                onchange="window.mcpToggle('${esc(s.id)}', this.checked)">启用
+            </label>
+            <button class="btn ghost" style="padding:4px 8px;font-size:12px" onclick="window.mcpEdit('${esc(s.id)}')">编辑</button>
+            <button class="btn ghost" style="padding:4px 8px;font-size:12px" onclick="window.mcpProbe('${esc(s.id)}')">测试</button>
+            <button class="icon-btn danger" title="删除" onclick="window.mcpDel('${esc(s.id)}')">✕</button>
+          </div>
+        </div>`;
   }
 
   async function loadMCP() {
@@ -1526,28 +1623,7 @@
           '<p class="dim">接入后，智能助手就能直接查数据库、调内部接口，而不是瞎猜</p></div>';
         return;
       }
-      box.innerHTML = list.map(s => {
-        const st = s.status || {};
-        const tools = (st.tools || []).map(n => '<code style="font-size:11px">' + esc(n) + '</code>').join(' ');
-        return `
-        <div class="prov-row">
-          <div class="inf" style="min-width:0">
-            <div class="nm">${esc(s.name)} ${s.enabled ? '<span class="pill-active">已启用</span>' : ''}</div>
-            <div class="dt">${esc(s.id)} · ${esc(s.url)} · 超时 ${s.timeout_sec}s · 密钥 ${s.has_key ? esc(s.key_mask) : '未设置'}</div>
-            <div class="dt" style="${st.ok ? '' : 'color:#b45309'}">${esc(mcpStateText(s))}</div>
-            ${tools ? '<div class="dt dt-wrap" style="margin-top:4px;line-height:1.7">' + tools + '</div>' : ''}
-          </div>
-          <div class="row-actions" style="display:flex;align-items:center;gap:8px">
-            <label style="display:flex;align-items:center;gap:4px;font-size:12px;white-space:nowrap;margin:0">
-              <input type="checkbox" style="width:auto;margin:0" ${s.enabled ? 'checked' : ''}
-                onchange="window.mcpToggle('${esc(s.id)}', this.checked)">启用
-            </label>
-            <button class="btn ghost" style="padding:4px 8px;font-size:12px" onclick="window.mcpEdit('${esc(s.id)}')">编辑</button>
-            <button class="btn ghost" style="padding:4px 8px;font-size:12px" onclick="window.mcpProbe('${esc(s.id)}')">测试</button>
-            <button class="icon-btn danger" title="删除" onclick="window.mcpDel('${esc(s.id)}')">✕</button>
-          </div>
-        </div>`;
-      }).join('');
+      box.innerHTML = list.map(mcpRowHTML).join('');
     } catch (err) { showMCPListMsg('加载失败', 'err'); }
   }
 
