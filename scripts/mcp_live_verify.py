@@ -121,7 +121,9 @@ def sse_chat(message, session_id):
                 cur = line[7:].strip()
                 if cur not in names:
                     names.append(cur)
-    return names, "\n".join(buf)
+    # 第三项是「流有没有正常收口」：服务重启/连接断掉时只有前几帧，
+    # 这时候把「模型没调 MCP」当结论就是尺子坏 —— 明明什么都没测到。
+    return names, "\n".join(buf), ("done" in names)
 
 
 def main():
@@ -271,8 +273,13 @@ def main():
     sess = "mcp-live-%d" % int(time.time())
     msg = ("用已经接入的 DataToolbox MCP 工具，列出数据库里前 5 张表的表名和行数。"
            "必须真的调用 MCP 工具去查，不要凭印象回答，也不要用 http_request 裸调接口。")
-    names, text = sse_chat(msg, sess)
-    print("    事件类型：%s" % ",".join(names))
+    names, text, closed = sse_chat(msg, sess)
+    print("    事件类型：%s（流%s）" % (",".join(names), "正常收口" if closed else "被截断"))
+    if not closed and "delta" not in names:
+        print("  尺子坏：这轮只收到 %s 就断了 —— 服务重启/连接断了，不是「模型没调 MCP」。"
+              % ",".join(names))
+        print("  重启后重跑这条，别拿它当红。")
+        sys.exit(2)
     m = re.search(r"mcp_%s_[a-zA-Z0-9_]+" % re.escape(MCP_ID), text)
     if not m:
         fail("工具轨迹里没有出现 mcp_%s_* —— 模型没调 MCP（它可能去写 http_request 了）" % MCP_ID)
