@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SkillForge · 管理端</title>
-  <link rel="stylesheet" href="/assets/css/style.css?v=20260917A">
+  <link rel="stylesheet" href="/assets/css/style.css?v=20260919A">
   <link rel="stylesheet" href="/assets/vendor/codemirror/lib/codemirror.min.css?v=20260908A">
   <link rel="stylesheet" href="/assets/vendor/codemirror/addon/fold/foldgutter.min.css?v=20260908A">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23111418'/><rect x='9' y='9' width='6' height='14' rx='2' fill='%23c8ccd2'/><rect x='17' y='9' width='6' height='14' rx='2' fill='%23757c86'/></svg>">
@@ -88,7 +88,9 @@
       <!-- Tab: MCP -->
       <!-- 一个入口管所有外部工具：配置、开关、测试连接都在这里。 -->
       <div class="tab-pane hidden" id="tab-mcp" style="display:none">
-        <div class="admin-grid">
+        <!-- mcp-grid：这一栏要装「25 个已挂载工具名」，用 .admin-grid 默认的 380px 左栏
+             会被挤成每行 113px（实测），工具名只剩 ellipsis。所以在这里单独放宽。 -->
+        <div class="admin-grid mcp-grid">
           <div class="card">
             <h3>已接入的 MCP 服务</h3>
             <p class="card-sub">开关立即生效：关掉后对话里立刻不再出现这台服务提供的工具</p>
@@ -305,6 +307,6 @@
 <script src="/assets/vendor/codemirror/addon/fold/foldcode.min.js?v=20260908A"></script>
 <script src="/assets/vendor/codemirror/addon/fold/foldgutter.min.js?v=20260908A"></script>
 <script src="/assets/js/site.js?v=20260911M"></script>
-<script src="/assets/js/admin.js?v=20260919A"></script>
+<script src="/assets/js/admin.js?v=20260919B"></script>
 </body>
 </html>

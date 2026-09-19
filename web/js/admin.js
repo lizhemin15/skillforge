@@ -1535,7 +1535,7 @@
             <div class="nm">${esc(s.name)} ${s.enabled ? '<span class="pill-active">已启用</span>' : ''}</div>
             <div class="dt">${esc(s.id)} · ${esc(s.url)} · 超时 ${s.timeout_sec}s · 密钥 ${s.has_key ? esc(s.key_mask) : '未设置'}</div>
             <div class="dt" style="${st.ok ? '' : 'color:#b45309'}">${esc(mcpStateText(s))}</div>
-            ${tools ? '<div class="dt" style="margin-top:4px;line-height:1.7">' + tools + '</div>' : ''}
+            ${tools ? '<div class="dt dt-wrap" style="margin-top:4px;line-height:1.7">' + tools + '</div>' : ''}
           </div>
           <div class="row-actions" style="display:flex;align-items:center;gap:8px">
             <label style="display:flex;align-items:center;gap:4px;font-size:12px;white-space:nowrap;margin:0">
