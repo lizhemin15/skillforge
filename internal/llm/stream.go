@@ -51,9 +51,15 @@ type StreamOpts struct {
 
 // StreamChat 走流式 chat/completions，把思考链与正文片段分别交给回调，返回正文全文。
 //
-// 与 Complete 的分工：Complete 用 go-openai 且不带任何 provider 私有开关（正文执笔
-// 用它，行为与历史逐字一致）；StreamChat 自己拼 body，因此能带关思考链的开关，
-// 也知道怎么把 reasoning_content 与 content 分开。
+// 与 Complete 的分工：Complete 用 go-openai 且不带任何 provider 私有开关；
+// StreamChat 自己拼 body，因此能带关思考链的开关，也知道怎么把 reasoning_content
+// 与 content 分开。
+//
+// 2026-09-20 起**正文执笔也走这条路**（StreamChat + DisableThinking=false，即 knobNone，
+// 请求体与 CompleteEx 逐字一致）：go-openai 那条隧道不认 SKILLFORGE_THINK_BUDGET，
+// 也没有这里的空闲看门狗与断流重试，而执笔是整轮最长的一跳——上游一慢就是「一直卡着
+// 计时」（线上实测首正文 347.8s、最大静默 297.7s）。Complete/CompleteEx 保留给需要
+// go-openai 语义的老调用方。
 func (c *Client) StreamChat(ctx context.Context, sys, user string, o StreamOpts) (string, error) {
 	if err := c.usable(); err != nil {
 		return "", err
