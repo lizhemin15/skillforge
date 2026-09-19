@@ -256,7 +256,7 @@ func (m *MCPManager) Refresh(ctx context.Context) []MCPServerStatus {
 	}
 
 	newly := map[string]Tool{}
-	owner := map[string]string{}   // 工具名 → 服务器 id
+	owner := map[string]string{} // 工具名 → 服务器 id
 	hintByServer := map[string]string{}
 	statuses := make([]MCPServerStatus, 0, len(cfgs))
 	var hintParts []string
