@@ -300,3 +300,51 @@ func TestEvalTurnBoundsClassifierHop(t *testing.T) {
 		t.Fatalf("超时后不该重试（等待会翻倍），实际发生 %d 次请求", n)
 	}
 }
+
+// TestWriteHopKnobActuallyReachesProvider 守 `SKILLFORGE_WRITE_THINKING` 的落点。
+//
+// 为什么必须有这条：这个开关从引入那天起就是**死的**（见 agent.go 里那段注释）。
+// 它只把调用从 CompleteEx 换成 StreamChat，而 StreamChat 的 `DisableThinking=false`
+// 意思是「不带关思考的开关」= provider 默认=思考照开。于是「关掉它首字 63s→4.8s」
+// 的承诺一次都没兑现过，而线上 A/B 会因为**模型方差**给出「确实快了一点」的假象
+// （实测 186s vs 138s，两臂其实都开着思考链）。
+//
+// 断言钉在「真发出去的请求体」上，不钉耗时：耗时会被网关和模型波动淹没，
+// 而「开关接线断了」是确定性的坏，也只有请求体能一眼看出来。
+func TestWriteHopKnobActuallyReachesProvider(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     string
+		wantOff bool
+	}{
+		{"默认（不设/设 1）= 保留思考链，质量优先", "", false},
+		{"设 1 = 仍然保留", "1", false},
+		{"显式设 0 = 真的关掉", "0", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("SKILLFORGE_WRITE_THINKING", c.env)
+			fp := &fakeProvider{content: "正文一两句，够断言用。"}
+			eng := newTestEngine(t, fp)
+			sc := agentSkillContent("公司新闻通稿")
+			if _, err := eng.GenerateWithPlan(context.Background(), sc, nil, "要点：首段写五要素", func(string) {}); err != nil {
+				t.Fatalf("GenerateWithPlan 失败: %v", err)
+			}
+			body := fp.bodyAt(t, 0)
+			off := body["enable_thinking"] == false || body["reasoning_effort"] == "none"
+			if off != c.wantOff {
+				t.Errorf("请求体里关思考链的开关 = %v，期望 %v（enable_thinking=%v reasoning_effort=%v）"+
+					" —— 这一行漏了就等于「关掉思考链」这个选项根本不存在",
+					off, c.wantOff, body["enable_thinking"], body["reasoning_effort"])
+			}
+			if c.wantOff && body["stream"] != true {
+				t.Errorf("关思考链那一臂仍必须是流式（否则正文一个字都不会滚），实际 stream=%v", body["stream"])
+			}
+		})
+	}
+}
+
+// agentSkillContent 造一个最小可用的写作技能（只给执笔跳要的字段）。
+func agentSkillContent(name string) *SkillContent {
+	return &SkillContent{Name: name, SkillType: "write", SystemPrompt: "你是" + name + "的执行者。"}
+}

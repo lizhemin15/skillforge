@@ -830,14 +830,23 @@ func (e *Engine) generateWithExtraPlan(ctx context.Context, sc *SkillContent, ar
 	} else {
 		done = "请据此给出结构化、可直接照做的办事流程/答案。"
 	}
-	// 执笔这一跳**保留思考链**（质量优先），但把思考片段当中间材料流出去：
+	// 执笔这一跳**默认保留思考链**（质量优先），但把思考片段当中间材料流出去：
 	// 思考链期间正文一个字都没有，不流的话用户看到的就是「一直卡着计时」。
 	if writeThinkingOn() {
 		return e.llm.CompleteEx(ctx, sys, argBlockOf(sc, args)+"\n"+done, onDelta, reasoningSink(ctx))
 	}
+	// ★ 2026-09-19 修：`DisableThinking: true` 是这个开关的**全部意义**，而它从
+	// b1a431a 引入时就漏在这一行了 —— 于是 SKILLFORGE_WRITE_THINKING=0 只是把调用
+	// 从 CompleteEx 换成 StreamChat，思考链照旧开着（stream.go 里 DisableThinking=false
+	// 就是「不带关思考的开关」，等于 provider 默认=开）。也就是文档里写的
+	// 「首字 63s → 4.8s」从来没有兑现过：线上 A/B 实测两臂 186s vs 138s，那 48s
+	// 全是模型方差，因为「关掉」那一臂根本没关。
+	// 守着这一行的是 TestWriteHopKnobActuallyReachesProvider（默认臂必须**不带**开关，
+	// =0 臂必须**真带** enable_thinking=false + reasoning_effort=none）。
 	return e.llm.StreamChat(ctx, sys, argBlockOf(sc, args)+"\n"+done, llm.StreamOpts{
-		OnContent:   onDelta,
-		OnReasoning: reasoningSink(ctx),
+		DisableThinking: true,
+		OnContent:       onDelta,
+		OnReasoning:     reasoningSink(ctx),
 	})
 }
 
