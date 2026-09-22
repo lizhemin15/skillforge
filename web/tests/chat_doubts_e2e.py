@@ -30,7 +30,7 @@
   带引用停问 / 无疑点直写 必须全绿。任一不符合即 rc=1。
   **这是本尺子自己的前提**：没有它，"判据恒绿" 无法被排除。
 
-# LIVE-LEGS: informed TIMEOUT_S=240 | vague TIMEOUT_S=240
+# LIVE-LEGS: doubts-informed TIMEOUT_S=300 | doubts-vague TIMEOUT_S=300
 # ↑ 线上验收 leg 声明。scripts/acceptance-live.sh 只认这一行来枚举要跑几条 leg；
 #   web/tests/live_e2e_roster.test.mjs 守着它跟文件真身不许脱钩。
 """
@@ -76,7 +76,11 @@ def msg_informed(anchor):
 MSG_VAGUE = '帮我写个新闻稿。'
 MSG_INFORMED = msg_informed(ANCHOR)
 
-MSG = {'informed': MSG_INFORMED, 'vague': MSG_VAGUE}[LEG if LEG in ('informed', 'vague') else 'informed']
+# leg 名带 `doubts-` 前缀是给 runner 的 `ONLY=doubts` 用的（一次挑中两条腿）；
+# 判据里只认家族名（informed / vague），免得前缀一改判据就跟着瞎。
+FAMILY = LEG.split('-')[-1] if LEG.split('-')[-1] in ('informed', 'vague') else 'informed'
+
+MSG = {'informed': MSG_INFORMED, 'vague': MSG_VAGUE}[FAMILY]
 
 fails = []
 checks = 0
@@ -314,8 +318,8 @@ def main():
     print(f'{"停问文案" if obs["asked"] else "正文前 120 字"}={norm(obs["ask_text"] or obs["body_text"])[:120]}')
     print(f'原始帧落盘：{raw_path}')
 
-    rows = judge_turn(LEG, MSG, obs['asked'], obs['ask_text'], obs['body_text'],
-                      obs['notes'], obs['first_useful_s'], ANCHOR if LEG == 'informed' else '')
+    rows = judge_turn(FAMILY, MSG, obs['asked'], obs['ask_text'], obs['body_text'],
+                      obs['notes'], obs['first_useful_s'], ANCHOR if FAMILY == 'informed' else '')
     for name, ok, extra in rows:
         check(name, ok, extra)
     if obs['notes']:
