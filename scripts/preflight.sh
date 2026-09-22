@@ -358,6 +358,13 @@ if [ "$QUICK" = 0 ]; then
   selfcheck 'OCR / 质量判据单测'        python3 deploy/ocr/test_ocrd_quality.py
   # 退出前等在飞请求走完（有上限），且不许把自愈路径堵死 —— 也是 0 引用的游离尺子。
   selfcheck 'OCR / 退出等待与自愈单测'  python3 deploy/ocr/test_guard_wait.py
+  # 逐页流复验尺子的自证（六方向：真流式 / 攒齐再吐 / 老件一把回 JSON / 缓存命中 /
+  # 半途断流 / 接口 404），六个方向各自必须精确命中**它自己那条**判据。
+  # 守的是用户投诉「一直卡着计时」这个体验：解析期原来静默 33s 只有裸计时在跳，
+  # 现在边解析边把每页真材料滚出来 —— 而「是真的渐进」这件事只有这把尺子量得到。
+  # 自证挂这里（假服务，不需要 ocrd，CI 也跑得动）；真验收腿在 scripts/deploy_ocrd.sh
+  # 第 6b 步（上线门禁，要一台活着的 ocrd），两边共用同一个 judge()。
+  selfcheck 'OCR / 逐页流尺子自证'      python3 scripts/verify_ocr_stream.py --selftest
   # Bug N「停用即从界面蒸发」的自证：跨前端契约 + 后端契约 + Go 行为三层。
   selfcheck '前端 / 停用技能列表自证'   python3 web/tests/skill_disabled_admin_ui_mutation_check.py
   # Bug O「误报目标机没有 python3」的自证：候选名单漂移 / 写死单路径 / 不探活。

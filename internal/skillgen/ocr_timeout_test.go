@@ -96,7 +96,7 @@ func TestOCRProgressTicks(t *testing.T) {
 	}
 
 	start := time.Now()
-	stop := ocrProgress(collect, "手册.pdf", start)
+	stop := ocrProgress(collect, "手册.pdf", start, nil)
 	if _, err := ocrExtract(context.Background(), srv.URL, "手册.pdf", []byte("x"), (&Generator{}).ocrClient()); err != nil {
 		t.Fatalf("解析应当成功：%v", err)
 	}
@@ -127,7 +127,7 @@ func TestOCRProgressTicks(t *testing.T) {
 
 // TestOCRProgressNilSteps：没有 steps 回调时不许 panic（也不许阻塞）。
 func TestOCRProgressNilSteps(t *testing.T) {
-	stop := ocrProgress(nil, "手册.pdf", time.Now())
+	stop := ocrProgress(nil, "手册.pdf", time.Now(), nil)
 	stop()
 	stop() // 幂等：重复调用不能 panic（close 已关闭的 chan 会炸，这里必须靠实现保证）
 }

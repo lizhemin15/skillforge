@@ -35,7 +35,7 @@ for i in $(seq 1 60); do curl -s --max-time 2 "http://127.0.0.1:$PORT/health" >/
 PREH="$(curl -s --max-time 5 "http://127.0.0.1:$PORT/health" || true)"
 kill "$PREPID" 2>/dev/null || true; wait "$PREPID" 2>/dev/null || true
 echo "  预验 /health：$PREH"
-echo "$PREH" | grep -q "ocrd-v5-runtime-guard" || { echo "FAIL: 新件版本串不对（期望 ocrd-v5-runtime-guard）→ 拒绝上线"; exit 3; }
+echo "$PREH" | grep -q "ocrd-v6-page-stream" || { echo "FAIL: 新件版本串不对（期望 ocrd-v6-page-stream）→ 拒绝上线"; exit 3; }
 echo "$PREH" | grep -q '"runtime_ok": *true' || { echo "FAIL: 新件 /health 没报 runtime_ok=true"; exit 3; }
 echo "  ok: 新件自带运行时守卫且健康可见"
 
@@ -53,8 +53,8 @@ echo "=== 6) 线上复验 ==="
 H="$(curl -s --max-time 5 http://127.0.0.1:8093/health)"
 echo "  /health：$H"
 echo "$H" | grep -q '"runtime_ok": *true' || { echo "FAIL: 线上 /health 无 runtime_ok=true → 回滚"; systemctl stop skillforge-ocr; install -m 0755 "$BAK" "$LIVE"; systemctl start skillforge-ocr; exit 4; }
-echo "$H" | grep -q 'ocrd-v5-runtime-guard' || { echo "FAIL: 线上版本串不是新件 → 回滚"; systemctl stop skillforge-ocr; install -m 0755 "$BAK" "$LIVE"; systemctl start skillforge-ocr; exit 4; }
-echo "  ok: 线上已是 ocrd-v5-runtime-guard 且 runtime_ok=true"
+echo "$H" | grep -q 'ocrd-v6-page-stream' || { echo "FAIL: 线上版本串不是新件 → 回滚"; systemctl stop skillforge-ocr; install -m 0755 "$BAK" "$LIVE"; systemctl start skillforge-ocr; exit 4; }
+echo "  ok: 线上已是 ocrd-v6-page-stream 且 runtime_ok=true"
 systemctl is-active skillforge-ocr
 systemctl show skillforge-ocr -p NRestarts --no-pager
 
@@ -68,4 +68,28 @@ if [ -f /tmp/live_mixed/mixed_wm.pdf ]; then
     | python3 -c "import json,sys; d=json.load(sys.stdin); print('  混合料:', json.dumps(d.get('stats'), ensure_ascii=False), 'chars=', d.get('chars'), 'ok=', d.get('ok'))"
 fi
 
+echo "=== 6b) 逐页流复验（v6 新能力：解析期屏幕要滚材料，而不是滚裸计时）==="
+# 为什么这条必须是**上线门禁**而不是躺在 CI 里的单测：逐页流是「屏幕上有真材料在动」
+# 这个体验修复的**唯一**来源。它若在路上（反向代理缓冲、老件没换、Accept 头没被认），
+# 现象就是回到「一直卡着计时」——用户投诉的原话，而所有既有断言照样全绿。
+# 判据**只有一份**：scripts/verify_ocr_stream.py（真验收腿与尺子自证共用同一个 judge()）。
+# 此前这里抄过第二份判据，而且写成 `curl … | python3 - <<'PY'` —— heredoc 与管道抢 stdin，
+# python3 把程序文本当输入、sys.stdin 是空的，于是所有断言都在空数据上跑：看着「跑了」，
+# 实际一条都没量到。抄出来的判据不会自动跟着变，这就是它烂掉的方式。
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+STREAM_PDF=""
+for c in "${FIXTURE_PDF:-}" "$ROOT/testdata/ocr/scan3-rtloss.pdf" /tmp/heavy_mixed_s15_t45.pdf; do
+  if [ -n "$c" ] && [ -f "$c" ]; then STREAM_PDF="$c"; break; fi
+done
+if [ -z "$STREAM_PDF" ]; then
+  # 逐页流是本次发布的核心能力：量不到就不许发布（SKIP 不算过）。
+  echo "FAIL: 本机没有可用 PDF 试料 → 逐页流**未验证** → 回滚"
+  systemctl stop skillforge-ocr; install -m 0755 "$BAK" "$LIVE"; systemctl start skillforge-ocr; exit 5
+fi
+# NONCE=1：ocrd 按内容 hash 缓存，命中缓存时 on_page 根本不回调 → 同料复跑会量成
+# 「零逐页行」的假红。尺子会给试料尾部追加唯一注释改掉内容 hash，保证每次都量到冷解析。
+NONCE=1 python3 "$ROOT/scripts/verify_ocr_stream.py" http://127.0.0.1:8093 "$STREAM_PDF" 2 \
+  || { echo "FAIL: 逐页流复验没过 → 回滚"; systemctl stop skillforge-ocr; install -m 0755 "$BAK" "$LIVE"; systemctl start skillforge-ocr; exit 5; }
+
 echo "=== 上线完成：$TAG ==="
+

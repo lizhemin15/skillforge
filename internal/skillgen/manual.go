@@ -1,6 +1,7 @@
 package skillgen
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -231,9 +232,76 @@ func (g *Generator) OCRTimeout() time.Duration { return g.ocrTimeoutOrDefault() 
 // 给页数更多 / dpi 更高的手册留空间；再多就用 SKILLFORGE_OCR_TIMEOUT 调。
 const DefaultOCRTimeout = 30 * time.Minute
 
-// ocrProgressInterval 是长解析期间回报进度的间隔。
+// ocrProgressInterval 是长解析期间回报进度的间隔（**只在拿不到逐页流时用**：
+// 老版解析服务、或非 PDF 这类本来就没有「页」的格式）。
 // 变量而非常量：测试要把它压到毫秒级，避免真的等 30s。
 var ocrProgressInterval = 30 * time.Second
+
+// ocrStallInterval 是逐页流式下「真卡住」的判定阈值：连着这么久一页都没回来，
+// 才播一句兜底旁白（带已读到第几页）。
+//
+// 为什么不再固定 30s 报一次「已等待 30s…」：有页可报时屏幕上滚的是**材料本身**，
+// 再叠一句裸计时纯属噪音，还会把材料挤走。用户原话——「一直卡着计时，体验不佳」。
+var ocrStallInterval = 8 * time.Second
+
+// ocrActivity 记录逐页流的活性，供心跳区分「在动」和「真卡住」。
+// 并发说明：onPage 由读流的 goroutine 调，心跳是另一个 goroutine —— 必须加锁。
+type ocrActivity struct {
+	mu       sync.Mutex
+	pages    int
+	total    int
+	lastPage time.Time
+	seen     bool
+}
+
+func (a *ocrActivity) page(pno, total int) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.pages, a.total, a.seen, a.lastPage = pno, total, true, time.Now()
+	a.mu.Unlock()
+}
+
+// snapshot 返回 (已收到第几页, 共几页, 是否收到过页, 距上一页的静默时长)。
+func (a *ocrActivity) snapshot() (int, int, bool, time.Duration) {
+	if a == nil {
+		return 0, 0, false, 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var idle time.Duration
+	if a.seen {
+		idle = time.Since(a.lastPage)
+	}
+	return a.pages, a.total, a.seen, idle
+}
+
+// ocrPageStep 把一页解析结果说成一行人话：**带上这一页的真材料**。
+// 这是「一直卡着计时」的直接修复 —— 屏幕滚的是材料，不是秒数。
+func ocrPageStep(fn string, pno, total int, src, text string) string {
+	how := map[string]string{"text": "文本层直取", "ocr": "扫描页 OCR", "empty": "无文字"}[src]
+	if how == "" {
+		how = src
+	}
+	return fmt.Sprintf("%s 第 %d/%d 页（%s）：%s", fn, pno, total, how, pageSnippet(text, 60))
+}
+
+// pageSnippet 取这一页开头一小段文字当「材料在动」的证据。
+// 空页不编话：直接说「（本页无文字）」——别让用户以为有内容被吞了。
+func pageSnippet(text string, max int) string {
+	for _, ln := range strings.Split(text, "\n") {
+		ln = strings.Join(strings.Fields(ln), " ")
+		if ln == "" {
+			continue
+		}
+		if r := []rune(ln); len(r) > max {
+			return string(r[:max]) + "…"
+		}
+		return ln
+	}
+	return "（本页无文字）"
+}
 
 // ocrClient 返回调用解析服务用的 HTTP 客户端。
 // 超时是**整体**上限（含逐页推理），不是连接超时——别改小。
@@ -247,28 +315,41 @@ func (g *Generator) ocrClient() *http.Client {
 	return tlsconf.NewClient(d)
 }
 
-// ocrProgress 在解析期间周期回报「还在跑、已等待多久」，避免前端看起来像卡死。
+// ocrProgress 在解析期间回报进度，避免前端看起来像卡死。
 //
 // 返回的 stop 必须在解析返回后**立刻**调用：它停掉心跳并等待心跳 goroutine 退出。
 // 少了这一步，goroutine 可能在 HTTP handler 返回之后还在往 ResponseWriter 写。
 // stop 幂等（内部 sync.Once）：调用点写成 defer 再显式调用一次也不会炸。
-func ocrProgress(steps func(string), fn string, start time.Time) func() {
+//
+// act 为 nil 或「一页都没收到」时退回老行为（固定间隔报裸计时）——那是没有逐页可
+// 播报的场景（老解析服务 / 非 PDF），此时秒数就是唯一能给的活信息。
+func ocrProgress(steps func(string), fn string, start time.Time, act *ocrActivity) func() {
 	if steps == nil {
 		return func() {}
+	}
+	tick := ocrProgressInterval
+	if ocrStallInterval < tick {
+		tick = ocrStallInterval
 	}
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		t := time.NewTicker(ocrProgressInterval)
+		t := time.NewTicker(tick)
 		defer t.Stop()
+		lastSpeak := time.Now()
 		for {
 			select {
 			case <-done:
 				return
 			case <-t.C:
-				steps(fmt.Sprintf("%s 解析中，已等待 %s…", fn, humanDuration(time.Since(start))))
+				msg, ok := ocrProgressNarration(fn, start, act, time.Since(lastSpeak))
+				if !ok {
+					continue
+				}
+				lastSpeak = time.Now()
+				steps(msg)
 			}
 		}
 	}()
@@ -279,6 +360,28 @@ func ocrProgress(steps func(string), fn string, start time.Time) func() {
 			wg.Wait()
 		})
 	}
+}
+
+// ocrProgressNarration 决定这一拍要不要说话、说什么。ok=false 就是「闭嘴」。
+//
+// 三条规则（顺序即优先级）：
+//  1. 逐页流在动（距上一页 < ocrStallInterval）→ 不说。屏幕上已经有材料在滚了。
+//  2. 逐页流卡住（≥ ocrStallInterval 没新页）→ 说，且带上「已读到第几页」：
+//     用户能立刻分清「在慢慢啃这份扫描件」和「进程死了」。
+//  3. 根本没有页（老服务 / 非 PDF）→ 按 ocrProgressInterval 报已等待时长。
+func ocrProgressNarration(fn string, start time.Time, act *ocrActivity, sinceSpeak time.Duration) (string, bool) {
+	pages, total, seen, idle := act.snapshot()
+	if seen {
+		if idle < ocrStallInterval {
+			return "", false
+		}
+		return fmt.Sprintf("%s 解析中：已读到第 %d/%d 页，本页仍在识别（已等待 %s）…",
+			fn, pages, total, humanDuration(time.Since(start))), true
+	}
+	if sinceSpeak < ocrProgressInterval {
+		return "", false
+	}
+	return fmt.Sprintf("%s 解析中，已等待 %s…", fn, humanDuration(time.Since(start))), true
 }
 
 // ocrTimeoutOrDefault 返回当前生效的解析超时上限（用于给人看的报错文案）。
@@ -325,8 +428,20 @@ type ocrResult struct {
 
 // ocrExtract 调用 ocrd 的 /extract 接口把文档解析成纯文本。
 // 字段名与 api 层 extractDoc 保持一致（form 字段 "file"），避免两个调用方
-// 对同一个微服务用两套协议。
+// 对同一个微服务用两套协议。不带逐页回调：自检 / 诊断这类只关心最终文本的调用方。
 func ocrExtract(ctx context.Context, ocrURL, filename string, data []byte, client *http.Client) (ocrResult, error) {
+	return ocrExtractPages(ctx, ocrURL, filename, data, client, nil)
+}
+
+// ocrExtractPages 同上，但带逐页回调：解析边做边把「第几页、走的哪条路、这页的真文字」
+// 交出去，让屏幕在解析期就滚**材料本身**，而不是一个「已等待 30s…」的裸计时。
+// 用户原话是「中间可以流式输出思考的中间材料，现在一直卡着计时」——解析期正是最长那段。
+//
+// 兼容性（这条兜底不是「保险起见」）：只有响应确实是 NDJSON（Content-Type 含 ndjson）
+// 才走逐页解析；老版 ocrd、或提前失败（运行时丢失 / 参数错）回的还是单 JSON，
+// 一律走原路径。有了它，「应用服务」和「解析服务」才可以不同版本各自升级。
+func ocrExtractPages(ctx context.Context, ocrURL, filename string, data []byte, client *http.Client,
+	onPage func(pno, total int, src, text string)) (ocrResult, error) {
 	var res ocrResult
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
@@ -349,6 +464,9 @@ func ocrExtract(ctx context.Context, ocrURL, filename string, data []byte, clien
 		return res, err
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
+	// 显式索取逐页流。**只认显式请求**（对端也只在显式时开流）：老版 ocrd 不认这个
+	// 头，照旧回单 JSON，我们下面的分支会认出来并走老路径。
+	req.Header.Set("Accept", "application/x-ndjson")
 	// 超时由调用方注入（默认 30 分钟，见 DefaultOCRTimeout）。这里坚决不写死数值：
 	// 旧实现写死 300s，而真实扫描件要 397.5s，导致解析必然失败却只在流里留一行 ⚠️。
 	resp, err := client.Do(req)
@@ -358,24 +476,39 @@ func ocrExtract(ctx context.Context, ocrURL, filename string, data []byte, clien
 		return res, ocrsvc.Explain(err, ocrURL)
 	}
 	defer resp.Body.Close()
+	if strings.Contains(resp.Header.Get("Content-Type"), "ndjson") {
+		return ocrReadPageStream(resp.Body, res, onPage, ocrURL)
+	}
+	// ── 老路径：单 JSON（老版 ocrd / 提前失败 / 非 PDF 直取）────────────────
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 	if err != nil {
 		return res, err
 	}
-	var out struct {
-		OK      bool           `json:"ok"`
-		Text    string         `json:"text"`
-		Error   string         `json:"error"`
-		Warning string         `json:"warning"`
-		Stats   map[string]any `json:"stats"`
-	}
-	if err := json.Unmarshal(body, &out); err != nil {
+	return ocrResultFromWire(body, res, ocrURL)
+}
+
+// ocrWire 是 ocrd 的单 JSON 回包（老路径，也是逐页流的末行）。
+type ocrWire struct {
+	OK      bool           `json:"ok"`
+	Done    bool           `json:"done"`
+	Text    string         `json:"text"`
+	Error   string         `json:"error"`
+	Warning string         `json:"warning"`
+	Stats   map[string]any `json:"stats"`
+}
+
+// ocrResultFromWire 把一个 JSON 回包翻成 (结果, 错误)。单 JSON 路径与逐页流的
+// 末行走**同一份**判定逻辑——两份实现早晚会漂移，而漂移的代价是「自愈提示有时
+// 出现有时不出现」这种最难查的差异。
+func ocrResultFromWire(body []byte, res ocrResult, ocrURL string) (ocrResult, error) {
+	var out ocrWire
+	if err := json.Unmarshal(bytes.TrimSpace(body), &out); err != nil {
 		return res, fmt.Errorf("解析服务返回无法识别: %w", err)
 	}
 	// 服务自报「运行时损坏、正在自动重启」：与「这份文件解析不了」是两码事——
 	// 文件没问题，约 10 秒后重试就成功。不识别它，用户看到的是内部错误文案，
 	// 然后就再也不会重试了。
-	if ocrsvc.SelfHealing(body) {
+	if ocrsvc.SelfHealing(bytes.TrimSpace(body)) {
 		return res, errors.New(ocrsvc.SelfHealingMessage(ocrURL, out.Error))
 	}
 	if !out.OK {
@@ -385,6 +518,42 @@ func ocrExtract(ctx context.Context, ocrURL, filename string, data []byte, clien
 	res.Warning = strings.TrimSpace(out.Warning)
 	res.Stats = out.Stats
 	return res, nil
+}
+
+// ocrReadPageStream 读 NDJSON 逐页流：每行一页（page/pages/src/text），末行是
+// 与单 JSON 同形的汇总。**边读边回调**，所以解析期屏幕上滚的是材料本身。
+//
+// 用 bufio.Reader+ReadBytes 而不是 Scanner：Scanner 有 64KB 单行上限，而一页正文
+// 超过 64KB 完全正常（大字号扫描页），撞上就报 "token too long" 把整份解析判死。
+func ocrReadPageStream(r io.Reader, res ocrResult, onPage func(pno, total int, src, text string), ocrURL string) (ocrResult, error) {
+	br := bufio.NewReaderSize(r, 1<<20)
+	for {
+		line, err := br.ReadBytes('\n')
+		if trim := bytes.TrimSpace(line); len(trim) > 0 {
+			var obj struct {
+				ocrWire
+				Page  int    `json:"page"`
+				Pages int    `json:"pages"`
+				Src   string `json:"src"`
+			}
+			if uerr := json.Unmarshal(trim, &obj); uerr != nil {
+				// 单行坏掉不该把整轮解析判死：跳过并留证据，末行才是判定依据。
+				log.Printf("[ocr] 逐页流有无法解析的行（已跳过，共 %d 字节）：%.160s", len(trim), trim)
+			} else if obj.Done {
+				return ocrResultFromWire(trim, res, ocrURL)
+			} else if onPage != nil && obj.Page > 0 {
+				onPage(obj.Page, obj.Pages, obj.Src, obj.Text)
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				// 没收到末行流就断了（服务被杀 / 连接被中间设备掐）：结果完整性无从确认。
+				// 这里必须报错而不是把半截文本当成功——半截素材会安静地训出一个错技能。
+				return res, errors.New("解析流在汇总行到达前中断，结果不完整")
+			}
+			return res, err
+		}
+	}
 }
 
 // statsLine 把逐页统计压成一行人能读的话，写进训练进度流。
@@ -617,8 +786,17 @@ func (g *Generator) ingestFiles(ctx context.Context, in *Input, steps func(strin
 		start := time.Now()
 		raw := []byte(uf.Content)
 		// 扫描件解析要几分钟，中途必须回报进度——否则前端看起来就是卡死。
-		stopProgress := ocrProgress(steps, fn, start)
-		res, err := ocrExtract(ctx, g.ocrURL, fn, raw, g.ocrClient())
+		// 但「回报进度」的正确形态是**材料本身**：每解析完一页就把那页真文字吐进流，
+		// 屏幕在滚正文；只有真的连续多秒没新页时才补一句带页码的兜底话。
+		act := &ocrActivity{}
+		stopProgress := ocrProgress(steps, fn, start, act)
+		res, err := ocrExtractPages(ctx, g.ocrURL, fn, raw, g.ocrClient(),
+			func(pno, total int, src, text string) {
+				act.page(pno, total)
+				if steps != nil {
+					steps(ocrPageStep(fn, pno, total, src, text))
+				}
+			})
 		stopProgress()
 		if err != nil {
 			// 环境类失败（服务没在运行）：逐文件只留一行短句，完整修复指引走 EnvHint

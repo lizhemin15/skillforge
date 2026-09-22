@@ -64,7 +64,13 @@ GARBLED_DETAIL_MAX = 20
 # 事故教训：换二进制后只靠 `systemctl restart` + 进程活着，看不出新逻辑有没有生效；
 # 一旦 /health 能把「逐页择优 + 阈值」报出来，部署验收就有可 curl 的证据，
 # 不用去猜「是不是没重启成功」。
-VERSION = "ocrd-v5-runtime-guard"
+# v6 新增：/extract 支持**逐页流式**（请求头 Accept: application/x-ndjson）——
+# 逐页把「第几页、走的哪条路、这页的真文字」作为一行 NDJSON 吐出去。
+# 为什么值一次版本跳：解析是整条链路里最长的静默段（60 页混合件冷解析实测 33.2s，
+# 客户内网扫描件是分钟级），而那段时间上层只能给用户一个**裸计时**（「已等待 30s…」），
+# 用户读作「卡死」。逐页一吐，屏幕上滚的就是材料本身，静默从「数十秒」压到「单页耗时」。
+# 老客户端（不带 Accept）走的还是原来那条阻塞式单 JSON 路径，字节级不变。
+VERSION = "ocrd-v6-page-stream"
 
 # ---------- 运行时目录守卫（2026-09-16 线上事故）----------
 # PyInstaller onefile 会把权重/配置解包到 $TMPDIR/_MEIxxxx/。默认 TMPDIR=/tmp，而线上
@@ -140,6 +146,15 @@ def private_tmpdir() -> bool:
 def tmpdir_is_shared() -> bool:
     """解包目录落在共用临时目录里 → 随时可能被系统清理，启动时要显式警告。"""
     return bool(runtime_dir()) and not private_tmpdir()
+
+
+class _ClientGone(Exception):
+    """逐页流式里对端中途断开（关页面 / 杀进程 / 超时放弃）。
+
+    单独一个类型是必须的：_pdf 对「逐页回调抛异常」一律吞掉（进度是锦上添花，
+    不能让回调 bug 把整份解析带走），但对端已经没了属于**另一类** —— 继续把这本
+    算完是纯烧 CPU，必须让它穿透那层保护网，见 _pdf 里的 re-raise。
+    """
 
 
 def exit_for_restart(delay: float = 0.4, timeout: float = 10.0):
@@ -451,8 +466,11 @@ class OcrEngine:
         self._n_since_recycle = 0
         gc.collect()
 
-    def extract(self, raw: bytes, name: str):
+    def extract(self, raw: bytes, name: str, on_page=None):
         """全格式入口: 返回 (fmt, text, chars, from_cache, stats)。per-hash 锁并发去重。
+
+        on_page(pno, total, src, text) 可选：每解析完一页回调一次（PDF 专用），
+        给 /extract 的逐页流式用。非 PDF / 缓存命中不回调 —— 那两条路本来就没有「页」。
 
         stats 是解析可信度诊断（PDF: pages/text_pages/ocr_pages/empty_pages），非 PDF 为 {}。
         为什么要它：**char 数分辨不出「解析出 1129 字正文」和「解析出 1129 字水印」**。
@@ -468,7 +486,7 @@ class OcrEngine:
             cached = self.cache.get(h)
             if cached is not None:
                 return cached[0], cached[1], len(cached[1]), True, cached[2]
-            fmt, text, stats = self._do_extract(raw, name)
+            fmt, text, stats = self._do_extract(raw, name, on_page)
             if len(text) > MAX_TEXT:
                 text = text[:MAX_TEXT]
                 stats = dict(stats or {})
@@ -476,7 +494,7 @@ class OcrEngine:
             self.cache.put(h, (fmt, text, stats), len(raw))
             return fmt, text, len(text), False, stats
 
-    def _do_extract(self, raw: bytes, name: str):
+    def _do_extract(self, raw: bytes, name: str, on_page=None):
         fmt = detect_format(raw, name)
         if fmt == "text":
             return "text", decode_text(raw), {}
@@ -485,7 +503,7 @@ class OcrEngine:
             text, _ = fn(raw)
             return fmt, text, {}
         if fmt == "pdf":
-            return self._pdf(raw)
+            return self._pdf(raw, on_page)
         if fmt == "legacy_office":
             raise ValueError("老格式 .doc/.xls/.ppt 无法在线解析, 请另存为 docx/xlsx/pptx 后上传")
         raise ValueError("不支持的文件格式: %s" % name)
@@ -515,7 +533,7 @@ class OcrEngine:
         lines = [ln[1] for ln in res] if res else []
         return "\n".join(lines).strip()
 
-    def _pdf(self, raw: bytes):
+    def _pdf(self, raw: bytes, on_page=None):
         """既有三层优化 PDF 路径 (逐页文本层判定 + OCR + 流式)。返回 (fmt, text, stats)。
 
         逐页判定要过两道关：MIN_PAGE_CHARS（够厚）+ _text_quality（可读）。可选中 PDF 两关
@@ -546,28 +564,41 @@ class OcrEngine:
                 # ① 文本层够厚**且可读** → 直取（最省，可选中 PDF 的正常路径）
                 if len(txt) >= MIN_PAGE_CHARS and txt_ok:
                     stats["text_pages"] += 1
-                    pieces.append(txt)
-                    continue
-                # ② 文本层为空 / 只有水印页码 / 够厚但乱码 → 按扫描页处理，渲染 + OCR
-                ocr_txt = self._ocr_page(page, tmpdir, pno)
-                # 采信 OCR 的前提是它自己也「可读」：否则等于把乱码从文本层搬到 OCR 结果里。
-                ocr_ok = bool(ocr_txt) and _text_quality(ocr_txt)[0]
-                if ocr_txt and (ocr_ok or not txt):
-                    # 文本层本来就没字时，即便 OCR 结果不太可读也比空页强，照样采用
-                    stats["ocr_pages"] += 1
-                    pieces.append(ocr_txt)
-                elif txt:
-                    # OCR 失败或结果同样不可读：宁可留下不可信的文本层，也不要丢页
-                    stats["text_pages"] += 1
-                    pieces.append(txt)
+                    src, piece = "text", txt
                 else:
-                    stats["empty_pages"] += 1
-                # 文本层被判乱码的页单独记一笔：无论最后用 OCR 救回来还是留了原文，
-                # 对上层都是同一个问题（字体缺 ToUnicode），都要能查得到。
-                if txt and not txt_ok:
-                    stats["garbled_pages"] += 1
-                    if len(stats["garbled_detail"]) < GARBLED_DETAIL_MAX:
-                        stats["garbled_detail"].append("第%d页: %s" % (pno + 1, txt_why))
+                    # ② 文本层为空 / 只有水印页码 / 够厚但乱码 → 按扫描页处理，渲染 + OCR
+                    ocr_txt = self._ocr_page(page, tmpdir, pno)
+                    # 采信 OCR 的前提是它自己也「可读」：否则等于把乱码从文本层搬到 OCR 结果里。
+                    ocr_ok = bool(ocr_txt) and _text_quality(ocr_txt)[0]
+                    if ocr_txt and (ocr_ok or not txt):
+                        # 文本层本来就没字时，即便 OCR 结果不太可读也比空页强，照样采用
+                        stats["ocr_pages"] += 1
+                        src, piece = "ocr", ocr_txt
+                    elif txt:
+                        # OCR 失败或结果同样不可读：宁可留下不可信的文本层，也不要丢页
+                        stats["text_pages"] += 1
+                        src, piece = "text", txt
+                    else:
+                        stats["empty_pages"] += 1
+                        src, piece = "empty", ""
+                    # 文本层被判乱码的页单独记一笔：无论最后用 OCR 救回来还是留了原文，
+                    # 对上层都是同一个问题（字体缺 ToUnicode），都要能查得到。
+                    if txt and not txt_ok:
+                        stats["garbled_pages"] += 1
+                        if len(stats["garbled_detail"]) < GARBLED_DETAIL_MAX:
+                            stats["garbled_detail"].append("第%d页: %s" % (pno + 1, txt_why))
+                if piece:
+                    pieces.append(piece)
+                # 逐页回报：这是「解析期静默」的解药 —— 上层拿到就能立刻把**材料本身**
+                # 滚到屏幕上，而不是干等一个「已等待 N 秒…」的裸计时。
+                # 回调抛异常必须吞掉：进度是锦上添花，不能把整份解析连带搞砸。
+                if on_page is not None:
+                    try:
+                        on_page(pno + 1, total, src, piece)
+                    except _ClientGone:
+                        raise          # 对端没了：别算了（见 _ClientGone 注释）
+                    except Exception:
+                        pass
             return "pdf", "\n\n".join(pieces), stats
         finally:
             if doc: doc.close()
@@ -636,12 +667,52 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
     def _send_json(self, code, obj):
-        body = json.dumps(obj, ensure_ascii=False).encode()
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    # ---------- 逐页流式（v6）----------
+    # 契约（只有显式要流的客户端才看得到，老客户端字节级不变）：
+    #   每页一行：{"page":N,"pages":M,"src":"text|ocr|empty","chars":C,"text":"<本页原文>"}
+    #   末行一行：{"done":true,"ok":true, ...与阻塞式完全相同的字段}
+    #         或：{"done":true,"ok":false,"error":"...","self_healing":bool}
+    # 为什么用「一行一词 JSON + 连接关闭定界」而不是 Content-Length：
+    #   解析是边做边有结果的，页数事先未必知道（也算不出来），必须能边算边发。
+    #   本服务默认 HTTP/1.0（没设 protocol_version），所以用 Connection: close 定界，
+    #   不硬塞 chunked —— 少一层编码就少一个对端要实现的协议细节。
+    def _wants_page_stream(self) -> bool:
+        """逐页流式开关：只认显式请求（Accept: application/x-ndjson 或 ?stream=1）。
+
+        默认关闭是刻意的：现网调用方（自检、离线包内测、验收脚本）用的还是阻塞式
+        协议，切换默认值等于把它们一起打断 —— 新能力不该靠改默认值上线。
+        """
+        if "stream=1" in (self.path or ""):
+            return True
+        return "application/x-ndjson" in (self.headers.get("Accept") or "").lower()
+
+    def _stream_begin(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def _stream_line(self, obj):
+        # ensure_ascii=False + 逐行写：页面原文里的换行由 json 转义承载，
+        # 不会把「一行」撑破成多行（撑破就等于对端解析全乱）。
+        if getattr(self, "_stream_dead", False):
+            return
+        try:
+            self.wfile.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+            self.wfile.flush()
+        except Exception:
+            # 对端断了（关页面 / 关进程 / RST）。这不是本服务的错误，不该冒泡给
+            # do_POST（那样只会多一条无人看的栈）。但它必须**记下来**：
+            # 下一次 on_page 会据此抛 _ClientGone 让解析提前收工。
+            self._stream_dead = True
     def do_GET(self):
         inflight_delta(1)
         try:
@@ -719,10 +790,30 @@ class Handler(BaseHTTPRequestHandler):
         if raw is None:
             return self._send_json(400, {"ok": False, "error": "no_file_field"})
         t0 = time.time()
+        # 逐页流式只在 /extract 上开，且必须由调用方显式索取（见 _wants_page_stream）。
+        stream = (path == "/extract") and self._wants_page_stream()
+        if stream:
+            self._stream_begin()
+
+        def on_page(pno, total, src, text):
+            # text 是这一页的**真材料**，不是「进度：3/60」。上层拿它直接上屏，
+            # 用户看到的从「已等待 30s…」变成「第 3/60 页（扫描件 OCR）：<正文>」。
+            if getattr(self, "_stream_dead", False):
+                raise _ClientGone()
+            self._stream_line({"page": pno, "pages": total, "src": src,
+                               "chars": len(text), "text": text})
+
         try:
-            fmt, text, chars, from_cache, stats = ENGINE.extract(raw, name or "")
+            fmt, text, chars, from_cache, stats = ENGINE.extract(
+                raw, name or "", on_page if stream else None)
             ms = round((time.time() - t0) * 1000)
             warn = parse_warning(stats, chars)
+            if stream:
+                return self._stream_line({
+                    "done": True, "ok": True, "fmt": fmt, "text": text, "chars": chars,
+                    "name": name or "", "hash": hashlib.sha256(raw).hexdigest(),
+                    "from_cache": from_cache, "total_ms": ms,
+                    "stats": stats, "warning": warn})
             if path == "/extract":
                 return self._send_json(200, {
                     "ok": True, "fmt": fmt, "text": text, "chars": chars,
@@ -742,10 +833,22 @@ class Handler(BaseHTTPRequestHandler):
             msg = str(e)
             # 引擎重建时才发现运行时目录没了 → 同样「说清 + 自愈」，而不是回一句 Errno 2。
             if (not runtime_ok()) or msg == RUNTIME_LOST_MSG or RUNTIME_LOST_MSG in msg:
+                if stream:
+                    # 响应头早就发出去了，回不了 JSON 状态码；用末行说同一句话。
+                    self._stream_line({"done": True, "ok": False, "error": RUNTIME_LOST_MSG,
+                                       "runtime_ok": False, "self_healing": True})
+                    self.close_connection = True
+                    exit_for_restart()
+                    return
                 # body 此时已读完，不存在「对端还在上传」的问题；仍走同一条路径，
                 # 让「回包 → 等其它在飞请求 → 退出」只有一处实现。
                 self._reply_then_restart({"ok": False, "error": RUNTIME_LOST_MSG,
                                           "runtime_ok": False, "self_healing": True})
+                return
+            if stream:
+                # 含 _ClientGone（对端已断）：_stream_line 自己会因为 _stream_dead 直接返回，
+                # 这里不用再分情况 —— 多一个分支就多一处「谁负责收尾」的扯皮。
+                self._stream_line({"done": True, "ok": False, "error": msg})
                 return
             self._send_json(200, {"ok": False, "error": msg})  # 200 + ok:false (与 v1 兼容)
     def do_POST(self):
