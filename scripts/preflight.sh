@@ -325,6 +325,9 @@ if [ "$QUICK" = 0 ]; then
   # 它守的是「部署完成后二进制与前端资源是同一批」这件事 —— 部署脚本第 5 步靠它。
   selfcheck '部署 / 静态资源尺子自证'   bash scripts/selftest_live_assets_ruler.sh
   selfcheck '写作 / 可选缺参不拦稿自证' python3 scripts/selftest_optional_needs.py
+  # 疑点回执的 8 条注入自证（判据全在「不许对用户做什么」那一侧，退化时界面全绿、
+  # 用户又被问一遍通用要素清单）。缺这一行 = 本地闸门比 CI 少一道，本地全绿推上去才红。
+  selfcheck '写作 / 疑点回执尺子自证'   python3 scripts/selftest_doubts_ruler.py
   # 解析服务（ocrd）的单测。它此前又是一把**游离尺子**：本机跑得动、0 引用，
   # 于是钉死的版本串 `ocrd-v5-quality` 一直没跟着真值改名而烂掉（2/15 红）。
   # 已改成「与部署门禁 scripts/deploy_ocrd.sh 对账」——不再抄字面量。
