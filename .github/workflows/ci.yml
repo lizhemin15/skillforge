@@ -317,6 +317,15 @@ jobs:
           python3 scripts/selftest_timeline_stub.py
           python3 scripts/selftest_writethinking_default.py
 
+      # 部署链上的静态资源尺子（verify-live-assets.sh）的自证。为什么必须单列：
+      # 这条尺子的第一版写死了 /js/chat.js（真实路径是 /assets/js/chat.js），
+      # 于是每次都抓 19 字节的 404 页面 → 恒定报「二进制换了但前端资源没换」。
+      # 一把恒红的尺子和恒绿的一样没用，而且更坏：它会让人去修不存在的故障。
+      # 六条判据：真串绿 / 假串精确红 rc=1 / 错端口 rc=2（前提不成立 ≠ 断言失败）/
+      # 还原回绿 / 非常规资源路径也能现取（防写死路径）/ 变异副本必须当场红。
+      - name: 部署链自证（静态资源同批尺子）
+        run: bash scripts/selftest_live_assets_ruler.sh
+
       # 沙箱限额（run_python 的 cgroup MemoryMax / Timeout）的负向自证。
       # 为什么单列一条：这是单机离线客户的**真阻碍** —— 模型写的解析脚本一碰大文件
       # 就被 cgroup OOM 秒杀，旧实现只回一句没有信息量的「退出码 -1」；而

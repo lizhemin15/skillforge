@@ -67,6 +67,17 @@ type Eval struct {
 	// 为 true 时走 Agent 工具循环（http_request / run_python），而不是让模型
 	// 凭记忆编内容——编造 star 数、销量、汇率这类「看起来合理」的数字是最坏的结果。
 	NeedsTools bool `json:"needs_tools"`
+
+	// MaterialChars 是**这一轮分类时模型手里实际有多少成篇材料**（本轮消息与注入
+	// 上下文块取大者，单位：字）。由本地数出来，用 json:"-" 挡在序列化之外——它不是
+	// 给前端看的字段，是给「该不该因为必填项缺失而拦下用户」这个判定用的地面真值。
+	//
+	// 为什么要带出来（2026-09-22 线上逮到）：needs 是分类器照技能清单自报的，同一份
+	// 10360 字素材 + 同一句写稿指令连发 6 次，报上来的是 **0/1/3/4/6**（journalctl
+	// [classify] 可逐条对），报 3 的那次就把整轮拦成一句「请补充：…」，正文一个字
+	// 没有。追问的正当性取决于「用户到底给了多少材料」，而这件事只有本地数得准，
+	// 交给模型自觉扫一万字，必然抖。
+	MaterialChars int `json:"-"`
 }
 
 // TraceStep is one visible stage of the agent's decision pipeline.
@@ -409,6 +420,11 @@ action 必须根据上面「意图→动作」映射严格输出，不要省略�
 	if retry {
 		eval, _, _, _ = e.classify(pctx, id, sys, history, user)
 	}
+	// 「材料在手」的字数在这里量一次，挂到 eval 上带出去。只认本地事实（本轮消息
+	// 与模型实际看到的上下文块），所以下游拿它下闸是确定性的——详见 MaterialNoAsk。
+	// 三条出口（兜底成功 / 降级 / 正常）都要挂上，少挂一条就是「同一个判据在某个
+	// 分支上变成 0」，而那正是闸门会抖回来的地方。
+	materialChars := MaterialInHand(user, ctxBlk)
 	if eval == nil {
 		// 超时 / 上游报错走的是 retry=false 那条路，过去**直接静默降级**：意图丢空、
 		// skill 为空，整轮当成通用写作。线上 2026-09-20 第 2 轮「把上面那篇整理成 Word」
@@ -457,14 +473,16 @@ action 必须根据上面「意图→动作」映射严格输出，不要省略�
 		// 有没有长文产物，两条本地事实就够。降级成通用写作等于把这一轮彻底丢掉。
 		if ev := e.localRescueRoute(user, history); ev != nil {
 			ReportProgress(ctx, "· 意图识别超时/失败：已按本地规则判定这是承接上一轮稿子并要求出文件，直接走文档生成")
+			ev.MaterialChars = materialChars
 			return ev, nil
 		}
 		// 降级可以，但**必须出声**。用户看到的材料会写明「本轮没按你的上文
 		// 路由」，而不是产出一份看起来正常、其实走错链的东西。
 		ReportProgress(ctx, "· 意图识别超时/失败：本轮按通用写作处理（没有按你的上文路由到对应能力）")
-		return &Eval{SkillSlug: "", Reason: "意图识别异常，按普通对话处理"}, nil
+		return &Eval{SkillSlug: "", Reason: "意图识别异常，按普通对话处理", MaterialChars: materialChars}, nil
 	}
 	eval.SkillSlug = strings.TrimSpace(eval.SkillSlug)
+	eval.MaterialChars = materialChars
 	return eval, nil
 }
 

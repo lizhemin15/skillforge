@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/lizhemin15/skillforge/internal/model"
@@ -116,5 +117,52 @@ func TestNeedsSummaryTrimsLabel(t *testing.T) {
 	})
 	if got != "标题亮点、语气" {
 		t.Fatalf("NeedsSummary=%q，期望「标题亮点、语气」", got)
+	}
+}
+
+// TestMaterialInHandTakesMaxNotSum 是这条判据的地基：**取大者，不相加**。
+//
+// 素材轮的两个来源装的是同一份东西（消息里用户贴的素材 + 注入块里 ContextBlock 压缩
+// 后的同一份），相加会把门槛推得虚高，判据就随「压缩后剩多少」抖起来。线上实测这两
+// 个数是 10340/11235 字 —— 同一个量级，不是两个独立来源。
+func TestMaterialInHandTakesMaxNotSum(t *testing.T) {
+	cases := []struct {
+		name, user, ctx string
+		want            int
+	}{
+		{"消息更长（用户直接把素材贴在这一轮）", strings.Repeat("a", 900), strings.Repeat("b", 120), 900},
+		{"注入块更长（「把上面那篇整理成 Word」型：消息十来个字，材料在上下文里）",
+			"把上面那篇整理成 Word", strings.Repeat("b", 900), 900},
+		{"两边都没有（一句话需求）", "帮我写篇新闻稿", "", 7},
+		// 相加会得 1020 —— 这条用例就是守住「别写成相加」的那一行代码。
+		{"两边都有：900/120 相加是 1020，必须取 900", strings.Repeat("a", 900), strings.Repeat("b", 120), 900},
+	}
+	for _, c := range cases {
+		if got := MaterialInHand(c.user, c.ctx); got != c.want {
+			t.Errorf("%s：MaterialInHand=%d，期望 %d", c.name, got, c.want)
+		}
+	}
+}
+
+// TestMaterialNoAskBoundary 钉住门槛本身，以及它两侧各差一个字的行为。
+//
+// 门槛不是随手取的数：一句话需求（线上实测 4~40 字）够不到，素材轮（实测
+// 10340~10432 字）远超。这里把 799/800 两个相邻值都钉死，是为了让「谁把常量改了」
+// 立刻在测试里现形 —— 它改的是产品行为（还拦不拦用户），不是性能参数。
+func TestMaterialNoAskBoundary(t *testing.T) {
+	cases := []struct {
+		chars int
+		want  bool
+	}{
+		{0, false},
+		{7, false},   // 「帮我写篇新闻稿」
+		{799, false}, // 门槛下沿：还是拦
+		{800, true},  // 门槛上沿：不拦
+		{10340, true},
+	}
+	for _, c := range cases {
+		if got := MaterialNoAsk(c.chars); got != c.want {
+			t.Errorf("MaterialNoAsk(%d)=%v，期望 %v", c.chars, got, c.want)
+		}
 	}
 }

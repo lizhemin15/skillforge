@@ -321,6 +321,9 @@ if [ "$QUICK" = 0 ]; then
   selfcheck '流式 / SSE 尺子桩流自证'   python3 scripts/selftest_chat_sse_ruler.py
   selfcheck '流式 / 时间线桩流自证'     python3 scripts/selftest_timeline_stub.py
   selfcheck '流式 / 写稿默认关思考自证' python3 scripts/selftest_writethinking_default.py
+  # 部署链上的静态资源尺子的自证（六条判据，含「写死路径」的变异自证）。
+  # 它守的是「部署完成后二进制与前端资源是同一批」这件事 —— 部署脚本第 5 步靠它。
+  selfcheck '部署 / 静态资源尺子自证'   bash scripts/selftest_live_assets_ruler.sh
   selfcheck '写作 / 可选缺参不拦稿自证' python3 scripts/selftest_optional_needs.py
   # 解析服务（ocrd）的单测。它此前又是一把**游离尺子**：本机跑得动、0 引用，
   # 于是钉死的版本串 `ocrd-v5-quality` 一直没跟着真值改名而烂掉（2/15 红）。

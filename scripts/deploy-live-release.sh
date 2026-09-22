@@ -146,4 +146,38 @@ esac
 say "✓ 部署完成：$LIVE_VER"
 say "  HTTP=$code  备份=$DEST_BAK"
 say "  回滚：systemctl stop $SVC && mv $DEST_BAK $DEST && systemctl start $SVC"
+
+# ---- 独立复验：不采信上面那句 DEPLOY_OK（那是本脚本自己说的）----
+# 自报不等于事实，换三条**外部**证据：
+#   ① 内核视角：进程真正在跑的可执行文件是哪个（/proc/<pid>/exe，而不是「我以为装上去的那个」）
+#   ② systemd 视角：重启时间戳有没有真的变新
+#   ③ 浏览器视角：前端资源和二进制是不是同一批（见 scripts/verify-live-assets.sh）
+#      —— 资源路径从服务端返回的 index.html 里**现取**。这里踩过一次假红：
+#      写死 /js/chat.js 而真实路径是 /assets/js/chat.js，抓到 404 页面就报「资源没换」，
+#      差点当成真故障去修。尺子本身必须先自证（scripts/selftest_live_assets_ruler.sh）。
+PID="$(systemctl show -p MainPID --value "$SVC" 2>/dev/null || true)"
+EXE="$(readlink -f "/proc/${PID:-0}/exe" 2>/dev/null || true)"
+say "独立复验：MainPID=${PID:-?} 内核视角可执行文件=${EXE:-?}"
+if [ -n "$EXE" ] && [ "$EXE" != "$DEST" ]; then
+  rollback "内核视角：进程跑的不是 $DEST（而是 $EXE）"
+fi
+say "  重启时间戳：$(systemctl show -p ActiveEnterTimestamp --value "$SVC" 2>/dev/null)"
+
+FEAT="${FEAT:-}"
+RULER="$REPO_DIR/scripts/verify-live-assets.sh"
+rc=0
+BASE="$BASE" bash "$RULER" $FEAT || rc=$?
+case "$rc" in
+  0) say "  ✓ 前端资源与二进制同一批${FEAT:+（特征串 $FEAT）}" ;;
+  1) rollback "前端资源与二进制不是同一批${FEAT:+（特征串「$FEAT」在线上 JS 里找不到）}" ;;
+  2)
+    # 前提不成立（首页拿不到 / 解析不出任何 js|css 引用）：这**可能是探测方式的问题**，
+    # 不是「件不对」。此时拆掉刚装好的件更亏，所以不回滚；但必须红着退出 ——
+    # 「验不了」不能算「验过了」。
+    echo "✗ 静态资源复验前提不成立（BASE=$BASE）→ 不回滚，但本次部署不认作成功" >&2
+    exit 1
+    ;;
+  *) rollback "静态资源尺子异常退出 rc=$rc" ;;
+esac
+
 echo "DEPLOY_OK tag=$TAG"

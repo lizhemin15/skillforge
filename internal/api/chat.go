@@ -300,6 +300,29 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			clock.Thinking("技能「" + sc.Name + "」的可选信息没给（" + agent.NeedsSummary(optional) +
 				"），按它自己的默认继续起草…")
 		}
+		if len(blocking) > 0 && agent.MaterialNoAsk(eval.MaterialChars) {
+			// 材料在手就不拦，但**必须说清假设**：文案里带上「哪几项没在素材里写明」
+			// 和「我按素材自行推断」，用户随时能纠正。
+			//
+			// 这一跳就是用户投诉「有的时候像没看到我给的信息，还在问我要信息」的
+			// 现场：needs 是模型照技能清单自报的，同一份 10360 字素材 + 同一句指令
+			// 连发 6 次报的是 0/1/3/4/6，报 3 的那次整轮就只剩一句「请补充：…」。
+			// 追问的正当性取决于「用户给了多少材料」—— 本地数得准，就别外包给模型。
+			// 危害不对称：拦错一轮，用户白等且以为材料丢了（不可感知）；放过一轮，
+			// 字段靠推断但假设摆在明面上（可感知、可纠正）。详见 agent.MaterialNoAsk。
+			fmt.Fprintf(os.Stderr, "[needs-gate] 材料在手（%d 字）→ 不追问必填项「%s」，改为按素材推断并流式告知\n",
+				eval.MaterialChars, agent.NeedsSummary(blocking))
+			// 告知走 meta.note，**不走 material**：material 通道是给「思考链滚动尾巴」设计的
+			// （短命、只留尾部 160 字、会被下一阶段 Set() 覆盖、旁白还会被摘掉），
+			// 而这句话是一次性、必须留住的 —— 走 material 等于用户永远看不到，
+			// 闸门就退化成「既不追问、也不说明」的闷声自作主张（接线测试抓到过这个 bug：
+			// 闸门确实执行了，stderr 有日志，但 SSE 帧里一个字都没有）。
+			write(evMeta, jsonSafe(map[string]string{
+				"note": "你已给了成篇材料（" + strconv.Itoa(eval.MaterialChars) + " 字）；「" +
+					agent.NeedsSummary(blocking) + "」没在素材里显式写明，我按素材自行推断后接着起草…",
+			}))
+			blocking = nil
+		}
 		if len(blocking) > 0 {
 			// surface missing required params as a needs event, then skip gen
 			msg := needsMessage(blocking)
