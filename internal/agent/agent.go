@@ -2009,9 +2009,27 @@ func (e *Engine) plainChatWithPlan(ctx context.Context, id, user string, history
 	// 换 StreamChat 的等价性：`DisableThinking=false` 走 streamOnce 的 knobNone 分支，
 	// 请求体仍是 model/messages/stream:true（只有配了预算才多一个 thinking_budget），
 	// 也就是默认配置下这次改造**行为零变化**，纯粹把预算与看门狗这两条路接通。
+	// 写稿这一跳默认**关掉思考链**，理由是实测出来的，不是拍的：
+	// 同一 1 万字素材、同一提示词，用 scripts/attrib_write_ttft.py 顺序不并发量四臂
+	// （2026-09-22，Qwen3.6-35B-A3B @ siliconflow）：
+	//   臂          首正文   思考字   正文   整跳
+	//   b1024(旧默认) 195.0s  19524   1189  204.9s
+	//   unbounded     138.0s  20087   1139  142.8s
+	//   nothink        12.5s      0    882   16.7s   ← 本分支
+	// 两条结论：
+	//   ① thinking_budget 在**当前线上模型上不予理会**（19524 vs 20087 字，差 2.9% 属抖动）。
+	//      注意线上模型已换成 35B-A3B，而 stream.go:307 那条「1024 → 22.76s」是 27B 时代的
+	//      数字：这个预算旋钮**是模型相关的**，照搬旧结论到新模型上就变成空转 ——
+	//      于是「给思考链封顶」这条兜底在这台线上白给，首正文该等 3~5 分钟还是等 3~5 分钟，
+	//      用户看到的就是「一直卡着计时」。
+	//   ② 思考链在这一跳不是打转（复读体 0B、重复窗 1%）——它是**真在推敲**，
+	//      所以「加闸门掐掉重复思考」这条路不通，唯一有效的是「这一跳根本别想」。
+	// 代价与边界：正文 1189 → 882 字（-26%）。质量靠上面这段「本轮构思要点」兜住结构，
+	// 并且要求「要质量优先」时可以用 SKILLFORGE_WRITE_THINKING=on 换回旧行为
+	// （带思考 + 预算封顶）。默认选快的那个：等待期屏幕上只有秒数在涨，这是第一位的投诉。
 	st := &hopStat{t0: time.Now()}
 	out, err := e.llm.StreamChat(ctx, sys, combined, llm.StreamOpts{
-		DisableThinking: false,
+		DisableThinking: llm.WriteThinkingOff(),
 		OnContent:       st.content(onDelta),
 		OnReasoning:     st.reasoning(reasoningSink(ctx)),
 		// 断流/空正文时的重试要说出来。这是**最常走的一条路**，而它过去不接 OnNote：

@@ -509,10 +509,70 @@ func TestPlanEssayStreamsOutlineAsMaterial(t *testing.T) {
 // 当材料流出去。两件事都曾是坏的——这条路上的执笔走的是 go-openai SDK，SDK 既不认
 // SKILLFORGE_THINK_BUDGET 也没有空闲看门狗，线上实测首正文 347.8s、最大静默 297.7s。
 //
-// 2026-09-20：默认档从「不带参数」翻成「带 1024」。原来那条「默认与改造前逐字一致 =
-// 零风险」的判据看着稳，实际是把最坏档（线上 226.7s 首正文空转）设成出厂默认。
-// 现在默认值本身有线上实测背书，要「不限」得显式写 0 —— 见 docs/slow-why-20260918.md。
-func TestPlainWriteHopGetsThinkBudgetAndStreamsMaterial(t *testing.T) {
+// 通用写作路（write-plain）的思考链接线。**2026-09-22 契约反转**，别照着旧断言改回来。
+//
+// 历史的两次翻转，别再绕回去：2026-09-20 默认档从「不带参数」翻成「带 1024」，
+// 当时判据是「默认与改造前逐字一致 = 零风险」，实际是把最坏档（226.7s 首正文空转）
+// 设成了出厂默认；2026-09-22 再翻成「默认关思考」，因为四臂实测证明那个 1024 在当前
+// 线上模型上根本不生效（见下）。两次翻转之间隔的不是口味，是量出来的数
+// —— 旧记录见 docs/slow-why-20260918.md。
+//
+// 旧契约是「吃 thinking_budget=1024 且不许夹带关思考开关」，当时的理由是「思考链是质量来源」。
+// 四臂实测把这条理由推翻了（scripts/attrib_write_ttft.py，同一 1 万字素材、顺序不并发）：
+//
+//	b1024(旧默认) 首正文 195.0s 思考 19524 字 正文 1189 字
+//	nothink       首正文  12.5s 思考     0 字 正文  882 字
+//
+// ① 那 1024 根本没人理（19524 vs unbounded 20087 字，差 2.9% 属抖动）——旧断言守的
+// 是一个恒等于 1024、实际不生效的数字，测试全绿而用户等 3~5 分钟；
+// ② 思考链在这一跳不是打转（复读体 0B、重复窗 1%），是**真在推敲**，所以只能整跳关掉。
+//
+// 因此下面的断言翻了个方向：默认必须**真的关掉**（三条开关都在），要回旧行为得显式
+// SKILLFORGE_WRITE_THINKING=on。这样「有人悄悄把默认改回开」会立刻变红——
+// 比守着一条不生效的预算数字有意义得多。
+func TestPlainWriteHopDisablesThinkingByDefault(t *testing.T) {
+	fp := &fakeProvider{reasoning: "先想结构：导语—亮点—引语", content: "星禾科技发布数据中台 3.0。"}
+	eng := newTestEngine(t, fp)
+
+	var materials, deltas []string
+	ctx := WithProgress(context.Background(), func(s string) { materials = append(materials, s) })
+
+	out, err := eng.PlainChatWithPlan(ctx, "s1", "写一篇新闻稿", nil, "要点：先导语后亮点",
+		func(d string) { deltas = append(deltas, d) })
+	if err != nil {
+		t.Fatalf("PlainChatWithPlan 失败: %v", err)
+	}
+
+	body := fp.bodyAt(t, 0)
+	if body["enable_thinking"] != false {
+		t.Errorf("通用写作路默认必须请求 enable_thinking=false（实测首正文 195.0s → 12.5s 全靠它），实际 %v",
+			body["enable_thinking"])
+	}
+	if body["reasoning_effort"] != "none" {
+		t.Errorf("通用写作路默认必须请求 reasoning_effort=none，实际 %v", body["reasoning_effort"])
+	}
+	// 关思考时带的是 disabledThinkingBudget（512）兜底，不是那个不生效的 1024。
+	// 这条同时钉住「别再退回 1024」：旧契约就是靠它把 195 秒的等待当成正常。
+	if got := body["thinking_budget"]; got != float64(512) {
+		t.Errorf("关思考时思考预算兜底应为 512，实际 %v —— 若是 1024，说明默认又变回「开着思考」了", got)
+	}
+	// 材料与正文的接线不因关思考而断：上游仍可能吐思考片（缓存、换 provider），
+	// 到了就必须照原样转成材料，不许静默丢。
+	if joined := strings.Join(materials, ""); joined != fp.reasoning {
+		t.Errorf("思考片到了就必须当材料流出去，实际 %q", joined)
+	}
+	if strings.Join(deltas, "") != fp.content {
+		t.Errorf("正文必须原样转发给前端，实际 %q", strings.Join(deltas, ""))
+	}
+	if out != fp.content {
+		t.Errorf("正文不对: %q", out)
+	}
+}
+
+// 显式 SKILLFORGE_WRITE_THINKING=on 时回到旧行为：带思考 + 预算旋钮照旧生效。
+// 这条守的是**回退路径本身别烂掉**——真要拿质量优先（长公文、逐条对齐素材）时，
+// 那个旋钮必须还能拧，否则「可回退」就是句空话。
+func TestPlainWriteHopKeepsThinkingWhenOptedIn(t *testing.T) {
 	cases := []struct {
 		name       string
 		env        string
@@ -525,6 +585,7 @@ func TestPlainWriteHopGetsThinkBudgetAndStreamsMaterial(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("SKILLFORGE_WRITE_THINKING", "on")
 			t.Setenv("SKILLFORGE_THINK_BUDGET", c.env)
 			fp := &fakeProvider{reasoning: "先想结构：导语—亮点—引语", content: "星禾科技发布数据中台 3.0。"}
 			eng := newTestEngine(t, fp)
@@ -551,7 +612,7 @@ func TestPlainWriteHopGetsThinkBudgetAndStreamsMaterial(t *testing.T) {
 				}
 			}
 			if body["enable_thinking"] == false || body["reasoning_effort"] == "none" {
-				t.Errorf("通用写作路不该夹带关思考的开关（enable_thinking=%v reasoning_effort=%v）—— 那是它质量的来源",
+				t.Errorf("显式要回思考链时不该再夹带关思考的开关（enable_thinking=%v reasoning_effort=%v）",
 					body["enable_thinking"], body["reasoning_effort"])
 			}
 			if joined := strings.Join(materials, ""); joined != fp.reasoning {

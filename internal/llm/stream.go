@@ -334,6 +334,30 @@ func writingThinkBudget() int {
 	return n
 }
 
+// WriteThinkingOff 决定「正文执笔跳」要不要请求思考链。默认 true（关掉）。
+//
+// 默认值来自四臂实测，不是偏好（详见 agent.go plainChatWithPlan 上方那张表）：
+// 同一 1 万字素材，带思考首正文 195.0s、关思考 12.5s —— 思考链在这一跳的唯一
+// 作用就是把首字推迟 3 分钟起步，而等待期屏幕上只有计时器在跳，
+// 这正是用户投诉的「一直卡着计时，用户体验不佳」。
+//
+// 为什么不做成「有素材才关」这种聪明规则：实测里无素材的对照臂带思考也要 13.7s
+// 首正文（思考 5164 字），说明慢的成因是**提示词里东西多**，不是「有没有附件」。
+// 加一条只有部分场景生效的规则，只会让「为什么这次快那次慢」变得没人说得清。
+//
+// SKILLFORGE_WRITE_THINKING=on 换回旧行为（带思考 + SKILLFORGE_THINK_BUDGET 封顶）：
+// 要质量优先的部署（长公文、要求逐条对齐素材）可以要回那 307 字。
+func WriteThinkingOff() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SKILLFORGE_WRITE_THINKING"))) {
+	case "on", "1", "true", "yes":
+		return false
+	case "off", "0", "false", "no":
+		return true
+	default:
+		return true // 默认关：快是第一位的，且实测只掉 26% 长度
+	}
+}
+
 // idleReader 记住「最后一次读到字节」的时刻，供看门狗判定上游是不是挂了。
 type idleReader struct {
 	rc   io.ReadCloser

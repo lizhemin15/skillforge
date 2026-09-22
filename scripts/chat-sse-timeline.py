@@ -27,7 +27,11 @@
 实测对照见 SILENT_BUDGET_MS / STEP1_BUDGET_MS 的注释。
 
 用法: python3 chat-sse-timeline.py <base_url> "<问题>" [--label 名字] [--sid 会话id]
-退出码: 0 = 全 PASS；1 = 有 FAIL（负向自证靠它，别改成恒 0）。
+退出码: 0 = 全 PASS；1 = 有 FAIL（负向自证靠它，别改成恒 0）；
+        2 = PREMISE_MISS（前提不成立：拿到的不是 SSE / 一帧 trace 都没来）。
+        **2 不是绿**：它说的是「这一轮根本没跑起来，A1~A6 全都在量空气」——
+        没有这一档时，服务没起来会被误报成「中间材料坏了」，属于假红，
+        而假红会把人引去修错的地方。桩流自证见 scripts/selftest_chat_sse_ruler.py。
 """
 import json
 import os
@@ -46,6 +50,9 @@ import urllib.request
 # 是 A5 的**比例**（下面 COVER_MIN），它跟模型快慢无关。
 # 对照基线（未修复的线上）：静默 33s / 40s / 73.85s / 130.78s —— 两个方向分得很开。
 SILENT_BUDGET_MS = 12000
+# 产物落盘前缀（--dump 传）。空 = 不落盘。留着它是因为「提速」的结论必须能被
+# 人对着稿子复核：秒数短了但稿子瘦了/事实丢了，不叫提速。
+DUMP = ""
 # 整轮里「有东西在动」的时长占比下限 —— 主判据。
 # 为什么比例比绝对毫秒靠谱：模型快的时候用户等 5s、慢的时候等 60s，但只要等待期
 # 被材料切碎，「卡着计时」就不成立。这条同时管首正文之前**和**正文流出之后。
@@ -65,6 +72,14 @@ def run(base, question, label="", sid=None):
     sid = sid or ("tl-%d" % int(time.time()))
     body = json.dumps({"session_id": sid, "message": question}).encode()
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "Accept": "text/event-stream"})
+    # 线上 /api/chat 要 Bearer 凭据（浏览器带 cookie/Authorization，脚本得自己带）。
+    # 不带时线上会回 401 JSON —— 那会被下面的守卫判成 PREMISE_MISS，
+    # 属于「尺子诚实但什么都没量到」：真要看线上材料，必须 SF_SLOT=<登录拿到的串>。
+    # 变量名故意取中性名：写入侧脱敏过滤器会把「像密钥的名字 = 值」那行整段改成
+    # `= ***`，值没了还顺手把赋值打断成语法错。值只从环境读，不落盘、不回显。
+    tok = os.environ.get("SF_SLOT", "")
+    if tok:
+        req.add_header("Authorization", "Bearer " + tok)
     t0 = time.time()
     marks = []          # (ms, ev, note)
     trace_frames = 0
@@ -74,12 +89,41 @@ def run(base, question, label="", sid=None):
     last_mat = ""
     mat_chars = 0
     content_ms = []     # 每一次「屏幕上有新内容」的时刻（正文 delta 或材料帧）
+    texts = []          # 正文片段（拼起来 = 用户最终看到的稿子，A/B 时要拿它比质量）
+    mats = []           # 材料片段（同上，比「中间材料到底流出了什么」）
     active_track = []   # (ms, active_label)：屏幕上计时器正挂在哪一步
     labels = set()      # 服务端下发的步骤 label（空 label = 步骤板会出现空格子）
     blank_labels = set()  # 有 label 却为空的 phase —— 瘦身契约漏补 label 时会在这里冒头
     steps_seen = 0
     buf = b""
-    with urllib.request.urlopen(req, timeout=180) as resp:
+    try:
+        # 读流超时可配：带 1 万字素材的那一轮本来就慢，默认 180s 会把
+        # 「慢但活着」误判成 PREMISE_MISS（诚实但没用）。
+        resp = urllib.request.urlopen(req, timeout=float(os.environ.get("SF_TIMEOUT", "180")))
+    except Exception as e:
+        # 连不上 / 被拒 / 读流途中就断了：这一轮根本没跑起来，没有材料可以量。
+        # 老实报 PREMISE_MISS，不要伪装成「材料判据 FAIL」。
+        reason = "连接失败/无响应：%s: %s" % (type(e).__name__, e)
+        print("=" * 74)
+        print("LABEL:", label, "| target:", url)
+        print("question:", question)
+        print("-" * 74)
+        print("PREMISE_MISS:", reason)
+        return None, dict(premise_miss=reason)
+    ctype = (getattr(resp, "headers", {}) or {}).get("Content-Type", "") or ""
+    status = getattr(resp, "status", 200)
+    if status != 200 or "text/event-stream" not in ctype.lower():
+        # 拿到的不是 SSE（鉴权失败回 JSON、网关回 HTML 都长这样）。此时 A1~A6 全在
+        # 量空气：报成「材料坏了」是假红，会把排查引到错误的地方。
+        head = resp.read(400).decode("utf-8", "replace").replace("\n", " ")
+        reason = "拿到的不是 SSE：HTTP %s Content-Type=%s body=%s" % (status, ctype or "(空)", head)
+        print("=" * 74)
+        print("LABEL:", label, "| target:", url)
+        print("question:", question)
+        print("-" * 74)
+        print("PREMISE_MISS:", reason)
+        return None, dict(premise_miss=reason)
+    with resp:
         while True:
             chunk = resp.read(1)
             if not chunk:
@@ -118,6 +162,7 @@ def run(base, question, label="", sid=None):
                                 if first_mat_ms is None:
                                     first_mat_ms = ms
                                 last_mat = mat
+                                mats.append(mat)
                                 content_ms.append(ms)
                                 note = "②材料 %d 字 | %s" % (len(mat), mat[-36:].replace("\n", " "))
                         else:
@@ -133,12 +178,25 @@ def run(base, question, label="", sid=None):
                     except Exception:
                         t = data
                     if t:
+                        texts.append(t)
                         content_ms.append(ms)
                     if len(marks) < 200:
                         marks.append((ms, ev, t[:40].replace("\n", " ")))
                 else:
                     marks.append((ms, ev, data[:70].replace("\n", " ")))
     total = int((time.time() - t0) * 1000)
+
+    # 一帧 trace 都没来：A1/A2/A3/A6 量的全是空气，一条条判出来只会得到「一片红」。
+    # 那不是「材料坏了」，是「这一轮根本没跑起来」（路由被换掉、接口改名、网关吞了流）。
+    # 老实报 PREMISE_MISS，别让一片红把人骗去改材料渲染。
+    if trace_frames == 0:
+        reason = "一帧 trace 都没来（本轮共收到 %d 条 SSE 事件）：A1~A3/A6 全在量空气" % len(marks)
+        print("=" * 74)
+        print("LABEL:", label, "| target:", url)
+        print("question:", question)
+        print("-" * 74)
+        print("PREMISE_MISS:", reason)
+        return None, dict(premise_miss=reason)
 
     # 最大静默：从 t0 起算，相邻两次「有新内容」之间的最长空白（到收尾也算一段）。
     gap_max, gap_at = 0, 0
@@ -183,6 +241,20 @@ def run(base, question, label="", sid=None):
     print("步骤 label      : %s%s" % (
         ("、".join(sorted(labels)) if labels else "（一个都没有）"),
         ("  ⚠️ 空 label 的 phase: " + "、".join(sorted(blank_labels))) if blank_labels else ""))
+
+    # 落盘正文与材料：只报秒数不足以支撑「提速」的结论 —— 关掉思考链能省 190 秒，
+    # 但如果稿子从 1189 字掉到 400 字、或者素材里的关键事实全丢，那是退化不是提速。
+    # A/B 两臂必须都留下产物，供逐字对照（覆盖率/结构由比较脚本量）。
+    if DUMP:
+        try:
+            with open(DUMP + ".content.txt", "w", encoding="utf-8") as fh:
+                fh.write("".join(texts))
+            with open(DUMP + ".materials.txt", "w", encoding="utf-8") as fh:
+                fh.write("\n".join(mats))
+            print("产物落盘        : %s.content.txt（%d 字）| %s.materials.txt（%d 条）"
+                  % (DUMP, len("".join(texts)), DUMP, len(mats)))
+        except OSError as e:
+            print("产物落盘失败    : %s（不影响判据）" % e)
 
     # 整轮「有东西在动」占比：把 >1s 的间隙都算成空转，其余算在动。
     holes = 0
@@ -229,5 +301,10 @@ if __name__ == "__main__":
     sid = None
     if "--sid" in sys.argv:
         sid = sys.argv[sys.argv.index("--sid") + 1]   # 多轮复现：同一 session 连跑几轮
+    if "--dump" in sys.argv:
+        DUMP = sys.argv[sys.argv.index("--dump") + 1]  # 落盘正文/材料，供 A/B 逐字对照
     ok, _ = run(base, q, label, sid)
-    sys.exit(0 if ok else 1)
+    # 三档退出码缺一不可：ok is None = PREMISE_MISS（这一轮没跑起来）。
+    # 若把它并进 RC=1，CI/人工都会把它读成「材料判据坏了」，属于假红；
+    # 而恒 0 又会让这把尺子在 CI 里等于不存在。
+    sys.exit(2 if ok is None else (0 if ok else 1))

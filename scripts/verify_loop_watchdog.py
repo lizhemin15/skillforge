@@ -49,12 +49,20 @@ for i, a in enumerate(sys.argv):
     if a == '--prompt':
         PROMPT = sys.argv[i + 1]
 BOUND = int(os.environ.get('LOOPWATCH_BOUND', '12288'))
+# 单次读超时（整条流）。旧二进制复读会一直吐到总预算，所以给足；
+# 超时后仍有帧就照评，不当 SKIP。
+STREAM_TIMEOUT = int(os.environ.get('LOOPWATCH_TIMEOUT', '420'))
 
 PHRASE = '循环测试'
 
 
 def collect(base, prompt, sid):
-    """收完整条 SSE 流，记下每个帧的字节偏移与内容。"""
+    """收完整条 SSE 流，记下每个帧的字节偏移与内容。
+
+    返回 (frames, cut)：cut 非空表示流被截断（读超时/连接断）。
+    **截断不能当「打不开」处理**：旧二进制那种复读刷屏恰好会跑很久，
+    若把它当成 SKIP(=绿)，这把尺子就专挑被测故障时瞎掉 —— 典型的假绿。
+    """
     url = base.rstrip('/') + '/api/chat'
     body = json.dumps({'session_id': sid, 'message': prompt}).encode()
     req = urllib.request.Request(url, data=body, headers={
@@ -62,26 +70,31 @@ def collect(base, prompt, sid):
     frames = []
     buf = b''
     t0 = time.time()
-    with urllib.request.urlopen(req, timeout=300) as r:
-        while True:
-            chunk = r.read(4096)
-            if not chunk:
-                break
-            buf += chunk
-            while b'\n\n' in buf:
-                raw, buf = buf.split(b'\n\n', 1)
-                ev, data = None, ''
-                for line in raw.decode('utf-8', 'replace').splitlines():
-                    if line.startswith('event:'):
-                        ev = line[6:].strip()
-                    elif line.startswith('data:'):
-                        data += line[5:].strip()
-                try:
-                    obj = json.loads(data) if data else {}
-                except Exception:
-                    obj = {}
-                frames.append({'ev': ev, 'obj': obj, 'at': time.time() - t0})
-    return frames
+    cut = ''
+    try:
+        with urllib.request.urlopen(req, timeout=STREAM_TIMEOUT) as r:
+            while True:
+                chunk = r.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b'\n\n' in buf:
+                    raw, buf = buf.split(b'\n\n', 1)
+                    ev, data = None, ''
+                    for line in raw.decode('utf-8', 'replace').splitlines():
+                        if line.startswith('event:'):
+                            ev = line[6:].strip()
+                        elif line.startswith('data:'):
+                            data += line[5:].strip()
+                    try:
+                        obj = json.loads(data) if data else {}
+                    except Exception:
+                        obj = {}
+                    frames.append({'ev': ev, 'obj': obj, 'at': time.time() - t0})
+    except Exception as e:
+        # 一帧都没收到 = 真打不开（服务没起/连不上）；已经有帧 = 中途断了，照评。
+        cut = '%s: %s' % (type(e).__name__, str(e)[:120])
+    return frames, cut
 
 
 def main():
@@ -92,35 +105,41 @@ def main():
     print('PROMPT :', PROMPT[:60] + ('…' if len(PROMPT) > 60 else ''))
     print('BOUND  : %d 字节（客户端实收 delta 上限）' % BOUND)
 
-    try:
-        frames = collect(BASE, PROMPT, sid)
-    except Exception as e:
-        print('SKIP 打不开 %s（服务没起？）：%s' % (BASE, str(e)[:160]))
+    frames, cut = collect(BASE, PROMPT, sid)
+    if not frames:
+        print('SKIP 打不开 %s（服务没起/连不上）：%s' % (BASE, cut))
         return 0
+    if cut:
+        print('⚠️ 流被截断（%s）—— 已收 %d 帧，仍按现有帧评估（不当 SKIP）'
+              % (cut, len(frames)))
 
     # 逐帧累计：正文字节、reset 位置、done 正文、error 文本
     delta_bytes = 0
     first_delta_at = None
-    first_reset = None          # (帧序号, reset 前的 delta 字节)
+    first_reset = None          # 帧序号
     delta_at_first_reset = None
     resets = 0
-    done_bodies = []
+    tail_text = ''              # 最后一个 reset 之后的累计正文 = 用户最终看到的内容
     errors = []
+    terminal = None             # done / error，用来判「断流后有没有跟用户说一声」
     for n, f in enumerate(frames):
         if f['ev'] == 'delta':
             t = f['obj'].get('t') or ''
             if t:
                 delta_bytes += len(t.encode())
+                tail_text += t
                 if first_delta_at is None:
                     first_delta_at = f['at']
         elif f['ev'] == 'reset':
             resets += 1
+            tail_text = ''       # 前端在这里清气泡，气泡里的内容归零
             if first_reset is None:
                 first_reset = n
                 delta_at_first_reset = delta_bytes
         elif f['ev'] == 'done':
-            done_bodies.append(str(f['obj']))
+            terminal = 'done'
         elif f['ev'] == 'error':
+            terminal = 'error'
             errors.append(str(f['obj'].get('message') or f['obj'].get('error') or f['obj']))
 
     print('\n--- 实测 ---')
@@ -135,10 +154,10 @@ def main():
     fails = []
 
     # C0 前提：本轮真的吐过正文，否则后面全空跑
+    premise_miss = None
     if first_delta_at is None:
-        print('\nPREMISE_MISS: 本轮一帧正文都没有，无法评「有没有刷屏」。'
-              '重跑或换提示词。')
-        return 3
+        premise_miss = '本轮一帧正文都没有，无法评「有没有刷屏」'
+        print('\nPREMISE_MISS 候选：%s' % premise_miss)
 
     # C1
     if delta_bytes > BOUND:
@@ -147,41 +166,49 @@ def main():
     else:
         print('C1 OK  客户端实收 %d 字节 ≤ %d' % (delta_bytes, BOUND))
 
-    # C2
-    if resets < 1:
-        # 别急着报 PREMISE_MISS：没有 reset 也可能是「看门狗压根没上线」
-        # （旧二进制就是这样），此时 C1 的 FAIL 才是真相，不能被掩盖。
-        if fails:
-            for f in fails:
-                print('FAIL', f)
-            print('（且没有任何 reset 帧 —— 看门狗可能未生效）')
-            return 1
-        print('\nPREMISE_MISS: 没有 reset 帧，本轮模型可能压根没复读（看门狗不该响）。'
-              '看服务端日志确认；换个更极端的提示词重跑。')
-        return 3
-    if first_reset == 0 or (delta_at_first_reset or 0) == 0:
+    # C2 三态，各自含义不同，别混：
+    #   ≥1 个 reset            → 看门狗真响了，且没在正文之前空清（下面还要查）
+    #   没有 reset 但流 > 上限  → 真事故：复读刷屏、看门狗没上线/没触发 → FAIL
+    #   没有 reset 且流很短     → 本轮模型没复读，看门狗本就不该响 → PREMISE_MISS
+    # 早先版本在「没有 reset」时直接 return，把 C3/C4/C5 全短路了 —— 事故形态
+    # 只报出 C1 一条红，剩下三条判据根本没跑，报告等于缺证据。
+    if resets < 1 and delta_bytes > BOUND:
+        fails.append('C2 没有 reset 帧，且实收了 %d 字节 —— 看门狗没上线/没触发'
+                     % delta_bytes)
+    elif resets < 1:
+        premise_miss = premise_miss or ('没有 reset 帧，本轮模型可能压根没复读（看门狗不该响）')
+    elif first_reset == 0 or (delta_at_first_reset or 0) == 0:
         fails.append('C2 reset 帧出现在任何正文之前 —— 清的是空气，不是真流过的内容')
     else:
         print('C2 OK  %d 个 reset，首个之前已有 %d 字节正文被清掉'
               % (resets, delta_at_first_reset))
 
-    # C3
-    if (delta_at_first_reset or 0) > BOUND:
+    # C3（没有 reset 就无从谈通知早晚，跳过并明说）
+    if first_reset is None:
+        print('C3 --  没有 reset 帧，跳过（通知早晚无从评）')
+    elif (delta_at_first_reset or 0) > BOUND:
         fails.append('C3 首个 reset 到来前已流出 %d 字节（上限 %d）—— 通知太晚'
                      % (delta_at_first_reset, BOUND))
     else:
         print('C3 OK  reset 与收手同源（其前 %d 字节 ≤ %d）'
               % (delta_at_first_reset, BOUND))
 
-    # C4
-    worst = 0
-    for b in done_bodies:
-        c = b.count(PHRASE)
-        worst = max(worst, c)
-    if worst >= 50:
-        fails.append('C4 done 帧交付了重复 %d 遍的短语 —— 半截复读被当成成品交给用户' % worst)
+    # C4 用户最终看到的内容不能是一屏复读。
+    # 为什么看「最后一个 reset 之后的正文」而不是 done 帧：done 帧带的是
+    # skill/asked 这类元信息，**根本没有正文**（写成「done 里没有复读」= 恒真断言，
+    # 一开始就写错了一版）。真正交付到气泡里的是 delta 累计，而 reset 会清空气泡，
+    # 所以「用户最终看到什么」= 最后一个 reset 之后的 delta 之和。
+    c = tail_text.count(PHRASE)
+    if c >= 50:
+        fails.append('C4 reset 之后仍交付了重复 %d 遍的短语 —— 用户最终看到的还是一屏复读' % c)
     else:
-        print('C4 OK  done 帧里短语最多出现 %d 遍（< 50）' % worst)
+        print('C4 OK  reset 之后交付的正文里短语只出现 %d 遍（< 50）' % c)
+
+    # C5 断流后必须给用户一个明确终态，不能静默挂住。
+    if terminal is None:
+        fails.append('C5 整条流既没有 done 也没有 error —— 用户会看到气泡停在半路、没有任何提示')
+    else:
+        print('C5 OK  终态明确（%s 帧）' % terminal)
 
     # 诊断：服务端日志里的周期与收手字节（验证 hit() 报的数是否可信）
     try:
@@ -202,6 +229,10 @@ def main():
         for f in fails:
             print('FAIL', f)
         return 1
+    if premise_miss:
+        print('PREMISE_MISS: %s。看服务端日志确认；换个更极端的提示词重跑。'
+              % premise_miss)
+        return 3
     print('=== 全绿：复读被秒级掐断，气泡被 reset 帧清空，垃圾未交付 ===')
     return 0
 
