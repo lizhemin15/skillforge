@@ -883,8 +883,8 @@ func (e *Engine) buildRoster() (string, []model.Skill, error) {
 // param values (from eval params + any follow-up filled by the user). Behavior
 // is typed: write skills produce an article; query/template skills produce an
 // actionable flow (and reference the downloadable attachment if present).
-func (e *Engine) Generate(ctx context.Context, sc *SkillContent, args map[string]string, onDelta func(string)) (string, error) {
-	return e.generateWithExtra(ctx, sc, args, "", onDelta)
+func (e *Engine) Generate(ctx context.Context, sc *SkillContent, args map[string]string, userMsg string, onDelta func(string)) (string, error) {
+	return e.generateWithExtra(ctx, sc, args, "", userMsg, onDelta)
 }
 
 // generateWithExtra 是 Generate 的完整实现。extra 非空时被追加到 system prompt
@@ -892,8 +892,8 @@ func (e *Engine) Generate(ctx context.Context, sc *SkillContent, args map[string
 // 是因为 system prompt 里越靠后的内容离用户这句话越近，越不容易被中间的大段
 // 技能说明冲淡——手册要求是硬约束，不能被当成背景介绍。
 // extra 留空即普通生成，与原实现逐字等价。
-func (e *Engine) generateWithExtra(ctx context.Context, sc *SkillContent, args map[string]string, extra string, onDelta func(string)) (string, error) {
-	return e.generateWithExtraPlan(ctx, sc, args, extra, "", onDelta)
+func (e *Engine) generateWithExtra(ctx context.Context, sc *SkillContent, args map[string]string, extra, userMsg string, onDelta func(string)) (string, error) {
+	return e.generateWithExtraPlan(ctx, sc, args, extra, "", userMsg, onDelta)
 }
 
 // hopStat 给「执笔/构思」这类长跳记账：总时长、首字时刻、思考片数、正文片数。
@@ -982,7 +982,10 @@ func (e *Engine) PlanEssay(ctx context.Context, sc *SkillContent, args map[strin
 	lead := ""
 	if sc != nil {
 		sys = e.generateSys(sc)
-		lead = argBlockOf(sc, args)
+		// 命中技能时更要带原话：构思这一跳定的是「这一篇写什么」，而它过去只看
+		// argBlockOf（抽参）——抽参丢了什么，构思就跟着丢什么，后面执笔跳再照抄
+		// 范文占位符。原话进不来，整条链路就都在对着参数表空写。
+		lead = userRawBlock(sc, userMsg) + argBlockOf(sc, args)
 	} else {
 		lead = "用户本轮需求：\n" + strings.TrimSpace(userMsg)
 	}
@@ -1016,8 +1019,8 @@ func (e *Engine) PlanEssay(ctx context.Context, sc *SkillContent, args map[strin
 }
 
 // GenerateWithPlan 同 Generate，额外把本轮构思要点并进 system prompt 末尾。
-func (e *Engine) GenerateWithPlan(ctx context.Context, sc *SkillContent, args map[string]string, plan string, onDelta func(string)) (string, error) {
-	return e.generateWithExtraPlan(ctx, sc, args, "", plan, onDelta)
+func (e *Engine) GenerateWithPlan(ctx context.Context, sc *SkillContent, args map[string]string, plan, userMsg string, onDelta func(string)) (string, error) {
+	return e.generateWithExtraPlan(ctx, sc, args, "", plan, userMsg, onDelta)
 }
 
 // writeThinkingOn 执笔跳是否保留思考链。**默认保留**（质量优先）。
@@ -1056,7 +1059,7 @@ func planDeadline() time.Duration {
 	return time.Duration(n) * time.Millisecond
 }
 
-func (e *Engine) generateWithExtraPlan(ctx context.Context, sc *SkillContent, args map[string]string, extra, plan string, onDelta func(string)) (string, error) {
+func (e *Engine) generateWithExtraPlan(ctx context.Context, sc *SkillContent, args map[string]string, extra, plan, userMsg string, onDelta func(string)) (string, error) {
 	sys := e.generateSys(sc)
 	if strings.TrimSpace(extra) != "" {
 		sys += "\n\n" + extra
@@ -1086,7 +1089,7 @@ func (e *Engine) generateWithExtraPlan(ctx context.Context, sc *SkillContent, ar
 	// 守着这两行的是 TestWriteHopKnobActuallyReachesProvider（默认臂必须**不带**开关，
 	// =0 臂必须**真带** enable_thinking=false + reasoning_effort=none）。
 	st := &hopStat{t0: time.Now()}
-	out, err := e.llm.StreamChat(ctx, sys, argBlockOf(sc, args)+"\n"+done, llm.StreamOpts{
+	out, err := e.llm.StreamChat(ctx, sys, userRawBlock(sc, userMsg)+argBlockOf(sc, args)+"\n"+done, llm.StreamOpts{
 		DisableThinking: !writeThinkingOn(),
 		OnContent:       st.content(onDelta),
 		OnReasoning:     st.reasoning(reasoningSink(ctx)),
@@ -1111,6 +1114,40 @@ func (e *Engine) generateSys(sc *SkillContent) string {
 		sys += "\n\n注意：有一个模板文件《" + sc.Attachment + "》会随本次回答下发，请在回答中明确指引用户下载使用。"
 	}
 	return sys
+}
+
+// userRawBlock 把「本轮用户原话」原样摆到执笔跳 prompt 的**最前面**。
+//
+// 为什么必须有这一块（线上账本，不是推测）：chat.go 是在 Push 用户消息**之前**取
+// `history := h.eng.Session(id)` 的，所以传给写作链路的 history 天然不含本轮原话；
+// 而 GenerateWithPack / GenerateWithPlan 的签名里也从来没有 userMsg 这一项。于是
+// 执笔跳能看到的用户内容**只有 EvalTurn 抽出来的那几个参数**——一次有损的模型调用。
+// 后果在线上实测里长这样：用户原话里写着「星禾云桥科技」「数据中台 3.0」「128 家」
+// 「36 城」「91.5%」，成稿却把范文里的 {公司名称}/{日期} 原样吐出来，或者自己编
+// 一组数字——用户看到的观感正是「生成的 skill 和我给的内容完全没关系」。
+//
+// 抽参不能取代原话：抽参是「模型读一遍，摘几个字段」，原话是「一手材料本身」。
+// 摘错了、漏摘了、字段名对不上模板占位符了，都只能靠原话兜住。所以这一块不设开关、
+// 不允许为空时静默跳过（为空只在「本轮确实没有用户文本」这种情形下发生，那时它
+// 返回空串，prompt 与改造前逐字等价）。
+func userRawBlock(sc *SkillContent, userMsg string) string {
+	m := strings.TrimSpace(userMsg)
+	if m == "" {
+		return ""
+	}
+	isWrite := sc != nil && sc.SkillType == model.SkillTypeWrite
+	head := "# 本轮用户原话（本次要办理/查询的事项原文，逐字为准）\n"
+	rules := "以上是用户这次的原话。其中的名称、单位、日期、编号、数字等具体事实**必须逐字照用**，" +
+		"不得改写、不得换成同义词、不得自行猜测补充。原话没提到的事实宁可省略，也不要编一个出来。\n"
+	if isWrite {
+		head = "# 本轮用户原话（本次写作的一手材料，逐字为准）\n"
+		rules = "以上是用户这次的原话，是本次写作的**第一手材料**。其中的公司/机构名称、日期、编号、" +
+			"金额、比例、数量等具体事实**必须逐字照用**，不得改写、不得换成同义词、不得自行猜测补充。" +
+			"原话没提到的事实宁可省略，也不要编一个出来。\n" +
+			"骨架模板与范文里的 {xxx} 是占位符标记，**必须**用上面的实际内容替换掉；" +
+			"把 {xxx} 原样写进正文视为不合格。\n"
+	}
+	return head + m + "\n\n" + rules + "\n"
 }
 
 // argBlockOf 把本次的要素整理成 user 侧的一段。写作类读作「具体要求」，

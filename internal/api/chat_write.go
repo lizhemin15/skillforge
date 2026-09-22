@@ -101,7 +101,7 @@ func (h *chatHandler) runManualWrite(
 	// 起草同样是一次无上界的阻塞调用（实测静默几分钟、provider 一片 reasoning 都不推），
 	// 本地旁白顶上：滚的是「命中哪一类、几篇范文、要素是什么」，全是真值。
 	stopNarr := clock.Narrate(narrateLines("", facts.note()))
-	draft, err := h.eng.GenerateWithPack(ctx, sc, pack, cat, args, prior, clock.Thinking)
+	draft, err := h.eng.GenerateWithPack(ctx, sc, pack, cat, args, prior, userMsg, clock.Thinking)
 	stopNarr()
 	if err != nil {
 		write(evError, jsonSafe(map[string]string{"error": "生成失败: " + err.Error()}))

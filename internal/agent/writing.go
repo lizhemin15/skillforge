@@ -235,14 +235,14 @@ func packBlock(pack *WritePack, cat *WriteCategory) string {
 // 的正文，模型只会重新写一篇看起来差不多的东西——用户的原话就是「通常没有管之前
 // 生成的内容」。所以这里把产物原文并进 extra（system 侧），而不是丢进 user 消息，
 // 免得被模型当成「本轮的新素材」混进正文。
-func (e *Engine) GenerateWithPack(ctx context.Context, sc *SkillContent, pack *WritePack, cat *WriteCategory, args map[string]string, prior string, onDelta func(string)) (string, error) {
+func (e *Engine) GenerateWithPack(ctx context.Context, sc *SkillContent, pack *WritePack, cat *WriteCategory, args map[string]string, prior, userMsg string, onDelta func(string)) (string, error) {
 	extra := packBlock(pack, cat)
 	if strings.TrimSpace(prior) != "" && prior != "（无历史）" {
 		extra += "\n\n## 本会话前文（含用户已认可的产物原文）\n" +
 			"用户说「改成…/在上一篇基础上…/接着写」时，指的就是下面的产物；" +
 			"必须在它基础上修改，不要另起炉灶重写一遍。\n\n" + prior + "\n"
 	}
-	return e.generateWithExtra(ctx, sc, args, extra, onDelta)
+	return e.generateWithExtra(ctx, sc, args, extra, userMsg, onDelta)
 }
 
 // ReviewIssue 是审稿人挑出的一条问题。

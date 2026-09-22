@@ -288,7 +288,7 @@ func TestGenerateKeepsThinkingButStreamsItAsMaterial(t *testing.T) {
 	ctx := WithProgress(context.Background(), func(s string) { materials = append(materials, s) })
 
 	sc := &SkillContent{Slug: "tz", Name: "通知", SkillType: model.SkillTypeWrite, SystemPrompt: "按通知格式写"}
-	out, err := eng.Generate(ctx, sc, map[string]string{"topic": "数据治理"}, nil)
+	out, err := eng.Generate(ctx, sc, map[string]string{"topic": "数据治理"}, "", nil)
 	if err != nil {
 		t.Fatalf("Generate 失败: %v", err)
 	}
@@ -320,7 +320,7 @@ func TestGenerateWithoutProgressSink(t *testing.T) {
 	eng := newTestEngine(t, fp)
 
 	sc := &SkillContent{Slug: "tz", Name: "通知", SkillType: model.SkillTypeWrite, SystemPrompt: "x"}
-	out, err := eng.Generate(context.Background(), sc, nil, nil)
+	out, err := eng.Generate(context.Background(), sc, nil, "", nil)
 	if err != nil {
 		t.Fatalf("没有接收器时不该失败: %v", err)
 	}
@@ -401,7 +401,7 @@ func TestWriteHopKnobActuallyReachesProvider(t *testing.T) {
 			fp := &fakeProvider{content: "正文一两句，够断言用。"}
 			eng := newTestEngine(t, fp)
 			sc := agentSkillContent("公司新闻通稿")
-			if _, err := eng.GenerateWithPlan(context.Background(), sc, nil, "要点：首段写五要素", func(string) {}); err != nil {
+			if _, err := eng.GenerateWithPlan(context.Background(), sc, nil, "要点：首段写五要素", "", func(string) {}); err != nil {
 				t.Fatalf("GenerateWithPlan 失败: %v", err)
 			}
 			body := fp.bodyAt(t, 0)
@@ -450,7 +450,7 @@ func TestWriteHopThinkBudgetReachesProvider(t *testing.T) {
 			fp := &fakeProvider{content: "正文一两句，够断言用。"}
 			eng := newTestEngine(t, fp)
 			sc := agentSkillContent("公司新闻通稿")
-			if _, err := eng.GenerateWithPlan(context.Background(), sc, nil, "要点：首段写五要素", func(string) {}); err != nil {
+			if _, err := eng.GenerateWithPlan(context.Background(), sc, nil, "要点：首段写五要素", "", func(string) {}); err != nil {
 				t.Fatalf("GenerateWithPlan 失败: %v", err)
 			}
 			body := fp.bodyAt(t, 0)

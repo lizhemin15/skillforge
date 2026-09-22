@@ -538,7 +538,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// 是什么」报出去——这是本地事实，t≈0 就能发。
 		clock.Thinking(noteFacts(sc, args, history).note())
 		stopNarr := clock.Narrate(narrateLines(plan, noteFacts(sc, args, history).note()))
-		full, err = h.eng.GenerateWithPlan(ctx, sc, args, plan, func(delta string) {
+		full, err = h.eng.GenerateWithPlan(ctx, sc, args, plan, req.Message, func(delta string) {
 			write(evDelta, jsonSafe(map[string]string{"t": delta}))
 		})
 		stopNarr()
