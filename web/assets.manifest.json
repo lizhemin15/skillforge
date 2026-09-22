@@ -17,8 +17,8 @@
       ]
     },
     "/assets/js/chat.js": {
-      "v": "20260919C",
-      "sha256": "ac8a0d8696c72c5c9971408be13426906c2f11ac3a12caa63dcfe11e2bab4278",
+      "v": "20260922C",
+      "sha256": "ceccef861b9f0ff704385370a7cc45f40f310d3065a7e13d43cd40283e98b1ee",
       "in": [
         "index.html"
       ]
