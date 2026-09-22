@@ -196,8 +196,20 @@ def main():
                 browser.close()
                 return 1
         if not page.locator('#train-form').is_visible():
+            hint = ''
+            if os.environ.get('ADMIN_USER') is None and os.environ.get('ADMIN_PASS') is None:
+                # 2026-09-23 实测踩到：在交互 shell 里 `ADMIN_USER=x` 只是**shell 变量**，
+                # 不 export 就不进环境，子进程（runner → env → python）一律看不到，
+                # 于是表现为「我明明设了凭据却 SKIP」。真凭据在 /opt/skillforge/skillforge.env
+                # 的 SKILLFORGE_ADMIN_USER/PASS，要转名字并 export：
+                #   set -a; . /opt/skillforge/skillforge.env; set +a
+                #   export ADMIN_USER="$SKILLFORGE_ADMIN_USER" ADMIN_PASS="$SKILLFORGE_ADMIN_PASS"
+                hint = ('（ADMIN_USER/ADMIN_PASS 在**环境里根本不存在** —— 注意 shell 变量不 export '
+                        '就不进子进程环境；真值在 skillforge.env 的 SKILLFORGE_ADMIN_USER/PASS）')
+            elif user and pwd:
+                hint = '（凭据已给出但登录/跳转没成功，看上面的 V1 报错）'
             skip('训练表单不可见（未登录 / 不是训练页）—— SKIP 不等于 PASS；'
-                 '要真跑请给 ADMIN_USER/ADMIN_PASS')
+                 '要真跑请给 ADMIN_USER/ADMIN_PASS' + hint)
             browser.close()
             return 0
 

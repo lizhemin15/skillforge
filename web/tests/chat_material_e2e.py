@@ -35,6 +35,17 @@ REQUIRE_FILE=1：docgen（生成 .docx）那条路径专用。
   独立前提只有文件卡片本身：出现「已生成文档」的 atx-link。
 
 SKIP 规则：playwright 不可用 / 页面打不开 → 打 SKIP 并 exit 0。SKIP != PASS。
+
+为什么没有第二把「几何尺子」（2026-09-23 实测后故意不加）：
+  曾另写过一个 chat_material_visible_e2e.py，专门量材料区的渲染几何：可见多行高度、
+  内部滚动贴底。线上真值把这个念头否掉了 —— 写作链路「等待期」实测只有 **4.8s**
+  （模型 5 秒内就开写正文，20s 时正文已 2080 字），材料峰值 310 字、材料区
+  scrollHeight == clientHeight == 74px，**从不溢出**。于是「溢出时贴底」永远空跑
+  （gap=0 恒真），「增长 ≥200 字」在 4.8s 窗口里根本达不到 —— 那不是产品红，是尺子
+  门槛错。空跑的断言不是防线、是噪音（用户已明确反感「计时器空转」式的假动作）。
+  「不可见」这条主路径本文件已覆盖：材料块 display:none 时 innerText 为空 → mats 为空
+  → M1 转红（不是靠 textContent 骗自己）。真痛的「卡着计时」现场不在写作链路，
+  在训练链路（一轮 860.5s / 20~27 分钟）—— 尺子该往那边搬。
 """
 # LIVE-LEGS: writing | docgen REQUIRE_FILE=1 PROMPT_KEY=docgen
 # ↑ 线上验收 leg 声明。scripts/acceptance-live.sh 只认这一行来枚举要跑几条 leg
