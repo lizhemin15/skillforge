@@ -3,12 +3,15 @@
 # 用法：bash scripts/deploy_ocrd.sh v260916.0147
 set -euo pipefail
 TAG="${1:?用法: bash scripts/deploy_ocrd.sh <tag>}"
+# ROOT 必须在**任何 cd 之前**按绝对路径定死，而且**只算这一次**。本脚本第 1 步就
+# `cd "$WORK"`；6b 里曾经又算了一次 `$(dirname "$0")/..` —— 那时 $0 已是相对路径
+# "scripts/deploy_ocrd.sh"，于是 `cd scripts/..` 失败、脚本当场中止，整个逐页流门禁
+# **静默跳过**（外层 `| tail` 又吞掉退出码：屏幕一切正常，门禁一次都没跑）。2026-09-23 真上线踩到。
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="$(git -C "$ROOT" remote get-url origin)"
 WORK="/tmp/sfdeploy-$TAG"
 LIVE="/opt/skillforge/bin/ocrd"
 PORT=18099
-
 echo "=== 1) 下载离线包（含 ocrd）==="
 mkdir -p "$WORK"; cd "$WORK"
 gh release download "$TAG" -R "$REPO" --pattern "skillforge-offline-${TAG}-linux-amd64.tar.gz*" --clobber
@@ -76,7 +79,6 @@ echo "=== 6b) 逐页流复验（v6 新能力：解析期屏幕要滚材料，而
 # 此前这里抄过第二份判据，而且写成 `curl … | python3 - <<'PY'` —— heredoc 与管道抢 stdin，
 # python3 把程序文本当输入、sys.stdin 是空的，于是所有断言都在空数据上跑：看着「跑了」，
 # 实际一条都没量到。抄出来的判据不会自动跟着变，这就是它烂掉的方式。
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # 料单：仓里那份（3 页纯扫描）**总是**跑，它覆盖「只扫扫描页」这条路由；本机若有混合重料
 # （可选 45 页 + 扫描 15 页）一并跑 —— 只有混合料能覆盖「可选中页直取」（纯扫描料的
 # text_pages 恒为 0），而且 30s 量级才把「边解析边发」与「解析完再拆行」彻底分开。
@@ -94,6 +96,8 @@ for c in "$ROOT/testdata/ocr/scan3-rtloss.pdf" "${FIXTURE_PDF:-}" /tmp/heavy_mix
   STREAM_PDFS="$STREAM_PDFS $c"
 done
 # 逐页流是本次发布的核心能力：一份料都量不到就不许发布（SKIP 不算过）。
+[ -f "$ROOT/scripts/verify_ocr_stream.py" ] \
+  || rollback_stream "找不到尺子 $ROOT/scripts/verify_ocr_stream.py（路径算错了？）→ 这条腿没跑，不许算通过"
 [ -n "$STREAM_PDFS" ] || rollback_stream "本机没有任何可用 PDF 试料，逐页流未验证"
 RAN=0
 for c in $STREAM_PDFS; do
