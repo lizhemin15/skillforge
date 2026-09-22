@@ -117,6 +117,38 @@ test('leg 里的环境变量必须真的被脚本读（死键 = 切换路径是�
   }
 });
 
+test('多 leg 脚本的 leg 之间必须有区分项（两条腿跑同一件事 = 假对照）', () => {
+  // 为什么单独立这条（而不是靠上面那条「env 必须被脚本读」兜住）：
+  // 2026-09-22 线上实测踩到 —— chat_doubts_e2e.py 声明过
+  //   `# LIVE-LEGS: doubts-informed TIMEOUT_S=300 | doubts-vague TIMEOUT_S=300`
+  // 两条腿的 env 只差 TIMEOUT_S，脚本里 LEG 又有默认值 'informed'，于是「vague」那条腿
+  // 实际跑的是 informed 的原话 + informed 的判据，回来报 6/6 绿。上面那条断言管不着它：
+  // 每个键（TIMEOUT_S）确实被脚本读了，键和值都不是死的 —— 死的是「两条腿没有区别」。
+  // 假对照比没对照更毒：报告上看着覆盖了两种路径，实际只跑了一条，而另一条永远绿。
+  for (const f of e2eFiles()) {
+    const { legs } = parseLegs(read(`web/tests/${f}`));
+    if (legs.length < 2) continue;
+    const sigs = legs.map((leg) => {
+      const [name, ...kvs] = leg.split(/\s+/);
+      // TIMEOUT_S 不算区分项：它只决定「等多久才砍」，不改变脚本做什么。
+      // 「300 vs 600」这种差别套上「两条腿都覆盖了」的皮，实际跑的是同一件事。
+      return { name, diff: kvs.filter((kv) => !kv.startsWith('TIMEOUT_S=')).sort().join(' ') };
+    });
+    const seen = new Map();
+    for (const s of sigs) {
+      if (seen.has(s.diff)) {
+        throw new Error(
+          `web/tests/${f} 的 leg「${s.name}」和「${seen.get(s.diff)}」的入参完全一样` +
+            `（都不带任何非 TIMEOUT_S 的键）—— 这两条腿跑的是同一件事，` +
+            `报告上却会显示覆盖了两条路径（假对照）。给每条腿一个真正区分行为的键，` +
+            `或者把多余那条删掉。`,
+        );
+      }
+      seen.set(s.diff, s.name);
+    }
+  }
+});
+
 test('runner 必须用通配枚举脚本，禁止写死文件名', () => {
   assert.ok(existsSync(new URL(RUNNER, REPO)), `${RUNNER} 不存在 —— 线上验收又只剩"我手动敲命令"了`);
 

@@ -40,11 +40,17 @@ LEG='web/tests/admin_train_progress_e2e.py'
 LEG_BAK="$TMP/leg.bak"
 cp "$LEG" "$LEG_BAK"
 LEG_BEFORE="$(md5sum "$LEG" | awk '{print $1}')"
+# A6 要注入的是另一条真腿（chat_doubts_e2e.py 的 LIVE-LEGS 声明），同样备份 + 校验还原。
+LEG2='web/tests/chat_doubts_e2e.py'
+LEG2_BAK="$TMP/leg2.bak"
+cp "$LEG2" "$LEG2_BAK"
+LEG2_BEFORE="$(md5sum "$LEG2" | awk '{print $1}')"
 
 cleanup() {
   rm -f "$PROBE"
   cp "$RUNNER_BAK" "$RUNNER" 2>/dev/null || true
   cp "$LEG_BAK" "$LEG" 2>/dev/null || true
+  cp "$LEG2_BAK" "$LEG2" 2>/dev/null || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -164,6 +170,26 @@ if inject "$LEG" "print(f'\n--- {ok_cnt}/{total} ok ---')" \
 else
   bad "A5 注入点不存在：leg 的小结行写法变了，锚点要跟着改"
   cp "$LEG_BAK" "$LEG"
+fi
+
+# A6 真实 leg 的声明退回「两条腿只差 TIMEOUT_S」的老写法
+# → 这是 2026-09-22 实测抓到的假对照形态：doubts-informed / doubts-vague 两条腿的 env
+#   一模一样，脚本里 LEG 有默认值，于是 vague 那条腿跑的是 informed 的话术，还报 6/6 绿。
+#   注意注入的是**真腿**（chat_doubts_e2e.py）：那条 roster 断言的职责就是盯真脚本的声明，
+#   拿假脚本注入等于没验 —— 假脚本的 leg 名是现拼的，压根复现不了这次踩的具体形态。
+if inject "$LEG2" '# LIVE-LEGS: doubts-informed LEG=informed TIMEOUT_S=300 | doubts-vague LEG=vague TIMEOUT_S=300' \
+                 '# LIVE-LEGS: doubts-informed TIMEOUT_S=300 | doubts-vague TIMEOUT_S=300'; then
+  roster_run
+  expect_roster_red "A6 两条腿的入参一样（只差 TIMEOUT_S）" "假对照"
+  cp "$LEG2_BAK" "$LEG2"
+  if [ "$(md5sum "$LEG2" | awk '{print $1}')" = "$LEG2_BEFORE" ]; then
+    ok "A6 真腿已逐字节还原"
+  else
+    bad "A6 真腿没还原干净 —— 这个脚本在改坏仓库"
+  fi
+else
+  bad "A6 注入点不存在：chat_doubts_e2e.py 的 LIVE-LEGS 声明写法变了，锚点要跟着改"
+  cp "$LEG2_BAK" "$LEG2"
 fi
 
 # A4 还原后必须回绿
@@ -329,4 +355,4 @@ if [ "$fails" -gt 0 ]; then
   echo "FAILED: 有 $fails 条自证不合格"
   exit 1
 fi
-echo "自证通过：结构注入 5 条 + 行为注入 10 条，红的都是预期那条，还原后全绿。"
+echo "自证通过：结构注入 6 条 + 行为注入 10 条，红的都是预期那条，还原后全绿。"

@@ -23,6 +23,9 @@
       这条就是投诉的直接反面：旧行为下锚串两边都不在（没引用、也没写）。
   Q4b 文案里每个「」引用必须能在我的原话里逐字查到（防编造引用 —— 展示假引用比不展示更糟）。
   Q5（informed 腿专有）信息齐全时不许停下追问：结局必须是「写」。
+  Q6 正文里不许原样出现未填的模板占位符（{公司名称} 这种）—— 真缺字段要么停问问，
+      要么按技能约定写中文占位 【待补:字段名】；把模板 token 当稿子交出去 = 用户说的
+      「生成的 skill 和我给的内容完全没有关系」。
 
 负向对照（手动跑，不进 LIVE-LEGS；不需要服务、不需要模型）：
   SELFCHECK=1 python3 web/tests/chat_doubts_e2e.py
@@ -30,9 +33,15 @@
   带引用停问 / 无疑点直写 必须全绿。任一不符合即 rc=1。
   **这是本尺子自己的前提**：没有它，"判据恒绿" 无法被排除。
 
-# LIVE-LEGS: doubts-informed TIMEOUT_S=300 | doubts-vague TIMEOUT_S=300
+# LIVE-LEGS: doubts-informed LEG=informed TIMEOUT_S=300 | doubts-vague LEG=vague TIMEOUT_S=300
 # ↑ 线上验收 leg 声明。scripts/acceptance-live.sh 只认这一行来枚举要跑几条 leg；
 #   web/tests/live_e2e_roster.test.mjs 守着它跟文件真身不许脱钩。
+# ★ `LEG=…` 是**必须**的，不是装饰：2026-09-22 实测踩到过 —— 这里原本只写
+#   `doubts-informed TIMEOUT_S=300 | doubts-vague TIMEOUT_S=300`，两条腿的 env 一模一样，
+#   脚本又给了 LEG 默认值 'informed'，于是「vague」那条腿跑的是 informed 的原话和判据，
+#   报回来 6/6 绿。**假对照比没对照更毒**：报告上写着覆盖两条路径，实际只跑了一条。
+#   现在双层拦住：声明里显式带 LEG=…（roster 元守卫守「多 leg 必须有非 TIMEOUT_S 的区分项」），
+#   main() 里再把默认值去掉 —— 没给就红，不给静默兜底的机会。
 """
 import json
 import os
@@ -46,7 +55,7 @@ BASE = os.environ.get('BASE', 'http://127.0.0.1:8092')
 U = os.environ.get('SKILLFORGE_ADMIN_USER', '')
 P = os.environ.get('SKILLFORGE_ADMIN_PASS', '')
 SKILL = os.environ.get('SKILL', '公司新闻通稿')
-LEG = os.environ.get('LEG', 'informed')
+LEG = os.environ.get('LEG', '')
 TIMEOUT_S = int(os.environ.get('TIMEOUT_S', '240'))
 # 首个有用帧的预算。本地事实旁白（clock.Thinking）实测 <0.3s，疑点跳/写稿首帧 ~秒级；
 # 20s 是「用户会不会觉得卡住」的体感线，不是实现细节线（别收到 5s 去卡模型方差）。
@@ -78,7 +87,12 @@ MSG_INFORMED = msg_informed(ANCHOR)
 
 # leg 名带 `doubts-` 前缀是给 runner 的 `ONLY=doubts` 用的（一次挑中两条腿）；
 # 判据里只认家族名（informed / vague），免得前缀一改判据就跟着瞎。
-FAMILY = LEG.split('-')[-1] if LEG.split('-')[-1] in ('informed', 'vague') else 'informed'
+_FAMILY = LEG.split('-')[-1]
+# 声明里到底有没有给出「这条腿该说哪种话」。False 时 main() 直接红 ——
+# 模块级这里必须留一个兜底值，否则 SELFCHECK 那条路（不带 LEG 跑桩）会在 import 期
+# 就 KeyError 崩掉，把自检变成一个跟被测系统无关的假红。
+LEG_DECLARED = _FAMILY in ('informed', 'vague')
+FAMILY = _FAMILY if LEG_DECLARED else 'informed'
 
 MSG = {'informed': MSG_INFORMED, 'vague': MSG_VAGUE}[FAMILY]
 
@@ -114,6 +128,12 @@ def norm(s):
     动标点会让「引用对不上」变成「引用对一半」，那就不是逐字引用了。
     """
     return re.sub(r'[\s\u3000\u200b]+', '', s or '')
+
+
+# 未填模板占位符：花括号里带中文的短 token（{公司名称} / {具体数据} / {行业名称}）。
+# 为什么限定「含中文」：正文里合法出现的花括号基本是代码/JSON（{"a":1}、{ i++ }、{{ }}），
+# 一刀切把花括号都判红会造出假红 —— 假红会让人把尺子关掉，比没有尺子更糟。
+PLACEHOLDER_RE = re.compile(r'\{[^{}\n]{0,12}[\u4e00-\u9fff][^{}\n]{0,12}\}')
 
 
 def quoted_spans(text):
@@ -155,6 +175,18 @@ def judge_turn(leg, msg, asked, ask_text, body_text, notes, first_useful_s, anch
             bad.append(q)
     out.append(('Q4b 文案里的每条「」引用都能在我的原话里逐字查到',
                 not bad, f'编造的引用={bad}'))
+
+    # Q6 交付物卫生：正文里不许原样出现「未填的模板占位符」。
+    # 依据用户原话：「生成的 skill 和我给的内容完全没有关系」。2026-09-22 线上实测复现 ——
+    # vague 腿我方只说「帮我写个新闻稿。」，流出的正文是
+    #   **{公司名称}完成{具体数据}融资营收同比增长{具体数据}%**X月X日，{公司名称}宣布完成{具体数据}万元融资…
+    # 即把技能模板里的 token 当稿件交出去。合法的 (a) 结局要求「带假设直接起草」，那就得写出人话；
+    # 真缺字段只能走 (b) 停问，或按技能约定用中文占位 【待补:字段名】。
+    # 只判「没停问」的轮次：停问文案里引用模板字段名来解释缺什么是正常的。
+    if not asked:
+        toks = PLACEHOLDER_RE.findall(body_text or '')
+        out.append((f'Q6 正文里没有未填的模板占位符（实得 {len(toks)} 个 {toks[:3]}）',
+                    not toks, f'形如 {toks[0]} 的模板 token 被当稿子交出去了' if toks else ''))
 
     # Q5 informed 腿：四个必填项都给了还停下追问 = 投诉复现
     if leg == 'informed':
@@ -202,6 +234,20 @@ SELFCHECK_CASES = [
      _turn(leg='informed', msg=SC_MSG, asked=False, anchor=SC_ANCHOR,
            body_text='星禾云桥科技（编号 zz9999）2026年9月22日发布数据中台3.0，' + '正文' * 120),
      '', True),
+    # 交付物卫生的负向前提：正文是没填的模板 token —— 2026-09-22 线上 vague 腿的真实产出
+    ('vague：正文把「{公司名称}」模板 token 当稿子交出去必须转红',
+     _turn(asked=False,
+           body_text='**{公司名称}完成{具体数据}融资营收同比增长{具体数据}%**X月X日，{公司名称}宣布完成融资。' * 3),
+     'Q6', False),
+    ('正文用技能约定里的中文占位【待补:客户数】不算模板 token（不许假红）',
+     _turn(asked=False,
+           body_text='星禾云桥科技今日发布数据中台3.0，签约客户【待补:客户数】家，' + '正文' * 120),
+     '', True),
+    ('正文里的代码/JSON 花括号不许被当成模板 token（不许假红）',
+     _turn(asked=False,
+           body_text='示例配置：{"name":"demo"} 与 Go 的 struct{ Name string }；' + '正文' * 120),
+     '', True),
+
     # 负向前提：informed 腿里锚串两边都没出现 —— 这正是投诉现场，必须转红
     ('informed：锚串既不在引用也不在正文（投诉现场）必须转红',
      _turn(leg='informed', msg=SC_MSG, asked=False, anchor=SC_ANCHOR,
@@ -292,6 +338,13 @@ def read_turn(sid, msg, tok, raw_log):
 def main():
     if os.environ.get('SELFCHECK') == '1':
         return selfcheck()
+    # 先拦「这条腿没告诉脚本该说哪种话」再谈别的：顺序放在凭据检查之前，
+    # 因为这是**尺子自己的配置错**（声明写漏了），不该被后面任何一个 SKIP 出口绕过去。
+    if not LEG_DECLARED:
+        print(f'FAIL LEG={LEG!r} 既不是 informed 也不是 vague —— 这条 leg 没说清该跑哪种话术。'
+              f'源头通常在 scripts/acceptance-live.sh 读的那行声明：# LIVE-LEGS 里要显式写 '
+              f'LEG=informed / LEG=vague。默认值已经去掉了，就是为了不让两条腿静默跑成同一件事。')
+        return 1
     if not U or not P:
         print('SKIP 缺 SKILLFORGE_ADMIN_USER / SKILLFORGE_ADMIN_PASS（先 set -a; . /opt/skillforge/skillforge.env）')
         return 0
