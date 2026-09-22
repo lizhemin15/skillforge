@@ -1073,6 +1073,9 @@ func (e *Engine) generateWithExtraPlan(ctx context.Context, sc *SkillContent, ar
 		OnReasoning:     st.reasoning(reasoningSink(ctx)),
 		// 同 write-plain：断流重试要让用户看见，别只让计时器在跳。
 		OnNote: func(s string) { ReportProgress(ctx, "· "+s) },
+		// 复读收手/断流重试时清掉已流到气泡的正文（SSE reset 帧），
+		// 重试的干净答案从零开始，不接在半截垃圾后面。
+		OnReset: ResetOf(ctx),
 	})
 	st.log("write-skill", out, err)
 	return out, err
@@ -2014,6 +2017,9 @@ func (e *Engine) plainChatWithPlan(ctx context.Context, id, user string, history
 		// 上游卡住 60s 后系统悄悄重试，用户屏幕上只有计时器在跳，
 		// 于是「一直卡着计时、体验不佳」里有一大截是我们没解释造成的。
 		OnNote: func(s string) { ReportProgress(ctx, "· "+s) },
+		// 复读收手/断流重试时清掉已流到气泡的正文（SSE reset 帧）。
+		// 2026-09-22 线上实锤：这一路复读时 47KB 同一句话直接刷进气泡。
+		OnReset: ResetOf(ctx),
 	})
 	st.log("write-plain", out, err)
 	return out, err

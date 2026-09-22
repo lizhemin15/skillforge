@@ -47,6 +47,13 @@ type StreamOpts struct {
 	// 说的话，前端按类别分开显示（skillgen 的 MaterialThink / MaterialNote）。
 	// 混在一起的话，用户会把「系统正在重试」误读成模型想到了重试这件事。
 	OnNote func(string)
+	// OnReset：本轮作废、即将重试时回调（调用方据此清掉已经流出去的
+	// 半截/复读正文——不清的话，重试成功后新正文会追加在一屏垃圾后面）。
+	// 可为 nil。
+	OnReset func()
+	// FrequencyPenalty：>0 时随请求发送。复读重试时由 StreamChat 自动带上
+	// （frequency_penalty 是破 repetition loop 的标准旋钮）。
+	FrequencyPenalty float64
 }
 
 // StreamChat 走流式 chat/completions，把思考链与正文片段分别交给回调，返回正文全文。
@@ -83,7 +90,7 @@ func (c *Client) StreamChat(ctx context.Context, sys, user string, o StreamOpts)
 		knob = knobNone
 	}
 	opt := o
-	triedBigger, droppedJSON, triedPartial := false, false, false
+	triedBigger, droppedJSON, triedPartial, triedLoopFix := false, false, false, false
 	var lastErr error
 	for attempt := 0; attempt < 4; attempt++ {
 		content, status, err := c.streamOnce(ctx, sys, user, opt, knob)
@@ -100,12 +107,27 @@ func (c *Client) StreamChat(ctx context.Context, sys, user string, o StreamOpts)
 		case status == http.StatusBadRequest && knob == knobBoth:
 			// 网关不认 enable_thinking（严格校验未知字段的 Azure / 部分自建）。
 			knob = knobEffortOnly
+		case IsLoopDetected(err) && !triedLoopFix && ctx.Err() == nil:
+			// 模型复读（线上实锤：5 字问题流了 47KB 同一句话）。收手后不是干重试：
+			// frequency_penalty 是破 repetition loop 的标准旋钮，带上再问一次。
+			// 已经流到前端的复读正文由 OnReset 通知清掉，别让新答案追加在一屏垃圾后面。
+			triedLoopFix = true
+			opt.FrequencyPenalty = 0.4
+			if opt.OnReset != nil {
+				opt.OnReset()
+			}
+			if opt.OnNote != nil {
+				opt.OnNote("检测到模型在复读同一内容，已提前收手；正在调整采样参数重试…")
+			}
 		case IsStreamBroken(err) && !triedPartial && ctx.Err() == nil:
 			// 流断在半路（上游把连接挂住 / 没给结束标记）。与 5xx 的区别很关键：
 			// 5xx 是「请求没成」，交给上层决定重试；这里是「请求成了但回答不完整」，
 			// 当场重试一次最省事——而且绝不能把半截正文漏给调用方（那会变成
 			// 「模型输出不是合法json」这种指向错方向的诊断）。
 			triedPartial = true
+			if opt.OnReset != nil {
+				opt.OnReset() // 半截正文同样作废：清掉，重试后流干净的新正文
+			}
 			if opt.OnNote != nil {
 				opt.OnNote("上游流式中断（连接被挂住或没有结束标记），正在重试一次…")
 			}
@@ -130,6 +152,11 @@ func (c *Client) StreamChat(ctx context.Context, sys, user string, o StreamOpts)
 				opt.OnNote(fmt.Sprintf("这一轮模型只回了思考过程、没有正文，正在放大输出预算到 max_tokens=%d 重试一次…", mt))
 			}
 		default:
+			// 终态前若这次已经流过正文又作废（复读二次/断流二次），同样先清屏再报错——
+			// 否则半屏复读正文和 ⚠ 错误提示缝在同一屏，用户还得手动滚过那屏垃圾。
+			if opt.OnReset != nil && (IsLoopDetected(err) || IsStreamBroken(err)) {
+				opt.OnReset()
+			}
 			return content, err
 		}
 	}
@@ -162,7 +189,84 @@ var (
 	// 一个 Read 很活跃），排障时要能一眼分开；对上层处理方式则一致——都算
 	// 「请求成了但回答不完整」，当场重试一次。
 	ErrNoProgress = errors.New("上游流式响应卡住：连接活着、保活帧在滴，但一直不出正文/思考片段")
+	// ErrLoopDetected：片很活跃、看门狗全绿，但吐出来的是同一段话的第 N 遍。
+	// 2026-09-22 线上实锤（10:53 那轮）：5 字问题（「现在在调用的是什么模型」）
+	// 流了 10748 片 / 47KB 正文、5 分半不给结束标记，idle/progress/片级三个
+	// 看门狗全绿（每片都 mark），最后靠总预算 327.5s 硬 cancel、整段丢弃——
+	// 用户盯着一屏复读刷屏白等 5 分钟。这是模型层 repetition loop，应用层
+	// 必须自己收手。
+	ErrLoopDetected = errors.New("上游模型陷入复读循环")
 )
+
+// IsLoopDetected 判断错误是不是「复读循环」这一类。与 IsStreamBroken 分开：
+// 复读重试要带 frequency_penalty（破复读的标准旋钮），不是干重试。
+func IsLoopDetected(err error) bool { return errors.Is(err, ErrLoopDetected) }
+
+// loopState：在线复读检测器。判据——尾部 loopTailBytes 字节在前文出现 ≥2 次
+// （含尾部自身共 3 遍）即判复读。
+//
+// 误报分析：192 字节的连续精确重复，在自然语言/表格/JSON 正文里几乎不可能合法
+// 出现 3 遍（表格行内容各不相同；段落级重复的正常文档会在写完后正常给 stop，
+// 但检测是流式进行的，不能依赖它——所以阈值取 3 遍而不是 2 遍，给合法重复留了
+// 一遍余量）。抓不住的：周期 > 全文 1/3 的大循环，那种由总预算兜底。
+//
+// 成本：每 loopCheckEvery 字节检测一次。检测要扫完尾巴在前文里的**全部**出现
+// （取最小间距，见 hit 内注释），所以单次是 O(前文长度)；47KB 正文最坏也不过
+// 十几次 × 几十 KB 的原生 strings.Index 扫描，毫秒级。这个代价换来的是
+// 错误信息里那个「循环体约 N 字节」在任何形态下都不说谎。
+type loopState struct {
+	checked int // 上次检测时的累计字节数
+}
+
+const (
+	loopTailBytes  = 192 // 复读判据用的尾巴长度
+	loopCheckEvery = 2048
+	loopMinContent = 3 * loopTailBytes // 尾巴×3 遍是判复读的最小正文量
+)
+
+// hit 检测一次。返回（循环体长度, 是否复读）。
+func (ls *loopState) hit(sb *strings.Builder) (period int, ok bool) {
+	n := sb.Len()
+	if n < ls.checked+loopCheckEvery || n < loopMinContent {
+		return 0, false
+	}
+	ls.checked = n
+	full := sb.String()
+	tail := full[n-loopTailBytes:]
+	prev := full[:n-loopTailBytes]
+	// 从前到后把尾巴在前文里的每次出现都找出来，取**最小相邻间距**当循环体长度。
+	// 不取「头两次出现的间距」：尾巴若在正文里零散出现过（合法文档引用同一长句、
+	// 模板头尾重复），头两次的间距是个假数（实测把 456 的循环体报成 798），
+	// 而最小间距在真循环里恰好就是循环体本身。
+	prevAt, cnt, period := -1, 0, 0
+	for i := 0; ; {
+		j := strings.Index(prev[i:], tail)
+		if j < 0 {
+			break
+		}
+		i += j
+		if prevAt >= 0 {
+			if gap := i - prevAt; period == 0 || gap < period {
+				period = gap
+			}
+		}
+		prevAt, cnt = i, cnt+1
+		// 重叠搜索（i++ 而非跳 192 字节）：循环体 < 尾巴长时（线上实锤 45 字节/帧），
+		// 下一处出现就在 i+unit——跳过尾巴会量出一个 192+ε 的假周期，错误信息里
+		// 「循环体约 N 字节」就失真了。代价是落空时多扫一遍 prev，MB 级微不足道。
+		i++
+	}
+	if cnt >= 2 {
+		// 尾巴自身也算一次出现：它与前文最后一处的间距，就是「手上正在吐的这一遍」
+		// 的长度。少了这一项，循环体报的是前两处之间的老间距（实测 798），
+		// 而手上真实的那一遍是 456。
+		if gap := (n - loopTailBytes) - prevAt; gap < period {
+			period = gap
+		}
+		return period, true
+	}
+	return 0, false
+}
 
 // IsStreamBroken 判断错误是不是「流断在半路」这一类。
 func IsStreamBroken(err error) bool {
@@ -433,6 +537,9 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 	if o.MaxTokens > 0 {
 		body["max_tokens"] = o.MaxTokens
 	}
+	if o.FrequencyPenalty > 0 {
+		body["frequency_penalty"] = o.FrequencyPenalty
+	}
 	switch knob {
 	case knobBoth:
 		// 两族开关互不通用，谁也不指望对方管用：enable_thinking 给 Qwen 系，
@@ -507,9 +614,17 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 	// 终止信号：正常收尾**必给其中一个**（线上 provider 实测 3/3 都给
 	// finish_reason=stop + [DONE]）。两者都缺 ⇒ 这次回答是被截断的。
 	sawDone, sawStop := false, false
+	// 复读看门狗：片级看门狗只看「来不来」，这台看「来的是什么」。
+	ls := &loopState{}
+	looped, loopPeriod := false, 0
 	sc := bufio.NewScanner(rc)
 	// SSE 的 data 行里带整段 delta JSON；默认 64KB 上限对长思考片段偏紧，放宽到 1MB。
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	// scan 标签是必须的：收手要跳出**扫描循环**，不是只跳出内层 choices 循环。
+	// 只 break 内层的话，scanner 已经缓冲在手的帧（实测 33KB ≈ 743 帧）会被逐帧
+	// 继续写进 sb 并逐帧 OnContent 推给前端——用户气泡里照样刷满一屏复读，
+	// 而且错误信息里「已收 N 字节」会被这个下溢过程污染成 33456（真值 2KB 级）。
+scan:
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, ":") {
@@ -567,8 +682,22 @@ func (c *Client) streamOnce(ctx context.Context, system, user string, o StreamOp
 				if o.OnContent != nil {
 					o.OnContent(d)
 				}
+				// 复读检测。触发就断流收手——继续等只会把同一句话
+				// 刷到天荒地老（2026-09-22 线上那轮：47KB / 5 分半）。
+				if period, ok := ls.hit(&sb); ok {
+					looped, loopPeriod = true, period
+					rc.Close()  // 让阻塞中的 sc.Scan() 当场返回
+					break scan  // 必须跳出扫描循环：缓冲在手的帧也不能再吐给前端
+				}
 			}
 		}
+	}
+	if looped {
+		// 复读收手。终止信号没来，正文按不完整丢弃（半截复读更不能交付）；
+		// 循环体长度与收到字节数都进错误信息，排障时一眼看出循环有多大。
+		return "", resp.StatusCode, &TransientError{Err: fmt.Errorf(
+			"%w（循环体约 %d 字节，已收 %d 字节时收手），按不完整丢弃",
+			ErrLoopDetected, loopPeriod, sb.Len())}
 	}
 	stalled := stopWatch()
 	noProgress, progWhy := stopProgress()

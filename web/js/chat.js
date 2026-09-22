@@ -1304,6 +1304,13 @@
       case 'delta':
         appendText(bubble, obj.t || '');
         break;
+      case 'reset':
+        // 本轮作废重试（复读收手/断流）：清空已流正文，重试的干净答案从零开始。
+        // 只清 data-md 累积源再重渲染，与 appendText 的累积机制对称，不会残留半截。
+        bubble.dataset.md = '';
+        bubble.innerHTML = '<span class="stream-cursor"></span>';
+        keepBottom();
+        break;
       case 'file':
         // 文件永远以独立、可见的对话消息出现；绝不埋进可能折叠的 trace 面板。
         pendingFiles.push(obj);

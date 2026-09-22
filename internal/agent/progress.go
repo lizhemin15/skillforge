@@ -45,6 +45,32 @@ func ReportProgress(ctx context.Context, text string) {
 	}
 }
 
+// ---- 重试重置通道 ----
+// OnReset 的 ctx 版：StreamChat 在「本轮作废、即将重试」时回调（复读收手 / 断流），
+// 调用方据此清掉已经流到前端的正文。不挂就返回 nil，llm 层自己判 nil，零成本。
+//
+// 为什么走 ctx 不走参数：write-skip / write-plain 的函数签名已经带 onDelta，
+// 再加一个 onReset func() 参数，每个调用方（含单测、docgen-test）都要跟着改；
+// 而 ctx 链路本来就贯穿全跳，挂一次全链路可见——与 ProgressSink 同一套理由。
+type resetKeyT struct{}
+
+func WithReset(ctx context.Context, fn func()) context.Context {
+	if ctx == nil || fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, resetKeyT{}, fn)
+}
+
+func ResetOf(ctx context.Context) func() {
+	if ctx == nil {
+		return nil
+	}
+	if v, ok := ctx.Value(resetKeyT{}).(func()); ok {
+		return v
+	}
+	return nil
+}
+
 // reasoningSink 返回可直接当 llm 回调用的闭包；没挂接收器时返回 nil，
 // 让 LLM 层省掉每片一次的函数调用。
 //

@@ -51,6 +51,7 @@ const evSkill = "skill"
 const evTrace = "trace"
 const evMeta = "meta"
 const evDelta = "delta"
+const evReset = "reset" // 本轮作废重试：前端清掉已流的正文，避免重试答案接在一屏垃圾后面
 const evFile = "file"
 const evDone = "done"
 const evError = "error"
@@ -138,6 +139,9 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 会被 clock 挂到进行中的那一步上滚动显示。挂一次全链路可见，因为下游所有
 	// 跳用的是同一条 ctx。
 	ctx := agent.WithProgress(r.Context(), clock.Thinking)
+	// 复读收手/断流重试时，StreamChat 经 OnReset 回调到这里：清掉气泡里已流
+	// 出的正文再重试，别让用户看到「半屏复读 + 一份正常答案」缝合在一起。
+	ctx = agent.WithReset(ctx, func() { write(evReset, "{}") })
 
 	// 0. persist the user turn
 	history := h.eng.Session(req.SessionID)
