@@ -212,6 +212,35 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 2. generation
 	var full string
+
+	// 2a-pre0. 用户**明说**只要正文，但命中的技能是文档生成型 → 弃用该技能，改走正文。
+	// 取证（2026-09-23 线上，非推断）：同一份 134 字输入（末句「直接输出正文」）连跑 8 次，
+	// 4 次分类器把「办公文档管家」(skill_type=docgen) 挑成命中技能，而 intent 是 **write**
+	// （它其实听懂了用户只要正文，meta.reason 里也写着「无文件生成需求」）。两件事各自都对，
+	// 合起来却把这一轮送进下面的发文分支出 .docx：屏幕上只有文件卡片，正文是
+	// 「已为您生成《…docx》，点击下方文件即可下载」39 字回执，看不到一个字的正文内容。
+	// 既有闸门（2a-pre）拦不住这种组合 —— 它只在 intent=docgen 时咨询 ExplicitTextOnly。
+	// 交付形态是用户亲手写在提示词里的判据，不该由模型投票决定，所以这里用确定性的
+	// agent.TextOnlyDropsDocGenSkill 兜底；清空 SkillSlug 后本轮自然落到下面
+	// 「3. plain chat (no skill)」的真正文路径（线上实测该路径这份输入能出 944~1078 字正文）。
+	if eval.SkillSlug != "" {
+		if dsc, derr := h.eng.LoadSkill(eval.SkillSlug); derr == nil && dsc != nil &&
+			agent.TextOnlyDropsDocGenSkill(req.Message, dsc.SkillType, manualSkill != nil) {
+			fmt.Fprintf(os.Stderr, "[route] 用户明说要正文，命中 %s(%s) 是文档生成型 → 弃技能走正文\n",
+				dsc.Slug, dsc.SkillType)
+			// needs 是照这个技能的参数名算出来的，技能弃了就该清掉（同 2a-pre 的处置）。
+			eval.Needs = nil
+			// 换路由必须让用户看见，否则就是闷声改路由：走 meta.note
+			// （前端有「降级说明」渲染通道，出现在回复开头）。
+			write(evMeta, jsonSafe(map[string]string{
+				"reason": eval.Reason, "skill": "", "intent": eval.Intent, "mode": mode,
+				"note": "「" + dsc.Name + "」是「文档生成」型技能，产出的是 Word/Excel 文件；" +
+					"你这轮要的是正文，已按你说的一步出正文。",
+			}))
+			eval.SkillSlug = ""
+		}
+	}
+
 	if eval.SkillSlug != "" {
 		sc, lerr := h.eng.LoadSkill(eval.SkillSlug)
 		if lerr != nil {

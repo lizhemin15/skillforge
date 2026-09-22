@@ -763,6 +763,34 @@ func ExplicitTextOnly(msg string) bool {
 	return false
 }
 
+// TextOnlyDropsDocGenSkill 判断这一轮是否该**弃用**命中的文档生成技能、改回正文。
+//
+// 为什么需要（2026-09-23 线上取证，非推断）：
+//
+//	既有闸门（api/chat.go 的 2a-pre）只在 intent=docgen 时咨询 ExplicitTextOnly。
+//	而分类器还有第二种翻法 —— 两件事各自都对，合起来是故障：
+//	  · intent=**write**（它听懂了用户只要正文，meta.reason 也写着「无文件生成需求」）；
+//	  · 命中技能却是 skill_type=docgen 的「办公文档管家」。
+//	api/chat.go 的发文分支只看 sc.SkillType==docgen，于是这一轮直接生成 .docx：
+//	屏幕上只有文件卡片，正文是「已为您生成《…docx》，点击下方文件即可下载」39 字回执，
+//	用户一个字正文都看不到。
+//	取证：同一份 134 字输入（末句「直接输出正文」）连跑 8 次，4 次命中办公文档管家
+//	（出文件、正文 39 字），4 次 skill=- 正常出 944~1078 字正文 —— 同一输入的交付形态
+//	在「文件」与「正文」之间翻。用户那句「像是没看到我的信息」有一类就是这么来的。
+//
+// 为什么不靠调提示词：命中与否是模型的投票，压不到零；而「明说的交付形态」是用户亲手
+// 写在提示词里的判据，确定性闸门优先级高于模型投票（与 ExplicitTextOnly 同一条理由）。
+//
+// manual 例外：用户手动点名的技能是最强指令（既有规矩：接力逻辑必须让位），且点名一个
+// docgen 技能本身就是选了「要文件」这个交付形态；同一句话里两个指令打架时交给用户自己
+// 改，代码不替他推翻。
+func TextOnlyDropsDocGenSkill(msg, skillType string, manual bool) bool {
+	if manual || skillType != model.SkillTypeDocGen {
+		return false
+	}
+	return ExplicitTextOnly(msg)
+}
+
 // PickDocGenSkill 挑一个能出文件的技能（skill_type=docgen 且提示词带 DOCJSON 契约）。
 // 用途：分类器给出「intent=docgen（要出文件）却命中非 docgen 型技能」这种自相矛盾的
 // 组合时，由调用方纠偏到这里，而不是静默降级成写正文。

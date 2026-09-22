@@ -66,6 +66,34 @@ INJ = {'hits': 0, 'landed': False}  # 注入落地状态，供 N1 断言自证�
 DUMP_TIMELINE = os.environ.get('DUMP_TIMELINE', '') == '1'
 
 
+def _material_log_cap():
+    """从 Go 源码读 materialLogCap —— 判据必须跟着实现走，不写死。
+
+    为什么：M3 原本写死 `<= 220`，那是更早一版材料面板的上限；后端换成一整块可滚动的
+    材料日志（窗口取尾部 materialLogCap 字）之后，实测峰值就到 1086~1198 了，而判据没跟着
+    改 —— 结果是**尺子过期**：产品明明是对的，writing 腿却恒红，还顺手把真故障的信号埋了。
+    教训：凡是「实现里有个常量、尺子里抄了个数字」的判据，一律改成读源码，脱钩一次就够。
+    下面找不到常量时**不静默兜底**：打一行 STALE 让它显眼（rc 由断言决定，不由这行决定）。
+    """
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    src = os.path.join(root, 'internal', 'api', 'chat_trace.go')
+    try:
+        with open(src, encoding='utf-8') as f:
+            m = re.search(r'materialLogCap\s*=\s*(\d+)', f.read())
+        if m:
+            return int(m.group(1))
+    except OSError:
+        pass
+    print('[STALE] 读不到 internal/api/chat_trace.go 的 materialLogCap，退回避风港 1200；'
+          '这不是通过，是判据来源丢了，请修尺子')
+    return 1200
+
+
+# 材料面板上限（DOM 里统计的字数）。留 64 字余量给后端为「首字对齐句读」加的前缀省略号
+# 与尾部旁白行 —— 那些不计入窗口本身，但会出现在 DOM 文本里。
+MAT_CAP = _material_log_cap() + 64
+
+
 def print_timeline(samples, limit_gap_ms=1500):
     """把采样打成时间线；只打变化点，间隔 >limit_gap_ms 时标注静默时长。"""
     if not samples:
@@ -360,8 +388,19 @@ def run_checks(pg):
               f"genfile={last.get('genfile')}")
     else:
         ok_body = last['bubble'] >= 200
+        # 前提不成立时**点名根因**：该腿的提示词末尾写着「直接输出正文」，若屏幕上却只有
+        # 文件卡片 + 一条「已为您生成《…docx》」的短回执，那不是「材料尺子坏了」，而是
+        # 交付形态被翻了 —— 2026-09-23 实锤：同一份输入 8 跑里 4 跑命中 docgen 型技能，
+        # intent=write 也被直落发文分支（正文 39 字）。修法见 internal/agent/agent.go 的
+        # TextOnlyDropsDocGenSkill + api/chat.go 的 2a-pre0 闸门；Go 侧守卫在
+        # internal/agent/textonly_route_test.go。这里把它翻译成一句能搜索的故障名，
+        # 免得下一个人对着一行「bubble=39」猜半天。
+        hint = ''
+        if not ok_body and last.get('genfile'):
+            hint = ('  ← 交付形态被翻转：提示词明说「直接输出正文」，却走了文档生成分支'
+                    '（见 agent.TextOnlyDropsDocGenSkill / chat.go 2a-pre0）')
         check('M5 前提：整轮真收到 ≥200 字正文（否则 M1 是空跑）', ok_body,
-              f"bubble={last['bubble']}")
+              f"bubble={last['bubble']}{hint}")
 
     if mats:
         first = mats[0]
@@ -373,8 +412,9 @@ def run_checks(pg):
                 tails.append(s[2])
         check('M2 材料在滚（≥3 个不同尾部快照，不是一次性贴一块）', len(tails) >= 3,
               f'不同快照 {len(tails)} 个')
-        check('M3 材料被截尾 ≤220 字（不撑破面板）', max(s[1] for s in mats) <= 220,
-              f"峰值 {max(s[1] for s in mats)} 字")
+        check('M3 材料被截尾 ≤%d 字（不撑破面板）' % MAT_CAP, max(s[1] for s in mats) <= MAT_CAP,
+              f"峰值 {max(s[1] for s in mats)} 字 / 判据上限 {MAT_CAP}"
+              f"（取自 internal/api/chat_trace.go 的 materialLogCap）")
         check('M4 材料只挂进行中那一步（`.ctk-step.done .ctk-mat` 全程为 0）',
               max(s[5] for s in samples) == 0, f"done 步里出现过 {max(s[5] for s in samples)} 个材料块")
     else:
@@ -382,7 +422,7 @@ def run_checks(pg):
         check('M1 材料出现在首段正文之前（等的时候屏幕上有真内容，不是跳秒）', False,
               '整轮没有材料帧')
         check('M2 材料在滚（≥3 个不同尾部快照，不是一次性贴一块）', False, '整轮没有材料帧')
-        check('M3 材料被截尾 ≤220 字（不撑破面板）', False, '整轮没有材料帧')
+        check('M3 材料被截尾 ≤%d 字（不撑破面板）' % MAT_CAP, False, '整轮没有材料帧')
         check('M4 材料只挂进行中那一步（`.ctk-step.done .ctk-mat` 全程为 0）',
               max((s[5] for s in samples), default=0) == 0, '')
 
