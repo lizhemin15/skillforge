@@ -90,8 +90,17 @@ type TraceStep struct {
 	// Material 是模型侧正在流出来的**中间材料**（思考链片段 / 分析过程）。
 	// 与 Detail 分开而不是拼进 Detail：Detail 是稳定的一句话（也是顶部状态条的
 	// 文本源），Material 是每 400ms 滚动的长文本，混在一起会让状态条变成一个
-	// 不断变长的墙。只做展示，不参与任何判定。
+	// 只做展示，不参与任何判定。
 	Material string `json:"material,omitempty"`
+	// MaterialLog 是同一份材料的**滚动日志**（比 Material 长得多，形如
+	// 「…整句。整句。整句」），给前端渲染成多行滚动区。
+	//
+	// 为什么单开一个字段而不是把 Material 调大：Material 是**单行**尾巴（160 字），
+	// 前端原地替换它——那是「一行字在原地抖」，用户读不懂也看不出在累积，屏幕上
+	// 就只剩计时器在跳（用户原话：「一直卡着计时，用户体验不佳」）。日志窗口要的是
+	// 「整段在长」的多行呈现，两者的读取方式不同，硬塞进一个字段会让两条渲染路径
+	// 互相打架。老字段原样保留，前端有日志就渲染日志、没有就退回单行。
+	MaterialLog string `json:"material_log,omitempty"`
 }
 
 // Engine orchestrates the dialogue.

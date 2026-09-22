@@ -32,9 +32,11 @@ JS = os.path.join(ROOT, 'web/js/chat.js')
 TEST = os.path.join(ROOT, 'web/tests/chat_trace.test.mjs')
 BAK = JS + '.trace.bak'
 
-# 材料渲染那一行的三元条件（唯一锚点：连注释一起锚，避免命中别处的 `s.material`）。
-COND = """          (s.material
-            ? '<span class="ctk-mat">"""
+# 材料渲染那一行的三元条件（唯一锚点：连缩进与下一行一起锚，避免命中别处的 `s.material`）。
+# matOf 现在的形状是「先判 material_log（滚动日志），没有日志才退回单行 material」，
+# 所以锚点要跟着实现走 —— 锚点找不到脚本会自己报 FAIL，不会静默空跑。
+COND = """    return s.material
+      ? '<span class="ctk-mat">"""
 
 
 def run_test():
@@ -71,12 +73,32 @@ def main():
         # 第 4 项必须精确 —— 只证明「改坏了会红」不够，得证明**改坏成那种故障**会红。
         # 作用域 'cond' = 只在材料那一行的三元条件里替换；'file' = 全文件替换（要求唯一命中）。
         muts = [
-            ('材料整块不渲染', 'cond', '(s.material', '(false', '有材料时渲染 .ctk-mat',
+            ('材料整块不渲染', 'cond', 's.material', 'false', '有材料时渲染 .ctk-mat',
              '三元条件恒假 → 材料 span 根本不进 DOM。这正是「后端发了、前端没渲染」的故障形态。'),
             ('材料不转义', 'file', 'esc(s.material)', "(s.material || '')", '材料被转义（不产生真标签）',
              '去掉 esc → 模型吐出的任意文本直接当 HTML。真实注入点，且是**静默**的：不报错、不断言、只是能被 XSS。'),
-            ('无材料也留空壳', 'cond', '(s.material', '(true', '无材料时不留空壳',
+            ('无材料也留空壳', 'cond', 's.material', 'true', '无材料时不留空壳',
              '三元条件恒真 → 每次心跳都多一个空的「思考中」框，把行撑高、时间线变成一堵墙。'),
+            # ---- 思考日志（MaterialLog）这一组 ----
+            # 上面三条守的是单行材料；用户投诉的第二个形态是「一行字在地上抖」：
+            # 单行窗口只有 160 字，每帧原地替换，屏幕上除了跳秒什么都读不出来。
+            # 日志窗口就是为这个加的，这三条守它。
+            ('日志窗口渲染不出（退回单行抖）', 'file',
+             "const log = s.material_log || '';",
+             "const log = '';",
+             '有 material_log 时渲染滚动日志容器',
+             '日志分支恒不进 → 退回 160 字单行原地替换，正是用户说的「一行字在抖」；'
+             '此时后端仍在发 material_log，Go 侧与 SSE 验收全绿，只有这条断言能抓。'),
+            ('日志被截成短尾巴（整段在长退化成一行）', 'file',
+             'esc(log)',
+             "esc(log.slice(-40))",
+             '日志整段进 DOM（不是只剩尾巴一句）',
+             '日志只送 40 字 → 容器有、贴底也对，但「整段在长」没了，用户还是只看到一行在换。'),
+            ('贴底跟随失效（新内容滚出视野）', 'file',
+             "const follow = body.dataset.matFollow !== '0';",
+             "const follow = false;",
+             '贴底跟随：首帧就把日志滚到底',
+             '不再跟随 → 日志越写越长但视口停在顶部，用户看到的是「卡住不动的一段旧文字」。'),
         ]
 
         for name, scope, old, repl, expect, why in muts:
@@ -123,7 +145,7 @@ def main():
         shutil.copy2(BAK, JS)
         os.remove(BAK)
 
-    print('--- ' + ('全部自证通过：材料断言抓得住这 3 类故障' if not rc_bad else '自证失败'))
+    print('--- ' + ('全部自证通过：材料断言抓得住这 6 类故障' if not rc_bad else '自证失败'))
     return rc_bad
 
 

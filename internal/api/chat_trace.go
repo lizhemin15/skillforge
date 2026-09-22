@@ -13,7 +13,7 @@ import (
 // 用户就开始怀疑卡死——人对 <4s 的静默不敏感，对 >5s 就会去点刷新。
 const traceBeat = 3 * time.Second
 
-// 中间材料的两个常数。
+// 中间材料的三个常数。
 //
 // materialCap：材料只留**尾部** 160 字。思考链是几万字的长文，整段下发既刷爆
 // SSE 又没人读；用户要的是「它在动、动的是什么」这一个信号。
@@ -24,6 +24,18 @@ const (
 	materialCap      = 160
 	materialThrottle = 400 * time.Millisecond
 )
+
+// materialLogCap：材料**滚动日志**（MaterialLog）的窗口，1200 字。
+//
+// 为什么单开一个比 materialCap 大得多的窗口：160 字的尾巴在屏幕上是一行原地
+// 替换的文本，用户实际看到的是「一行字在抖 + 计时在涨」——比只有计时更糟，
+// 因为抖动让人以为程序坏了。实测的 25 帧全是同一个尾巴，每帧开头还被从词中间
+// 劈开（真实 dump：「兰察布风电场的…」「确的时间节点…」）。
+//
+// 1200 字 ≈ 3~5 句连续思考，够前端铺成一个多行滚动区，读起来是「整段在长」，
+// 而不是「一行在闪」。上限仍然要有：思考链是几万字，无上限会让每帧 SSE 膨胀到
+// 几十 KB。
+const materialLogCap = 1200
 
 // traceClock 把「阻塞等待」变成「看得见的步骤流」。
 //
@@ -55,7 +67,11 @@ type traceClock struct {
 	// material 是**当前进行中那一步**累积的中间材料尾部；lastMat 是上次因材料
 	// 而下发的时间戳（节流用）。
 	material string
-	lastMat  time.Time
+	// materialLog 是同一份材料的**滚动日志**（尾部 materialLogCap 字）。与 material
+	// 同源同节流，只是窗口大得多、且对齐到句首——前端拿它铺多行滚动区，材质就从
+	// 「一行在原地抖」变成「整段在长」。
+	materialLog string
+	lastMat     time.Time
 
 	stopOnce sync.Once
 	done     chan struct{}
@@ -100,6 +116,7 @@ func (c *traceClock) Set(steps []agent.TraceStep) {
 	c.steps = cloneSteps(steps)
 	// 换阶段了：上一阶段攒的材料属于上一件事，留着会挂在新步骤下面误导人。
 	c.material = ""
+	c.materialLog = ""
 	c.mu.Unlock()
 	c.emit()
 }
@@ -123,6 +140,10 @@ func (c *traceClock) Thinking(text string) {
 		return
 	}
 	c.material = appendMaterial(c.material, text)
+	// 日志窗口必须**同时**更新：它与 material 共用同一次节流判断，分开算会出现
+	// 「单行在动、日志不动」（或反之）——两条线上的内容对不上，读起来更像坏了。
+	// align=true：日志是给人连续读的，从词中间劈开会被读成乱码。
+	c.materialLog = appendMaterialWindow(c.materialLog, text, materialLogCap, true)
 	now := time.Now()
 	if !c.lastMat.IsZero() && now.Sub(c.lastMat) < materialThrottle {
 		c.mu.Unlock()
@@ -146,7 +167,46 @@ func (c *traceClock) Thinking(text string) {
 //
 // 不摘老的会得到线上 dump /tmp/mat_dump_final.json 里那个样子：同一句话黏八遍。
 func appendMaterial(mat, text string) string {
-	return tailRunes(dropTrailingNarration(mat)+text, materialCap)
+	return appendMaterialWindow(mat, text, materialCap, false)
+}
+
+// appendMaterialWindow 是材料窗口**唯一**的写入实现（materialCap / materialLogCap
+// 两个窗口共用）。align=true 时把窗口首字对齐到句首。
+//
+// 为什么要对齐：线上 dump 里 25 帧全是同一个 160 字尾巴，每帧开头都被劈在词中间
+// ——「兰察布风电场的…」「确的时间节点…」「026年9月20日…」。用户读到的是乱码在抖，
+// 第一反应是「这程序坏了」，比只跳计时更伤。对齐的代价是每次多丢半句残句，换来
+// 每一帧都是完整可读的句子。
+//
+// 保底：如果第一处句读离窗口尾部不到半个窗口（模型一口气写了个超长句），就不对齐、
+// 原样给尾巴——宁可读半句，也不能把窗口丢成几行字。
+func appendMaterialWindow(mat, text string, cap int, align bool) string {
+	out := strings.TrimLeft(dropTrailingNarration(mat)+text, "…")
+	r := []rune(out)
+	if len(r) <= cap {
+		return out
+	}
+	r = r[len(r)-cap:]
+	if align {
+		if i := firstSentenceBreak(r); i >= 0 && len(r)-(i+1) >= cap/2 {
+			return "…" + string(r[i+1:])
+		}
+	}
+	return string(r)
+}
+
+// firstSentenceBreak 找窗口里第一处**句读**的位置，找不到返回 -1。
+//
+// 只认中文句读与换行：ASCII 的 '.' 不能进这个集合——中文技术文本里「2026.09」
+// 「3.5%」「v1.2」到处都是，按 '.' 对齐会把数字/版本号劈成两半，比不对齐更糟。
+func firstSentenceBreak(r []rune) int {
+	for i, ch := range r {
+		switch ch {
+		case '。', '！', '？', '；', '\n':
+			return i
+		}
+	}
+	return -1
 }
 
 // visibleMaterial 从材料窗口里取出该给用户看的那一段。
@@ -202,6 +262,7 @@ func (c *traceClock) Awaiting(detail string) {
 		}
 	}
 	c.material = ""
+	c.materialLog = ""
 	c.mu.Unlock()
 	c.emit()
 }
@@ -214,6 +275,7 @@ func (c *traceClock) Finish() {
 	}
 	// 收口这帧是给用户看「都做完了」的，挂着最后一段思考材料反而像还没完。
 	c.material = ""
+	c.materialLog = ""
 	c.mu.Unlock()
 	c.emit()
 	c.stop()
@@ -275,6 +337,7 @@ func (c *traceClock) snapshot(decorate bool) []agent.TraceStep {
 	c.mu.Lock()
 	out := cloneSteps(c.steps)
 	mat := c.material
+	log := c.materialLog
 	c.mu.Unlock()
 	// 材料窗口是滚动尾巴，旁白（带前导换行）会黏在真材料后面。只把**最后一段**
 	// 给用户看：新旁白替换旧旁白，真材料照旧跟在后面。不这么做的话窗口会变成
@@ -287,6 +350,10 @@ func (c *traceClock) snapshot(decorate bool) []agent.TraceStep {
 		out[i].Detail = withElapsed(out[i].Detail, c.Elapsed())
 		// 材料只挂进行中的那一步：它是「这一步正在干什么」的证据。
 		out[i].Material = mat
+		// 日志同样只挂进行中的那一步；旁白在日志里是**最后一行**（appendMaterialWindow
+		// 每条旁白都带前导换行、且新旁白先摘掉旧的），所以这里不用再 visibleMaterial
+		// 收一次——收了就只剩旁白一行，正好把要展示的整段思考丢掉。
+		out[i].MaterialLog = strings.TrimSpace(log)
 	}
 	return out
 }

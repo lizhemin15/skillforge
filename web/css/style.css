@@ -952,6 +952,22 @@ select.ch-field-ctl { appearance: none; }
   font-size: 10px; line-height: 1.7; color: var(--text-faint);
   background: rgba(0,0,0,.05); border: 1px solid var(--line-soft); border-radius: 999px;
 }
+/* 材料日志（后端 material_log）：整段思考的滚动窗口。
+   与单行 .ctk-mat 的关键差别是高度**固定**、内容自己在里面滚：让面板跟着长高会
+   把下方内容一直往下推，页面在 400ms 一帧的节奏里抖，比不动更晕。
+   7.2em ≈ 4~5 行，够看清「正在想什么」，又不至于占掉半屏。 */
+.ctk-mat-log {
+  max-height: none; overflow: visible;
+}
+.ctk-mat-log .ctk-mat-body {
+  display: block; max-height: 7.2em; overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+.ctk-mat-log .ctk-mat-body::-webkit-scrollbar { width: 3px; }
+.ctk-mat-log .ctk-mat-body::-webkit-scrollbar-thumb {
+  background: var(--line-soft); border-radius: 3px;
+}
 
 /* input bar */
 .ch-input-bar {

@@ -1441,6 +1441,43 @@
     pending: '<span class="ctk-dot"></span>',
   };
 
+  // matOf 渲染中间材料：优先后端的**滚动日志**（material_log，1200 字、按句对齐），
+  // 没有才退回单行尾巴（material，160 字）。
+  //
+  // 为什么必须优先日志：单行尾巴每帧原地替换，屏幕上是一行字在原地抖 —— 实测
+  // 用户看到「一条乱码在抖 + 计时在涨」，比只有计时更糟（抖动会被读成程序坏了）。
+  // 日志是多行累积、只往尾部加，配 stickMatLog 的底部跟随才是「整段在长」。
+  function matOf(s) {
+    const log = s.material_log || '';
+    if (log) {
+      return '<span class="ctk-mat ctk-mat-log"><span class="ctk-mat-tag">思考中</span>' +
+        '<span class="ctk-mat-body">' + esc(log) + '</span></span>';
+    }
+    return s.material
+      ? '<span class="ctk-mat"><span class="ctk-mat-tag">思考中</span>' + esc(s.material) + '</span>'
+      : '';
+  }
+
+  // stickMatLog 让思考日志默认贴底跟随，且**不抢**用户的手动滚动位置。
+  //
+  // 状态记在 body.dataset 而不是闭包变量里：renderTrace 每帧把 body.innerHTML
+  // 清空重建，日志元素是新造的（它的 scrollTop 归零），只有 body 本身跨帧存活。
+  // 不记住的话，用户刚往上翻去读半句，下一帧（≤400ms 后）就被弹回底部 —— 那比
+  // 不跟随更烦人。翻走时按「距顶部像素」还原：内容只在尾部增长，顶部不动，
+  // 所以同一个 scrollTop 就是同一段文字。
+  function stickMatLog(body) {
+    const log = body.querySelector('.ctk-mat-log .ctk-mat-body');
+    if (!log) return;
+    const follow = body.dataset.matFollow !== '0';
+    log.scrollTop = follow ? log.scrollHeight : Number(body.dataset.matTop || 0);
+    log.addEventListener('scroll', () => {
+      // 4px 容差：亚像素高度会让「就差 1px」被判成用户翻走了。
+      const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight <= 4;
+      body.dataset.matFollow = atBottom ? '1' : '0';
+      body.dataset.matTop = String(log.scrollTop);
+    });
+  }
+
   // "AI 调度台" — an open timeline workbench showing how the orchestrator
   // decomposes the user's request, picks a skill and walks it step by step.
   // First trace event builds the DOM (open by default); later events just
@@ -1528,13 +1565,20 @@
           '</span>' +
           '<span class="ctk-detail">' + esc(s.detail || '') + '</span>' +
           // 中间材料：模型正在想的片段。有它用户才看得到「在动的是什么」，
-          // 而不是只有一个跳秒的计时器。后端已截成尾部 160 字并节流下发。
-          (s.material
-            ? '<span class="ctk-mat"><span class="ctk-mat-tag">思考中</span>' + esc(s.material) + '</span>'
-            : '') +
+          // 而不是只有一个跳秒的计时器。
+          //
+          // 优先渲染 material_log（后端 1200 字、按句对齐的滚动窗口），没有才退回
+          // material（160 字单行尾巴）。为什么必须有 log：单行尾巴每帧原地替换，
+          // 用户看到的是「一行字在原地抖 + 计时在涨」，实测比只有计时更糟——抖动
+          // 让人以为程序坏了。log 是「整段在长」，配上固定高度 + 底部跟随，才是
+          // 用户要的「流式输出思考的中间材料」。
+          matOf(s) +
         '</span>';
       body.appendChild(row);
     });
+    // 先摆滚动位置再 keepBottom()：整页贴底会把这行推上去，顺序反了日志会停在
+    // 用户翻走的旧位置、却已经被整页滚动带离视线。
+    stickMatLog(body);
     keepBottom();
   }
 
