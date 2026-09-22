@@ -686,8 +686,8 @@ scan:
 				// 刷到天荒地老（2026-09-22 线上那轮：47KB / 5 分半）。
 				if period, ok := ls.hit(&sb); ok {
 					looped, loopPeriod = true, period
-					rc.Close()  // 让阻塞中的 sc.Scan() 当场返回
-					break scan  // 必须跳出扫描循环：缓冲在手的帧也不能再吐给前端
+					rc.Close() // 让阻塞中的 sc.Scan() 当场返回
+					break scan // 必须跳出扫描循环：缓冲在手的帧也不能再吐给前端
 				}
 			}
 		}
