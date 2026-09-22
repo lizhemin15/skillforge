@@ -324,16 +324,50 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			blocking = nil
 		}
 		if len(blocking) > 0 {
-			// surface missing required params as a needs event, then skip gen
-			msg := needsMessage(blocking)
-			write(evNeeds, jsonSafe(blocking))
-			// 让 generate 那一步读作「等补充」而不是「还在跑」
-			clock.Awaiting("等待补充：" + needsShort(blocking))
-			write(evDelta, jsonSafe(map[string]string{"t": msg}))
-			// record assistant prompt asking for the fields
-			h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: msg, SkillSlug: eval.SkillSlug, At: time.Now()})
-			write(evDone, jsonSafe(map[string]string{"skill": eval.SkillSlug, "asked": "true"}))
-			return
+			// 疑点回执（用户投诉的正面回应）：「有的时候似乎像是没看到我的信息一样
+			// 的，还在问我要信息，要的时候也不是根据我目前提供的信息的基础上来进一步
+			// 补充，而是直接通用的补充。」
+			//
+			// 旧版这一跳直接发 needsMessage —— 那是照技能 input_params 拼的通用要素
+			// 清单，跟用户这次说了什么**完全无关**，所以「信息其实就在原文里」也会被
+			// 问一遍。新做法：先让模型**逐字引用用户原文**挑 0~3 条真疑点（每条带默认
+			// 理解，用户回「就按你的」即可继续）；挑不出、或引用在原文里找不到（本地
+			// 校验判为不可信）、或这一跳超时 —— 三种情况一律**不拦**，带假设直接写。
+			//
+			// 危害不对称：拦错一轮，用户白等且以为材料丢了（不可感知）；放过一轮，
+			// 假设摆在明面上，可感知可纠正。详见 agent/doubts.go 文件头。
+			//
+			// 旁白先发（本地事实，t≈0）：疑点跳是一次网络调用，不发旁白就又是
+			// 「屏幕上只有计时在跳」。
+			clock.Thinking("先把「" + agent.NeedsSummary(blocking) + "」和你给的原话对一遍，真有歧义才来问你…")
+			hay := agent.DoubtHaystack(req.Message, fullHist)
+			rep, derr := h.eng.RaiseDoubts(ctx, sc.Name, blocking, req.Message, fullHist)
+			doubts := agent.ValidateDoubts(rep, hay)
+			if len(doubts) == 0 {
+				// 无疑点（或疑点全被本地校验丢弃=引用对不上原文，不可信）：
+				// 明说「无疑点」再直写，别让用户以为我们什么都没看就动笔。
+				rawN := 0
+				if rep != nil {
+					rawN = len(rep.Doubts)
+				}
+				fmt.Fprintf(os.Stderr, "[needs-gate] 疑点回执：无疑点（raw=%d err=%v）→ 带假设直写\n", rawN, derr)
+				write(evMeta, jsonSafe(map[string]string{
+					"note": "无疑点，开始写：「" + agent.NeedsSummary(blocking) +
+						"」按你给的内容推断后直接起草，哪条不对随时喊停。",
+				}))
+			} else {
+				// 有真疑点：停下等确认，但问题是**锚定原文 + 带默认理解**的，
+				// 不是通用清单——用户回「就按你的」或改第几条都能一句话说完。
+				msg := agent.DoubtsMessage(doubts)
+				write(evNeeds, jsonSafe(blocking))
+				// 让 generate 那一步读作「等确认」而不是「还在跑」
+				clock.Awaiting("等待确认：" + agent.DoubtsShort(doubts))
+				write(evDelta, jsonSafe(map[string]string{"t": msg}))
+				// record assistant prompt asking for the fields
+				h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: msg, SkillSlug: eval.SkillSlug, At: time.Now()})
+				write(evDone, jsonSafe(map[string]string{"skill": eval.SkillSlug, "asked": "true"}))
+				return
+			}
 		}
 		// docgen skills produce an office file, not streamed text: drive the
 		// generator, cache the bytes, and hand the client a one-time download.
@@ -646,22 +680,11 @@ func (h *chatHandler) declaredParams(slug string) []model.Param {
 	return sk.InputParams
 }
 
-func needsMessage(needs []model.Param) string {
-	labels := make([]string, 0, len(needs))
-	for _, n := range needs {
-		l := n.Label
-		if l == "" {
-			l = n.Name
-		}
-		if l != "" {
-			labels = append(labels, l)
-		}
-	}
-	if len(labels) == 0 {
-		return "好的，我需要你补充一些信息才能开始写作，请告诉我。"
-	}
-	return "要开始写作，我需要你补充以下信息：" + strings.Join(labels, "、") + "。你可以直接告诉我。"
-}
+// 这里原本是 needsMessage + needsShort：旧版停问文案，照技能 input_params 拼一份
+// 通用要素清单（「要开始写作，我需要你补充以下信息：标题亮点」）。用户投诉
+// 「像没看到我的信息，还在问我要信息，而且是通用补充」的根源就是它 —— 清单跟用户
+// 这次说了什么完全无关。现由 agent.DoubtsMessage（锚定原文 + 带默认理解）取代，
+// 见 agent/doubts.go。特意整段删掉而不是留着：留着就会被再接线回去。
 
 // skillTypeLabel 把技能类型翻成给用户看的说法。
 // 用途：路由纠偏时那句「X 是『文章写作』型技能，产出正文而不是文件」必须说人话 ——
@@ -681,24 +704,6 @@ func skillTypeLabel(t string) string {
 		return "未标注类型"
 	}
 	return t
-}
-
-// needsShort returns a compact comma list of missing-param labels, for trace detail.
-func needsShort(needs []model.Param) string {
-	labels := make([]string, 0, len(needs))
-	for _, n := range needs {
-		l := n.Label
-		if l == "" {
-			l = n.Name
-		}
-		if l != "" {
-			// strip trailing question mark for a tight trace line
-			l = strings.TrimSuffix(l, "？")
-			l = strings.TrimSuffix(l, "?")
-			labels = append(labels, l)
-		}
-	}
-	return strings.Join(labels, "、")
 }
 
 func jsonSafe(v interface{}) string {

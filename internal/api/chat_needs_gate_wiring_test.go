@@ -44,7 +44,22 @@ const classifyNeedsTitlePoint = `{"skill_slug":"gongchang-news","intent":"写公
 // 必须走 CreateSkill 而不是 Create：只写库不写盘，引擎读 system_prompt.md 会失败，
 // 整轮以一个 error 帧收场（第一版就这么红过：连 done 帧都等不到）。写盘这步在闸门
 // **之前**，漏了就测不到闸门。
-func newNeedsGateHandler(t *testing.T) *chatHandler {
+func newNeedsGateHandler(t *testing.T) (*chatHandler, *fakeLLM) {
+	t.Helper()
+	return newNeedsGateHandlerWith(t, func(usr string) string {
+		return doubtsJSON("ambiguity", verbatimQuote(usr, 8), "按素材里的项目名与投产时间写", "主题口径")
+	})
+}
+
+// newNeedsGateHandlerWith 同 newNeedsGateHandler，但疑点跳的回执由用例指定：
+// doubtsReply 收到的是**疑点跳真正的 user 提示原文**，用例据此抠引用（而不是写死
+// 一个常量再断言常量）—— 这样「引用必须逐字命中原文」这条判据才真的被走到。
+//
+// 跳感知靠 system 提示里的标记：疑点跳的 system 是 agent 的 doubtsSys（含「对齐疑点」），
+// 其余跳仍回分类器的 JSON。为什么必须跳感知：旧版用例让所有跳回同一个常量，改了停问
+// 分支之后它会「因为疑点跳解析不出疑点」而静默改走直写 —— 用例仍会红，但红在错的
+// 原因上（分不清是接线断了还是假回执没造好）。
+func newNeedsGateHandlerWith(t *testing.T, doubtsReply func(usr string) string) (*chatHandler, *fakeLLM) {
 	t.Helper()
 	sk := newStoreForTest(t, t.TempDir())
 	if err := sk.CreateSkill(
@@ -57,9 +72,62 @@ func newNeedsGateHandler(t *testing.T) *chatHandler {
 	); err != nil {
 		t.Fatalf("建测试技能失败（闸门的判据是技能声明的 input_params，没有它测不到闸门）：%v", err)
 	}
-	f := newFakeLLM(t, func(system, user string) string { return classifyNeedsTitlePoint })
+	f := newFakeLLM(t, func(system, user string) string {
+		if strings.Contains(system, doubtsHopMarker) {
+			return doubtsReply(user)
+		}
+		return classifyNeedsTitlePoint
+	})
 	cli := llm.New(&model.LLMConfig{APIKey: "test", BaseURL: f.srv.URL, Model: "fake"})
-	return &chatHandler{eng: agent.New(cli, sk), maxRound: 1, gen: newGenCache()}
+	return &chatHandler{eng: agent.New(cli, sk), maxRound: 1, gen: newGenCache()}, f
+}
+
+// doubtsHopMarker 出现在 agent 疑点跳的 system 提示里（「你是『对齐疑点』裁判」）。
+const doubtsHopMarker = "对齐疑点"
+
+// verbatimQuote 从疑点跳的 user 提示里抠出「用户这次给的原话」，取前 n 字。
+// 这是引用校验的地面真值：引用合法与否，只能由这条路径决定。
+func verbatimQuote(usr string, n int) string {
+	const mark = "## 用户这次给的原话"
+	i := strings.Index(usr, mark)
+	if i < 0 {
+		return ""
+	}
+	rest := strings.TrimLeft(usr[i+len(mark):], "\n")
+	if j := strings.Index(rest, "\n## "); j >= 0 {
+		rest = rest[:j]
+	}
+	return headRunes(strings.TrimSpace(rest), n)
+}
+
+// headRunes 取前 n 个字符（rune，不是字节 —— 中文按字节切会切出半个字）。
+func headRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) < n {
+		return s
+	}
+	return string(r[:n])
+}
+
+// doubtsJSON 拼疑点跳的 JSON 回执（一条疑点）。
+func doubtsJSON(kind, quote, infer, impact string) string {
+	b, _ := json.Marshal(map[string]any{"doubts": []map[string]string{
+		{"kind": kind, "quote": quote, "inference": infer, "impact": impact},
+	}})
+	return string(b)
+}
+
+// doubtsHops 数一数这一轮疑点跳被调了几次（跳过=接线断了，用例必须能区分）。
+func doubtsHops(f *fakeLLM) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, r := range f.reqs {
+		if strings.Contains(r.System, doubtsHopMarker) {
+			n++
+		}
+	}
+	return n
 }
 
 // eventWriter 是**保住事件名**的 SSE 收集器。
@@ -199,22 +267,100 @@ func materialTurns(n int) string {
 	return sb.String()
 }
 
-// TestNeedsGateShortMessageStillAsks：用户**没给材料**时闸门必须照旧拦。
+// TestNeedsGateAnchoredDoubtStillAsks：有真疑点时闸门照旧拦，但**问法换成锚定原文**。
 //
-// 这是闸门的反向自证，防的是「一改就改成一律不拦」：技能声明必填、素材里也没有、
-// 用户只说了一句话 —— 这时候追问是对的，放过去才是拿空字段去套模板。
-func TestNeedsGateShortMessageStillAsks(t *testing.T) {
-	h := newNeedsGateHandler(t)
-	frames := collectChat(t, h, chatBody(t, "s-needs-short", "帮我写一篇公司新闻通稿"))
+// 这条替代了旧的 TestNeedsGateShortMessageStillAsks。旧用例断言的是「照技能清单拼出
+// 通用要素清单」（"我需要你补充以下信息：标题亮点"）—— 那正是用户投诉的东西：
+// 「要的时候也不是根据我目前提供的信息的基础上来进一步补充，而是直接通用的补充」。
+// 契约变了，守卫必须跟着变；留着旧断言等于留一条「改回旧行为会绿」的假守卫。
+//
+// 反向自证仍在（防「一改就改成一律不拦」）：有疑点就必须拦、必须 asked=true。
+func TestNeedsGateAnchoredDoubtStillAsks(t *testing.T) {
+	h, f := newNeedsGateHandler(t)
+	const msg = "帮我写一篇公司新闻通稿"
+	frames := collectChat(t, h, chatBody(t, "s-needs-anchored", msg))
 	all := joinedFrames(frames)
+
 	if !hasEvent(frames, "needs") {
-		t.Fatalf("短消息（用户没给材料）时闸门没拦，缺 needs 事件：\n%s", all)
+		t.Fatalf("有真疑点时闸门没拦，缺 needs 事件（改成一律不拦了？）：\n%s", all)
 	}
 	if !strings.Contains(all, `"asked":"true"`) {
 		t.Fatalf("拦下了但没标 asked=true，前端会读成「还在跑」：\n%s", all)
 	}
-	if strings.Contains(all, "按素材自行推断") {
-		t.Fatalf("短消息里不该出现「按素材自行推断」（没有素材可推）：\n%s", all)
+	// 接线证据：疑点跳真的被调了。没有这条，上面的断言也可能绿在别的路上。
+	if n := doubtsHops(f); n == 0 {
+		t.Fatalf("疑点跳一次都没调 —— 停问走的是别的路，用例绿在错的原因上：\n%s", all)
+	}
+	// 锚定原文：引用必须是用户这次真的说过的话（引用取自真提示，不是常量）。
+	quote := headRunes(msg, 8)
+	if quote == "" {
+		t.Fatalf("测试前提不成立：没能从疑点跳提示里抠出用户原话")
+	}
+	if !strings.Contains(all, "「"+quote+"」") {
+		t.Fatalf("停问文案里没有逐字引用用户原话 %q（又退回通用追问了？）：\n%s", quote, all)
+	}
+	// 旧病复发的直接特征串：通用要素清单。
+	if strings.Contains(all, "我需要你补充以下信息") {
+		t.Fatalf("停问又用回了通用要素清单（用户投诉的原话就是这个）：\n%s", all)
+	}
+	// 一句话可确认的出口：用户不想逐条答，回一句就能开工。
+	if !strings.Contains(all, "就按你的") {
+		t.Fatalf("停问没给出「回一句就继续」的出口，等于逼用户填表：\n%s", all)
+	}
+}
+
+// TestNeedsGateFabricatedQuoteDoesNotAsk：模型编了一条原文里找不到的引用时，
+// **不许**拿它去拦用户 —— 这条引用会在原文里找不着，比不问更糟。
+// 拦不住就带假设直写，且必须把假设说出来（可感知、可纠正）。
+func TestNeedsGateFabricatedQuoteDoesNotAsk(t *testing.T) {
+	h, f := newNeedsGateHandlerWith(t, func(string) string {
+		// 引用逐字写在原文里根本不存在的句子（"客户要求" 从未出现）
+		return doubtsJSON("ambiguity", "客户要求必须当天发布且署名", "按当天发布处理", "发布节奏")
+	})
+	frames := collectChat(t, h, chatBody(t, "s-needs-fabricated", "帮我写一篇公司新闻通稿"))
+	all := joinedFrames(frames)
+
+	if n := doubtsHops(f); n == 0 {
+		t.Fatalf("疑点跳没被调用，这条用例测不到校验逻辑：\n%s", all)
+	}
+	if hasEvent(frames, "needs") {
+		t.Fatalf("引用对不上原文却还是拦下了用户（用户会去原文里找这句话，找不到）：\n%s", all)
+	}
+	if !strings.Contains(all, "无疑点，开始写") {
+		t.Fatalf("没拦但也没说「无疑点，开始写」，用户只会觉得它自作主张：\n%s", all)
+	}
+	if !strings.Contains(all, "标题亮点") {
+		t.Fatalf("假设里没点名是哪一项（用户无法纠正）：\n%s", all)
+	}
+	if strings.Contains(all, "客户要求必须当天发布且署名") {
+		t.Fatalf("把对不上原文的引用展示给用户了：\n%s", all)
+	}
+}
+
+// TestNeedsGateGarbageDoubtsStillWrites：疑点跳输出不是 JSON（模型抽风/被截断）时，
+// 绝不退回通用清单，直接带假设写 —— 「坏输出」是危害不对称里最该放过的一侧。
+func TestNeedsGateGarbageDoubtsStillWrites(t *testing.T) {
+	h, f := newNeedsGateHandlerWith(t, func(string) string {
+		return "嗯，这个我看看……还是直接写吧"
+	})
+	frames := collectChat(t, h, chatBody(t, "s-needs-garbage", "帮我写一篇公司新闻通稿"))
+	all := joinedFrames(frames)
+
+	if n := doubtsHops(f); n == 0 {
+		t.Fatalf("疑点跳没被调用，这条用例测不到容错：\n%s", all)
+	}
+	if hasEvent(frames, "needs") {
+		t.Fatalf("疑点输出坏了却拦下了用户：\n%s", all)
+	}
+	if !strings.Contains(all, "无疑点，开始写") {
+		t.Fatalf("坏输出时既没拦也没说明，用户白等一轮：\n%s", all)
+	}
+	if strings.Contains(all, "我需要你补充以下信息") {
+		t.Fatalf("坏输出退回了通用要素清单（最该避免的回退）：\n%s", all)
+	}
+	// 真的继续写了：必须有正文流出来，不能「不拦也不写」。
+	if !hasEvent(frames, "delta") {
+		t.Fatalf("没拦但也没流正文，整轮空转：\n%s", all)
 	}
 }
 
@@ -229,7 +375,7 @@ func TestNeedsGateShortMessageStillAsks(t *testing.T) {
 //	③ 字数取自**本轮消息本身**（用例按 len([]rune(msg)) 算期望值）—— 防「把数字写死」，
 //	   那个数必须是从消息里数出来的地面真值。
 func TestNeedsGateLongMaterialDoesNotAsk(t *testing.T) {
-	h := newNeedsGateHandler(t)
+	h, _ := newNeedsGateHandler(t)
 	msg := "请根据以下素材写一篇公司新闻通稿。\n\n素材：\n" + materialTurns(9000)
 	if n := len([]rune(msg)); n < 9000 {
 		t.Fatalf("测试前提不成立：素材只有 %d 字，够不到门槛就测不到闸门", n)
