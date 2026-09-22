@@ -77,19 +77,32 @@ echo "=== 6b) 逐页流复验（v6 新能力：解析期屏幕要滚材料，而
 # python3 把程序文本当输入、sys.stdin 是空的，于是所有断言都在空数据上跑：看着「跑了」，
 # 实际一条都没量到。抄出来的判据不会自动跟着变，这就是它烂掉的方式。
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-STREAM_PDF=""
-for c in "${FIXTURE_PDF:-}" "$ROOT/testdata/ocr/scan3-rtloss.pdf" /tmp/heavy_mixed_s15_t45.pdf; do
-  if [ -n "$c" ] && [ -f "$c" ]; then STREAM_PDF="$c"; break; fi
-done
-if [ -z "$STREAM_PDF" ]; then
-  # 逐页流是本次发布的核心能力：量不到就不许发布（SKIP 不算过）。
-  echo "FAIL: 本机没有可用 PDF 试料 → 逐页流**未验证** → 回滚"
+# 料单：仓里那份（3 页纯扫描）**总是**跑，它覆盖「只扫扫描页」这条路由；本机若有混合重料
+# （可选 45 页 + 扫描 15 页）一并跑 —— 只有混合料能覆盖「可选中页直取」（纯扫描料的
+# text_pages 恒为 0），而且 30s 量级才把「边解析边发」与「解析完再拆行」彻底分开。
+# 之前写成「命中第一个就 break」是个坑：仓里那份排在前面，于是本机重料永远轮不到，
+# 直取路由在这条腿上等于从没量过 —— 绿灯亮着，缝在外面。
+rollback_stream() {
+  echo "FAIL: 逐页流复验没过（$1）→ 回滚"
   systemctl stop skillforge-ocr; install -m 0755 "$BAK" "$LIVE"; systemctl start skillforge-ocr; exit 5
-fi
-# NONCE=1：ocrd 按内容 hash 缓存，命中缓存时 on_page 根本不回调 → 同料复跑会量成
-# 「零逐页行」的假红。尺子会给试料尾部追加唯一注释改掉内容 hash，保证每次都量到冷解析。
-NONCE=1 python3 "$ROOT/scripts/verify_ocr_stream.py" http://127.0.0.1:8093 "$STREAM_PDF" 2 \
-  || { echo "FAIL: 逐页流复验没过 → 回滚"; systemctl stop skillforge-ocr; install -m 0755 "$BAK" "$LIVE"; systemctl start skillforge-ocr; exit 5; }
+}
+STREAM_PDFS=""
+for c in "$ROOT/testdata/ocr/scan3-rtloss.pdf" "${FIXTURE_PDF:-}" /tmp/heavy_mixed_s15_t45.pdf; do
+  [ -n "$c" ] || continue
+  [ -f "$c" ] || continue
+  case " $STREAM_PDFS " in *" $c "*) continue ;; esac   # 去重：同一份料不跑两遍
+  STREAM_PDFS="$STREAM_PDFS $c"
+done
+# 逐页流是本次发布的核心能力：一份料都量不到就不许发布（SKIP 不算过）。
+[ -n "$STREAM_PDFS" ] || rollback_stream "本机没有任何可用 PDF 试料，逐页流未验证"
+RAN=0
+for c in $STREAM_PDFS; do
+  # NONCE=1：ocrd 按内容 hash 缓存，命中缓存时 on_page 根本不回调 → 同料复跑会量成
+  # 「零逐页行」的假红。尺子会给试料尾部追加唯一注释改掉内容 hash，保证每次都量到冷解析。
+  NONCE=1 python3 "$ROOT/scripts/verify_ocr_stream.py" http://127.0.0.1:8093 "$c" 2 || rollback_stream "$c"
+  RAN=$((RAN + 1))
+done
+echo "  逐页流复验通过：$RAN 份料（覆盖「扫描页 OCR」与「文本层直取」两种路由）"
 
 echo "=== 上线完成：$TAG ==="
 
