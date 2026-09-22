@@ -298,6 +298,25 @@ jobs:
           # 没有报错、没有红字，回归测试是唯一能提前红的地方。
           python3 scripts/selftest_optional_needs.py
 
+      # 「屏幕上到底有没有东西在动」这条链路的四把尺子（2026-09-22 接线）。
+      # 为什么单列一步、为什么必须在这里跑：用户投诉的原话是「速度过于慢了，
+      # 中间可以流式输出思考的中间材料，现在一直卡着计时」—— 这类故障的形态是
+      # **单元测试全绿、界面全绿、只有计时器在空转**，所以只有这几把尺子会响。
+      # 而它们此前有 3 条是 0 引用的游离尺子（本地能跑、能红、能精确转红，
+      # CI/preflight 里都没有），第 4 条只在 CI 有、preflight 没有 ——
+      # 等于「本地觉得有防线、实际没有」。接线后由 preflight_parity 守卫钉死两边都在。
+      # 四个脚本各自的判据：
+      #   chat_sse_ruler     桩流七例（含 A0 闸门双向 + 「没跑起来/不是 SSE」拒绝报绿）
+      #   timeline_stub      时间线的桩流自证
+      #   writethinking_default  写稿默认关思考（361s→12.5s 那条改动）的注入自证
+      # 第 4 把 optional_needs 已经在上面那条 step 里跑（同一条链路，够近），
+      # 这里不重复跑：跑两遍只花 CI 时间，不增加覆盖。
+      - name: 流式材料链路自证（SSE 尺子 / 时间线桩流 / 思考默认关）
+        run: |
+          python3 scripts/selftest_chat_sse_ruler.py
+          python3 scripts/selftest_timeline_stub.py
+          python3 scripts/selftest_writethinking_default.py
+
       # 沙箱限额（run_python 的 cgroup MemoryMax / Timeout）的负向自证。
       # 为什么单列一条：这是单机离线客户的**真阻碍** —— 模型写的解析脚本一碰大文件
       # 就被 cgroup OOM 秒杀，旧实现只回一句没有信息量的「退出码 -1」；而

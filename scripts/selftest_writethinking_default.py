@@ -8,9 +8,36 @@
   M3 FAIL 必须是预期那条（enable_thinking=false 的断言），不是别的测试顺带红
   M4 还原后文件与原始字节逐字节相同，且测试回绿
 """
-import subprocess, sys, pathlib
+import os, re, shutil, subprocess, sys, pathlib
 
-REPO = pathlib.Path("/root/skillforge")
+# 仓库根从脚本位置推；go 也要挑「够新的那个」。
+# 2026-09-22 实测代价：这两处写死（/root/skillforge、/usr/local/go/bin/go）之后，
+# 本地怎么跑都绿，CI runner 上工作目录是 /home/runner/work/skillforge/skillforge、
+# go 在 setup-go 的 toolcache 里 —— 直接崩在 open() 上，红得跟断言毫无关系。
+REPO = pathlib.Path(__file__).resolve().parents[1]
+
+
+def resolve_go():
+    """GO_BIN 钉死优先；否则按 go.mod 的要求在候选里挑第一个够新的。挑不到报环境红。"""
+    m = re.search(r"^go (\d+)\.(\d+)", (REPO / "go.mod").read_text(), re.M)
+    need = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+    tried = []
+    for c in [os.environ.get("GO_BIN"), shutil.which("go"),
+              "/usr/local/go/bin/go", "/usr/bin/go"]:
+        if not c or not os.path.isfile(c) or not os.access(c, os.X_OK):
+            continue
+        out = subprocess.run([c, "version"], capture_output=True, text=True).stdout
+        vm = re.search(r"go(\d+)\.(\d+)", out)
+        got = (int(vm.group(1)), int(vm.group(2))) if vm else (0, 0)
+        tried.append(f"{c}(go{got[0]}.{got[1]})")
+        if got >= need:
+            return c
+    print(f"环境红：找不到 go >= {need[0]}.{need[1]}；试过 {tried or '（无候选）'}"
+          f" —— 这不是断言红，先修环境")
+    sys.exit(1)
+
+
+GO = resolve_go()
 SRC = REPO / "internal/llm/stream.go"
 TEST = "TestPlainWriteHopDisablesThinkingByDefault"
 OLD = '\tdefault:\n\t\treturn true // 默认关：快是第一位的，且实测只掉 26% 长度\n'
@@ -23,7 +50,7 @@ if orig.count(OLD) != 1:
     sys.exit(1)
 
 def run(tag):
-    p = subprocess.run(["/usr/local/go/bin/go", "test", "./internal/agent/",
+    p = subprocess.run([GO, "test", "./internal/agent/",
                         "-run", TEST, "-v", "-count=1"],
                        cwd=REPO, capture_output=True, text=True, timeout=600)
     out = p.stdout + p.stderr

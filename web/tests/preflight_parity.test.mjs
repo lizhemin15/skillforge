@@ -63,6 +63,20 @@ const selfCheckGroups = () => [
     readdirSync(new URL('web/tests/', REPO)).filter((f) => f.endsWith('_mutation_check.py')).map((f) => `web/tests/${f}`)],
   ['scripts 的 inject*.py',
     readdirSync(new URL('scripts/', REPO)).filter((f) => /inject.*\.py$/.test(f)).map((f) => `scripts/${f}`)],
+  // 2026-09-22 补：这是**第四个免疫区**，形状和前三个一模一样 ——
+  // scripts/selftest_*.py 当时有 4 条，其中 3 条 0 引用（chat_sse_ruler / timeline_stub /
+  // writethinking_default，本地能跑、能红、能精确转红，但 CI 和 preflight 里都没有它），
+  // 第 4 条（optional_needs）只在 ci.yml 里有、preflight 里没有，于是本地闸门比 CI 少一道。
+  // 发现路径：CI 红在一句 `PermissionError: '/root/skillforge/internal/agent/needs_gate.go'` ——
+  // 那两条尺子把**本机仓库根**写死在源码里，本地跑恰好命中所以怎么跑都绿，
+  // runner 上工作目录是 /home/runner/work/skillforge/skillforge，一 open() 就崩，
+  // 红得跟被测判据毫无关系（环境红冒充断言红）。所以这一组除了「必须被两边调用」，
+  // 还配了一条专门的守卫：见下面「自证脚本不许写死本机路径」。
+  //
+  // 为什么按目录+suffix 收而不是逐个列名字：这四条就是「列名字」漏出来的，
+  // 下一个人新写一条 `selftest_xxx.py` 会长在同一个洞里。目录比名单难绕过。
+  ['scripts 的 selftest_*.py',
+    readdirSync(new URL('scripts/', REPO)).filter((f) => /^selftest_.*\.py$/.test(f)).map((f) => `scripts/${f}`)],
   ['deploy/ocr 的可跑单测（.py 除生产件与造料 helper）',
     // 2026-09-17 补：这是**第三个免疫区**，形状和前两个一模一样。
     // deploy/ocr/test_ocrd_quality.py 是「可选中页直取 / 乱码页回落 OCR」这条
@@ -222,6 +236,69 @@ test('每条注入自证脚本都必须在 CI 与 preflight 里被真正调用',
         `于是这类问题只能等推送之后由 CI 告诉你。`,
     );
   }
+});
+
+// 自证脚本不许写死「本机路径」与「工具链路径」（2026-09-22）。
+//
+// 为什么这条要单独存在，而不是靠上面那条「必须被两边调用」：
+// 上面那条只能保证**被调用**，保证不了**调用得起来**。真实事故：CI run 35690713741
+// 红在 `PermissionError: [Errno 13] Permission denied: '/root/skillforge/...'`——
+// 两条新接线的自证脚本把仓库根写死成 `/root/skillforge`（开发机的路径），
+// 本地跑恰好命中所以怎么跑都绿，runner 上工作目录是
+// `/home/runner/work/skillforge/skillforge`，第一次 open() 就崩。
+// 这比「不跑」更难查：它**看起来**在 CI 里跑了，报的却是一句跟被测判据毫无关系的
+// 环境错误（环境红冒充断言红），于是人会去翻被守的实现，翻错方向。
+// 工具链同理：写死 `/usr/local/go/bin/go` 在开发机对（1.25），在别的机器可能是 1.18
+// 发行版包，报出来的是一堆莫名其妙的编译错。仓库既有约定是 resolve_go()
+// （见 scripts/thinking_knob_inject.py:212），候选按 go.mod 要求筛，挑不到要报**环境红**
+// 并明说「这不是断言红，先修环境」。
+//
+// 判定前先剥注释和三引号字符串 —— 讽刺的是，解释这条坑的注释里就得写出那个字面量，
+// 不剥就会把「讲这个坑的说明文字」当场判红（写好第一版就踩了，见
+// preflight_parity_mutation_check.sh 的 E 类注入：注入的是**代码**，不是注释）。
+// 剥注释只会让守卫变弱（字符串里的假阳性不算），不会造成误判红。
+const stripPyCommentsAndDocstrings = (src) =>
+  src
+    .replace(/"""[\s\S]*?"""/g, '""')
+    .replace(/'''[\s\S]*?'''/g, "''")
+    .replace(/(^|\n)[ \t]*#[^\n]*/g, '$1');
+
+test('自证脚本不许写死本机路径与工具链路径', () => {
+  const SELF_PY = selfCheckGroups()
+    .filter(([label]) => label.startsWith('scripts 的 '))
+    .flatMap(([, files]) => files)
+    .filter((f) => f.endsWith('.py'));
+  assert.ok(SELF_PY.length > 0, '枚举规则失效：scripts 下的自证 .py 一个都没收到');
+
+  // 本机/线上部署路径：CI 上不存在，或存在但属于另一个上下文（线上目录不该被本地闸门碰）
+  const HOST_PATH = /(?:\/root\/skillforge|\/opt\/skillforge)/;
+  // 写死工具链：subprocess 的第一段就直接钉死绝对路径，而非走候选解析
+  const HARD_GO = /subprocess\.(?:run|call|check_output|Popen)\(\s*\[\s*["']\/usr\/local\/go\/bin\/go["']/;
+
+  const bad = [];
+  for (const rel of SELF_PY) {
+    const raw = readFileSync(new URL(rel, REPO), 'utf8');
+    const code = stripPyCommentsAndDocstrings(raw);
+    const lines = code.split('\n');
+    lines.forEach((line, i) => {
+      if (HOST_PATH.test(line)) bad.push([rel, i + 1, '写死了本机/线上路径', line.trim()]);
+      if (HARD_GO.test(line)) bad.push([rel, i + 1, '写死了 go 工具链路径', line.trim()]);
+    });
+  }
+
+  assert.equal(
+    bad.length,
+    0,
+    bad.length === 0
+      ? ''
+      : `有 ${bad.length} 行把「只有本机才成立的路径」写进了自证脚本，` +
+        `这些脚本在 CI 上会以**环境红**的形态崩掉，报的错跟它守的判据无关：\n` +
+        bad.map(([f, l, why, t]) => `  ${f}:${l} ${why}\n      ${t}`).join('\n') +
+        `\n修法：仓库根从脚本自身位置推（pathlib.Path(__file__).resolve().parents[1]）；` +
+        `go 用 resolve_go() 那套候选解析（GO_BIN → which("go") → /usr/local/go/bin/go → ` +
+        `/usr/bin/go，按 go.mod 筛），挑不到要报「环境红：… 设 GO_BIN=…」，` +
+        `不要静默兜底成某个版本。`,
+  );
 });
 
 test('离线包装后探测自证：正向与两路注入都必须在 CI / preflight 里真跑', () => {

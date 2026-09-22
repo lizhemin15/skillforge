@@ -13,12 +13,45 @@
   那样注入出来的「红」跟真实故障无关。真实故障是**整段判据只问「缺没缺」**，
   所以注入必须打在最终那个 if 上。
 """
+import os
+import re
+import shutil
 import subprocess
 import sys
 import pathlib
 
-REPO = pathlib.Path("/root/skillforge")
+# 仓库根从**脚本自己的位置**推，不写死 /root/skillforge。
+# 2026-09-22 实测代价：写死之后本地一路绿，CI runner 上工作目录是
+# /home/runner/work/skillforge/skillforge → REPO/"internal/agent/needs_gate.go"
+# 这个路径**不存在**，read_bytes() 抛 PermissionError（父目录不可读，报的还是
+# 「权限」这种把人引去查权限的假象），整个 CI 红在一个跟断言毫无关系的地方。
+REPO = pathlib.Path(__file__).resolve().parents[1]
+
+
+def resolve_go():
+    """挑一个**够新**的 go：本地这台机 PATH 里是 1.18，CI runner 上没有 /usr/local/go/bin/go。
+    所以既不能信 PATH 第一个，也不能写死绝对路径 —— 候选都试一遍，按 go.mod 的要求筛。
+    一个都不合格就报**环境红**（退出码 1 + 明确文案），别退化成「断言红」把人引去修判据。
+    """
+    m = re.search(r"^go (\d+)\.(\d+)", (REPO / "go.mod").read_text(), re.M)
+    need = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+    cands = [os.environ.get("GO_BIN"), shutil.which("go"),
+             "/usr/local/go/bin/go", "/usr/bin/go"]
+    tried = []
+    for c in cands:
+        if not c or not os.path.isfile(c) or not os.access(c, os.X_OK):
+            continue
+        v = subprocess.run([c, "version"], capture_output=True, text=True).stdout
+        vm = re.search(r"go(\d+)\.(\d+)", v)
+        got = (int(vm.group(1)), int(vm.group(2))) if vm else (0, 0)
+        tried.append(f"{c}(go{got[0]}.{got[1]})")
+        if got >= need:
+            return c
+    print(f"环境红：找不到 go >= {need[0]}.{need[1]}；试过 {tried or '（无候选）'}"
+          f" —— 设 GO_BIN=... 指一个（这不是断言红，先修环境）")
+    sys.exit(1)
 SRC = REPO / "internal/agent/needs_gate.go"
+GO = resolve_go()
 OLD = "\t\tif must {\n"
 NEW = "\t\tif must || true { // [MUTANT] 忽略 required：任何缺参都拦（复现线上事故）\n"
 EXPECT = "可选字段不该拦下写作"
@@ -31,7 +64,7 @@ if orig.count(OLD) != 1:
 
 
 def run(tag):
-    p = subprocess.run(["/usr/local/go/bin/go", "test", "./internal/agent/",
+    p = subprocess.run([GO, "test", "./internal/agent/",
                         "-run", "TestSplitNeeds", "-v", "-count=1"],
                        cwd=REPO, capture_output=True, text=True, timeout=600)
     out = p.stdout + p.stderr

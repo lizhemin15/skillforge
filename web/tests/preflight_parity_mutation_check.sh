@@ -42,16 +42,25 @@ CI_FILE='.github/workflows/ci.yml'
 PF_FILE='scripts/preflight.sh'
 REQ_FILE='deploy/ocr/test-requirements.txt'
 NEWLEDGER='deploy/offline/tests/selftest_parse_live_check.py'
+# E 类要注入的两个自证脚本（scripts 下的 selftest_*.py）
+RULER_STUB='scripts/selftest_timeline_stub.py'
+RULER_NEEDS='scripts/selftest_optional_needs.py'
+STUB_REPO_LINE='REPO = pathlib.Path(__file__).resolve().parent.parent'
+NEEDS_GO_LINE='p = subprocess.run([GO, "test"'
 
 TMP="$(mktemp -d)"
 CI_BAK="$TMP/ci.yml.bak"
 PF_BAK="$TMP/preflight.sh.bak"
 GUARD_BAK="$TMP/preflight_parity.test.mjs.bak"
 REQ_BAK="$TMP/test-requirements.txt.bak"
+STUB_BAK="$TMP/timeline_stub.bak"
+NEEDS_BAK="$TMP/optional_needs.bak"
 cp "$CI_FILE" "$CI_BAK"
 cp "$PF_FILE" "$PF_BAK"
 cp "$GUARD" "$GUARD_BAK"
 cp "$REQ_FILE" "$REQ_BAK"
+cp "$RULER_STUB" "$STUB_BAK"
+cp "$RULER_NEEDS" "$NEEDS_BAK"
 STRAY="$ROOT/deploy/offline/tests/zzz_stray_probe_check.py"
 
 cleanup() {
@@ -61,6 +70,8 @@ cleanup() {
   cp "$PF_BAK" "$PF_FILE" 2>/dev/null || true
   cp "$GUARD_BAK" "$GUARD" 2>/dev/null || true
   cp "$REQ_BAK" "$REQ_FILE" 2>/dev/null || true
+  cp "$STUB_BAK" "$RULER_STUB" 2>/dev/null || true
+  cp "$NEEDS_BAK" "$RULER_NEEDS" 2>/dev/null || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -252,6 +263,50 @@ else
 fi
 
 echo
+echo "==== E 类：自证脚本的「环境红」注入（写死本机路径 / 写死工具链）===="
+# 这一类的现实原型：CI run 35690713741 红在
+#   PermissionError: [Errno 13] Permission denied: '/root/skillforge/internal/agent/needs_gate.go'
+# —— 自证脚本自己把开发机的仓库根写死了，本地恰好命中所以怎么跑都绿，
+# runner 上工作目录是 /home/runner/work/skillforge/skillforge，open() 直接崩。
+# 报的是环境错、抄的是被测判据的地址，方向全错。所以必须有一条守卫专治这个形态。
+
+# E1 代码里写死本机仓库根 → 必须红在「写死了本机/线上路径」
+if inject "$RULER_STUB" "$STUB_REPO_LINE" 'REPO = pathlib.Path("/root/skillforge")'; then
+  guard_run
+  expect_red "E1 自证脚本写死本机仓库根" "写死了本机/线上路径"
+  cp "$STUB_BAK" "$RULER_STUB"
+else
+  say_inject_fail "E1" "$RULER_STUB 里的 REPO 推导行"
+fi
+
+# E2 subprocess 第一段写死 go 绝对路径 → 必须红在「写死了 go 工具链路径」
+if inject "$RULER_NEEDS" "$NEEDS_GO_LINE" 'p = subprocess.run(["/usr/local/go/bin/go", "test"'; then
+  guard_run
+  expect_red "E2 自证脚本写死 go 工具链路径" "写死了 go 工具链路径"
+  cp "$NEEDS_BAK" "$RULER_NEEDS"
+else
+  say_inject_fail "E2" "$RULER_NEEDS 里的 subprocess.run([GO, \"test\""
+fi
+
+# E3 反向：**注释里**写出同一个字面量 → 必须保持全绿。
+# 为什么这条必须有：解释这个坑的注释本身就要写出 `/root/skillforge` 那串字面量
+# （上面 E1/E2 的注释、以及守卫生成的那段说明文字都写了）。守卫若不剥注释，
+# 就会出现「讲这个坑的说明文字被判成这个坑」——第一版守卫写好就是这样，当场假红。
+# 这条注入把「剥注释」这件事本身钉住：改动剥注释逻辑（比如忘了 .replace 注释那步）会红。
+if inject "$RULER_STUB" "$STUB_REPO_LINE" '# REPO 曾经写死成 "/root/skillforge"（本机路径，CI 上 Permission denied）
+REPO = pathlib.Path(__file__).resolve().parent.parent'; then
+  guard_run
+  if [ "$GUARD_RC" -eq 0 ]; then
+    ok "E3 注释里的本机路径不被误判（剥注释逻辑生效）"
+  else
+    bad "E3 注释里的本机路径被判红了：这条守卫在误伤说明文字，$(printf '%s' "$GUARD_OUT" | grep -o '有 .* 行把.*' | head -1)"
+  fi
+  cp "$STUB_BAK" "$RULER_STUB"
+else
+  say_inject_fail "E3" "$RULER_STUB 里的 REPO 推导行"
+fi
+
+echo
 echo "==== 收尾：全部还原后必须回绿 ===="
 guard_run
 if [ "$GUARD_RC" -eq 0 ]; then ok "收尾 preflight_parity 回绿（注入无残留）"; else
@@ -280,4 +335,4 @@ if [ "$fails" -gt 0 ]; then
   echo "FAILED: 有 $fails 条自证不合格"
   exit 1
 fi
-echo "自证通过：基线 1 条 + 接线注入 3 条 + 注入模式 2 条 + 枚举活性 2 条 + 闸门依赖 4 条 + 收尾 2 条，红的都是预期那条，还原后全绿。"
+echo "自证通过：基线 1 条 + 接线注入 3 条 + 注入模式 2 条 + 枚举活性 2 条 + 闸门依赖 4 条 + 环境红 3 条 + 收尾 2 条，红的都是预期那条，还原后全绿。"

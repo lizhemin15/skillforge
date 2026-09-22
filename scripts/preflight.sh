@@ -314,6 +314,14 @@ if [ "$QUICK" = 0 ]; then
   #   ① 滚动窗口不得报静默（防假红，否则又去修不存在的问题）；② 真静止必须报出来（防假绿，
   #   否则流真挂住时 M7 会安静地绿）。case ③ 还反过来证明「只看长度的老尺子 = 假绿」。
   selfcheck '前端 / 静默段判据自证'     python3 web/tests/silent_gaps_mutation_check.py
+  # 「卡着计时」这条链路的四把尺子（2026-09-22 接线，此前 3 条 0 引用、1 条只在 CI 跑）。
+  # 本地这道闸门此前比 CI **少四道**：用户在本地/内网遇到的就是「速度过于慢了、
+  # 中间没有流式材料、一直卡着计时」，而这四把尺子恰好是唯一会响的判据。
+  # 逐条判据见 .github/workflows/ci.yml 同名 step 的注释。
+  selfcheck '流式 / SSE 尺子桩流自证'   python3 scripts/selftest_chat_sse_ruler.py
+  selfcheck '流式 / 时间线桩流自证'     python3 scripts/selftest_timeline_stub.py
+  selfcheck '流式 / 写稿默认关思考自证' python3 scripts/selftest_writethinking_default.py
+  selfcheck '写作 / 可选缺参不拦稿自证' python3 scripts/selftest_optional_needs.py
   # 解析服务（ocrd）的单测。它此前又是一把**游离尺子**：本机跑得动、0 引用，
   # 于是钉死的版本串 `ocrd-v5-quality` 一直没跟着真值改名而烂掉（2/15 红）。
   # 已改成「与部署门禁 scripts/deploy_ocrd.sh 对账」——不再抄字面量。

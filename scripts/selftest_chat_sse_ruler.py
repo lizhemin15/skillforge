@@ -47,6 +47,59 @@ FAILS = []
 SILENCE = 13.0
 
 
+# ---------------------------------------------------------------------------
+# 桩流的正文长度 —— 这**不是**随手写的装饰文本，它跟尺子的 A0 判据硬耦合。
+#
+# 踩过的坑（2026-09-22，本次修复的真实起因）：
+#   A0 是前置判据，拿 BODY_MIN（默认 300 字）区分「模型真在写稿」和「缺参追问话术」
+#   （线上追问回话 40~90 字、写稿正文 882~1205 字，300 卡在两簇中间）。
+#   而桩流原先每段只有 7~14 字，healthy/ticking/precise 三例的正文总量是
+#   130 / 54 / 88 字 —— **全部低于 300**，于是三例永远过不了 A0，A1~A6 一律「不评」，
+#   这个自证脚本变成**恒红**。它当时又游离在 CI/preflight 之外，没人调用，
+#   所以「尺子的自证坏了」可以一直不被人发现 —— 正是本仓注释里反复警告的那种腐烂。
+#
+# 修法的方向很关键：不是把 BODY_MIN 调松去迁就料（那是把尺子锯短），
+# 而是把料造成**像真稿子**（写稿轮本来就该有几百字）。下面每段 ~50 字，
+# 总量 500+/390+/490+，既过 A0，也不改变各例的时序（sleep 间隔没动，
+# 所以 A4/A5 的静默与占比判据的含义没变）。
+# ---------------------------------------------------------------------------
+BODY_ARTICLE = '正文第%d段：会上通报了三项主要经营指标均超额完成，并对下一阶段重点工作作出安排，要求各条线把既定部署落到具体项目上。'
+BODY_LATE    = '迟到的正文第%d段：会议指出，当前外部环境复杂多变，要坚持稳中求进的总基调，把风险防控和业务发展统筹起来抓。'
+BODY_PRECISE = '正文第%d段：这是用于量测静默间隔的正文，长度按真实稿件的字数密度来写，不为了对齐而缩短。'
+
+
+def ruler_body_min():
+    """从尺子源码里抠出 A0 的默认下限 —— 不在本文件里抄一份。
+
+    抄一份的后果：尺子把 300 改成 500 时这里还是 300，自证继续「绿」，
+    而真实的 healthy 例已经在尺子里红了 —— 断言与实现脱钩就是假绿。
+    抠不到就**直接报错退出**（不是回退到 300）：那说明尺子的写法变了，
+    这个提取器必须跟着改，悄悄用兜底值等于把这道守卫撤掉。
+    """
+    src = open(RULER, encoding='utf-8').read()
+    m = re.search(r'BODY_MIN\s*=\s*int\(os\.environ\.get\("SF_BODY_MIN",\s*"(\d+)"\)\)', src)
+    if not m:
+        print('✗ 没能从 %s 里抠出 BODY_MIN 的默认值 —— 尺子改了注入写法？'
+              '这里必须跟着改，否则料够不够长就没人管了。' % RULER, file=sys.stderr)
+        sys.exit(1)
+    return int(m.group(1))
+
+
+def check_fixture_lengths():
+    """造料长度自己先过一遍尺子 —— 料不够长时给出**「料的问题」**，而不是让使用者
+    对着 A0 FAIL 去猜「尺子是不是坏了」。先报 A0 的原因，再报 A1~A6 的不评，噪音太大。"""
+    floor = ruler_body_min()
+    for name, tpl, n in (('healthy', BODY_ARTICLE, 10), ('ticking', BODY_LATE, 6),
+                         ('precise', BODY_PRECISE, 14)):
+        total = len(tpl % 0) * n
+        if total < floor:
+            print('✗ 桩流 %s 正文只有 %d 字 < 尺子 A0 下限 %d 字 —— 是**料**配不上尺子，'
+                  '不是尺子坏了。请把 %s 那段写长，别去调尺子的下限。'
+                  % (name, total, floor, name), file=sys.stderr)
+            sys.exit(1)
+        print('  桩流 %-8s 正文 %d 字 ≥ A0 下限 %d 字 ✓' % (name, total, floor))
+
+
 def sse(ev, obj):
     return ('event: %s\ndata: %s\n\n' % (ev, json.dumps(obj, ensure_ascii=False))).encode()
 
@@ -111,7 +164,7 @@ class Stub(BaseHTTPRequestHandler):
             w(sse('trace', [s1d, step('write', '② 执笔', 'active', '落笔', material='拟稿：导语→主体→结尾')]))
             for i in range(10):                     # 正文
                 time.sleep(0.25)
-                w(sse('delta', {'t': '正文第%d段，正常流式输出。' % i}))
+                w(sse('delta', {'t': BODY_ARTICLE % i}))
             w(sse('trace', [s1d, step('write', '② 执笔', 'done', '完成')]))
             w(sse('done', {'skill': '公司新闻通稿'}))
 
@@ -128,7 +181,7 @@ class Stub(BaseHTTPRequestHandler):
             w(sse('trace', [s1d, step('write', '② 执笔', 'active', '落笔')]))
             for k in range(6):
                 time.sleep(0.25)
-                w(sse('delta', {'t': '迟到的正文第%d段。' % k}))
+                w(sse('delta', {'t': BODY_LATE % k}))
             w(sse('done', {'skill': ''}))
             print('      (桩流跳了 %d 次心跳、全程无材料)' % i, file=sys.stderr)
 
@@ -137,9 +190,23 @@ class Stub(BaseHTTPRequestHandler):
             w(sse('trace', [s1]))
             for k in range(14):
                 time.sleep(0.3)
-                w(sse('delta', {'t': '正文第%d段。' % k}))
+                w(sse('delta', {'t': BODY_PRECISE % k}))
                 if k == 7:
                     w(sse('trace', [s1d, step('write', '② 执笔', 'active', '落笔')]))
+            w(sse('done', {'skill': ''}))
+
+        elif mode == 'shortbody':
+            # A0 的**负向**料：材料在放、心跳在跳、正文也在流 —— 但只有 ~130 字。
+            # 对应线上「模型提前收手 / 路由跑偏成短答」。期望：只有 A0 红，A1~A6 全部「不评」。
+            w(sse('trace', [s1]))
+            for i in range(4):
+                time.sleep(0.35)
+                w(sse('trace', [step('intent', '① 意图分析', 'active', '分析素材',
+                                     material='思考片段%d：先确认体裁与读者' % i)]))
+            w(sse('trace', [s1d, step('write', '② 执笔', 'active', '落笔', material='拟稿：先搭骨架')]))
+            for i in range(9):
+                time.sleep(0.25)
+                w(sse('delta', {'t': '正文第%d段，短。' % i}))
             w(sse('done', {'skill': ''}))
 
         else:  # nothing
@@ -154,8 +221,13 @@ def verdicts(out):
     # 整条 A5 漏掉，字典里少一项就会被读成「判据不符」。锚在 '-> ' 上才对。
     return {m.group(1): m.group(2) for m in re.finditer(r'A(\d) .*?-> (PASS|FAIL)', n)}
 
-
-ALL_PASS = {str(i): 'PASS' for i in range(1, 7)}
+# A0 也要钉住：它是前置闸门，**放水**的表现正好是把不该绿的判绿。
+# 早先这里只写 1~6，A0 不在期望表里 —— 于是 A0 由 PASS 变 FAIL 时，
+# 报出来的是「判据结果不符」，而不是「A0 闸门坏了」，定位要多绕一圈。
+ALL_PASS = {str(i): 'PASS' for i in range(0, 7)}
+def with_a0(d):
+    """把一条判据表补上 A0=PASS（除 shortbody 那例外，A0 在全部例子里都该绿）。"""
+    return dict(d, **{'0': 'PASS'})
 
 
 def run_case(name, mode, want_rc, want_sub=(), forbid_sub=(), want_verdicts=None):
@@ -194,6 +266,8 @@ def main():
     time.sleep(0.3)
     print('=== 尺子自证（桩流，格式照抄 internal/api/chat.go）===')
     print('桩流端口: %d ，静默档 %.0fs\n' % (PORT, SILENCE))
+    check_fixture_lengths()
+    print()
     try:
         # 1) 健康轮：不许有任何 FAIL（含 A3、A6）
         run_case('1. healthy（有材料 + 材料早于正文 + 步骤1 只占 ~2s）', 'healthy', 0,
@@ -201,10 +275,12 @@ def main():
         # 2) 事故原形：红必须红在「没材料」上，心跳管道本身（A1/A2）仍是绿的 ——
         #    若这例把 A1/A2 也判红，说明尺子根本分不清「没材料」和「心跳断了」。
         run_case('2. ticking（只跳秒 13s，无材料）', 'ticking', 1,
-                 want_verdicts={'1': 'PASS', '2': 'PASS', '3': 'FAIL', '4': 'FAIL', '5': 'FAIL', '6': 'PASS'})
+                 want_verdicts=with_a0({'1': 'PASS', '2': 'PASS', '3': 'FAIL', '4': 'FAIL',
+                                        '5': 'FAIL', '6': 'PASS'}))
         # 3) 精确转红：只有 A3 一条红
         run_case('3. precise（正文在流、心跳在跳、唯独没材料）', 'precise', 1,
-                 want_verdicts={'1': 'PASS', '2': 'PASS', '3': 'FAIL', '4': 'PASS', '5': 'PASS', '6': 'PASS'})
+                 want_verdicts=with_a0({'1': 'PASS', '2': 'PASS', '3': 'FAIL', '4': 'PASS',
+                                        '5': 'PASS', '6': 'PASS'}))
         # 4) 本轮什么都没发生：必须自认量不到，不许报绿
         run_case('4. nothing（零 trace 帧）', 'nothing', 2, want_sub=['PREMISE_MISS'])
         # 5) 拿到的不是 SSE（200 + JSON）：走 ctype 守卫
@@ -213,6 +289,11 @@ def main():
         # 6) 服务端 500：走 urlopen 抛异常那条分支
         run_case('6. http500（HTTP 500 + JSON）', 'http500', 2,
                  want_sub=['PREMISE_MISS', 'HTTP Error 500'])
+        # 7) A0 的负向：材料/心跳/正文流都正常，但正文太短 → **只有 A0 红**，
+        #    A1~A6 必须报「不评」而不是各自红。没有这一例时，A0 这道闸门可以被
+        #    悄悄调松（BODY_MIN 改成 0）而自证仍然全绿 —— 闸门失效无人察觉。
+        run_case('7. shortbody（正文仅 ~70 字：模型提前收手）', 'shortbody', 1,
+                 want_sub=['=> HAS FAIL', '本轮真写了正文'], want_verdicts={'0': 'FAIL'})
     finally:
         srv.shutdown()
 
@@ -222,7 +303,8 @@ def main():
             print('FAIL', f)
         print('%d 项不符预期' % len(FAILS))
         return 1
-    print('=== 六例全符预期：尺子能绿、能红、能精确转红、且对「没跑起来/不是 SSE」拒绝报绿 ===')
+    print('=== 七例全符预期：尺子能绿、能红、能精确转红、A0 闸门双向有效，'
+          '且对「没跑起来/不是 SSE」拒绝报绿 ===')
     return 0
 
 
