@@ -41,6 +41,10 @@ U = os.environ.get('SKILLFORGE_ADMIN_USER', '')
 P = os.environ.get('SKILLFORGE_ADMIN_PASS', '')
 MAT = os.environ.get('MAT', '/tmp/material_10k.txt')
 ASK = os.environ.get('ASK', '按上面素材里的【写作要求】，写一篇新闻通稿。')
+# 种素材那一轮默认只贴素材原文；但服务端可能把它判成「参数不全 → 追问」轮
+# （asked=true），那样第 1 轮压根没进写作跳，前提不成立。给一个旋钮让操作者
+# 附一句明确写稿指令，把「压住素材再写」这个前提真正造出来。默认空=行为不变。
+SEED_SUFFIX = os.environ.get('SEED_SUFFIX', '')
 SID = os.environ.get('SID', 'tl-live-%d' % int(time.time()))
 # 递凭据用的环境变量名：故意取中性名（不含 TOKEN/KEY/SECRET/AUTH 字样）。
 # 写入侧的脱敏过滤器会把「像密钥的名字 = 值」那行整段改成 `= ***`，不但丢值还会
@@ -71,6 +75,7 @@ def seed_turn(tok, text):
     ev = {}
     txt = 0
     errs = []
+    done = {}
     buf = b''
     with urllib.request.urlopen(req, timeout=float(os.environ.get('SF_TIMEOUT', '300'))) as r:
         ctype = (r.headers.get('Content-Type') or '')
@@ -98,7 +103,15 @@ def seed_turn(tok, text):
                         pass
                 elif e == 'error':
                     errs.append(d[:200])
-    return dict(ms=int((time.time() - t0) * 1000), ev=ev, chars=txt, errs=errs)
+                elif e == 'done':
+                    # 「这一轮到底写了没有」只能从 done 帧看：asked=true 意味着它只是
+                    # 追问了参数，压根没进写作那一跳 —— 那种轮的正文短是正常的，不是
+                    # 「第 1 轮断了」。区分开才能给出对的结论（下面 main 里用）。
+                    try:
+                        done = json.loads(d)
+                    except Exception:
+                        done = {}
+    return dict(ms=int((time.time() - t0) * 1000), ev=ev, chars=txt, errs=errs, done=done)
 
 
 def main():
@@ -117,12 +130,21 @@ def main():
         print('第 1 轮就没成：登录失败 %s: %s' % (type(e).__name__, e))
         return 3
     print('登录 ok（指纹 %s，不落盘不回显）' % fp(tok))
-    r1 = seed_turn(tok, mat)
-    print('第 1 轮（种素材）: %d ms | 事件 %s | 正文 %d 字%s' % (
-        r1['ms'], r1['ev'], r1['chars'], (' | error ' + str(r1['errs'])) if r1['errs'] else ''))
+    r1 = seed_turn(tok, mat + SEED_SUFFIX)
+    asked1 = str((r1['done'] or {}).get('asked', '')).lower() == 'true'
+    print('第 1 轮（种素材）: %d ms | 事件 %s | 正文 %d 字%s%s' % (
+        r1['ms'], r1['ev'], r1['chars'], ' | asked=true（追问参数轮）' if asked1 else '',
+        (' | error ' + str(r1['errs'])) if r1['errs'] else ''))
     # 素材轮必须真的产出过正文：否则「第 2 轮忘了素材」不是上下文问题，是第 1 轮就断了。
-    if r1['chars'] < 50:
-        print('TURN1_FAIL：第 1 轮几乎没吐正文（%d 字），第 2 轮的前提不成立 —— 不拿它的红顶罪' % r1['chars'])
+    # 而「追问参数」轮（asked=true）压根没进写作那一跳，它的正文短是产品行为不是故障 ——
+    # 这种轮不能当「压住素材再写」的前提，要如实说清并让人拿 SEED_SUFFIX 补一句写稿指令，
+    # 而不是含混地报「几乎没吐正文」（差 2 个字就翻盘的门槛会把这种情形误判成故障）。
+    if r1['chars'] < 300:
+        if asked1:
+            print('TURN1_FAIL：第 1 轮是「追问参数」轮（asked=true，%d 字），没进写作那一跳，'
+                  '前提不成立 —— 加 SEED_SUFFIX="请按上面的【写作要求】写一篇新闻通稿。" 让它真写。' % r1['chars'])
+        else:
+            print('TURN1_FAIL：第 1 轮几乎没吐正文（%d 字），第 2 轮的前提不成立 —— 不拿它的红顶罪' % r1['chars'])
         return 3
     print('\n--- 第 2 轮交给尺子量 ---')
     env = dict(os.environ)

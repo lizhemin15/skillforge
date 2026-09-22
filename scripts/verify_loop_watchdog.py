@@ -210,17 +210,34 @@ def main():
     else:
         print('C5 OK  终态明确（%s 帧）' % terminal)
 
-    # 诊断：服务端日志里的周期与收手字节（验证 hit() 报的数是否可信）
+    # 诊断：服务端侧的复读证据（周期与收手字节）。
+    #
+    # 这里**刻意不把「没找到行」说成故障**：`循环体约 N 字节` 只出现在
+    # ErrLoopDetected 的**错误文本**里，代码从没把它写进日志（线上只在收手后
+    # 二次复读/终态报错那条路径才可能落到日志里）。旧版把 grep 落空写成
+    # 「需人工核」，本尺子跑一百遍也不会命中——是条恒不成立的僵尸断言，
+    # 会让人误以为漏了证据。现在改成：有就贴出来当旁证，没有就明说本段无证据力，
+    # 真正的判据是 C1~C5（客户端实收帧 + reset 帧）。
+    #
+    # 日志来源可指定：打线上走 journalctl，打自带假上游的第二实例走文件
+    # （那种实例的日志根本不在 journalctl 里，不指定就是读错地方）。
+    log_file = os.environ.get('LOOPWATCH_SERVER_LOG', '')
     try:
-        out = subprocess.run(['journalctl', '-u', 'skillforge', '-n', '400', '--no-pager'],
-                             capture_output=True, text=True, timeout=20).stdout
+        if log_file:
+            src = 'logfile:' + log_file
+            with open(log_file, 'r', errors='replace') as fh:
+                out = fh.read()
+        else:
+            src = 'journalctl -u skillforge'
+            out = subprocess.run(['journalctl', '-u', 'skillforge', '-n', '400', '--no-pager'],
+                                 capture_output=True, text=True, timeout=20).stdout
         hits = [l for l in out.splitlines() if '循环体约' in l or 'ErrLoopDetected' in l]
-        print('\n--- 服务端日志（复读相关，最近 %d 条）---' % len(hits))
+        print('\n--- 服务端日志旁证（%s，命中 %d 条）---' % (src, len(hits)))
         for l in hits[-4:]:
             # 只留可读部分，避免把任何凭据带出来
             print('  ·', re.sub(r'\s+', ' ', l)[-220:])
         if not hits:
-            print('  （没找到复读日志行 —— 若 C1/C2 都绿，说明收手发生在更早的路径，需人工核）')
+            print('  （该来源没有复读行 —— 这段本来就不落日志，属正常；判据看 C1~C5，不在本段）')
     except Exception as e:
         print('\n（读日志失败：%s）' % str(e)[:80])
 

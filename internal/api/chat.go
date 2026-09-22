@@ -290,12 +290,22 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if args == nil {
 			args = map[string]string{}
 		}
-		if len(eval.Needs) > 0 {
+		// 可选字段没填**不该**拦下这一轮：技能自己的标签就写着「未提供则生成」，
+		// 产品反问用户就是自相矛盾（线上实测：整轮 4.5s 只回一句「我需要你补充
+		// 标题亮点（可选…）」，正文一个字没有）。只用必填缺参拦；顺手把「哪几个
+		// 可选字段放过了」写进中间材料 —— 这既是本地事实（t≈0 就能发），也正好
+		// 补上用户抱怨的「中间没材料、只看到计时在跳」。
+		blocking, optional := agent.SplitNeeds(h.declaredParams(eval.SkillSlug), eval.Needs)
+		if len(optional) > 0 {
+			clock.Thinking("技能「" + sc.Name + "」的可选信息没给（" + agent.NeedsSummary(optional) +
+				"），按它自己的默认继续起草…")
+		}
+		if len(blocking) > 0 {
 			// surface missing required params as a needs event, then skip gen
-			msg := needsMessage(eval.Needs)
-			write(evNeeds, jsonSafe(eval.Needs))
+			msg := needsMessage(blocking)
+			write(evNeeds, jsonSafe(blocking))
 			// 让 generate 那一步读作「等补充」而不是「还在跑」
-			clock.Awaiting("等待补充：" + needsShort(eval.Needs))
+			clock.Awaiting("等待补充：" + needsShort(blocking))
 			write(evDelta, jsonSafe(map[string]string{"t": msg}))
 			// record assistant prompt asking for the fields
 			h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: msg, SkillSlug: eval.SkillSlug, At: time.Now()})
@@ -596,6 +606,21 @@ func docSummarySuffix(spec string) string {
 		return ""
 	}
 	return " 已生成规格:" + spec
+}
+
+// declaredParams 取技能**声明**的参数表（input_params），给缺参判定当地面真值。
+//
+// 读不到就返回 nil，让 needs 自报的 Required 兜底 —— 读声明失败不该把一次写作
+// 变成一句报错，那比误判一轮更糟。
+func (h *chatHandler) declaredParams(slug string) []model.Param {
+	if strings.TrimSpace(slug) == "" {
+		return nil
+	}
+	sk, err := h.eng.Skill(slug)
+	if err != nil || sk == nil {
+		return nil
+	}
+	return sk.InputParams
 }
 
 func needsMessage(needs []model.Param) string {

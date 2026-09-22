@@ -13,7 +13,10 @@
 （internal/agent.TraceStep.Material，json:"material,omitempty"）；只挂进行中那一步，
 尾部 160 字、400ms 节流。**材料不会进顶部状态条**，所以必须单独判定。
 
-判据 A1~A6（任何一条 FAIL 就非零退出，否则这把尺子在 CI 里等于不存在）：
+判据 A0~A6（任何一条 FAIL 就非零退出，否则这把尺子在 CI 里等于不存在）：
+  A0 这一轮真写了正文 ← **前置判据**：done.asked=true（缺参闸门拦下）或正文 < 300 字
+                         就是产品缺陷，rc=1 精确红。此时 A1~A6 报「不评」而不是各自红，
+                         免得一片红把人骗去改材料渲染（真因在参数闸门，跟材料无关）。
   A1 首帧 trace < 1s
   A2 首段正文之前就有 trace 帧
   A3 首段正文之前就出现中间材料  ← 这条直接对应「一直卡着计时」
@@ -63,6 +66,11 @@ COVER_MIN = 0.5
 #   契约让模型写 label/status 时 8867~15171ms（带素材那轮 15.2s）；改成「模型只写
 #   phase+detail、label 服务端补」后 ~3s。8s 这条线卡在两者之间：契约再变肥就会红。
 STEP1_BUDGET_MS = int(os.environ.get("SF_STEP1_BUDGET_MS", "8000"))
+# A0 的正文下限：低于这个字数就认为这一轮没真写稿（追问话术、路由跑偏、提前收手都在这里露头）。
+# 定 300 的依据：线上写稿跳的正文实测 882~1205 字（关思考链那版最瘦 882）；而缺参追问的
+# 回话长度是 40~90 字（实测「我需要先确认以下信息：…」那条 74 字）。300 落在两簇中间，
+# 离两边都够远，不会因为模型这次写短一点就红。
+BODY_MIN = int(os.environ.get("SF_BODY_MIN", "300"))
 
 
 def run(base, question, label="", sid=None):
@@ -95,6 +103,10 @@ def run(base, question, label="", sid=None):
     labels = set()      # 服务端下发的步骤 label（空 label = 步骤板会出现空格子）
     blank_labels = set()  # 有 label 却为空的 phase —— 瘦身契约漏补 label 时会在这里冒头
     steps_seen = 0
+    done_seen = False   # 收到 done 帧没有（没收到 = 流被截断）
+    asked = False       # done 帧说 asked=true：这一轮只追问了缺参，没写正文
+    needs_frames = 0    # 缺参闸门（evNeeds）发了几条 —— A0 用它分辨追问的性质
+    last_trace_note = ""  # 最后一条 trace 的摘要，A0 红时贴出来当定位线索
     buf = b""
     try:
         # 读流超时可配：带 1 万字素材的那一轮本来就慢，默认 180s 会把
@@ -170,6 +182,7 @@ def run(base, question, label="", sid=None):
                     except Exception:
                         pass
                     marks.append((ms, ev, note))
+                    last_trace_note = note
                 elif ev == "delta":
                     if first_delta_ms is None:
                         first_delta_ms = ms
@@ -182,6 +195,24 @@ def run(base, question, label="", sid=None):
                         content_ms.append(ms)
                     if len(marks) < 200:
                         marks.append((ms, ev, t[:40].replace("\n", " ")))
+                elif ev == "needs":
+                    # 缺参闸门的**专属**信号：产品反问用户前会先发 needs 帧。
+                    # A0 靠它区分「闸门把整轮拦成追问（缺陷）」和「判不出类别、
+                    # 让用户点类目（产品有意）」—— 两者 done 帧长得一样（都是 asked=true），
+                    # 只有有没有 needs 帧能分开。
+                    needs_frames += 1
+                    marks.append((ms, ev, data[:70].replace("\n", " ")))
+                elif ev == "done":
+                    # done 帧是**唯一**能回答「这一轮到底交付了正文没有」的地方：
+                    # asked=true 意味着服务端只追问了缺参、一个字的正文都没生成。
+                    # 只看 delta 长度分不开这两种情况 —— 追问的话术本身也是 delta。
+                    done_seen = True
+                    try:
+                        dj = json.loads(data)
+                        asked = str(dj.get("asked", "")).lower() == "true"
+                    except Exception:
+                        pass
+                    marks.append((ms, ev, "asked=%s | %s" % (asked, data[:50].replace("\n", " "))))
                 else:
                     marks.append((ms, ev, data[:70].replace("\n", " ")))
     total = int((time.time() - t0) * 1000)
@@ -277,7 +308,60 @@ def run(base, question, label="", sid=None):
     # 第一跳的耗时 ≈ 输出字数 ÷ provider 吐字速度，所以它同时是「契约有没有悄悄变肥」的哨兵。
     step1_ms = (end_ms if active_track else None)
     c6 = step1_ms is not None and step1_ms <= STEP1_BUDGET_MS
+
+    # A0：这一轮到底写没写正文。放在最前面，因为 A1~A6 全都要以「这一轮真在写稿」为前提。
+    #
+    # 为什么它必须是 rc=1 的红、而不是像「一帧 trace 都没来」那样报 PREMISE_MISS：
+    # 被缺参闸门拦下是**产品缺陷**（线上 2026-09-22：技能自己标着「标题亮点（可选，
+    # 未提供则生成）」的字段把整轮拦成一句追问，4.5s 结束、正文 0 字）。报 PREMISE_MISS
+    # 等于这把尺子替产品背书：它会把「AI 没看你给的素材」说成「这次没量到」。
+    #
+    # 为什么 A0 红时其余判据报「不评」而不是各自 FAIL：追问轮里 A4/A5/A6 量的全是空气
+    # （整轮就一句问话），一片红会把人骗去改材料渲染 —— 上一版就是这么误导的：
+    # 报出来的是「A5 有内容在动 0.1%」，真因其实是参数闸门，跟材料渲染毫无关系。
+    body_chars = len("".join(texts))
+    if not done_seen:
+        a0 = False
+        a0_why = "流里没有 done 帧（被截断），无法确认这一轮交付了什么"
+    elif asked:
+        a0 = False
+        if needs_frames > 0:
+            a0_why = ("**被缺参闸门拦下**（needs 帧 %d 条 + done.asked=true）：整轮只回了一句追问、"
+                      "正文 0 字 —— 这是产品缺陷（技能声明里可选的字段被当成必填反问用户），"
+                      "不是量空气" % needs_frames)
+        else:
+            # 判不出写作类别时服务端**有意**让用户点类目（chat_write.go 的 ambiguous 分支），
+            # 那条路径同样 done.asked=true 但没有 needs 帧。这里是「这一轮没写正文」的事实
+            # 判定，仍然算红；但真因得人来定，所以把定位线索一起贴出来，别让读者去怪闸门。
+            a0_why = ("服务端只追问、正文 0 字，且**没有 needs 帧**：像是「判不出写作类别、"
+                      "让用户点类目」那条有意路径。这一轮本该不该判得出来要看 trace —— "
+                      "最后一条 trace: %s" % (last_trace_note[:90] or "（没量到）"))
+    elif body_chars < BODY_MIN:
+        a0 = False
+        a0_why = "正文只有 %d 字（<%d）：提前收手或路由跑偏" % (body_chars, BODY_MIN)
+    else:
+        a0 = True
+        a0_why = ""
+    print("本轮交付        : %s" % ("PASS（正文 %d 字，done=%s）" % (body_chars, "asked" if asked else "交付")
+                                    if a0 else "FAIL " + a0_why))
+
     print("结论:")
+    print("  A0 本轮真写了正文              -> %s" % ("PASS" if a0 else "FAIL"))
+    if not a0:
+        # 不早退：A0 的真因必须落盘（上面那行），但其余判据改成「不评」并明说原因，
+        # 免得读者把「一片红」当成材料层故障。
+        for line in ("A1 首帧<1000ms", "A2 首正文前有 trace", "A3 首正文前有中间材料（非跳秒）",
+                     "A4 最大静默<%dms" % SILENT_BUDGET_MS, "A5 有内容在动占比>=%.0f%%" % (COVER_MIN * 100),
+                     "A6 ① 意图分析占屏<=%dms" % STEP1_BUDGET_MS):
+            print("  %-30s -> 不评（A0 已红：%s）" % (line, a0_why))
+        print("  => HAS FAIL（真因见 A0）")
+        return False, dict(a0=a0, a0_why=a0_why, body_chars=body_chars, needs_frames=needs_frames,
+                           first_trace=first_trace, trace_frames=trace_frames, mat_frames=mat_frames,
+                           first_mat_ms=first_mat_ms, first_delta_ms=first_delta_ms,
+                           gap_max=gap_max, total=total, cover=cover,
+                           first_step_ms=step1_ms, steps_seen=steps_seen,
+                           labels=sorted(labels), blank_label_phases=sorted(blank_labels))
+
     print("  A1 首帧<1000ms                 -> %s" % ("PASS" if c1 else "FAIL"))
     print("  A2 首正文前有 trace            -> %s" % ("PASS" if c2 else "FAIL"))
     print("  A3 首正文前有中间材料（非跳秒）-> %s" % ("PASS" if c3 else "FAIL"))
@@ -287,7 +371,8 @@ def run(base, question, label="", sid=None):
         STEP1_BUDGET_MS, "PASS" if c6 else ("FAIL (%dms)" % step1_ms if step1_ms else "FAIL (没量到)")))
     ok = c1 and c2 and c3 and c4 and c5 and c6
     print("  => %s" % ("ALL PASS" if ok else "HAS FAIL"))
-    return ok, dict(first_trace=first_trace, trace_frames=trace_frames, mat_frames=mat_frames,
+    return ok, dict(a0=a0, body_chars=body_chars, needs_frames=needs_frames,
+                    first_trace=first_trace, trace_frames=trace_frames, mat_frames=mat_frames,
                     first_mat_ms=first_mat_ms, first_delta_ms=first_delta_ms,
                     gap_max=gap_max, total=total, cover=cover,
                     first_step_ms=step1_ms, steps_seen=steps_seen,

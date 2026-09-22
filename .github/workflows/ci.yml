@@ -287,11 +287,16 @@ jobs:
       # 打了「锚点失效 ✗」，但因为没有 step，谁也不会看见。
       # 防线不跑就等于没有防线，而「永远绿的自证脚本」比没有更糟：
       # 它会让人以为这块有人看着。
-      - name: 后端断言自证（分类结构管理 / 思考开关矩阵）
+      - name: 后端断言自证（分类结构管理 / 思考开关矩阵 / 可选缺参不拦稿）
         run: |
           python3 scripts/category_guard_inject.py
           python3 scripts/fastjson_knob_inject.py
           python3 scripts/thinking_knob_inject.py
+          # 可选字段把写作跳短路（线上 2026-09-22 事故：整轮 4.5s 只回一句追问、
+          # 正文 0 字）。挂在 CI 是因为这条判据**只在线上才有人看见**，
+          # 而它一旦退化，退化的形态就是「用户觉得 AI 没看他给的素材」——
+          # 没有报错、没有红字，回归测试是唯一能提前红的地方。
+          python3 scripts/selftest_optional_needs.py
 
       # 沙箱限额（run_python 的 cgroup MemoryMax / Timeout）的负向自证。
       # 为什么单列一条：这是单机离线客户的**真阻碍** —— 模型写的解析脚本一碰大文件
