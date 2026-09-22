@@ -32,10 +32,10 @@ func TestGenerateSysBansTemplateTokens(t *testing.T) {
 		t.Fatalf("generateSys 没注入骨架模板，用例自身不成立：%q", got)
 	}
 	for _, want := range []string{
-		"占位符标记，不是稿子",     // 把 token 定性清楚，模型才知道不能照抄
-		"视为交付失败",         // 后果要写死，软约束在实测里会被忽略
-		"【待补:字段名】",       // 合法退路一：单个字段缺失
-		"不要交稿",           // 合法退路二：主体都定不下来就先问
+		"占位符标记，不是稿子", // 把 token 定性清楚，模型才知道不能照抄
+		"视为交付失败",     // 后果要写死，软约束在实测里会被忽略
+		"【待补:字段名】",   // 合法退路一：单个字段缺失
+		"不要交稿",       // 合法退路二：主体都定不下来就先问
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("generateSys 的正文书写规则缺了 %q —— 骨架模板的 {xxx} 会再次漏进成稿", want)
