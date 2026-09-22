@@ -321,6 +321,16 @@ if [ "$QUICK" = 0 ]; then
   selfcheck '流式 / SSE 尺子桩流自证'   python3 scripts/selftest_chat_sse_ruler.py
   selfcheck '流式 / 时间线桩流自证'     python3 scripts/selftest_timeline_stub.py
   selfcheck '流式 / 写稿默认关思考自证' python3 scripts/selftest_writethinking_default.py
+  # 「中间材料是整段在长，不是一行在抖」这把线上尺子的自证（2026-09-22）。
+  # 为什么必须有：它是一条**只跑线上**的尺子（要真模型真 SSE，40~50s），判据本身没人量。
+  # 收口时正是它自己假红了一次 —— L2 拿「后帧前缀 == 前帧后缀」判只增，而产品合法的两种
+  # 形态都会破坏这个关系：①窗口顶到 1200 后前部按句读前移、加前导「…」标记（前一帧尾巴是
+  # 正文、后一帧头是「…」，逐字比永远归零，**连纯材料序列都假红**）；②尾部旁白被新旁白
+  # 替换（旧旁白不在后一帧里）。A/B 新臂那次「红」就是这么来的，跟产品无关。
+  # 自证 9 例覆盖三档方向：绿（尾部增长 / 带…前移 / 旁白替换 / 够长）、红（无 material_log /
+  # 真换文字 / 每帧同值）、尺子坏=2（日志全是旁白=本轮无思考链 / 没走到执笔跳）。
+  # 红与「尺子坏」必须分档：混在一起就会把「这轮没量到」当成产品病去改断言。
+  selfcheck '流式 / 材料日志尺子自证'   python3 scripts/sse_material_log_gate.py --selftest
   # 部署链上的静态资源尺子的自证（六条判据，含「写死路径」的变异自证）。
   # 它守的是「部署完成后二进制与前端资源是同一批」这件事 —— 部署脚本第 5 步靠它。
   selfcheck '部署 / 静态资源尺子自证'   bash scripts/selftest_live_assets_ruler.sh
