@@ -217,6 +217,41 @@ func (s *SkillStore) Create(sk *model.Skill, params []model.Param) error {
 	return tx.Commit()
 }
 
+// UpdateMeta 更新技能的展示元信息（名称/描述/分类）。
+//
+// 这是极简通道的专属需求：阶段 A 只能用「推断出来的名字」注册（名字来自指南标题
+// 或文件名），阶段 B 的模型精炼会给出更合适的名称与描述，必须能回写。
+// 只动这三列，不碰 version/enabled/skill_type —— 回写展示信息不该顺手改行为开关。
+func (s *SkillStore) UpdateMeta(slug, name, description, category string) error {
+	_, err := s.db.Exec(`UPDATE skills SET name=?,description=?,category=?,updated_at=CURRENT_TIMESTAMP WHERE slug=?`,
+		name, description, category, slug)
+	return err
+}
+
+// ReplaceParams 用一份新的输入项清单替换旧的（极简通道精炼完成后回写）。
+//
+// 用「删净再插」而不是逐条 upsert：输入项是「这份技能该向用户问哪些信息」的完整
+// 声明，两次生成的交集没有保留价值。留下上一版多出来的项，运行时就会继续追问一个
+// 已经不存在的字段——用户看到的是莫名其妙的问题，而不是明确的报错。
+func (s *SkillStore) ReplaceParams(slug string, params []model.Param) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM params WHERE slug=?`, slug); err != nil {
+		return err
+	}
+	for i, p := range params {
+		opts, _ := json.Marshal(p.Options)
+		if _, err := tx.Exec(`INSERT INTO params(slug,name,label,type,required,placeholder,help,options,default_val,position) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			slug, p.Name, p.Label, p.Type, bool2int(p.Required), p.Placeholder, p.Help, string(opts), p.Default, i); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // SetEnabled toggles a skill.
 func (s *SkillStore) SetEnabled(slug string, enabled bool) error {
 	_, err := s.db.Exec(`UPDATE skills SET enabled=?, updated_at=CURRENT_TIMESTAMP WHERE slug=?`, bool2int(enabled), slug)

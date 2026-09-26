@@ -225,6 +225,8 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/admin/mcp/refresh", h.Auth.Middleware(h.Admin.RefreshMCP))
 	mux.HandleFunc("DELETE /api/admin/mcp/{id}", h.Auth.Middleware(h.Admin.DeleteMCP))
 	mux.HandleFunc("POST /api/admin/train", h.Auth.Middleware(h.Admin.Train))
+	// 极简创建：指南 + 范文 → 秒级可用技能（1 次模型调用），见 Admin.TrainLite 的注释。
+	mux.HandleFunc("POST /api/admin/train/lite", h.Auth.Middleware(h.Admin.TrainLite))
 	mux.HandleFunc("POST /api/admin/skills/toggle", h.Auth.Middleware(h.Admin.ToggleSkill))
 	mux.HandleFunc("POST /api/admin/skills/core", h.Auth.Middleware(h.Admin.SetSkillCore))
 	mux.HandleFunc("DELETE /api/admin/skills/{slug}", h.Auth.Middleware(h.Admin.DeleteSkill))

@@ -237,34 +237,31 @@
     };
   }
 
-  // ---------- train: submit + SSE progress ----------
-  $('train-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const go = $('tr-go'), spin = $('tr-spin'), txt = $('tr-txt');
-    go.disabled = true; spin.style.display = 'inline-block'; txt.textContent = '训练中…';
-    $('tr-log').style.display = 'block';
-    $('tr-log').innerHTML = '';
-    $('tr-result').style.display = 'none';
+  // ---------- 训练实况执行器（AI 训练生成 / 极简创建共用）----------
+  // 两条通道跑的是同一个后端进度协议（status / step / delta / done / error，见
+  // internal/api/admin.go）。**不能各写一份解析逻辑**：事件名对不上是静默故障 ——
+  // 历史上后端把 stage 改成 step 而前端只认 stage，整场训练界面零进度、日志空框，
+  // 用户看到的只是「一直卡着计时」。一个契约，一处实现。
+  //
+  // 心跳：后端只在阶段边界发帧，阶段内部可能几十秒静默（内网更甚）。屏幕必须持续
+  // 有「还在跑」的活气：每秒刷新已用时长 + 距上次进度多久。
+  async function runTrainStream(o) {
+    const go = $(o.goId), spin = $(o.spinId), txt = $(o.txtId), log = $(o.logId), rd = $(o.resultId);
+    go.disabled = true; spin.style.display = 'inline-block'; txt.textContent = o.busyText;
+    log.style.display = 'block'; log.innerHTML = '';
+    rd.style.display = 'none';
     // 每场训练一份贴底器：把实况区拉进视野（上一场的手动翻页状态不该带到这一场）。
-    const pinLive = makeLivePinner($('skill-new'), $('tr-log'));
-    pinLive(); // 点「开始训练」就先把实况区拉进视野，而不是等第一帧材料
+    // 贴底器由**通道自己**提供（o.makePinner）：外层滚动容器和日志容器都是各通道自己的
+    // DOM，写在通道配置里，页面结构一改就在改的地方看得见；执行器只管调用。
+    const pinLive = o.makePinner();
+    pinLive(); // 点下按钮就先把实况区拉进视野，而不是等第一帧材料
 
-    const fd = new FormData();
-    fd.append('name', $('tr-name').value);
-    fd.append('category', $('tr-cat').value || '');
-    fd.append('description', $('tr-desc').value || '');
-    fd.append('requirement', $('tr-req').value || '');
-    for (const f of selectedFiles) fd.append('files', f);
-
-    // 心跳：后端只在阶段边界发帧，阶段内部可能几十秒静默（一跑二十分钟）。
-    // 屏幕必须持续有「还在跑」的活气，否则用户看到的只是一个不动的框 —— 投诉原话
-    // 「一直卡着计时，用户体验不佳」就是这个。每秒刷新已用时长 + 距上次进度多久。
     const tickFmt = (s) => (s >= 60 ? Math.floor(s / 60) + 'm' + String(s % 60).padStart(2, '0') + 's' : s + 's');
     let lastEvAt = Date.now();
     const t0 = Date.now();
     const hb = setInterval(() => {
       const now = Date.now();
-      txt.textContent = '训练中… 已 ' + tickFmt(Math.round((now - t0) / 1000)) +
+      txt.textContent = o.busyText + ' 已 ' + tickFmt(Math.round((now - t0) / 1000)) +
         '（距上次进度 ' + tickFmt(Math.round((now - lastEvAt) / 1000)) + '）';
     }, 1000);
 
@@ -273,15 +270,15 @@
       const div = document.createElement('div');
       div.className = 'ln ' + (cls || '');
       div.innerHTML = `<span class="t">${esc(stage)}</span><span class="s">${esc(s)}</span>`;
-      $('tr-log').appendChild(div);
+      log.appendChild(div);
       // 实况材料块始终贴在最下面：新阶段日志插在它前面，材料块跟着往下走。
-      const live = $('tr-material');
-      if (live) $('tr-log').appendChild(live);
+      const live = $(o.materialId);
+      if (live) log.appendChild(live);
       pinLive();
     };
 
     try {
-      const resp = await fetch('/api/admin/train', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token() }, body: fd });
+      const resp = await fetch(o.url, { method: 'POST', headers: { 'Authorization': 'Bearer ' + token() }, body: o.fd });
       if (!resp.ok) {
         const j = await resp.json().catch(() => ({}));
         logLine('!', j.error || '请求失败', 'err');
@@ -303,14 +300,10 @@
             const ev = JSON.parse(line0.slice(5).trim());
             // 终帧到了，实况块收掉：留着会让人以为还在跑。
             if (ev.type === 'done' || ev.type === 'error') {
-              const live = $('tr-material');
+              const live = $(o.materialId);
               if (live) live.remove();
             }
             switch (ev.type) {
-              // ⚠️ 契约：后端 internal/api/admin.go 发的是 status / step / error / done。
-              // 这里以前只认 'stage'，于是「开始训练」和整场训练的阶段进度帧被静默丢弃 ——
-              // 界面上只剩一个空日志框 + 不动的「训练中…」，二十分钟看不出任何进展。
-              // 事件名对不上是静默故障（没有任何报错），所以下面配了契约测试守着。
               // 中间材料：模型流式吐出的思考链/正文片段（后端已攒批：~400ms 或 240 字节一帧）。
               // 必须**就地更新**同一个实况块，不能一片一个 DOM 节点 —— 二十分钟下来那是
               // 几万个节点，页面直接被拖死。这里只保留尾部若干字符，像终端在跑。
@@ -320,13 +313,13 @@
                   try { d = JSON.parse(d); } catch (_) { d = { kind: 'note', text: String(ev.data) }; }
                 }
                 const label = d.kind === 'think' ? '思考' : (d.kind === 'note' ? '提示' : '正文');
-                let mp = $('tr-material');
+                let mp = $(o.materialId);
                 if (!mp) {
                   mp = document.createElement('div');
-                  mp.id = 'tr-material';
+                  mp.id = o.materialId;
                   mp.className = 'ln material';
                   mp.style.cssText = 'color:#6b7280;white-space:pre-wrap;word-break:break-all;border-left:2px solid #d1d5db;padding-left:8px;margin:6px 0;';
-                  $('tr-log').appendChild(mp);
+                  $(o.logId).appendChild(mp);
                 }
                 // 换类别时补一个分隔，否则「思考」和「正文」会连成一句读。
                 // 注意：分隔符必须拼进下面那次赋值里。先 += 再整体覆盖「看着等价」，
@@ -344,40 +337,21 @@
               case 'step':
               case 'stage': // 旧名，向后兼容
                 logLine('→', ev.data, ''); break;
-              case 'done':
+              case 'done': {
                 const r = ev.data && typeof ev.data === 'object' ? ev.data : JSON.parse(ev.data);
-                // 降级交付必须显性说出来：技能落盘了，但裁判没验收通过（没跑完或没过线）。
-                // 以前这种情况只在 fidelity.md 里留一行，前端照样显示「已就绪」——
-                // 于是「生成的技能和我给的素材没关系」这件事在界面上完全看不出来。
-                if (r.degraded) {
-                  logLine('⚠️', '技能已生成，但裁判未验收通过：' + (r.degrade_reason || '原因未知'), 'err');
-                } else {
-                  logLine('✔', '技能「' + r.name + '」训练完成', 'ok');
-                }
-                const rd = $('tr-result');
-                rd.style.display = 'block';
-                rd.innerHTML = `<h4${r.degraded ? ' style="color:#c0392b"' : ''}>${r.degraded ? '⚠️ 新技能已就绪（未验收通过）' : '✔ 新技能已就绪'}</h4>
-                  <div class="row">名称：<b>${esc(r.name)}</b> (§ ${esc(r.slug)})</div>
-                  <div class="row">版本：<b>v${r.version}</b></div>
-                  <div class="row">参数：<b>${(r.input_params || []).length}</b> 个</div>
-                  <div class="params">${(r.input_params || []).map(p => `<span class="param-tag">${esc(p.label || p.name)}</span>`).join('')}</div>
-                  ${r.degraded ? `<div class="row" style="margin-top:10px;color:#c0392b">裁判未验收通过：${esc(r.degrade_reason || '')}</div>
-                  <div class="row" style="color:#888">技能已落盘可用，但请人工复核 fidelity.md 与范文后再投入生产。</div>` : ''}
-                  <div class="row" style="margin-top:10px">前台列表已可用，也可在「技能管理」里编辑。</div>`;
-                loadManageSkills();
+                o.onDone(r, { logLine, rd, log });
                 break;
-              case 'error':
+              }
+              case 'error': {
                 // 素材门禁失败等硬错误必须「响亮」：以前只往日志里打一行红字，
                 // 用户滚一下就当警告忽略了，然后拿着上一次的成功结果以为训练过了。
                 logLine('✕', ev.data, 'err');
-                {
-                  const rd = $('tr-result');
-                  rd.style.display = 'block';
-                  rd.innerHTML = `<h4 style="color:#c0392b">✕ 训练已中止</h4>
-                    <div class="row">${esc(ev.data)}</div>
-                    <div class="row" style="margin-top:10px;color:#888">素材没读到内容时，本次不会生成技能——避免交付一份与素材无关的成品。</div>`;
-                }
+                rd.style.display = 'block';
+                rd.innerHTML = `<h4 style="color:#c0392b">✕ 训练已中止</h4>
+                  <div class="row">${esc(ev.data)}</div>
+                  <div class="row" style="margin-top:10px;color:#888">素材没读到内容时，本次不会生成技能——避免交付一份与素材无关的成品。</div>`;
                 break;
+              }
             }
           } catch (_) {}
         }
@@ -386,9 +360,123 @@
       logLine('!', '网络错误：' + err.message, 'err');
     } finally {
       clearInterval(hb);
-      go.disabled = false; spin.style.display = 'none'; txt.textContent = '开始训练';
-      selectedFiles = []; renderTags();
+      go.disabled = false; spin.style.display = 'none'; txt.textContent = o.idleText;
     }
+  }
+
+  // ---------- train: submit ----------
+  $('train-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData();
+    fd.append('name', $('tr-name').value);
+    fd.append('category', $('tr-cat').value || '');
+    fd.append('description', $('tr-desc').value || '');
+    fd.append('requirement', $('tr-req').value || '');
+    for (const f of selectedFiles) fd.append('files', f);
+    await runTrainStream({
+      url: '/api/admin/train', fd,
+      makePinner: () => makeLivePinner($('skill-new'), $('tr-log')),
+      goId: 'tr-go', spinId: 'tr-spin', txtId: 'tr-txt',
+      logId: 'tr-log', resultId: 'tr-result', materialId: 'tr-material',
+      idleText: '开始训练', busyText: '训练中…',
+      onDone: (r, ctx) => {
+        // 降级交付必须显性说出来：技能落盘了，但裁判没验收通过（没跑完或没过线）。
+        // 以前这种情况只在 fidelity.md 里留一行，前端照样显示「已就绪」——
+        // 于是「生成的技能和我给的素材没关系」这件事在界面上完全看不出来。
+        if (r.degraded) {
+          ctx.logLine('⚠️', '技能已生成，但裁判未验收通过：' + (r.degrade_reason || '原因未知'), 'err');
+        } else {
+          ctx.logLine('✔', '技能「' + r.name + '」训练完成', 'ok');
+        }
+        const rd = ctx.rd;
+        rd.style.display = 'block';
+        rd.innerHTML = `<h4${r.degraded ? ' style="color:#c0392b"' : ''}>${r.degraded ? '⚠️ 新技能已就绪（未验收通过）' : '✔ 新技能已就绪'}</h4>
+          <div class="row">名称：<b>${esc(r.name)}</b> (§ ${esc(r.slug)})</div>
+          <div class="row">版本：<b>v${r.version}</b></div>
+          <div class="row">参数：<b>${(r.input_params || []).length}</b> 个</div>
+          <div class="params">${(r.input_params || []).map(p => `<span class="param-tag">${esc(p.label || p.name)}</span>`).join('')}</div>
+          ${r.degraded ? `<div class="row" style="margin-top:10px;color:#c0392b">裁判未验收通过：${esc(r.degrade_reason || '')}</div>
+          <div class="row" style="color:#888">技能已落盘可用，但请人工复核 fidelity.md 与范文后再投入生产。</div>` : ''}
+          <div class="row" style="margin-top:10px">前台列表已可用，也可在「技能管理」里编辑。</div>`;
+        loadManageSkills();
+      },
+    });
+    // 文件选择器是整场训练共用的，跑完就清；清在这里而不是执行器内部，
+    // 免得哪天两条通道同时开着，一个跑完把另一个刚选好的文件清掉。
+    selectedFiles = []; renderTags();
+  });
+
+  // ---------- lite: 极简创建（写作指南 + 范文 → 秒级可用）----------
+  // 只要求两样东西：一份写作指南、至少一篇范文。技能名由材料推断（用户手上就这两份
+  // 东西，逼他先想技能名是本末倒置）。后端的做法是先本地装盘让技能立刻能用，
+  // 再用 1 次模型调用精炼措辞 —— 内网 token 慢，用户不该为了「等 AI 想名字」而卡住。
+  let liteFiles = [];      // 范文文件（可多份）
+  let liteGuideDoc = null; // 指南文件（只留一份，两份指南的硬约束会互相打架）
+  function renderLiteTags() {
+    $('lt-tags').innerHTML = liteFiles.map((f, i) =>
+      `<span class="file-tag">${esc(f.name)} <button onclick="liteRmFile(${i})">✕</button></span>`).join('');
+    $('lt-guide-tag').innerHTML = liteGuideDoc
+      ? `<span class="file-tag">${esc(liteGuideDoc.name)} <button onclick="liteRmGuide()">✕</button></span>` : '';
+  }
+  window.liteRmFile = (i) => { liteFiles.splice(i, 1); renderLiteTags(); };
+  window.liteRmGuide = () => { liteGuideDoc = null; $('lt-guide-file').value = ''; renderLiteTags(); };
+  function liteAddFiles(files) {
+    for (const f of files) liteFiles.push(f);
+    renderLiteTags();
+  }
+  {
+    const d = $('lt-drop'), fi = $('lt-file');
+    d.addEventListener('click', () => fi.click());
+    d.addEventListener('dragover', e => { e.preventDefault(); d.classList.add('over'); });
+    d.addEventListener('dragleave', () => d.classList.remove('over'));
+    d.addEventListener('drop', e => { e.preventDefault(); d.classList.remove('over'); liteAddFiles(e.dataTransfer.files); });
+    fi.addEventListener('change', () => liteAddFiles(fi.files));
+    $('lt-guide-pick').addEventListener('click', () => $('lt-guide-file').click());
+    $('lt-guide-file').addEventListener('change', () => {
+      const f = $('lt-guide-file').files[0];
+      if (f) { liteGuideDoc = f; renderLiteTags(); }
+    });
+  }
+
+  $('lite-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData();
+    fd.append('name', $('lt-name').value || '');
+    fd.append('guide', $('lt-guide').value || '');
+    fd.append('examples', $('lt-examples').value || '');
+    if (liteGuideDoc) fd.append('guide_doc', liteGuideDoc);
+    for (const f of liteFiles) fd.append('example_files', f);
+    await runTrainStream({
+      url: '/api/admin/train/lite', fd,
+      makePinner: () => makeLivePinner($('skill-new'), $('lt-log')),
+      goId: 'lt-go', spinId: 'lt-spin', txtId: 'lt-txt',
+      logId: 'lt-log', resultId: 'lt-result', materialId: 'lt-material',
+      idleText: '一键生成', busyText: '生成中…',
+      onDone: (r, ctx) => {
+        // 极简模式必须显性标记「没跑裁判」：这一版是「素材直装 + 一次精炼」，
+        // 裁判那一步是省掉的。前端要是照样印「✔ 已就绪」，管理员会以为它和
+        // 走完整流水线的技能是一个验收标准 —— 这正是「生成的技能和素材没关系」
+        // 这类投诉最容易被掩盖的地方。
+        const lite = r.mode === 'lite';
+        const warn = lite || r.degraded;
+        ctx.logLine(warn ? '🟡' : '✔', warn
+          ? '技能「' + r.name + '」已生成（极简模式：未经裁判验收）'
+          : '技能「' + r.name + '」生成完成', warn ? '' : 'ok');
+        const rd = ctx.rd;
+        rd.style.display = 'block';
+        rd.innerHTML = `<h4${warn ? ' style="color:#b45309"' : ''}>${warn ? '🟡 极简技能已就绪（还没过裁判验收）' : '✔ 新技能已就绪'}</h4>
+          <div class="row">名称：<b>${esc(r.name)}</b> (§ ${esc(r.slug)})</div>
+          <div class="row">范文：<b>${r.example_count || 0}</b> 篇（原文逐字落盘，写稿时按长度预算注入）</div>
+          <div class="row">提示词：<b>${r.prompt_len || 0}</b> 字</div>
+          <div class="row">参数：<b>${(r.input_params || []).length}</b> 个</div>
+          <div class="params">${(r.input_params || []).map(p => `<span class="param-tag">${esc(p.label || p.name)}</span>`).join('')}</div>
+          ${r.degraded ? `<div class="row" style="margin-top:10px;color:#b45309">${esc(r.degrade_reason || '')}</div>` : ''}
+          <div class="row" style="margin-top:10px">现在就能用：去前台开新对话，选「${esc(r.name)}」写一篇试试。</div>
+          <div class="row" style="color:#888">要更严格的话，用「AI 训练生成」把同一批材料再跑一次完整流水线（含裁判验收）。</div>`;
+        loadManageSkills();
+      },
+    });
+    liteFiles = []; liteGuideDoc = null; renderLiteTags();
   });
 
   // ---------- skill management ----------
@@ -1193,11 +1281,12 @@
     else toast(j.error || '保存失败', 'err');
   };
 
-  // ---------- new skill (AI train or manual) ----------
+  // ---------- new skill (AI train / manual / lite) ----------
   window.nsTab = (mode) => {
     document.querySelectorAll('.ns-seg-btn').forEach(b => b.classList.toggle('active', b.dataset.ns === mode));
     $('ns-view-train').style.display = mode === 'train' ? 'block' : 'none';
     $('ns-view-manual').style.display = mode === 'manual' ? 'block' : 'none';
+    $('ns-view-lite').style.display = mode === 'lite' ? 'block' : 'none';
   };
   window.newSkillView = () => {
     $('skill-new-mask').style.display = 'flex';
@@ -1213,6 +1302,15 @@
     // clear manual form
     $('ns-slug').value = ''; $('ns-name').value = ''; $('ns-cat').value = ''; $('ns-desc').value = ''; $('ns-prompt').value = '';
     $('ns-msg').textContent = ''; $('ns-msg').className = 'msg';
+    // clear lite form：极简通道有自己的文件列表（liteFiles/liteGuideDoc），
+    // 不跟着 train 的 selectedFiles 走，复位必须单独清 —— 否则上一场选的范文
+    // 会跟着下一次提交一起传上去，用户会以为新技能里混进了旧材料。
+    try { $('lite-form').reset(); } catch (_) {}
+    liteFiles = []; liteGuideDoc = null; try { renderLiteTags(); } catch (_) {}
+    $('lt-log').style.display = 'none'; $('lt-log').innerHTML = '';
+    $('lt-result').style.display = 'none';
+    $('lt-go').disabled = false;
+    $('lt-spin').style.display = 'none'; $('lt-txt').textContent = '一键生成';
   };
   window.closeNewSkill = () => {
     $('skill-new-mask').style.display = 'none';

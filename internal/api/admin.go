@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"strconv"
@@ -234,9 +235,159 @@ func (a *Admin) Train(w http.ResponseWriter, r *http.Request) {
 	send("done", string(b))
 }
 
-// ===== LLM config management =====
+// readUpload 读一个上传件（带上限，防止大文件把内存吃光）。
+func readUpload(h *multipart.FileHeader) ([]byte, bool) {
+	f, err := h.Open()
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+	b, _ := io.ReadAll(io.LimitReader(f, maxDocBytes))
+	return b, len(b) > 0
+}
 
-// ListLLM returns provider configs (API keys masked for display).
+// TrainLite 是「极简创建」通道：用户只给一份写作指南 + 若干篇范文。
+//
+// multipart 字段（前四项都是普通表单值，后两项是文件）：
+// name/slug（可空，空则从材料推断）、guide（粘贴的指南正文）、
+// examples（粘贴的范文，多篇用一行 --- 分隔）、guide_doc（指南文件，单份）、
+// example_files（范文文件，多份，前端同名多选）。
+// 范文的文本与文件用**不同字段名**：同名虽然 multipart 能分开存，但下一个看代码的
+// 人一定会以为 examples 是文件列表，改错一处就是「范文读不出来」这种哑故障。
+//
+// 为什么单开一个端点而不是给 Train 加个 mode 参数：
+//  1. 必填规则正好相反——Train 缺 name/requirement 直接 400，而极简通道这两项都由
+//     材料推断（用户手上只有指南和范文，逼他先想技能名是本末倒置）。塞进同一个
+//     handler，两套必填规则会在同一个 if 里互相打架。
+//  2. 失败语义不同——极简通道允许「AI 精炼失败但技能已经可用」，那是 done 帧不是
+//     error 帧；混在一起最容易在某个分支上把「可用」报成「失败」。
+func (a *Admin) TrainLite(w http.ResponseWriter, r *http.Request) {
+	if !a.mu.TryLock() {
+		writeErr(w, http.StatusConflict, "已有训练任务在运行，请稍候")
+		return
+	}
+	defer a.mu.Unlock()
+
+	if err := r.ParseMultipartForm(maxFormBytes); err != nil {
+		writeErr(w, http.StatusBadRequest, "表单过大或无效")
+		return
+	}
+	// 指南只取第一份：两份指南的硬约束常常互相矛盾（一份说 800 字、一份说 1500 字），
+	// 静默挑一份合并比直接报错危险得多。
+	guideFileName := ""
+	var files []*skillgen.UploadedFile
+	for _, h := range r.MultipartForm.File["guide_doc"] {
+		b, ok := readUpload(h)
+		if !ok {
+			continue
+		}
+		guideFileName = h.Filename
+		files = append(files, &skillgen.UploadedFile{Filename: h.Filename, Content: string(b)})
+		break
+	}
+	for _, h := range r.MultipartForm.File["example_files"] {
+		b, ok := readUpload(h)
+		if !ok {
+			continue
+		}
+		files = append(files, &skillgen.UploadedFile{Filename: h.Filename, Content: string(b)})
+	}
+
+	// slug 只在用户真填了的时候才预处理：对空串调 Slugify 会命中它内部的时间戳兜底
+	// （`skill-1790401421` 这种），于是 GenerateLite 以为「用户指定了 slug」而放弃
+	// 从指南标题推断名字——技能名和目录名就双双退化成时间戳。别在传参层替它做决定。
+	slugRaw := strings.TrimSpace(r.FormValue("slug"))
+	in := &skillgen.LiteInput{
+		Name:      strings.TrimSpace(r.FormValue("name")),
+		Guide:     strings.TrimSpace(r.FormValue("guide")),
+		Examples:  skillgen.SplitLiteExamples(r.FormValue("examples")),
+		Files:     files,
+		GuideFile: guideFileName,
+	}
+	if slugRaw != "" {
+		in.Slug = skillgen.Slugify(slugRaw)
+	}
+	// 预检只看「材料给没给」，不看「够不够长」：长度是素材门禁的判据，它要在 SSE 里
+	// 报出来（用户需要看到是「指南太短」还是「范文读不出来」），而不是一个 400 就没了。
+	exFileN := len(files)
+	if guideFileName != "" {
+		exFileN--
+	}
+	if in.Guide == "" && guideFileName == "" {
+		writeErr(w, http.StatusBadRequest, "缺写作指南：请粘贴指南正文，或上传指南文件")
+		return
+	}
+	if len(in.Examples) == 0 && exFileN <= 0 {
+		writeErr(w, http.StatusBadRequest, "缺范文：请粘贴至少一篇范文（多篇用一行 --- 分隔），或上传范文文件")
+		return
+	}
+
+	// LLM 配不上**不算失败**：极简通道的阶段 A 是纯本地装盘，没有模型也能生成一份
+	// 按素材直装的可用技能（内网常见的「模型还没接好」场景不该被卡在门口）。
+	// 只是要在流里说清楚，别让用户以为 AI 已经精炼过。
+	noLLM := false
+	if lcfg, err := a.store.GetActiveLLM(); err != nil {
+		noLLM = true
+	} else {
+		a.gen.SetLLM(llm.New(lcfg))
+		a.gen.SetOCR(a.ocrURL)
+		if a.eng != nil {
+			a.eng.SetLLM(llm.New(lcfg))
+		}
+	}
+
+	// SSE progress
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, "流式输出不可用")
+		return
+	}
+	tctx, cancelTrain := trainingCtx(r.Context())
+	defer cancelTrain()
+	var sendMu sync.Mutex
+	send := func(t, data string) {
+		b, _ := json.Marshal(map[string]string{"type": t, "data": data})
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		flusher.Flush()
+	}
+	relay := skillgen.NewMaterialRelay(400*time.Millisecond, 240, func(kind, text string) {
+		b, _ := json.Marshal(map[string]string{"kind": kind, "text": text})
+		send("delta", string(b))
+	})
+	tctx = skillgen.WithDelta(tctx, relay.Push)
+
+	send("status", "极简创建：读素材 → 按素材装盘（这一步不花模型时间）→ AI 精炼一次")
+	if noLLM {
+		send("step", "⚠️ 当前没有可用的 LLM 配置：将只按素材装盘生成可用技能，跳过 AI 精炼")
+	}
+	trainStart := time.Now()
+	res, err := a.gen.GenerateLite(tctx, in, func(step string) {
+		relay.Flush()
+		send("step", step)
+	})
+	relay.Flush()
+	// 失败时 res 可能是 nil，日志里的 slug 退回推断值：训练日志是事后排查的唯一线索，
+	// 不能在「已经失败」的路径上再因为取字段而 panic。
+	slugForLog := in.Slug
+	if res != nil && res.Slug != "" {
+		slugForLog = res.Slug
+	}
+	logTrainOutcome(in.Name, slugForLog, time.Since(trainStart), res, err)
+	if err != nil {
+		send("error", err.Error())
+		return
+	}
+	b, _ := json.Marshal(res)
+	send("done", string(b))
+}
+
+// ===== LLM config management =====
 func (a *Admin) ListLLM(w http.ResponseWriter, r *http.Request) {
 	cfgs, err := a.store.ListLLMConfigs()
 	if err != nil {

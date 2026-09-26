@@ -218,6 +218,12 @@ type Result struct {
 	ExampleN    int           `json:"example_count"`
 	SkillType   string        `json:"skill_type,omitempty"`
 	Attachment  string        `json:"attachment,omitempty"`
+	// Mode 标出这份技能是哪条通道生成的：
+	//   ""     = 通用流水线（9 步 + 裁判循环）
+	//   "lite" = 极简创建（本地装盘 + 1 次精炼，不跑裁判）
+	// 前端据此显示「极简模式」徽标与「完整流水线重训」入口；空串保持旧行为，
+	// 不会让既有接口的响应体发生变化。
+	Mode string `json:"mode,omitempty"`
 	// Degraded 表示这次交付是「降级版本」：裁判没跑完，或最优一轮没过通过线。
 	// 技能照样落盘（素材与提示词本身可用），但前端必须显性提示，
 	// 不能让管理员以为拿到的是验收通过的产物——静默降级是「技能和素材
@@ -535,6 +541,15 @@ func (g *Generator) land(dir, sysPrompt, tpl string, exFiles []string, in *Input
 		if deg, reason := mp.Judge.Degraded(); deg {
 			meta["degraded"] = true
 			meta["degrade_reason"] = reason
+		}
+		// 极简通道：模式标记 + 固定的降级状态，**无条件**写入。
+		// 管理端左树点开技能时看不到 fidelity.md，meta.json 是唯一能一眼确认
+		// 「这份技能验收过没有」的地方，所以它不能依赖任何条件成立。
+		if strings.TrimSpace(mp.LiteNote) != "" {
+			meta["mode"] = modeLite
+			meta["lite_note"] = mp.LiteNote
+			meta["degraded"] = true
+			meta["degrade_reason"] = liteDegradeReason()
 		}
 	}
 	if dtype != nil {

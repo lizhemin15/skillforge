@@ -250,6 +250,7 @@
           <div class="ns-seg">
             <button type="button" class="ns-seg-btn active" data-ns="train" onclick="window.nsTab('train')">AI 训练生成</button>
             <button type="button" class="ns-seg-btn" data-ns="manual" onclick="window.nsTab('manual')">手动创建</button>
+            <button type="button" class="ns-seg-btn" data-ns="lite" onclick="window.nsTab('lite')">极简创建</button>
           </div>
 
           <!-- AI train view -->
@@ -288,6 +289,38 @@
             <button class="btn primary" onclick="window.doNewSkill()">创建</button>
             <div class="msg" id="ns-msg"></div>
           </div>
+
+          <!-- lite view：写作指南 + 范文 → 一键生成（内网慢 token 的推荐路径） -->
+          <!-- 与「AI 训练生成」的区别：这里不要求技能名/描述，也不跑裁判循环。
+               先本地把素材装盘成一份立刻能用的技能，再用 1 次模型调用精炼措辞。 -->
+          <div id="ns-view-lite" style="display:none">
+            <p class="card-sub" style="margin-top:8px">给一份写作指南 + 至少一篇范文，一键生成可用的写作技能（想快点用就选这个）</p>
+            <form id="lite-form">
+              <div class="field">
+                <label>写作指南</label>
+                <textarea id="lt-guide" rows="5" placeholder="这套文章的硬要求：受众、结构、篇幅、语言风格、必含要素、避讳点……（也可上传文件）"></textarea>
+                <div style="margin-top:6px">
+                  <button type="button" class="btn" id="lt-guide-pick">选择指南文件</button>
+                </div>
+                <input type="file" id="lt-guide-file" style="display:none">
+                <div class="file-tags" id="lt-guide-tag"></div>
+              </div>
+              <div class="field">
+                <label>范文</label>
+                <div class="drop" id="lt-drop">点击或拖入范文文件（可多篇）</div>
+                <input type="file" id="lt-file" multiple style="display:none">
+                <div class="file-tags" id="lt-tags"></div>
+                <textarea id="lt-examples" rows="4" placeholder="也可以直接把范文粘在这里；多篇之间用一行 --- 分隔" style="margin-top:6px"></textarea>
+              </div>
+              <div class="field"><label>技能名称（可选）</label><input type="text" id="lt-name" placeholder="留空即从指南标题自动取名"></div>
+              <button type="submit" class="btn primary" id="lt-go">
+                <span id="lt-spin" class="spin" style="display:none"></span>
+                <span id="lt-txt">一键生成</span>
+              </button>
+              <div class="log" id="lt-log" style="margin-top:16px;display:none"></div>
+              <div class="result" id="lt-result" style="display:none"></div>
+            </form>
+          </div>
         </div>
       </div>
     </div>
@@ -307,6 +340,6 @@
 <script src="/assets/vendor/codemirror/addon/fold/foldcode.min.js?v=20260908A"></script>
 <script src="/assets/vendor/codemirror/addon/fold/foldgutter.min.js?v=20260908A"></script>
 <script src="/assets/js/site.js?v=20260911M"></script>
-<script src="/assets/js/admin.js?v=20260920A"></script>
+<script src="/assets/js/admin.js?v=20260926A"></script>
 </body>
 </html>

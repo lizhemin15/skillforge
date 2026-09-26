@@ -78,17 +78,38 @@ function makeDom() {
     return el;
   };
   const log = mk('div');
-  log.id = 'tr-log';
-  byId.set('tr-log', log);
+  log.id = logId;
+  byId.set(logId, log);
   const document = { createElement: (t) => { created++; return mk(t); } };
   const $ = (id) => byId.get(id) || null;
   return { document, $, log, created: () => created, byId };
 }
 
 const adminJS = read('web/js/admin.js');
+const adminHTML = read('web/admin.html');
 const block = extractCase(adminJS, 'delta');
 const pinnerSrc = extractFn(adminJS, 'makeLivePinner');
 const adminGo = read('internal/api/admin.go');
+
+// 材料块住哪个容器：**从出货源码的训练通道配置里读**，不在测试里写死。
+// 写死会白丢一层覆盖 —— 接线被改到别的元素上时，「块进了 tr-log 吗」还会照样绿。
+// 取法：先定位训练通道特有的 `logId: 'tr-log'`，再就**近**读同一行的 materialId。
+// （不能拿大括号配平去框整个配置：配置里的 onDone 是个带函数体的箭头函数，
+//  花括号配平会被它带偏；就近窗口没有这个风险。）
+const logIdAt = adminJS.indexOf(`logId: 'tr-log'`);
+const cfgWin = logIdAt >= 0 ? adminJS.slice(logIdAt, logIdAt + 400) : '';
+const logId = (cfgWin.match(/logId:\s*'([^']+)'/) || [, ''])[1];
+const matId = (cfgWin.match(/materialId:\s*'([^']+)'/) || [, ''])[1];
+
+check('从训练通道配置里读到了 logId / materialId', !!logId && !!matId,
+  `实得 logId「${logId}」materialId「${matId}」—— 配置形状变了或接线被删`);
+// 容器是静态写在 HTML 里的（材料块是 JS 建的，所以只查容器 id）。
+check('日志容器 id 在 admin.html 里真实存在（不是悬空 id）', !!logId && adminHTML.includes(`id="${logId}"`),
+  `admin.html 里没有 id="${logId}" —— 材料会挂到一个不存在的容器上`);
+// 材料块 id 若等于容器 id：`$(o.materialId)` 首次就命中容器本身，于是往容器上写
+// textContent —— 整个日志被这一段覆盖掉，而且不再有子节点可供数（真红会变成假绿）。
+check('材料块 id ≠ 容器 id（否则第一次写入就把日志容器覆盖了）', !!matId && matId !== logId,
+  `materialId 与 logId 都是「${matId}」`);
 
 // ---- ① 抠得出真代码 ----
 check('抠出 admin.js 里真正在跑的 case \'delta\' 分支', !!block, '抠不到说明前端没接 delta 帧，或写法变了导致配平失败');
@@ -113,7 +134,7 @@ function mkPin() {
 if (block) {
   const dom = makeDom();
   const pin = pinnerSrc ? mkPin() : { pinLive: () => {}, calls: () => 0 };
-  const run = new Function('ev', '$', 'document', 'pinLive',
+  const run = new Function('ev', '$', 'document', 'pinLive', 'o',
     `let lastEvAt = 0; switch (ev.type) { ${block} } return lastEvAt;`);
 
   const FRAMES = 500;
@@ -121,9 +142,10 @@ if (block) {
   let threw = null;
   for (let i = 0; i < FRAMES; i++) {
     try {
+      // 第 5 个参数 = 出货源码里的通道配置（材料块 id / 日志容器都从配置里读，见上方）。
       lastAt = run(
         { type: 'delta', data: JSON.stringify({ kind: i % 2 ? 'think' : 'text', text: '片段' + i }) },
-        dom.$, dom.document, pin.pinLive,
+        dom.$, dom.document, pin.pinLive, { materialId: matId, logId },
       );
     } catch (e) { threw = e; break; }
   }
@@ -132,7 +154,7 @@ if (block) {
     pin.calls() === FRAMES, `只调了 ${pin.calls()} / ${FRAMES} 次`);
   check('实况块只建 1 个 DOM 节点（不是一片一个节点）',
     dom.created() === 1, `一共建了 ${dom.created()} 个节点 —— 一片一节点会随帧数线性增长，二十分钟下来把页面拖死`);
-  check('实况块在日志容器里（不是飘在页面别处）', dom.log.children.length === 1 && dom.log.children[0].id === 'tr-material');
+  check('实况块在日志容器里（不是飘在页面别处）', dom.log.children.length === 1 && dom.log.children[0].id === matId);
 
   const mp = dom.byId.get('tr-material');
   check('正文字符有上限，不无限增长', !!mp && mp.textContent.length <= 700, mp ? `当前 ${mp.textContent.length} 字` : '块丢了');

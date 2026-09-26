@@ -959,6 +959,11 @@ type manualPack struct {
 	// （手册给标尺、裁判按标尺判手册类技能），一份数据一条路径写盘，
 	// 免得出现「传了裁判结果却漏传给 fidelity」这种缺失。
 	Judge *JudgeReport
+	// LiteNote 非空表示这份产物来自「极简创建」通道（见 lite.go）。它只影响
+	// fidelity.md / meta.json 里的措辞，不改变任何落盘结构：极简通道缺的不是
+	// 文件，是「裁判验收」这一环的证据，而报告必须把这件事说清楚
+	// （写成「未启用裁判评分」会让管理员以为只是没开开关，其实这一版根本没验过）。
+	LiteNote string
 }
 
 // ExampleCount 返回成功切出的范文总数。
@@ -1165,6 +1170,12 @@ func (mp *manualPack) writeFidelity(dir string) error {
 	if deg, reason := mp.Judge.Degraded(); deg {
 		fmt.Fprintf(&b, "> ⚠️ **本次为降级交付**：%s\n> 技能已落盘可用，但**未经裁判验收通过**，请人工复核后再投入生产。\n\n", reason)
 	}
+	// 极简创建的来源说明紧跟降级告示：它解释「为什么这份报告里没有裁判评分」。
+	// 两段必须都在最上面——下面的覆盖率、保真数都是细节，只有这两句能让人 3 秒内
+	// 判断该不该信这份技能。
+	if n := strings.TrimSpace(mp.LiteNote); n != "" {
+		fmt.Fprintf(&b, "> 🪶 **极简创建**：%s\n\n", n)
+	}
 	fmt.Fprintf(&b, "- 生成时间：%s\n", time.Now().Format("2006-01-02 15:04:05"))
 
 	total := len(mp.Structure.Categories)
@@ -1197,7 +1208,14 @@ func (mp *manualPack) writeFidelity(dir string) error {
 	b.WriteString("\n## 裁判评分（独立评审 · 上限 ")
 	fmt.Fprintf(&b, "%d 轮）\n\n", judgeMaxRounds)
 	if mp.Judge == nil {
-		b.WriteString("（未启用裁判评分）\n")
+		if strings.TrimSpace(mp.LiteNote) != "" {
+			// 「未启用」和「没跑」是两回事：前者听起来像开关没打开（打开就好了），
+			// 后者是这一版根本没有独立评审环节。措辞必须区分开。
+			b.WriteString("（**极简模式不跑裁判**：这一版由「写作指南 + 范文 → 1 次模型精炼」直接产出，" +
+				"没有独立评审环节；需要验收请在管理端用「完整流水线重训」重跑一遍）\n")
+		} else {
+			b.WriteString("（未启用裁判评分）\n")
+		}
 	} else {
 		b.WriteString(judgeRoundTable(mp.Judge.Rounds))
 		if mp.Judge.BestRound > 0 {

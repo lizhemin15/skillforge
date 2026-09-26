@@ -48,24 +48,36 @@ func (h *chatHandler) runManualWrite(
 	routeIdx := tb.Active("match", "② 手册分类", "按手册各分类的触发场景判断这条需求该走哪一类…")
 	clock.Set(tb.Steps())
 
-	route, err := h.eng.RouteCategory(ctx, pack, userMsg, history)
-	if err != nil {
-		write(evError, jsonSafe(map[string]string{"error": "分类判定失败: " + err.Error()}))
-		return true
-	}
-	cat := pack.FindCategory(route.Category)
-	if route.Ambiguous || cat == nil {
-		// 判不出类别时**不能**硬着头皮写：猜错类别等于整篇按错的要求写，用户还得
-		// 自己发现。手册里还留着一类自查清单，所以这里把类目摆出来让用户点。
-		tb.Close(routeIdx, "没找到明确对应的一类，把类目列给你挑")
-		tb.Active("generate", "等待你指定写作类别", "按你指定的那一类的要求与范文起草")
-		clock.Set(tb.Steps())
-		msg := ambiguousMessage(pack, route.Reason)
-		clock.Awaiting("等待确认写作类别")
-		write(evDelta, jsonSafe(map[string]string{"t": msg}))
-		h.eng.Push(sessionID, agent.Message{Role: "assistant", Content: msg, SkillSlug: sc.Slug, At: time.Now()})
-		write(evDone, jsonSafe(map[string]string{"skill": sc.Slug, "asked": "true"}))
-		return true
+	// 单分类技能（极简创建的产物都是这种）没有「选哪一类」这件事：分类名是确定的，
+	// 再花一次模型往返去确认「这属于唯一的那一类吗」纯属白等——内网一次往返就是
+	// 几十秒的静默。省掉的只是分类判定；缺参追问走的是意图评估的 eval.Needs
+	// （见 chat.go 的 SplitNeeds），与这次调用无关，多轮交互不受影响。
+	var cat *agent.WriteCategory
+	routeConf, routeReason := "", ""
+	if len(pack.Categories) == 1 {
+		cat = &pack.Categories[0]
+		routeConf, routeReason = "single", "技能只定义了一类写作"
+	} else {
+		route, err := h.eng.RouteCategory(ctx, pack, userMsg, history)
+		if err != nil {
+			write(evError, jsonSafe(map[string]string{"error": "分类判定失败: " + err.Error()}))
+			return true
+		}
+		cat = pack.FindCategory(route.Category)
+		if route.Ambiguous || cat == nil {
+			// 判不出类别时**不能**硬着头皮写：猜错类别等于整篇按错的要求写，用户还得
+			// 自己发现。手册里还留着一类自查清单，所以这里把类目摆出来让用户点。
+			tb.Close(routeIdx, "没找到明确对应的一类，把类目列给你挑")
+			tb.Active("generate", "等待你指定写作类别", "按你指定的那一类的要求与范文起草")
+			clock.Set(tb.Steps())
+			msg := ambiguousMessage(pack, route.Reason)
+			clock.Awaiting("等待确认写作类别")
+			write(evDelta, jsonSafe(map[string]string{"t": msg}))
+			h.eng.Push(sessionID, agent.Message{Role: "assistant", Content: msg, SkillSlug: sc.Slug, At: time.Now()})
+			write(evDone, jsonSafe(map[string]string{"skill": sc.Slug, "asked": "true"}))
+			return true
+		}
+		routeConf, routeReason = route.Confidence, route.Reason
 	}
 
 	// 分类命中要显性化：用户得看见「它按哪一类的要求写的」，否则稿件不合预期时
@@ -74,7 +86,7 @@ func (h *chatHandler) runManualWrite(
 	if catName == "" {
 		catName = cat.File
 	}
-	catDetail := hitDetail(catName, route.Confidence, route.Reason)
+	catDetail := hitDetail(catName, routeConf, routeReason)
 	tb.Close(routeIdx, catDetail)
 
 	// ③ 把「喂进去的是什么素材」摊开：这一环最容易出错（路由错类 = 整篇按错的
@@ -264,6 +276,11 @@ func reviewNoteFor(issues []agent.ReviewIssue, head string) string {
 // 这一类」还是「用户自己说了这几个字」。回归测试同样靠「类别名 + 命中」双条件断言，
 // 单条件会被需求原文假绿（踩过）。
 func hitDetail(catName, confidence, reason string) string {
+	if confidence == "single" {
+		// 单分类技能没有「判得准不准」这回事。这里要说清「为什么这一格没有模型参与」，
+		// 否则用户会发现同一套步骤流在有些技能上快得反常，却找不到解释。
+		return "技能只定义了一类《" + catName + "》，直接按它执笔（无需分类判定）"
+	}
 	detail := "命中「" + catName + "」"
 	if confidence == "low" {
 		detail += "（把握不大，需你核对是否为这一类）"

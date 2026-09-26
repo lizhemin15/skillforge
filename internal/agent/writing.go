@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 
 	"github.com/lizhemin15/skillforge/internal/llm"
@@ -205,9 +207,16 @@ func packBlock(pack *WritePack, cat *WriteCategory) string {
 	var b strings.Builder
 	b.WriteString("==== 本次命中的手册分类（硬约束） ====\n")
 	fmt.Fprintf(&b, "分类：%s\n", cat.Name)
-	if strings.TrimSpace(cat.Requirement) != "" {
+	if req := strings.TrimSpace(cat.Requirement); req != "" {
 		b.WriteString("\n【本类写作要求（手册原文，逐条遵守，不得取舍）】\n")
-		b.WriteString(strings.TrimSpace(cat.Requirement) + "\n")
+		// 要求原文是硬约束，能整段给就整段给；只有超长手册才按预算裁，且必须写明
+		// 裁掉了多少——管理员看不见 prompt，只能靠这句话判断内网为什么快/慢。
+		clip, cut := clipMaterial(req, packBudget(envPackRequirementBudget, defaultPackRequirementBudget))
+		b.WriteString(clip + "\n")
+		if cut > 0 {
+			fmt.Fprintf(&b, "（本类要求原文过长：本次注入前 %d 字，省略 %d 字。若这份需求确实需要那些规则，请让用户把完整手册贴进对话。）\n",
+				len([]rune(clip)), cut)
+		}
 	}
 	if strings.TrimSpace(cat.Trigger) != "" {
 		b.WriteString("\n【本类适用场景】\n" + strings.TrimSpace(cat.Trigger) + "\n")
@@ -220,13 +229,85 @@ func packBlock(pack *WritePack, cat *WriteCategory) string {
 		// {公司名称}/{日期}。这属于「用户给的信息没用上」，会被当成「没管我说的话」。
 		b.WriteString("范文中的占位符（如 {公司名称}、{日期}、{xx}）必须替换成本轮用户给出的真实信息；" +
 			"用户没给的，用中性表述绕开，**绝不允许把占位符原样写进正文**。\n")
+		// 范文按预算逐篇注入：预算够就整篇照给（设计要求就是引真实范文），不够才
+		// 从最后几篇上裁，并且**把裁掉这件事写进 prompt 与页面上**。内网的痛点是
+		// 首字延迟随输入长度涨——一万字的 system prompt 换来的等待，用户是看不见收益的。
+		budget := packBudget(envPackExampleBudget, defaultPackExampleBudget)
+		unlimited := budget <= 0
+		left := budget
+		skipped := 0
 		for i, ex := range cat.Examples {
+			body := strings.TrimSpace(ex.Content)
+			if !unlimited && left <= 0 {
+				// 预算用尽：只报名不注入。用户看到「还有 N 篇没展开」才知道可以点着看，
+				// 而不是以为范文丢了。
+				skipped++
+				continue
+			}
+			clippedN := 0
+			if !unlimited && len([]rune(body)) > left {
+				r := []rune(body)
+				clippedN = len(r) - left
+				body = string(r[:left])
+			}
+			if !unlimited {
+				left -= len([]rune(body))
+			}
 			fmt.Fprintf(&b, "\n----- 范文 %d（%s）-----\n", i+1, ex.Path)
-			b.WriteString(strings.TrimSpace(ex.Content) + "\n")
+			b.WriteString(body + "\n")
+			if clippedN > 0 {
+				fmt.Fprintf(&b, "（本篇过长：本次只注入前 %d 字，省略 %d 字。）\n", len([]rune(body)), clippedN)
+			}
+		}
+		if skipped > 0 {
+			fmt.Fprintf(&b, "\n（另有 %d 篇范文因长度预算未展开；需要参照时请让用户指定要看哪一篇，或直接把那篇贴进对话。）\n", skipped)
 		}
 	}
 	b.WriteString("\n==== 手册分类约束结束 ====\n")
 	return b.String()
+}
+
+// 注入预算（字符数）的默认值与开关名。
+//
+// 为什么要有预算：手册素材是按原文用的，但原文没有上界，而注入的 system prompt
+// 每轮都要重发一遍。内网模型的首字延迟随输入长度明显上升，一份 60 页手册的某一类
+// （要求 3000 字 + 两篇范文各 4000 字）就是一万多字的 prompt，用户看到的是
+// 「点了半天一个字都没出」。设 0 可关掉预算回到「全量注入」。
+const (
+	envPackRequirementBudget     = "SKILLFORGE_PACK_REQUIREMENT_BUDGET"
+	envPackExampleBudget         = "SKILLFORGE_PACK_EXAMPLE_BUDGET"
+	defaultPackRequirementBudget = 8000
+	defaultPackExampleBudget     = 6000
+)
+
+// packBudget 读注入预算；读不出或为负时退回默认值（0 表示不限）。
+func packBudget(env string, def int) int {
+	raw := strings.TrimSpace(os.Getenv(env))
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return def
+	}
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// clipMaterial 按字符（而非字节）裁剪素材，返回（裁剪结果，被裁掉的字符数）。
+// 按字节裁会把中文切成乱码——喂给模型的最后一句话若成了「……须在 3 个工作」这种
+// 断句，模型会顺着它编出莫名其妙的要求。
+func clipMaterial(s string, budget int) (string, int) {
+	if budget <= 0 || s == "" {
+		return s, 0
+	}
+	r := []rune(s)
+	if len(r) <= budget {
+		return s, 0
+	}
+	return string(r[:budget]), len(r) - budget
 }
 
 // GenerateWithPack 起草：在技能提示词之后注入本类的真实要求与范文。
