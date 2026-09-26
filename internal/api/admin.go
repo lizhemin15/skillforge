@@ -405,7 +405,38 @@ func (a *Admin) ListLLM(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"configs": cfgs})
+	// runtime_id 是「进程真正在用的那条库记录」。界面把「已启用」和「运行中」
+	// 都摆出来：这次线上事故的表象就是两者不一致，而界面只显示了前者，
+	// 用户只能看到「明明切了却没生效」。
+	//
+	// 不能拿模型名去判断是否一致：内网多套网关常挂同名模型（线上就是
+	// 讯飞maas 与 siliconflow 都叫 Qwen3.6-35B-A3B），名字相同、地址与 key 都不同，
+	// 靠名字对照会得出「一致」这个错误结论。所以只在服务端按 id 判。
+	runtimeID := 0
+	if a.eng != nil {
+		runtimeID = a.eng.LLMConfigID()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"configs": cfgs, "runtime_id": runtimeID})
+}
+
+// applyActiveLLM 把库里「当前启用」的配置推给生成器与引擎，让改动当场生效。
+//
+// 必须在任何改动 llm_config 启停状态的接口之后调用。旧实现只改库：
+// 进程里常驻的客户端还是启动时那一条，于是用户切了模型、界面显示「在用」，
+// 每一轮问答却仍在打旧地址（线上事故：切到讯飞后持续收到旧服务商的 402）。
+// 引擎侧的 ensureLLM 会在下一轮问答自愈，这里做的是「点完立刻就是新的」——
+// 用户点完那一下没变，就会认定这系统不支持热切换。
+func (a *Admin) applyActiveLLM() {
+	lcfg, err := a.store.GetActiveLLM()
+	if err != nil || lcfg == nil {
+		return // 一条都没配：保持现状，界面自己会提示「还没有配置 LLM 服务」
+	}
+	if a.gen != nil {
+		a.gen.SetLLM(llm.New(lcfg))
+	}
+	if a.eng != nil {
+		_ = a.eng.ReloadLLM()
+	}
 }
 
 // UpsertLLM creates/updates a provider config.
@@ -452,6 +483,10 @@ func (a *Admin) UpsertLLM(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 保存后必须刷新运行期客户端，且不能只在 c.IsActive 时刷：
+	// 「编辑已保存的服务」这条路径前端恒发 is_active:false（沿用库里的启用状态），
+	// 改的恰恰可能就是当前在用的那条的模型名/key —— 那是最需要立刻生效的改动。
+	a.applyActiveLLM()
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "ok": true})
 }
 
@@ -468,6 +503,9 @@ func (a *Admin) SetActiveLLM(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 「切换」按钮的语义就是立刻生效。这里不刷，用户切完发现还是旧模型在答，
+	// 只会得到一个「热切换是坏的」结论。
+	a.applyActiveLLM()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -483,6 +521,10 @@ func (a *Admin) DeleteLLM(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 删掉的如果正是在用的那条，运行期必须跟着退到剩下的那条去：
+	// 否则手里的客户端指向一条已经不存在的配置，界面「运行中」那一行
+	// 会指向幽灵记录，排查时越看越糊涂。
+	a.applyActiveLLM()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

@@ -108,10 +108,19 @@ git -c user.email=mutation@local -c user.name=mutation \
 check_expect_red '内容变了却没 bump ?v=（git 第四道）' '内容与上一提交不同，但 ?v= 还是'
 
 # 2) 只 bump 了一个 HTML 里的 v（另一处漏了）。
+#    ⚠️ 别把版本号写成字面量（原版写死 'style.css?v=20260913B'）：style.css 一被
+#    正常 bump，replace 就命中 0 次 = 注入变成空操作，而下面 check_expect_red
+#    会把「注入后仍然全绿」印成假红（2026-09-26 差点踩到）。从 HTML 里现读。
 python3 - <<'PY'
-p='web/index.html'; s=open(p).read()
-s=s.replace('style.css?v=20260913B','style.css?v=20260913Z')
-open(p,'w').write(s)
+import re, sys
+p = 'web/index.html'
+s = open(p, encoding='utf-8').read()
+m = re.search(r'style\.css\?v=([0-9A-Za-z]+)', s)
+if not m:
+    sys.exit('注入失败：web/index.html 里找不到 style.css 的 ?v= —— 守卫的锚点变了，请同步本脚本')
+old, new = m.group(0), 'style.css?v=' + m.group(1)[:-1] + 'Z'
+assert old != new, f'注入失败：版本号末位已经是 Z（{old}），换一个改法'
+open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
 PY
 check_expect_red '只改了一个 HTML 的 ?v=' '与另一处一致'
 

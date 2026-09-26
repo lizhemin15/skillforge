@@ -10,8 +10,8 @@
       ]
     },
     "/assets/js/admin.js": {
-      "v": "20260926A",
-      "sha256": "9856da05f2e5b1402a555d4b5c9342aa92b0641b6a1bbe417f95858e371473d2",
+      "v": "20260926B",
+      "sha256": "8ea9b2abed5d6d392a946ce3b6902e1148f427e1262afc85690e68bdf972d07c",
       "in": [
         "admin.html"
       ]

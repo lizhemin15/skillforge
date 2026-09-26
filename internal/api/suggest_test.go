@@ -287,19 +287,47 @@ func TestSuggestRoute_RegisteredAndServesChips(t *testing.T) {
 	}
 }
 
-// 没配模型（线上常见：管理端没填 key）时也必须 200 + 空数组：
+// 没配模型（线上常见：管理端没填 key）／引擎根本没接线时，都必须 200 + 空数组：
 // 5xx 会让前端控制台红一片，而用户其实什么都没坏。
+//
+// ⚠️ 这两半的**可观测性不一样**，所以拆成两个子用例、写法也不同 —— 这条是
+// 2026-09-26 注入自证逼出来的（原写法只有「有引擎但没模型」一半，注入自证
+// 把「短路整条删掉」注进去后测试仍然全绿：假断言）：
+//
+//	· 引擎 nil：短路被删后 h.eng.FastJSON 会一路走到 nil 接收者的 e.mu.Lock()
+//	  空指针 panic —— 这是公网端点最贵的故障形态（路由漏接线就是一片 500 /
+//	  连接重置）。这一半测得出来，必须断言；recover 成 FAIL 是为了让报错里
+//	  带「为什么」，而不是把 panic 原样抛给 runner。
+//	· 有引擎但库里没模型：短路被删后 ensureLLM 返回 error，接口**仍然** 200
+//	  空数组 —— 与短路路径观测等价。这一半是纵深防御（省掉 sem/超时那段
+//	  无用功），作为判据它天生测不出东西，所以注入自证打的是 nil 那一半。
 func TestSuggestRoute_NoLLMIsEmpty200(t *testing.T) {
-	h := &suggestHandler{eng: agent.New(nil, nil), timeout: time.Second, sem: make(chan struct{}, 1)}
-	req := httptest.NewRequest(http.MethodPost, "/api/chat/suggest", strings.NewReader(`{"last_user":"写一份通知"}`))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("状态码 %d，期望 200", rec.Code)
+	assertEmpty200 := func(t *testing.T, h *suggestHandler) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("handler panic 了（取不到模型时必须静默降级成空数组，不许把端点打成 500）：%v", r)
+				}
+			}()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/chat/suggest",
+				strings.NewReader(`{"last_user":"写一份通知"}`)))
+		}()
+		if rec.Code != http.StatusOK {
+			t.Fatalf("状态码 %d，期望 200", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), `"chips":[]`) {
+			t.Fatalf("应回空数组，实得 %s", rec.Body.String())
+		}
 	}
-	if !strings.Contains(rec.Body.String(), `"chips":[]`) {
-		t.Fatalf("应回空数组，实得 %s", rec.Body.String())
-	}
+
+	t.Run("引擎根本没接线（nil）", func(t *testing.T) {
+		assertEmpty200(t, &suggestHandler{eng: nil, timeout: time.Second, sem: make(chan struct{}, 1)})
+	})
+	t.Run("引擎在但库里没模型", func(t *testing.T) {
+		assertEmpty200(t, &suggestHandler{eng: agent.New(nil, nil), timeout: time.Second, sem: make(chan struct{}, 1)})
+	})
 }
 
 // 用户没说过话（首页刚打开）→ 不该花一次模型调用去猜。

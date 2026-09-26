@@ -294,6 +294,15 @@ jobs:
           go test ./internal/api/ -run 'TestNeedsGate' -count=1
           bash internal/api/zero_material_gate_mutation_check.sh
 
+      # 模型热切换：管理端改了模型（切换 / 就地编辑 / 删掉在用的那条）必须打到运行期。
+      # 旧实现三处接口都只改库，进程里的客户端还是启动时那一条 —— 用户切到 B、界面显示
+      # 「在用：B」，每一轮问答仍在打已欠费的 A，持续 402，只能得出「不支持热切换」。
+      # 三条注入分别打管理端接线被摘 / 引擎指纹换血被摘 / 外部注入的客户端被顶掉。
+      - name: 后端回归（模型热切换 + 断言自证）
+        run: |
+          go test ./internal/agent/ ./internal/api/ -run 'TestHotSwap|TestInjectedClient|TestReloadLLM|TestEnsureLLM|TestSetLLMKeeps|TestSwitchLLM|TestEditActiveLLM|TestDeleteActiveLLM|TestListLLMReports' -count=1
+          bash internal/api/llm_hotswap_mutation_check.sh
+
       # 这两条 .py 自证脚本此前**没有任何地方调用**：CI 里没有 step、本地也没跑。
       # 后果是可预测的 —— category_guard_inject.py 的一条锚点早就跟实现脱钩
       # （categoryErrStatus 里 ErrNotManualSkill 被有意删掉），脚本自己在那行

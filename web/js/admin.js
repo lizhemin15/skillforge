@@ -76,6 +76,24 @@
       const j = await r.json();
       const list = j.configs || [];
       const box = $('prov-list');
+      // 「运行中」= 进程手里真正在打的那条，跟库里标了「在用」的可能不是一条。
+      // 线上出过这事：点了切换、界面显示成功，对话仍打旧网关（已欠费）→ 持续 402。
+      // 只显示「在用」标签时用户没有任何办法看出这一点，所以两个都摆出来。
+      // 判定只认后端给的 runtime_id：内网多套网关常挂同名模型，按名字对照会得出
+      // 「一致」这个错误结论（线上 siliconflow 与讯飞maas 的模型名一字不差）。
+      const rt = j.runtime_id ? list.find(x => x.id === j.runtime_id) : null;
+      const rtLine = $('prov-runtime');
+      if (rtLine) {
+        if (!list.length) {
+          rtLine.textContent = '';
+        } else if (rt) {
+          const stale = !rt.is_active;
+          rtLine.innerHTML = `运行中：<b>${esc(rt.provider)} / ${esc(rt.model)}</b>` +
+            (stale ? ` <span style="color:#c0392b">—— 与「在用」的不一致，点右侧「切换」让它跟上</span>` : '');
+        } else {
+          rtLine.textContent = '运行中：尚未装载模型（点「切换」或重启后装载）';
+        }
+      }
       if (!list.length) {
         box.innerHTML = `<div class="empty" style="padding:30px 0"><h3>还没有配置 LLM 服务</h3><p class="dim">先添加一个，前台才能生成文章</p></div>`;
         return;

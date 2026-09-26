@@ -18,20 +18,40 @@ import (
 // buildHandler 装配路由。单独抽出来是为了让测试能断言「启动时激活模型真的进了引擎」——
 // 线上事故：这里曾经硬写 nil，重启后第一条模型请求就空指针 panic（见上方注释）。
 func buildHandler(st *store.SkillStore, cfg *config.Config) (*api.Handler, error) {
-	return api.NewHandler(st, newLLMClient(st), cfg.JWTSecret)
+	return api.NewHandler(st, newLLMClient(st, cfg), cfg.JWTSecret)
 }
 
 // newLLMClient 用库里"已激活"的那条配置建客户端。
 // 没有任何激活配置时返回 nil —— 此时引擎/生成器会给出可读的「未配置 LLM」错误，
 // 而不是让请求在 (*Client).Chat 上 panic 掉（llm.ErrNoLLM）。
-func newLLMClient(st *store.SkillStore) *llm.Client {
+func newLLMClient(st *store.SkillStore, cfg *config.Config) *llm.Client {
 	act, err := st.GetActiveLLM()
 	if err != nil || act == nil {
 		log.Printf("⚠️ 启动时库里没有激活的模型：聊天/生成会提示「未配置 LLM」，请在管理端选择模型")
 		return nil
 	}
 	log.Printf("已装载激活模型：%s / %s", act.Provider, act.Model)
+	warnEnvLLMShadowed(act, cfg)
 	return llm.New(act)
+}
+
+// warnEnvLLMShadowed：env 里的 SKILLFORGE_LLM_* 只在库里一条都没有时用来做种，
+// 库里有记录就以库（管理端）为准。
+//
+// 为什么要专门喊一声：改 env 再重启是最直觉的改配置方式，而这条路上改了等于没改，
+// 日志里又什么都不说 —— 用户只能看到「重启了，模型还是老的」，于是判断「这系统读不到
+// 我的配置」。实际把两者差异摆出来，一眼就知道该去管理端改。
+func warnEnvLLMShadowed(act *model.LLMConfig, cfg *config.Config) {
+	if cfg == nil || cfg.EnvLLMBaseURL == "" {
+		return
+	}
+	if act.BaseURL == cfg.EnvLLMBaseURL && act.Model == cfg.EnvLLMModel {
+		return
+	}
+	log.Printf("⚠️ env 里的模型（%s / %s）与库里启用的（%s / %s）不一致：",
+		cfg.EnvLLMProvider, cfg.EnvLLMModel, act.Provider, act.Model)
+	log.Printf("   env 只用于「库里一条配置都没有」时的首次做种，运行期以管理端（库）为准。" +
+		"要让这套生效，请在管理端「模型」里保存并点「切换」。")
 }
 
 // Run starts the whole server (called from main).

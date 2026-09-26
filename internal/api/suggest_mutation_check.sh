@@ -145,8 +145,15 @@ inject_case '空输入不再短路（首页刚打开就白白烧一次模型）'
   "$SUGGEST" 'if strings.TrimSpace(req.LastUser) == "" {' 'if false {' \
   'FAIL: TestSuggestRoute_EmptyInputShortCircuits'
 
-inject_case '没配模型时不再短路（走了 nil 引擎的 ensureLLM）' \
-  "$SUGGEST" 'if h.eng == nil || !h.eng.HasLLM() {' 'if false {' \
+# 「取不到模型就静默降级」这道短路有两个条件，但**只有 nil 那一半测得出来**：
+#   · 拿掉 `h.eng == nil ||` → h.eng.HasLLM() 在 nil 接收者上取锁 → 空指针 panic
+#     → 公网端点从 200 空数组变成 500/连接重置。这条注入打的就是它。
+#   · 拿掉 `|| !h.eng.HasLLM()` → 走进 ensureLLM，那边返回 error，接口**仍然**
+#     200 空数组 —— 与短路路径观测等价（2026-09-26 实测：原来那条 `if false`
+#     注入就是这么变成假绿的）。它只是纵深防御，别为了「让它也能被抓」去写
+#     一条自己造差异的假断言。
+inject_case 'nil 引擎不再短路（路由没接线时端点从 200 空数组变成 panic）' \
+  "$SUGGEST" 'if h.eng == nil || !h.eng.HasLLM() {' 'if !h.eng.HasLLM() {' \
   'FAIL: TestSuggestRoute_NoLLMIsEmpty200'
 
 inject_case '思考链开关被删（线上必然超时，功能静默消失）' \

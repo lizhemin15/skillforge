@@ -57,6 +57,10 @@
           <div class="card">
             <h3>已配置的服务</h3>
             <p class="card-sub">修改立即生效，无需重启</p>
+            <!-- 运行中：进程此刻真正在打的那条配置。与「在用」标签分开写——
+                 线上出过两者不一致（界面显示切成功、对话仍打已欠费的旧网关）。
+                 没这一行，用户没有任何办法看出「我改了但它没听」。 -->
+            <div id="prov-runtime" class="dim" style="margin:0 0 10px;font-size:12px"></div>
             <div id="prov-list"></div>
             <div class="msg" id="prov-msg"></div>
           </div>
@@ -340,6 +344,6 @@
 <script src="/assets/vendor/codemirror/addon/fold/foldcode.min.js?v=20260908A"></script>
 <script src="/assets/vendor/codemirror/addon/fold/foldgutter.min.js?v=20260908A"></script>
 <script src="/assets/js/site.js?v=20260911M"></script>
-<script src="/assets/js/admin.js?v=20260926A"></script>
+<script src="/assets/js/admin.js?v=20260926B"></script>
 </body>
 </html>

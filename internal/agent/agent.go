@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -105,7 +106,19 @@ type TraceStep struct {
 
 // Engine orchestrates the dialogue.
 type Engine struct {
-	llm      *llm.Client
+	llm *llm.Client
+	// llmFP 记录「手里的客户端是照哪份配置建的」（见 llm.Fingerprint）。
+	//
+	// 空串有确切含义：这个客户端**不是库里来的**（调用方注入的替身，或库里
+	// 根本没配置时的一次性实例）。空串的客户端永远不参与自动换血——拿库里的
+	// 配置去覆盖调用方指定好的客户端，等于把人家选定的模型偷偷换掉。
+	//
+	// 不记指纹的旧写法（2026-09-26 线上事故）：ensureLLM 只看 `e.llm == nil`，
+	// 于是启动时装上的客户端永不更换。用户在管理端把模型从 A 切到 B、界面显示
+	// 「在用：B」，每一轮问答却仍在打 A（A 已欠费 → 用户看到的是切换之后还在报
+	// 402，只会认为「这系统不能热切换」）。启动那一刻读一次库，不等于运行期
+	// 一直是对的。
+	llmFP    string
 	store    *store.SkillStore
 	mu       sync.Mutex
 	sessions map[string][]Message // in-memory trimmed history (maxHist)
@@ -135,6 +148,7 @@ type Engine struct {
 func New(l *llm.Client, s *store.SkillStore) *Engine {
 	e := &Engine{
 		llm:       l,
+		llmFP:     llmFingerprintOf(l),
 		store:     s,
 		sessions:  make(map[string][]Message),
 		full:      make(map[string][]Message),
@@ -212,8 +226,89 @@ func loadSessionFromDisk(path string) []Message {
 	return hist
 }
 
+// llmFingerprintOf 算出「这个客户端算不算库配置、算的话是哪一条」。
+// 非库配置（替身、或 id 为零值的构造）返回 ""，即「不参与自动换血」。
+func llmFingerprintOf(l *llm.Client) string {
+	if !l.FromStore() {
+		return ""
+	}
+	return llm.Fingerprint(l.Config())
+}
+
 // SetLLM swaps the underlying client (provider hot-swap).
-func (e *Engine) SetLLM(l *llm.Client) { e.mu.Lock(); e.llm = l; e.mu.Unlock() }
+//
+// 同时刷新指纹：管理端「启用/保存」推过来的都是库里那条配置建的客户端，
+// 不记指纹就会让这个引擎从此被判成「外部注入」而不再跟随库变化——
+// 换模型这件事就只生效一次，之后又变成启动时那份的老毛病。
+func (e *Engine) SetLLM(l *llm.Client) {
+	e.mu.Lock()
+	e.llm = l
+	e.llmFP = llmFingerprintOf(l)
+	e.mu.Unlock()
+}
+
+// ReloadLLM 立即按库里「已启用」的配置换掉手里的客户端，不必等下一轮问答。
+//
+// 存在理由：管理端点完「启用」，用户下一条消息可能马上就发出来。等下一轮靠
+// ensureLLM 自愈当然也行，但「点了没立刻变」正是这次线上事故的观感；
+// 让改配置的接口当场推下去，界面上的「运行中」才和用户的操作同步。
+// 库里一条都没有时返回错误、且**不动**手里的客户端（不许自毁）。
+func (e *Engine) ReloadLLM() error {
+	if e == nil || e.store == nil {
+		return errors.New("未配置 LLM 服务（请在管理端配置）")
+	}
+	cfg, err := e.store.GetActiveLLM()
+	if err != nil || cfg == nil {
+		return errors.New("未配置 LLM 服务（请在管理端配置）")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	old := ""
+	if e.llm != nil {
+		old = e.llm.Provider() + "/" + e.llm.Model()
+	}
+	e.llm = llm.New(cfg)
+	e.llmFP = llm.Fingerprint(cfg)
+	// 排障时唯一能事后看到的东西：日志里必须留下「换到哪了」。
+	// 线上事故里用户只能从「还在报 402」反推模型没换，日志里一个字都没有。
+	log.Printf("🔄 模型热切换：%s → %s / %s（%s）",
+		firstNonEmpty(old, "（未装载）"), cfg.Provider, cfg.Model, cfg.BaseURL)
+	return nil
+}
+
+func firstNonEmpty(s, fallback string) string {
+	if strings.TrimSpace(s) == "" {
+		return fallback
+	}
+	return s
+}
+
+// LLMModel 返回运行期真正在用的模型名（没有客户端时返回 ""）。
+// 给管理端显示「运行中」用：只显示库里「已启用」的那条，用户没法发现
+// 进程里装的其实是另一条——这正是 2026-09-26 那次「切换没生效」的可见性缺口。
+func (e *Engine) LLMModel() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.llm.Model()
+}
+
+// LLMConfigID 返回运行期在用的那条库记录 id（非库配置/无客户端返回 0）。
+func (e *Engine) LLMConfigID() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.llm.ConfigID()
+}
+
+// LLMEndpoint 返回运行期在用的网关地址（无客户端返回 ""）。
+// 内网常有多套网关（灰度/生产各一套），排查「到底打到哪」必须要它。
+func (e *Engine) LLMEndpoint() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.llm == nil || e.llm.Config() == nil {
+		return ""
+	}
+	return e.llm.Config().BaseURL
+}
 
 // HasLLM 报告引擎手里有没有模型客户端。
 // 存在理由：线上事故是"启动时传了 nil"，而 nil 只有在第一个请求打到模型时才炸成
@@ -259,20 +354,53 @@ func (e *Engine) ChatTools(ctx context.Context, msgs []llm.Msg, defs []llm.ToolD
 	return cli.ChatTools(ctx, msgs, defs)
 }
 
-// ensureLLM lazily builds a client from the store's active config if the
-// engine holds a nil one (typical at startup when only env config exists).
-// Returns nil if no LLM is configured yet — callers surface that as an error.
+// ensureLLM 保证手里的客户端就是库里「已启用」的那一条。
+//
+// 三个判定，顺序有意义：
+//  1. 指纹空 = 外部注入的客户端（测试替身/调用方指定）→ 一律不动。
+//  2. 指纹相同 = 库没变 → 不重建。每轮问答都会走到这里，无条件重建等于每轮
+//     丢一次连接、多一次 TLS 握手。
+//  3. 指纹不同 = 库变了（点「启用」、改已保存的服务、直接改库）→ 当场换血。
+//
+// 旧实现只有「nil 才建」这一条，于是启动时读一次库就再也不看库了：
+// 用户在管理端切模型，界面显示在用新模型，实际每一轮都还在打旧地址。
+// 一定要留一条「运行期也能发现配置变了」的路。
 func (e *Engine) ensureLLM() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.llm != nil {
+	if e.llm != nil && e.llmFP == "" {
 		return nil
 	}
-	cfg, err := e.store.GetActiveLLM()
-	if err != nil {
+	if e.store == nil {
+		// 没有 store 就没有「库里的配置」这个概念：手里有什么用什么。
+		if e.llm != nil {
+			return nil
+		}
 		return errors.New("未配置 LLM 服务（请在管理端配置）")
 	}
+	cfg, err := e.store.GetActiveLLM()
+	if err != nil || cfg == nil {
+		if e.llm != nil {
+			return nil // 库被清空了，手里这条还能用，不要自毁
+		}
+		return errors.New("未配置 LLM 服务（请在管理端配置）")
+	}
+	fp := llm.Fingerprint(cfg)
+	if e.llm != nil && fp == e.llmFP {
+		return nil
+	}
+	old := ""
+	if e.llm != nil {
+		old = e.llm.Provider() + " / " + e.llm.Model()
+	}
 	e.llm = llm.New(cfg)
+	e.llmFP = fp
+	if old != "" {
+		// 只在真的变了时打一行：这条日志是「切换到底生没生效」的唯一现场证据，
+		// 排查时不必再去猜进程里装的是哪一条。
+		log.Printf("🔄 模型已热切换：%s → %s / %s（%s）",
+			old, cfg.Provider, cfg.Model, cfg.BaseURL)
+	}
 	return nil
 }
 
