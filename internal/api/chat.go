@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -244,8 +245,30 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if eval.SkillSlug != "" {
 		sc, lerr := h.eng.LoadSkill(eval.SkillSlug)
 		if lerr != nil {
-			write(evError, jsonSafe(map[string]string{"error": lerr.Error()}))
-			return
+			// ── L3 兜底：技能加载失败**不许再整轮报错** ──────────────────────
+			//
+			// 2026-09-26 线上取证：分类器往 skill_slug 里写了不在库里的名字
+			// （「通用能力」），LoadSkill 撞 sql.ErrNoRows，这一格原来是
+			// write(evError, lerr.Error())，用户屏幕上只有一行
+			// 「⚠ sql: no rows in result set」——整轮零正文，连一句人话都没有。
+			//
+			// 两层错：① 存储层实现细节（sql: no rows）不该出现在用户能看见的
+			// 协议里；② 「没这个技能」和「技能存在但读不出来」都不是致命错误，
+			// 通用写作这条路本来就在下面等着，没有任何理由拿它当整轮失败。
+			//
+			// 现在改成降级到通用写作，并且**出声**（走 meta.note 的降级说明
+			// 通道，出现在回复开头）：换路由必须让用户看见，闷声改路由和报错
+			// 一样糟。L2（agent.EvalTurn 按清单校验 slug）已经把「模型编名字」
+			// 挡在前面，这里是最后一道网——撞上它说明清单和库真的不一致（文件
+			// 被删、并发删除、DB 与磁盘脱节），照样不该炸整轮。
+			log.Printf("[chat] 技能 %q 加载失败，降级通用写作: %v", eval.SkillSlug, lerr)
+			write(evMeta, jsonSafe(map[string]string{
+				"reason": "技能「" + eval.SkillSlug + "」暂时读不出来，本轮按通用写作处理",
+				"skill":  "", "intent": eval.Intent, "mode": mode,
+				"note": "技能「" + eval.SkillSlug + "」暂时读不出来（可能刚被删除或文件缺失），这一轮已按通用写作处理。",
+			}))
+			eval.SkillSlug = ""
+			goto plainPath
 		}
 		// Continuation relay: if the user is editing values from an earlier
 		// template fill (e.g. "把手机号改成139…"), route back to THAT template
@@ -620,6 +643,12 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// plainPath 是「没有技能可用」那条通用写作通路的入口。
+	//
+	// 正常走到这里有两种来法：① 分类器本来就没命中技能（eval.SkillSlug 为空）；
+	// ② 命中了但技能加载失败，从上面 goto 过来（见 L3 兜底处的注释）——那条路上
+	// 不能整轮报错，通用写作接着干就是了。
+plainPath:
 	// 3. plain chat (no skill) — stream a conversational reply
 	// 「没命中技能」这条路上，分类回来到首字之间同样是一次无上界的阻塞调用（线上实测
 	// 那 54.7 秒就发生在这条路上），所以材料同样先由本地事实顶上。

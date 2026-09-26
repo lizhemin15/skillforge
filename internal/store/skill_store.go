@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -69,12 +70,21 @@ func (s *SkillStore) List() ([]model.Skill, error) {
 }
 
 // Get returns one skill including params + content stats.
+//
+// 找不到时返回包装后的 ErrSkillNotFound，**不是** sql.ErrNoRows：
+// sql 层的 "no rows in result set" 是存储实现细节，2026-09-26 线上就是它一路
+// 漏到用户屏幕上（分类器编了个不在库里的 slug → LoadSkill → 这一格 → 整轮只剩
+// 一行「⚠ sql: no rows in result set」）。上层用 errors.Is(err, ErrSkillNotFound)
+// 就能把「技能不存在」当成可降级的情况处理，而不是当成系统故障。
 func (s *SkillStore) Get(slug string) (*model.Skill, error) {
 	var sk model.Skill
 	var ct, ut string
 	var enabled int
 	err := s.db.QueryRow(`SELECT slug,name,description,category,version,enabled,is_core,created_at,updated_at,COALESCE(skill_type,''),COALESCE(attachment,'') FROM skills WHERE slug=?`, slug).
 		Scan(&sk.Slug, &sk.Name, &sk.Description, &sk.Category, &sk.Version, &enabled, &sk.IsCore, &ct, &ut, &sk.SkillType, &sk.Attachment)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: %s", ErrSkillNotFound, slug)
+	}
 	if err != nil {
 		return nil, err
 	}

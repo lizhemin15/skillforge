@@ -423,6 +423,13 @@ if [ "$QUICK" = 0 ]; then
   # 全是用户看得见且会直接摧毁这个按钮价值的。五条注入含真 bug（完整端点拼出双份
   # /chat/completions）。
   selfcheck '后端 / LLM 连通性测试自证' bash internal/api/llm_probe_mutation_check.sh
+  # 「技能加载失败」不许整轮报错：线上原样是用户屏幕上只剩一行
+  #   ⚠ sql: no rows in result set
+  # 零正文、零人话（分类器把占位词「通用能力」写进 skill_slug，下游当真 slug 查库，
+  # sql.ErrNoRows 一路上抛，最后被当作系统故障结束整轮）。
+  # 三层各自都能独立防住它，所以三层都要有尺子：存储层映射 / 执行链按清单中和 /
+  # 加载失败降级通用写作且出声。五条注入分别打在这五处（含「降级改静默」这种更难查的坏法）。
+  selfcheck '后端 / 技能缺失降级自证' bash internal/api/chat_missing_skill_fallback_mutation_check.sh
   selfcheck '后端 / 分类结构管理自证'   python3 scripts/category_guard_inject.py
   selfcheck '后端 / 思考开关矩阵自证'   python3 scripts/fastjson_knob_inject.py
   selfcheck '后端 / 提速与中间材料自证' python3 scripts/thinking_knob_inject.py

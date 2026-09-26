@@ -315,6 +315,19 @@ jobs:
           go test ./internal/llm/ ./internal/api/ -run 'TestNormalizeBaseURL|TestChatEndpoint|TestProbeEndpoint|TestProbeEmptyContent|TestProbeUpstreamErrors|TestProbeLocalPrecheck|TestProbeTimeout|TestProbeNeverLeaksKey|TestProbeLLM' -count=1
           bash internal/api/llm_probe_mutation_check.sh
 
+      # 「技能加载失败」不许整轮报错。线上原样：分类器把占位词「通用能力」写进
+      # skill_slug，下游当真 slug 查库拿到 sql.ErrNoRows，一路当系统故障上抛，
+      # 用户屏幕上只剩一行 `⚠ sql: no rows in result set` —— 零正文、零人话。
+      # 三条来路各有一道闸门（存储层映射 / 执行链按可用清单中和 / 加载失败降级
+      # 通用写作并出声），任一处被拆掉都会退回旧形状，所以三层各挂一条行为级单测。
+      # 提级前的失败形态：不再有错误帧、真的有正文、且 meta 里点名技能与原因。
+      - name: 后端回归（技能缺失降级 + 断言自证）
+        run: |
+          go test ./internal/store/ -run 'TestGetMissingSkillReturnsErrSkillNotFoundNotSQLNoRows' -count=1
+          go test ./internal/agent/ -run 'TestEvalTurnNeutralizesSkillSlug' -count=1
+          go test ./internal/api/ -run 'TestChatMissingSkillContentDegradesToPlainWriteNotError' -count=1
+          bash internal/api/chat_missing_skill_fallback_mutation_check.sh
+
       # 这两条 .py 自证脚本此前**没有任何地方调用**：CI 里没有 step、本地也没跑。
       # 后果是可预测的 —— category_guard_inject.py 的一条锚点早就跟实现脱钩
       # （categoryErrStatus 里 ErrNotManualSkill 被有意删掉），脚本自己在那行

@@ -495,7 +495,8 @@ func (e *Engine) EvalTurn(ctx context.Context, id, user string, history []Messag
 		return nil, err
 	}
 	// Build a compact roster for intent routing.
-	rosterStr, _, err := e.buildRoster()
+	// skills 一并取出：L2 守卫要拿「可用清单」核对分类器给的 slug（见函数尾部）。
+	rosterStr, skills, err := e.buildRoster()
 	if err != nil {
 		return nil, err
 	}
@@ -525,12 +526,12 @@ func (e *Engine) EvalTurn(ctx context.Context, id, user string, history []Messag
 3. 无论什么情况，都在 steps 里输出 4 阶段拆解执行路径，让用户看到多智能体怎么处理。每项**只给两个字段**：
    {"phase":"analyze|match|params|generate","detail":"≤10字"}
    - **不要写 label / status**：那是固定文案，服务端按 phase 补齐（写它只是白等——这一跳的输出速度就是线上吐字速度）。
-   - analyze 写识别出的 intent/action（如 "write/write"）；match 写命中的技能名，未命中写 "通用能力"；params 写已提取/还需追问的参数名，未命中写 "提炼用户内容"；generate 写将执行的动作（如 "通用写作"、"填充模板"）。
+   - analyze 写识别出的 intent/action（如 "write/write"）；match 写命中的技能名（照抄 slug，不许自己编名字），未命中写 "无专用技能"；params 写已提取/还需追问的参数名，未命中写 "提炼用户内容"；generate 写将执行的动作（如 "通用写作"、"填充模板"）。
    - detail 一句话、面向用户，别用内部术语。
 
 只输出一个 JSON 对象，不要任何其他文字。照下面这个长度写，全篇 ≤220 字：
 {"intent":"docgen","action":"fill","skill_slug":"采购合同","needs_tools":false,"reason":"命中模板，开始填充","params":{"party":"星禾科技"},"needs":[],"steps":[{"phase":"analyze","detail":"docgen/fill"},{"phase":"match","detail":"命中 采购合同"},{"phase":"params","detail":"已提取 1 项"},{"phase":"generate","detail":"填充模板"}]}
-（字段说明：intent=write|docgen|query|chat，action=fill|template_only|gen|write|answer，skill_slug=<slug 或空>，reason ≤12 字；params 是对象、needs 是数组，没有内容就给 {} / []，不要写占位话术。）
+（字段说明：intent=write|docgen|query|chat，action=fill|template_only|gen|write|answer，skill_slug=**必须照抄下面「技能清单」里某个 slug 的原文，未命中就填空字符串 ""**（清单里没有的名字一个都不许写，尤其不许写「通用能力」「通用写作」这类词），reason ≤12 字；params 是对象、needs 是数组，没有内容就给 {} / []，不要写占位话术。）
 
 needs_tools 判断（很重要，判错会导致答案里的数字是编的）：
 - true：任务必须先拿到**外部实时数据**（查接口/API、抓网页、查实时行情、查仓库/订单/库存等外部系统数据），或需要对数据做**真实计算/统计**（求和、占比、同比、排序汇总）才能给出正确答案。
@@ -620,7 +621,41 @@ action 必须根据上面「意图→动作」映射严格输出，不要省略�
 	}
 	eval.SkillSlug = strings.TrimSpace(eval.SkillSlug)
 	eval.MaterialChars = materialChars
+	// ── L2 确定性守卫：模型给的技能名必须真在「可用清单」里 ──────────────
+	//
+	// 2026-09-26 线上取证：分类器把 steps 里的占位词「通用能力」写进了
+	// skill_slug（journalctl 20:24:01 `[classify] … skill=通用能力`，其后没有
+	// 任何 [plan]/[write] 行）。下游 LoadSkill 拿这个名字去查库，撞
+	// sql.ErrNoRows，而那一格是 write(evError, lerr.Error())——用户看见的就是
+	// 「⚠ sql: no rows in result set」，整轮一个字正文都没有。
+	//
+	// 提示词已收紧（未命中必须写空串），但提示词是软约束：换模型、温度抖一下
+	// 就会再犯，代价仍是整轮死。这里按清单做确定性校验，把模型编出来的名字在
+	// 进入执行链之前中和掉——编名字最坏只是回到通用写作，不会再炸整轮。
+	//
+	// 降级必须出声（走 ReportProgress，前端有降级说明通道）：静默换路由和报错
+	// 一样糟，历史上因为「闷声改路由」被投诉过。
+	if eval.SkillSlug != "" && !rosterHasSlug(skills, eval.SkillSlug) {
+		fmt.Fprintf(os.Stderr, "[route] 分类器给的技能 %q 不在可用清单里 → 按未命中处理，走通用写作\n", eval.SkillSlug)
+		ReportProgress(ctx, fmt.Sprintf("· 没找到叫「%s」的可用技能，本轮按通用写作处理", eval.SkillSlug))
+		eval.SkillSlug = ""
+		eval.Reason = "分类器命中的技能不在可用清单，按未命中处理"
+	}
 	return eval, nil
+}
+
+// rosterHasSlug 判断 slug 是否是**当前可用**（启用）的技能。
+//
+// 必须自己筛 Enabled：buildRoster 返回的是全量技能（含停用），清单里印出来的
+// 才只有启用的那些。停用技能模型根本看不见，万一它从历史上下文里翻出一个已
+// 停用的 slug，同样该按未命中处理，而不是放行到 LoadSkill 去撞库。
+func rosterHasSlug(skills []model.Skill, slug string) bool {
+	for _, sk := range skills {
+		if sk.Enabled && sk.Slug == slug {
+			return true
+		}
+	}
+	return false
 }
 
 // classifyHopLimit 是意图识别这一跳的独立时间预算。
