@@ -267,6 +267,23 @@ func materialTurns(n int) string {
 	return sb.String()
 }
 
+// grayMaterial 把一句话需求包成「灰区素材轮」：字数落在 [80,800)。
+//
+// 为什么必须落在灰区（2026-09-26 起）：材料真空（<80 字）这一格已经被**零材料强制门**
+// 接管 —— 它不进疑点跳，本地算缺口直接停问（内网慢 token，省一次模型调用）。疑点回执
+// 那条契约只有灰区才走得到：真空区走不到、材料在手（>=800）又会被放过去。
+//
+// 自带前提断言：谁动了 80/800 这两条线（判据在 internal/agent/needs_gate.go），这条
+// 用例当场红在「前提不成立」上，而不是红在一个看不懂的断言里。
+func grayMaterial(t *testing.T, msg string) string {
+	t.Helper()
+	full := msg + "\n\n素材：\n" + materialTurns(300)
+	if n := len([]rune(full)); n < 80 || n >= 800 {
+		t.Fatalf("测试前提不成立：灰区素材 %d 字，必须落在 [80,800)：否则这条用例测的不是疑点跳", n)
+	}
+	return full
+}
+
 // TestNeedsGateAnchoredDoubtStillAsks：有真疑点时闸门照旧拦，但**问法换成锚定原文**。
 //
 // 这条替代了旧的 TestNeedsGateShortMessageStillAsks。旧用例断言的是「照技能清单拼出
@@ -278,7 +295,8 @@ func materialTurns(n int) string {
 func TestNeedsGateAnchoredDoubtStillAsks(t *testing.T) {
 	h, f := newNeedsGateHandler(t)
 	const msg = "帮我写一篇公司新闻通稿"
-	frames := collectChat(t, h, chatBody(t, "s-needs-anchored", msg))
+	gmsg := grayMaterial(t, msg) // 灰区：疑点跳这条契约只有灰区才走得到（见 grayMaterial）
+	frames := collectChat(t, h, chatBody(t, "s-needs-anchored", gmsg))
 	all := joinedFrames(frames)
 
 	if !hasEvent(frames, "needs") {
@@ -292,7 +310,7 @@ func TestNeedsGateAnchoredDoubtStillAsks(t *testing.T) {
 		t.Fatalf("疑点跳一次都没调 —— 停问走的是别的路，用例绿在错的原因上：\n%s", all)
 	}
 	// 锚定原文：引用必须是用户这次真的说过的话（引用取自真提示，不是常量）。
-	quote := headRunes(msg, 8)
+	quote := headRunes(gmsg, 8)
 	if quote == "" {
 		t.Fatalf("测试前提不成立：没能从疑点跳提示里抠出用户原话")
 	}
@@ -317,7 +335,7 @@ func TestNeedsGateFabricatedQuoteDoesNotAsk(t *testing.T) {
 		// 引用逐字写在原文里根本不存在的句子（"客户要求" 从未出现）
 		return doubtsJSON("ambiguity", "客户要求必须当天发布且署名", "按当天发布处理", "发布节奏")
 	})
-	frames := collectChat(t, h, chatBody(t, "s-needs-fabricated", "帮我写一篇公司新闻通稿"))
+	frames := collectChat(t, h, chatBody(t, "s-needs-fabricated", grayMaterial(t, "帮我写一篇公司新闻通稿")))
 	all := joinedFrames(frames)
 
 	if n := doubtsHops(f); n == 0 {
@@ -343,7 +361,7 @@ func TestNeedsGateGarbageDoubtsStillWrites(t *testing.T) {
 	h, f := newNeedsGateHandlerWith(t, func(string) string {
 		return "嗯，这个我看看……还是直接写吧"
 	})
-	frames := collectChat(t, h, chatBody(t, "s-needs-garbage", "帮我写一篇公司新闻通稿"))
+	frames := collectChat(t, h, chatBody(t, "s-needs-garbage", grayMaterial(t, "帮我写一篇公司新闻通稿")))
 	all := joinedFrames(frames)
 
 	if n := doubtsHops(f); n == 0 {
@@ -396,5 +414,196 @@ func TestNeedsGateLongMaterialDoesNotAsk(t *testing.T) {
 	want := fmt.Sprintf("（%d 字）", len([]rune(msg)))
 	if !strings.Contains(all, want) {
 		t.Fatalf("中间材料里的字数不是从本轮消息数出来的（期望含 %q，防写死）：\n%s", want, all)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 零材料强制门（2026-09-26）：用户零材料发指令时技能直接编内容
+// ---------------------------------------------------------------------------
+//
+// 这一组守的是**新缺口**，和上面三条不是同一格：
+//
+//	上面三条：模型自报了 needs → 闸门有反应（拦，但换锚定问法）
+//	这一组：模型自报 0 条 needs（一句话指令 + 零材料，线上连发 6 次报 0/1/3/4/6 的那一端）
+//	        → 旧实现里 SplitNeeds 拿到空 needs 只能回空 blocking，闸门形同不存在，
+//	          写作跳直通，产出 645 字带假日期、假参会人的会议纪要 —— 用户读到的是「它替我编了」。
+//
+// 判据来源换成**技能声明的 input_params**（地面真值，本地算得准），代价是 0 次模型调用。
+
+// zeroMaterialMsg 是线上那次的形状：一句话指令（14 字）+ 零材料。
+const zeroMaterialMsg = "帮我写一份会议纪要"
+
+// classifyNoNeedsJSON 拼「一条 needs 都不报」的分类器回执（缺口现场的形状）。
+// 用 %q 拼 slug 而不是写死常量：技能是每个用例自建的，写死会让用例绿在「slug 对不上、
+// 直接降级成通用对话」这种跟被测逻辑无关的原因上。
+func classifyNoNeedsJSON(slug, action string) string {
+	return fmt.Sprintf(`{"skill_slug":%q,"intent":"写会议纪要","reason":"命中会议纪要技能",`+
+		`"action":%q,"params":{},"needs":[],`+
+		`"steps":[{"phase":"analyze","label":"① 意图分析"}]}`, slug, action)
+}
+
+// newZeroMaterialHandler 建一只「零材料现场」的 handler：技能**真的声明了必填项**，
+// 分类器却一条 needs 都不报。
+//
+// 为什么技能必须自己建：内置技能一个必填参数都没有（seed.go 写明 docgen 类「永不拦」），
+// 拿内置技能测，缺口算出来恒为空 —— 用例会绿，但它绿在「判据根本没输入」上。
+func newZeroMaterialHandler(t *testing.T) (*chatHandler, *fakeLLM) {
+	t.Helper()
+	return newZeroMaterialHandlerWith(t, "huiyi-jiyao", model.SkillTypeWrite, "", "write")
+}
+
+// newZeroMaterialHandlerWith 同 newZeroMaterialHandler，但技能类型 / 附件可指定
+// （template_only 那条豁免要用模板技能 + 附件才测得到）。
+func newZeroMaterialHandlerWith(t *testing.T, slug, skillType, attachment, action string) (*chatHandler, *fakeLLM) {
+	t.Helper()
+	sk := newStoreForTest(t, t.TempDir())
+	if err := sk.CreateSkill(
+		&model.Skill{
+			Slug: slug, Name: "会议纪要", Description: "按素材写会议纪要",
+			Category: "通用", Version: 1, Enabled: true,
+			SkillType: skillType, Attachment: attachment,
+		},
+		[]model.Param{
+			{Name: "subject", Label: "会议主题", Type: "text", Required: true},
+			{Name: "attendees", Label: "参会人", Type: "text", Required: true},
+		},
+		"# 会议纪要\n\n按素材写，只写素材里出现过的事实，不补日期不补人名。",
+	); err != nil {
+		t.Fatalf("建测试技能失败（缺了声明的必填项就没判据可算）：%v", err)
+	}
+	f := newFakeLLM(t, func(system, user string) string { return classifyNoNeedsJSON(slug, action) })
+	cli := llm.New(&model.LLMConfig{APIKey: "test", BaseURL: f.srv.URL, Model: "fake"})
+	return &chatHandler{eng: agent.New(cli, sk), maxRound: 1, gen: newGenCache()}, f
+}
+
+// llmHops 数这一轮总共发了多少次模型调用（内网 token 慢，调用次数是硬指标）。
+func llmHops(f *fakeLLM) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.reqs)
+}
+
+// TestNeedsGateZeroMaterialAsksInsteadOfFabricating 是缺口回放 + 封口。
+//
+// 断言六件事，缺一不可：
+//
+//	① 必须有 needs 事件 —— 零材料时不许直通写作（那就会编事实）；
+//	② asked=true —— 前端据此把这一轮读成「等你补信息」，不是「还在跑」；
+//	③ 逐字引用用户这轮的原话 —— 「像没看到我给的信息」那个投诉的正面回应；
+//	④ 点名缺的是哪几项（取自技能声明，不是模型自报）；
+//	⑤ 「就按你的」出口在 —— 不逼用户填表；
+//	⑥ **只发 1 次模型调用**（分类那一跳）—— 零材料停问纯本地，不额外花调用。
+//	   内网模型 token 慢，新增一次调用就是用户白等十几秒，所以这条也钉死。
+func TestNeedsGateZeroMaterialAsksInsteadOfFabricating(t *testing.T) {
+	h, f := newZeroMaterialHandler(t)
+	frames := collectChat(t, h, chatBody(t, "s-zero-material", zeroMaterialMsg))
+	all := joinedFrames(frames)
+
+	if !hasEvent(frames, "needs") {
+		t.Fatalf("零材料（%d 字）+ 必填项一项没落实，却没拦 —— 这就是产出假日期假参会人的那一格：\n%s",
+			len([]rune(zeroMaterialMsg)), all)
+	}
+	if !strings.Contains(all, `"asked":"true"`) {
+		t.Fatalf("拦下了但没标 asked=true，前端会读成「还在跑」：\n%s", all)
+	}
+	if !strings.Contains(all, "「"+zeroMaterialMsg+"」") {
+		t.Fatalf("停问没逐字引用用户这轮的话（旧病就是跟用户说了什么无关的通用清单）：\n%s", all)
+	}
+	for _, want := range []string{"会议主题", "参会人"} {
+		if !strings.Contains(all, want) {
+			t.Fatalf("缺口没点名 %q（取自技能声明表，用户不知道要补什么）：\n%s", want, all)
+		}
+	}
+	if !strings.Contains(all, "就按你的") {
+		t.Fatalf("没给一句话出口，等于逼用户填表：\n%s", all)
+	}
+	if strings.Contains(all, "我需要你补充以下信息") {
+		t.Fatalf("又用回了被投诉的通用清单句式：\n%s", all)
+	}
+	// 省调用：不许进疑点跳（真空区没有可锚的素材，疑点回执的引用对不上原文）。
+	if n := doubtsHops(f); n != 0 {
+		t.Fatalf("零材料停问进了疑点跳（白花 %d 次模型调用）：\n%s", n, all)
+	}
+	if n := llmHops(f); n != 1 {
+		t.Fatalf("这一轮发了 %d 次模型调用，期望 1 次（只分类）—— 内网 token 慢，多一次都是用户白等：\n%s",
+			n, all)
+	}
+}
+
+// TestNeedsGateZeroMaterialEscapeWordStillWrites 守住**出口必须闭得上**。
+//
+// 停问文案让用户回「就按你的」，那一轮消息只有 4 个字：材料依然真空、必填项依然没落实。
+// 如果授权词不被认，用户会被再问一遍，永远走不到写作 —— 这一格必须自己走出来。
+func TestNeedsGateZeroMaterialEscapeWordStillWrites(t *testing.T) {
+	h, f := newZeroMaterialHandler(t)
+	frames := collectChat(t, h, chatBody(t, "s-zero-material-escape", "就按你的"))
+	all := joinedFrames(frames)
+
+	if hasEvent(frames, "needs") {
+		t.Fatalf("用户已授权（「就按你的」）却还在问，出口闭不上会问成死循环：\n%s", all)
+	}
+	if !hasEvent(frames, "delta") {
+		t.Fatalf("授权后既没问也没写，整轮空转：\n%s", all)
+	}
+	// 真的走了写作跳（分类之外还有调用），不是「不拦也不写」。
+	if n := llmHops(f); n < 2 {
+		t.Fatalf("这一轮只发了 %d 次模型调用，没走写作跳：\n%s", n, all)
+	}
+}
+
+// TestNeedsGateZeroMaterialBlankTemplateStillDelivered 守**缩打击面**那一侧：
+// action=template_only（用户点名要空白模板）不许被零材料门拦成一句反问 ——
+// 交付物就是那个附件本身，跟必填项有没有落实无关。
+//
+// 为什么必须显式测：模板交付分支在闸门**之后**（chat.go 里 template_only 那段），
+// 少写一个豁免条件，「把会议纪要模板发我」就变成一句「请补充会议主题、参会人」。
+func TestNeedsGateZeroMaterialBlankTemplateStillDelivered(t *testing.T) {
+	const slug = "huiyi-jiyao-tpl"
+	h, _ := newZeroMaterialHandlerWith(t, slug, model.SkillTypeTemplate, "meeting-minutes.docx", "template_only")
+	frames := collectChat(t, h, chatBody(t, "s-zero-material-tpl", "把会议纪要的空白模板发我"))
+	all := joinedFrames(frames)
+
+	if hasEvent(frames, "needs") {
+		t.Fatalf("用户点名要空白模板却被零材料门拦下（打击面扩大了）：\n%s", all)
+	}
+	if !hasEvent(frames, "file") {
+		t.Fatalf("没下发模板文件：\n%s", all)
+	}
+	if !strings.Contains(all, "meeting-minutes.docx") {
+		t.Fatalf("文件事件里没有附件名：\n%s", all)
+	}
+}
+
+// TestNeedsGateZeroMaterialParamsGivenDoesNotAsk 反向：必填项**在指令里说清了**就不许问。
+//
+// 这是「扩打击面」的第二个方向：用户把要素写进一句话里（分类器也回填进 params），
+// 本地算出来没有缺口 —— 一个必填项都不缺却还停问，就是回到 2026-09-22 那个投诉。
+func TestNeedsGateZeroMaterialParamsGivenDoesNotAsk(t *testing.T) {
+	slug := "huiyi-jiyao-given"
+	sk := newStoreForTest(t, t.TempDir())
+	if err := sk.CreateSkill(
+		&model.Skill{Slug: slug, Name: "会议纪要", Description: "按素材写会议纪要",
+			Category: "通用", Version: 1, Enabled: true, SkillType: model.SkillTypeWrite},
+		[]model.Param{{Name: "subject", Label: "会议主题", Type: "text", Required: true}},
+		"# 会议纪要\n\n按素材写。",
+	); err != nil {
+		t.Fatalf("建测试技能失败：%v", err)
+	}
+	// 分类器把两项都回填了（用户这一句话里确实有）。
+	reply := fmt.Sprintf(`{"skill_slug":%q,"intent":"写会议纪要","reason":"命中技能","action":"write",`+
+		`"params":{"subject":"Q3 复盘"},"needs":[],`+
+		`"steps":[{"phase":"analyze","label":"① 意图分析"}]}`, slug)
+	f := newFakeLLM(t, func(system, user string) string { return reply })
+	cli := llm.New(&model.LLMConfig{APIKey: "test", BaseURL: f.srv.URL, Model: "fake"})
+	h := &chatHandler{eng: agent.New(cli, sk), maxRound: 1, gen: newGenCache()}
+
+	frames := collectChat(t, h, chatBody(t, "s-zero-material-given", "会议主题是 Q3 复盘，帮我写份纪要"))
+	all := joinedFrames(frames)
+
+	if hasEvent(frames, "needs") {
+		t.Fatalf("必填项已经从 params 拿到了值，却还是停问（这就是「像没看到我给的信息」）：\n%s", all)
+	}
+	if !hasEvent(frames, "delta") {
+		t.Fatalf("没拦也没写，整轮空转：\n%s", all)
 	}
 }

@@ -411,6 +411,10 @@ if [ "$QUICK" = 0 ]; then
   # 另一半是 phase 写了前端认不得的值（编号栏印出英文单词 "plan"、角色徽标空白）。
   # 两条都在线上真帧里取过证，所以断言挂到**出货的前端文件**上（尺子不许对着抄来的表量）。
   selfcheck '后端 / 步骤板渲染契约自证' bash internal/api/chat_board_contract_mutation_check.sh
+  # 零材料强制门：一句话指令（14 字）+ 零材料时，分类器一条 needs 都不报，旧实现里
+  # 闸门形同不存在 → 写作跳直通，产出 645 字带假日期假参会人的会议纪要。
+  # 失败形态是**用户看得见的编造**，所以判据（本地算缺口）+ 接线两侧都要钉。
+  selfcheck '后端 / 零材料强制门自证'   bash internal/api/zero_material_gate_mutation_check.sh
   selfcheck '后端 / 分类结构管理自证'   python3 scripts/category_guard_inject.py
   selfcheck '后端 / 思考开关矩阵自证'   python3 scripts/fastjson_knob_inject.py
   selfcheck '后端 / 提速与中间材料自证' python3 scripts/thinking_knob_inject.py

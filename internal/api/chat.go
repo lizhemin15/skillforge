@@ -324,7 +324,8 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// 标题亮点（可选…）」，正文一个字没有）。只用必填缺参拦；顺手把「哪几个
 		// 可选字段放过了」写进中间材料 —— 这既是本地事实（t≈0 就能发），也正好
 		// 补上用户抱怨的「中间没材料、只看到计时在跳」。
-		blocking, optional := agent.SplitNeeds(h.declaredParams(eval.SkillSlug), eval.Needs)
+		declared := h.declaredParams(eval.SkillSlug)
+		blocking, optional := agent.SplitNeeds(declared, eval.Needs)
 		if len(optional) > 0 {
 			clock.Thinking("技能「" + sc.Name + "」的可选信息没给（" + agent.NeedsSummary(optional) +
 				"），按它自己的默认继续起草…")
@@ -351,6 +352,35 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					agent.NeedsSummary(blocking) + "」没在素材里显式写明，我按素材自行推断后接着起草…",
 			}))
 			blocking = nil
+		}
+		// 零材料强制门（**本地确定性判据，不发模型调用**）。
+		//
+		// 为什么必须有它：上面两条判据都建立在「模型自报了 needs」之上 —— 分类器自报
+		// 0 条时 SplitNeeds 回来的 blocking 就是空的，闸门形同不存在。线上逮到的正是
+		// 这一格：一句话指令（测试里 14 字）+ 零材料，分类器一条 needs 都没报，写作跳
+		// 一路直通，产出 645 字带假日期、假参会人的会议纪要 —— 用户读到的是「它替我编了」。
+		// 技能声明的必填项是地面真值，缺哪项本地就算得出来，不该等模型自觉。
+		//
+		// 只开「材料确实是空的」这一格（< 80 字，见 agent.noMaterialChars），跟
+		// MaterialNoAsk 的 800 字那条线区间不重叠 —— 「材料在手还追问」那条路径一个字
+		// 都不改（用户投诉的原话是「像没看到我给的信息」，那条线绝不能往回退）。
+		//
+		// 这一跳**不进疑点跳**：疑点回执的价值是逐字锚定用户原文，而材料真空时根本没有
+		// 可锚的素材，花一次模型调用换来的大概率是一条对不上原文的引用（会被本地校验
+		// 丢掉、退回直写）。内网模型 token 慢，这一格宁可本地算准。
+		// template_only（用户点名要空白模板）显式放过：交付物是那个附件本身，跟必填项
+		// 有没有落实无关；模板交付分支在闸门之后，不放过就会被误伤成一句反问。
+		if zm := agent.ZeroMaterialAsk(declared, args, eval.MaterialChars, req.Message,
+			strings.EqualFold(strings.TrimSpace(eval.Action), "template_only")); len(zm) > 0 {
+			fmt.Fprintf(os.Stderr, "[needs-gate] 材料真空（%d 字）+ 技能声明必填项未落实 → 停问「%s」，不进写作跳\n",
+				eval.MaterialChars, agent.NeedsSummary(zm))
+			clock.Awaiting("等你补「" + agent.NeedsSummary(zm) + "」（回「就按你的」我就先起一稿）…")
+			gm := agent.ZeroMaterialMessage(req.Message, zm)
+			write(evNeeds, jsonSafe(zm))
+			write(evDelta, jsonSafe(map[string]string{"t": gm}))
+			h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: gm, SkillSlug: eval.SkillSlug, At: time.Now()})
+			write(evDone, jsonSafe(map[string]string{"skill": eval.SkillSlug, "asked": "true"}))
+			return
 		}
 		if len(blocking) > 0 {
 			// 疑点回执（用户投诉的正面回应）：「有的时候似乎像是没看到我的信息一样
