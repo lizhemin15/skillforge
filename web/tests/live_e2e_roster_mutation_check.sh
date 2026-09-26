@@ -28,6 +28,14 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
+# 互斥（2026-09-26）：本脚本会**就地改写仓库里的真文件** —— runner（$RUNNER）、两条真 leg
+# （$LEG / $LEG2），以及**必须**落在 web/tests/ 下的探针（roster 测试就是枚举
+# web/tests/*_e2e.py，挪到临时目录那条断言就假了）。两个实例并发跑必然互踩：
+# 实测同秒起跑 A 19/21 RC=1（FAIL B3/B5）、B 21/21 RC=0 —— 那种红不可归因。
+# 锁必须在下面 cp 备份**之前**拿到，否则会把别人注入到一半的状态当基线备份下来。
+source "$ROOT/scripts/suite-lock.sh"
+sf_lock "$ROOT"
+
 ROSTER='web/tests/live_e2e_roster.test.mjs'
 RUNNER='scripts/acceptance-live.sh'
 PROBE="$ROOT/web/tests/zzz_live_e2e_roster_probe_e2e.py"

@@ -35,6 +35,13 @@ if [ ! -f go.mod ] || [ ! -d web/tests ]; then
   exit 3
 fi
 
+# 套件互斥锁（2026-09-26）。本套件里的自证会**就地改写真源文件**（runner / 真 leg /
+# web/tests 下的探针），还会为缓存版本号自证提交一次 mutation 再 reset，且多条判据
+# 要求「树必须干净」。两个实例并发跑必然互踩，产出不可归因的红（实测同秒起跑：
+# 一个 19/21 RC=1、另一个 21/21 RC=0）。已有实例在跑时这里直接拒绝启动，不再生产假红。
+source "$PWD/scripts/suite-lock.sh"
+sf_lock "$PWD"
+
 FAILED=()
 PASSED=0
 SKIPPED=()
@@ -265,6 +272,10 @@ if [ "$QUICK" = 0 ]; then
     env INJECT_MCP_OFF=1 REQUIRE_LIVE=1 BASE="${BASE:-http://127.0.0.1:8092}" \
     python3 web/tests/chat_mcp_gate_e2e.py
   selfcheck '前端 / 线上验收 leg 接线自证' bash web/tests/live_e2e_roster_mutation_check.sh
+  # 套件互斥锁自证。锁没牙的形态是**静默**的：并发跑又会出现不可归因的红（本机实测过
+  # 同秒起跑 19/21 RC=1 对 21/21 RC=0），而没有任何一条别的判据会为此响。它还必须
+  # 钉住「探针要 env -u」这个陷阱 —— 否则负向断言会永远绿。见 scripts/suite-lock.sh。
+  selfcheck '套件 / 互斥锁自证（持锁时第二实例必须拒绝）' bash web/tests/suite_lock_mutation_check.sh
   # 大模型输出 JSON 的「手抖容忍层」自证。线上真故障（2026-09-17）：模型把
   # input_params.options 写成对象数组 [{"label":"启用","value":"on"}]，Go 严格解 []string
   # 当场报错 → 整轮训练在第 2 步 18 秒中断（用户看到「训练失败」，且这正是
@@ -460,7 +471,15 @@ if [ ${#SKIPPED[@]} -gt 0 ]; then printf '，跳过 %d 项（--quick）' "${#SKI
 if [ ${#FAILED[@]} -gt 0 ]; then
   printf '，\033[31m失败 %d 项\033[0m\n' "${#FAILED[@]}"
   for f in "${FAILED[@]}"; do printf '  ✗ %s\n' "$f"; done
-  printf '\n\033[31m别推 —— CI 会以同样的理由红。\033[0m\n'
+  # 这里原来写死成「CI 会以同样的理由红」—— 但 CI 里有几条腿**根本不跑**
+  # （真浏览器 / 真服务 / 真模型）。一刀切会让一条环境红冒充「全盘推不得」：
+  # 2026-09-26 实测，MCP 门控腿本地红（库里没有启用中的 MCP，该腿**设计上就该红**），
+  # 而 ci.yml 里压根没有这条腿。于是一句假预警差点让人不信任一棵绿的 CI ——
+  # 跟「假绿」同一个病：预警不带归因，就是狼来了。
+  printf '\n\033[31m别推 —— 先逐条定性：\033[0m\n'
+  printf '  · CI 跑得到的腿红了 → 必推不得。\n'
+  printf '  · CI 跑不到的腿（真浏览器 / 真服务 / 真模型）本地红 ≠ CI 会红，但**必须**点名说清是哪条、为什么。\n'
+  printf '  别把「本地红」当「CI 会红」，也别把前者当不存在。\n'
   exit 1
 fi
 printf '，\033[32m0 失败\033[0m\n'

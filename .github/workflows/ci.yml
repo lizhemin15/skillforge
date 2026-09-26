@@ -115,7 +115,7 @@ jobs:
 
       # 断言自证：往出货文件里注入真实故障，要求对应断言变红。
       # 全绿的断言集不代表真能抓住故障，这几个脚本把「抓得住」本身也守上。
-      - name: 前端断言自证（分类结构管理 / 缓存版本号 / 输入区布局与贴底滚动 / 思考材料的渲染 / MCP 数据源勾选 / 线上验收 leg 接线）
+      - name: 前端断言自证（分类结构管理 / 缓存版本号 / 输入区布局与贴底滚动 / 思考材料的渲染 / MCP 数据源勾选 / 线上验收 leg 接线 / 套件互斥锁）
         run: |
           bash web/tests/category_ui_mutation_check.sh
           bash web/tests/asset_version_mutation_check.sh
@@ -138,6 +138,11 @@ jobs:
           # 两次、runner 退回写死清单必须被 roster 测试抓住。它不需要服务/模型，
           # 所以能在 CI 里跑 —— 这正是它存在的理由。
           bash web/tests/live_e2e_roster_mutation_check.sh
+          # 套件互斥锁：preflight 与上面那条 roster 自证都会**就地改写真源文件**
+          # （runner / 真 leg / web/tests 下的探针），两条腿还会断言「树必须干净」。
+          # 两实例并发跑实测过同秒对照：19/21 RC=1 对 21/21 RC=0 —— 那种红不可归因，
+          # 会让人去怀疑一棵好树。这条自证守锁的**拒绝路径**（锁没牙时它是唯一的红）。
+          bash web/tests/suite_lock_mutation_check.sh
           # 「解释器探测」那条：候选名单两边脱钩 / 探测写死单一路径 / 只看存在不探活
           # ——三种退化看着都像对的，靠注入自证它们会被抓住（Bug O）。
           python3 web/tests/python_resolve_mutation_check.py
