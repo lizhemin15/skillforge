@@ -303,6 +303,18 @@ jobs:
           go test ./internal/agent/ ./internal/api/ -run 'TestHotSwap|TestInjectedClient|TestReloadLLM|TestEnsureLLM|TestSetLLMKeeps|TestSwitchLLM|TestEditActiveLLM|TestDeleteActiveLLM|TestListLLMReports' -count=1
           bash internal/api/llm_hotswap_mutation_check.sh
 
+      # LLM 连通性测试按钮：管理端「测试 / 测试连通性」按钮给出的结论必须可信。
+      # 这个按钮的全部价值在结论的可信度上，翻车的样子用户都看得见：
+      #   · 报的地址 ≠ 实际打出去的地址 → 「测试通过、聊天打不通」，从此没人再用它
+      #   · 「200 但正文空」被判不通（内网慢模型的常见长相）→ 整排假红，真坏的被淹掉
+      #   · 400+10404 被合并进泛化 400 → 用户不知道该去控制台换路由名
+      #   · 掩码不回退 → 列表点「测试」永远 401，看着像服务坏了
+      # 五条注入分别打在这五种坏法上（含真 bug：完整端点被拼出双份 /chat/completions）。
+      - name: 后端回归（LLM 连通性测试 + 断言自证）
+        run: |
+          go test ./internal/llm/ ./internal/api/ -run 'TestNormalizeBaseURL|TestChatEndpoint|TestProbeEndpoint|TestProbeEmptyContent|TestProbeUpstreamErrors|TestProbeLocalPrecheck|TestProbeTimeout|TestProbeNeverLeaksKey|TestProbeLLM' -count=1
+          bash internal/api/llm_probe_mutation_check.sh
+
       # 这两条 .py 自证脚本此前**没有任何地方调用**：CI 里没有 step、本地也没跑。
       # 后果是可预测的 —— category_guard_inject.py 的一条锚点早就跟实现脱钩
       # （categoryErrStatus 里 ErrNotManualSkill 被有意删掉），脚本自己在那行

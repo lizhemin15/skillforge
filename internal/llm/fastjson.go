@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -203,15 +204,39 @@ func (c *Client) fastOnce(ctx context.Context, system, user string, maxTokens in
 // 会把「没有 CA」的 transport 缓存下来（详见 stream.go 的同类说明）。
 func fastHTTPClient() *http.Client { return tlsconf.NewClient(60 * time.Second) }
 
-// normalizeBaseURL：BaseURL 为空走 OpenAI 默认；填了但没带 /v1 的补上
+// baseURLVersionRe 认「路径里已经带了版本段」：/v1、/v2、/v4、/v1beta…
+// 只看有没有 `/v<数字>(beta)?` 这样一整段，不做前缀匹配 ——
+// 否则 https://v1.example.com 这种主机名会被当成版本段。
+var baseURLVersionRe = regexp.MustCompile(`/v[0-9]+(beta)?(/|$)`)
+
+// normalizeBaseURL：BaseURL 为空走 OpenAI 默认；填了但没带版本段的补 /v1
 // （很多 provider 给的是 https://api.deepseek.com 这种）。
+//
+// 两处必须比「有没有 /v1」更聪明，否则会把地址拼坏（运行期真在打拼坏的地址）：
+//
+//  1. 用户常把**完整端点**整条粘进来 —— 平台控制台给的就是整条，例如
+//     讯飞maas 的 https://maas-api.cn-huabei-1.xf-yun.com/v2/chat/completions。
+//     SDK 会在 BaseURL 后面再拼一次 /chat/completions，所以这里必须先把尾巴剥掉，
+//     否则拼成 .../chat/completions/v1/chat/completions（实测就是这么拼坏的）。
+//  2. 版本段不只有 v1：智谱是 /v4、讯飞是 /v2、Google 是 /v1beta。
+//     以前只认 /v1，遇到 /v2 会补成 .../v2/v1 —— 路径凭空多一层，上游只会回 404。
+//
+// 改这里等于改所有 provider 的地址，务必同步跑 TestNormalizeBaseURL
+// 与 TestProbeEndpointMatchesRuntime（后者断言「测试按钮报的地址 = 实际打出去的地址」）。
 func normalizeBaseURL(base string) string {
+	const openaiDefault = "https://api.openai.com/v1"
 	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	for _, tail := range []string{"/chat/completions", "/completions"} {
+		if strings.HasSuffix(base, tail) {
+			base = strings.TrimRight(strings.TrimSuffix(base, tail), "/")
+			break
+		}
+	}
 	if base == "" {
-		return "https://api.openai.com/v1"
+		return openaiDefault
 	}
-	if !strings.HasSuffix(base, "/v1") && !strings.Contains(base, "/v1/") {
-		base += "/v1"
+	if baseURLVersionRe.MatchString(base) {
+		return base
 	}
-	return base
+	return base + "/v1"
 }

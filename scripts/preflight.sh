@@ -418,6 +418,11 @@ if [ "$QUICK" = 0 ]; then
   # 模型热切换：管理端改了模型必须打到运行期。旧实现三处接口都只改库，进程里的客户端
   # 还是启动时那一条 —— 用户切到 B、界面显示「在用：B」，每一轮问答仍在打已欠费的 A。
   selfcheck '后端 / 模型热切换自证'     bash internal/api/llm_hotswap_mutation_check.sh
+  # LLM 连通性测试按钮：按钮给出的结论必须可信。翻车形态（报的地址≠实际打的地址 /
+  # 「200 正文空」被判不通 → 内网慢模型整排假红 / 10404 归因被合并 / 掩码不回退）
+  # 全是用户看得见且会直接摧毁这个按钮价值的。五条注入含真 bug（完整端点拼出双份
+  # /chat/completions）。
+  selfcheck '后端 / LLM 连通性测试自证' bash internal/api/llm_probe_mutation_check.sh
   selfcheck '后端 / 分类结构管理自证'   python3 scripts/category_guard_inject.py
   selfcheck '后端 / 思考开关矩阵自证'   python3 scripts/fastjson_knob_inject.py
   selfcheck '后端 / 提速与中间材料自证' python3 scripts/thinking_knob_inject.py

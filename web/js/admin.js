@@ -107,6 +107,7 @@
             <div class="dt">${esc(c.model)} · base ${esc(c.base_url)}</div>
           </div>
           <div class="row-actions">
+            <button class="btn ghost" style="padding:4px 8px;font-size:12px" onclick="window.probeProv(${c.id})">测试</button>
             <button class="btn ghost" style="padding:4px 8px;font-size:12px" onclick="window.editProv(${c.id})">编辑</button>
             ${c.is_active ? '' : `<button class="btn ghost" style="padding:4px 8px;font-size:12px" onclick="window.useProv(${c.id})">切换</button>`}
             <button class="icon-btn danger" title="删除" onclick="window.delProv(${c.id})">✕</button>
@@ -174,6 +175,71 @@
       btn.disabled = false; btn.textContent = '获取模型';
     }
   });
+
+  // ---------- LLM: 测试连通性 ----------
+  // 「获取模型」只证明「地址 + key 能列出模型」，能不能真出字得靠一次真实调用。
+  // 而一条配置有四个会各自出错的地方（地址 / 模型名 / key / 额度），四种错的观感
+  // 在对话里**完全一样**（转两下报错或没反应），用户没有任何自查手段。
+  // 所以这里把结论、归因、上游原话、实际打到的地址、耗时一次全给出来。
+  function showLLMMsg(text, cls) {
+    const msg = $('llm-msg');
+    msg.className = cls ? 'msg ' + cls : 'msg';
+    msg.textContent = text;
+  }
+
+  // llmDetail：结论下面的证据行。地址要完整显示（内网常有多套网关，用户靠它核对），
+  // 不做省略号截断 —— 截在最关键的路径段上就等于没给。
+  function llmDetail(j) {
+    const bits = [];
+    if (j.endpoint) bits.push('地址 <code style="font-size:11px;word-break:break-all">' + esc(j.endpoint) + '</code>');
+    if (j.model) bits.push('模型 <code style="font-size:11px">' + esc(j.model) + '</code>');
+    if (j.status) bits.push('HTTP ' + esc(String(j.status)));
+    if (j.api_code) bits.push('上游码 ' + esc(String(j.api_code)));
+    bits.push('耗时 ' + (j.latency_ms || 0) + 'ms');
+    return '<div class="dt" style="margin-top:6px;line-height:1.9">' + bits.join(' · ') + '</div>';
+  }
+
+  window.probeLLM = async () => {
+    const out = $('llm-test-out');
+    const btn = $('llm-test');
+    const base = $('llm-base').value.trim();
+    if (!base) { showLLMMsg('请先填写 API Base URL', 'err'); return; }
+    if (!$('llm-model').value.trim()) { showLLMMsg('请先填写模型名', 'err'); return; }
+    btn.disabled = true; btn.textContent = '测试中…';
+    // 立刻写出「在等什么、等多久」。内网慢，一个不动的按钮会被读成卡死。
+    showLLMMsg('正在请求模型，最多等 30 秒…');
+    out.innerHTML = '<div class="dt">正在请求模型，最多等 30 秒…</div>';
+    try {
+      const probePayload = {
+        id: parseInt($('llm-id').value || '0') || 0,
+        base_url: base,
+        model: $('llm-model').value.trim(),
+        api_key: $('llm-key').value, // 编辑态这里是掩码，后端会自动回退用库里已存的 key
+      };
+      const r = await fetch('/api/admin/llms/test', {
+        method: 'POST', headers: authHdr(), body: JSON.stringify(probePayload),
+      });
+      const j = await r.json();
+      if (!r.ok) { showLLMMsg(j.error || '测试失败', 'err'); out.innerHTML = ''; return; }
+      // 注意：上游不通时后端仍然回 HTTP 200，结论在 body 的 ok 里 ——
+      // 这样「测出来不通」和「测试接口自己坏了」在这段代码里不会长得一样。
+      showLLMMsg(j.ok ? '连通正常' : '不通', j.ok ? 'ok' : 'err');
+      out.innerHTML = '<div class="msg ' + (j.ok ? 'ok' : 'err') + '" style="display:block">' +
+        esc(j.message) + '</div>' + llmDetail(j);
+    } catch (err) {
+      showLLMMsg('网络错误', 'err'); out.innerHTML = '';
+    } finally {
+      btn.disabled = false; btn.textContent = '测试连通性';
+    }
+  };
+  $('llm-test').addEventListener('click', window.probeLLM);
+
+  // 列表里点「测试」：先把该行填进表单再测，复用同一条链路（与 MCP 那边同一约定）。
+  // 好处是测完表单里就是刚测的那条配置，看到「模型名不对」能立刻改、立刻再测。
+  window.probeProv = async (id) => {
+    await window.editProv(id);
+    await window.probeLLM();
+  };
 
   $('llm-cancel').addEventListener('click', () => {
     $('llm-form').reset(); $('llm-id').value = 0; $('llm-cancel').style.display = 'none';

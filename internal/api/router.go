@@ -211,6 +211,9 @@ func (h *Handler) Routes() *http.ServeMux {
 	// ---- admin API ----
 	mux.HandleFunc("POST /api/login", h.Auth.Login)
 	mux.HandleFunc("POST /api/admin/llms/models", h.Auth.Middleware(h.Admin.ListProviderModels))
+	// 测试连通性：POST 而非 GET —— body 里可能带 API Key（新建时用户还没保存），
+	// 放进 URL 会进访问日志与浏览器历史。与 /api/admin/mcp/test 同一约定。
+	mux.HandleFunc("POST /api/admin/llms/test", h.Auth.Middleware(h.Admin.ProbeLLM))
 	mux.HandleFunc("GET /api/admin/llms", h.Auth.Middleware(h.Admin.ListLLM))
 	mux.HandleFunc("POST /api/admin/llms", h.Auth.Middleware(h.Admin.UpsertLLM))
 	mux.HandleFunc("POST /api/admin/llms/active", h.Auth.Middleware(h.Admin.SetActiveLLM))

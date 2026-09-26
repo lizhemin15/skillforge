@@ -82,8 +82,13 @@
               </div>
               <div class="field"><label>API Key</label><input type="password" id="llm-key" placeholder="sk-…" required></div>
               <button type="submit" class="btn primary" id="llm-save">保存</button>
+              <button type="button" class="btn ghost" id="llm-test">测试连通性</button>
               <button type="button" class="btn ghost" id="llm-cancel" style="display:none">取消</button>
               <div class="msg" id="llm-msg"></div>
+              <!-- 测试结果明细：地址 / 模型 / HTTP 码 / 耗时。单独一行而不是塞进上面的 msg，
+                   因为 msg 是「通 / 不通」的结论，这一行是「凭什么这么说」的证据 ——
+                   内网配错地址时，用户第一眼要看的就是「你到底打到了哪个地址」。 -->
+              <div id="llm-test-out" style="margin-top:10px"></div>
             </form>
           </div>
         </div>
@@ -344,6 +349,6 @@
 <script src="/assets/vendor/codemirror/addon/fold/foldcode.min.js?v=20260908A"></script>
 <script src="/assets/vendor/codemirror/addon/fold/foldgutter.min.js?v=20260908A"></script>
 <script src="/assets/js/site.js?v=20260911M"></script>
-<script src="/assets/js/admin.js?v=20260926B"></script>
+<script src="/assets/js/admin.js?v=20260926C"></script>
 </body>
 </html>

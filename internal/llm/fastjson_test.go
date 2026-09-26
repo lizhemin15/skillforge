@@ -335,6 +335,20 @@ func TestNormalizeBaseURL(t *testing.T) {
 		"https://api.siliconflow.cn/v1": "https://api.siliconflow.cn/v1",
 		"https://x.com/v1/":             "https://x.com/v1",
 		"  https://y.com/v1  ":          "https://y.com/v1",
+		// 控制台常把整条端点给用户，SDK 还会再拼一次 /chat/completions。
+		// 不剥尾巴 → .../chat/completions/v1/chat/completions（实测讯飞maas 就是这么拼坏的）。
+		"https://maas-api.cn-huabei-1.xf-yun.com/v2/chat/completions": "https://maas-api.cn-huabei-1.xf-yun.com/v2",
+		"https://host/v1/chat/completions":                            "https://host/v1",
+		// 版本段不只有 v1：智谱 /v4、讯飞 /v2、Google /v1beta。
+		// 以前只认 /v1，遇到 /v2 会补成 .../v2/v1 —— 凭空多一层路径，上游只回 404。
+		"https://api.siliconflow.cn/v2":        "https://api.siliconflow.cn/v2",
+		"https://open.bigmodel.cn/api/paas/v4": "https://open.bigmodel.cn/api/paas/v4",
+		"https://host/v1beta":                  "https://host/v1beta",
+		"https://host/compatible-mode/v1":      "https://host/compatible-mode/v1",
+		// 非版本段仍要补 /v1（保持旧行为）。
+		"https://host/maas": "https://host/maas/v1",
+		// 主机名里的 v1 不是版本段。
+		"https://v1.example.com": "https://v1.example.com/v1",
 	}
 	for in, want := range cases {
 		if got := normalizeBaseURL(in); got != want {
