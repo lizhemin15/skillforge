@@ -113,7 +113,15 @@ inject_case '不看意图就纠偏（用户要写文章，却被塞一份文件�
   'if (strings.EqualFold(strings.TrimSpace(eval.Intent), "docgen") || true) &&' \
   'FAIL: TestRouteWriteIntentNotCoercedToDocGen'
 
-# 注入 4 = 换了技能但不讲为什么换（用户要的是「为什么」，不是「skill_type=docgen」）。
+# 注入 4 = 「分类器没命中技能」那一格没人管：要文件却直接落到通用写作。
+# 锚点取这道兜底闸门自己的条件行（真源码里它跟 ExplicitTextOnly 让路折成两行，
+# 拿整行当锚点会命中 0 次）。
+inject_case '分类器没命中技能时不管 docgen 意图（要文件却拿到一屏正文）' \
+  "$CHAT" 'if eval.SkillSlug == "" && !agent.ExplicitTextOnly(req.Message) &&' \
+  'if false && !agent.ExplicitTextOnly(req.Message) &&' \
+  '要 Word 却只拿到文字'
+
+# 注入 5 = 换了技能但不讲为什么换（用户要的是「为什么」，不是「skill_type=docgen」）。
 inject_case '换技能不讲原因（用户看不懂自己锁的技能为什么被绕过）' \
   "$CHAT" '型技能，产出正文而不是文件；" +' '型技能，" +' \
   '换技能没讲清为什么换'

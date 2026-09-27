@@ -83,6 +83,77 @@ func TestRouteFileIntentCoercesWriteSkillToDocGen(t *testing.T) {
 	}
 }
 
+// 第二格：**分类器一个技能都没命中**，但意图是 docgen（本轮要出文件）。
+//
+// 线上取证（2026-09-27 验收连跑两次各咬一口）：
+//
+//	「给我一份会议通知的Word文档模板」    → action=template_only skill=""
+//	「帮我生成请假申请单Word文档并填入…」 → action=fill          skill=""
+//
+// 两次都是「用户要 Word，拿到一屏文字」：纠偏闸门建在 `if eval.SkillSlug != ""` 里面，
+// 这一格没进那道门，直接落到通用写作。断言同样三层：有 file 帧 / 请求发给了带契约的
+// 技能 / 换了路由讲了原因。
+func TestRouteDocgenIntentWithoutSkillFallsBackToDocGen(t *testing.T) {
+	f := newFakeLLM(t, func(system, user string) string {
+		switch {
+		case strings.Contains(system, "多智能体管线的调度器"):
+			// 意图对（要出文件），技能空 —— 线上真实出现过的那一态。
+			return `{"intent":"docgen","action":"template_only","skill_slug":"",` +
+				`"reason":"要文件，没想好技能","needs_tools":false}`
+		case strings.Contains(system, "办公文档管家"):
+			return `{"format":"word","filename":"会议通知.docx","title":"会议通知",` +
+				`"parags":["各部门：","定于本周五召开会议。"]}`
+		}
+		return "这是一段正文。"
+	})
+	h := &chatHandler{eng: newManualEngine(t, t.TempDir(), f), maxRound: 1, gen: newGenCache()}
+
+	sse := runRouteChat(t, h, `{"session_id":"s-noskill","message":"给我一份会议通知的Word文档模板","mode":"auto"}`)
+	frames := routeFrames(sse)
+
+	if d := findFrameData(frames, evFile); d == "" {
+		t.Fatalf("要 Word 却只拿到文字：分类器没命中技能时整轮落到了通用写作（SSE 无 file 帧）。\n"+
+			"---- 实际 SSE ----\n%s", sse)
+	}
+	if !anyRequestSystemContains(f, "办公文档管家") {
+		t.Fatalf("兜底没有把请求发给带契约的文档生成技能（拿别的提示词发文必解析失败）")
+	}
+	metaData := findFrameData(frames, evMeta)
+	if !strings.Contains(metaData, "办公文档管家") {
+		t.Fatalf("兜底换路由没告诉用户是谁在干活：%s", metaData)
+	}
+}
+
+// 同上那一格的反向：用户**明说**只要正文时，就算分类器把 intent 判成 docgen
+// 且没命中技能，也不许塞文件下载（交付形态是用户亲手写的判据）。
+func TestRouteNoSkillDocgenWithExplicitTextOnlyStaysText(t *testing.T) {
+	want := "各部门：\n为规范数据治理专项工作，现就有关事项通知如下：一、建立统一台账。"
+	f := newFakeLLM(t, func(system, user string) string {
+		switch {
+		case strings.Contains(system, "多智能体管线的调度器"):
+			return `{"intent":"docgen","action":"gen","skill_slug":"",` +
+				`"reason":"题材像公文","needs_tools":false}`
+		}
+		return want
+	})
+	h := &chatHandler{eng: newManualEngine(t, t.TempDir(), f), maxRound: 1, gen: newGenCache()}
+
+	msg := `写一份关于开展数据治理专项工作的通知。背景与核心素材：已建成数据中台。正文不少于 600 字，直接输出正文。`
+	sse := runRouteChat(t, h, `{"session_id":"s-noskill-text","message":"`+msg+`","mode":"auto"}`)
+	frames := routeFrames(sse)
+
+	if !anyRequestNotSystem(f, "多智能体管线的调度器") {
+		t.Fatalf("本轮没走到生成，这条尺子的前提不成立（不许空跑判绿）。\n---- 实际 SSE ----\n%s", sse)
+	}
+	if d := findFrameData(frames, evFile); d != "" {
+		t.Fatalf("用户明说了「直接输出正文」，却拿到文件下载卡片（文件=%s）", d)
+	}
+	body := deltaText(frames)
+	if !strings.Contains(body, want) {
+		t.Fatalf("没有 file 帧 ≠ 走对了路：拼回的正文里没有交付文字。\n---- 正文（%d 字）----\n%s", len([]rune(body)), body)
+	}
+}
+
 // 反向尺子：闸门开错方向同样是故障 —— 用户要写文章，却被塞一份文件下载。
 // 这条同时守住「补上纠偏」时别顺手把 write 路径也改掉。
 //

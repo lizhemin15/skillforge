@@ -69,6 +69,8 @@ func buildPDF(d Doc) ([]byte, error) {
 		return nil, fmt.Errorf("docgen pdf font %s: %w", fontPath, err)
 	}
 
+	fx := newPDFFontFixer(fontPath)
+
 	pdf.AddPage()
 	pageW := gopdf.PageSizeA4.W
 	pageH := gopdf.PageSizeA4.H
@@ -80,7 +82,7 @@ func buildPDF(d Doc) ([]byte, error) {
 	// 标题：二号居中（超宽自动折行，逐行居中）
 	if strings.TrimSpace(d.Title) != "" {
 		pdf.SetFont("cjk", "", pdfSizeTitle)
-		for _, ln := range wrapText(pdf, mdPlainText(d.Title), contentW) {
+		for _, ln := range wrapText(pdf, fx.text(mdPlainText(d.Title)), contentW) {
 			if y+pdfLineH > contentBottom {
 				pdf.AddPage()
 				y = pdfMarginTop
@@ -97,7 +99,7 @@ func buildPDF(d Doc) ([]byte, error) {
 	if len(d.Cols) > 0 {
 		rows := append([][]string{d.Cols}, d.Rows...)
 		var err error
-		y, err = pdfDrawTable(pdf, rows, y, contentW, pdfMarginLeft, contentBottom, pdfMarginTop)
+		y, err = pdfDrawTable(pdf, fx, rows, y, contentW, pdfMarginLeft, contentBottom, pdfMarginTop)
 		if err != nil {
 			return nil, err
 		}
@@ -107,17 +109,14 @@ func buildPDF(d Doc) ([]byte, error) {
 		switch b.kind {
 		case blockTable:
 			var err error
-			y, err = pdfDrawTable(pdf, b.rows, y, contentW, pdfMarginLeft, contentBottom, pdfMarginTop)
+			y, err = pdfDrawTable(pdf, fx, b.rows, y, contentW, pdfMarginLeft, contentBottom, pdfMarginTop)
 			if err != nil {
 				return nil, err
 			}
 		case blockSignoff:
-			y = pdfDrawRight(pdf, b.text(), y, contentW, contentBottom)
+			y = pdfDrawRight(pdf, fx.text(b.text()), y, contentW, contentBottom)
 		default:
-			text := b.text()
-			if b.kind == blockBullet {
-				text = pdfRewriteBullet(text, fontPath)
-			}
+			text := fx.text(b.text())
 			indent := 0.0
 			if b.kind == blockBody || b.kind == blockH1 || b.kind == blockH2 || b.kind == blockH3 ||
 				b.kind == blockBullet || b.kind == blockOrdered {
@@ -144,39 +143,45 @@ func buildPDF(d Doc) ([]byte, error) {
 	return buf, nil
 }
 
-// pdfBulletCandidates 是候选项目符号：优先 U+2022 •，再退回字体里确实有字形的符号。
-var pdfBulletCandidates = []string{"•", "●", "○", "·", "-"}
-
-var (
-	pdfBulletOnce sync.Once
-	pdfBulletPick string
-)
-
-// pdfBulletGlyph 选出 PDF 字体里**真的有字形**的项目符号。
+// pdfSubstCandidates 是「字体里没有字形 → 换成等效字符」的替换表。
 //
-// 本机实际用的字体（文鼎简宋 gbsn00lp）没有 U+2022 •：直接画下去，
-// gopdf 会静默渲染成空格 —— 用户看到的是一行「没有项目符号」的列表，
-// 而绘制期只留一条 WARN（Bug G 那类「静默变空格」）。
-// 所以这里先探测覆盖率再选符号，和 pdf_font.go 选字体是同一个道理。
-func pdfBulletGlyph(fontPath string) string {
-	pdfBulletOnce.Do(func() {
-		for _, c := range pdfBulletCandidates {
-			if miss, err := probeFontCoverage(fontPath, c); err == nil && len(miss) == 0 {
-				pdfBulletPick = c
-				return
-			}
-		}
-		pdfBulletPick = "-"
-	})
-	return pdfBulletPick
+// 为什么必须有：本机用的字体（文鼎简宋 gbsn00lp）实测缺 U+00A5「¥」——单据里的
+// 金额很容易带它，gopdf 遇到缺字形**不报错**，直接画成空格，用户看到「12,000」
+// 前面空一格（Bug G 那类「静默变空格」）。项目符号「•」同样缺。
+//
+// 判定不靠猜：对每一对逐一探测覆盖率，源字符**有**字形就不换（不做多余替换），
+// 源缺而目标有才换；目标也没有就原样保留，让绘制期的缺字告警照旧报出来。
+var pdfSubstCandidates = [][2]string{
+	{"•", "●"}, // 项目符号
+	{"¥", "￥"}, // 半角人民币号 → 全角（同义）
 }
 
-// pdfRewriteBullet 把「• xxx」换成字体支持的项目符号。
-func pdfRewriteBullet(text, fontPath string) string {
-	if !strings.HasPrefix(text, "• ") {
-		return text
+// pdfFontFixer 把要画出去的文本按「字体实际有什么字形」修一遍。
+// 构造时探测一次（解析字体不便宜），此后每次替换只做字符串操作。
+type pdfFontFixer struct {
+	subs [][2]string
+}
+
+func newPDFFontFixer(fontPath string) *pdfFontFixer {
+	f := &pdfFontFixer{}
+	for _, pair := range pdfSubstCandidates {
+		src, dst := pair[0], pair[1]
+		if miss, err := probeFontCoverage(fontPath, src); err != nil || len(miss) == 0 {
+			continue // 字体有这个字形，不用换（探测失败也不换，保持原样）
+		}
+		if miss, err := probeFontCoverage(fontPath, dst); err != nil || len(miss) > 0 {
+			continue // 目标字符也没有字形，换了没意义
+		}
+		f.subs = append(f.subs, pair)
 	}
-	return pdfBulletGlyph(fontPath) + " " + strings.TrimPrefix(text, "• ")
+	return f
+}
+
+func (f *pdfFontFixer) text(s string) string {
+	for _, pair := range f.subs {
+		s = strings.ReplaceAll(s, pair[0], pair[1])
+	}
+	return s
 }
 
 // pdfDrawParagraph 画一段正文：首行缩进 indent，固定行距 28pt，超页自动翻页。
@@ -249,7 +254,7 @@ func pdfTablePlan(rows [][]string) (cols int, colW, rowH, height float64, bodyRo
 // 参数顺序在这里是**有意**写全的：gopdf 的 NewTableLayout(startX, startY, rowHeight, maxRows)
 // 第 3 个是行高、第 4 个是「表体行数下限」——两者写反过一次，表格被撑成 41 行、
 // 约 7000pt 高，后画的正文全压在空表格上（2026-09-27 一并修掉）。
-func pdfDrawTable(pdf *gopdf.GoPdf, rows [][]string, y, contentW, x0, contentBottom, topMargin float64) (float64, error) {
+func pdfDrawTable(pdf *gopdf.GoPdf, fx *pdfFontFixer, rows [][]string, y, contentW, x0, contentBottom, topMargin float64) (float64, error) {
 	cols, _, rowH, height, bodyRows := pdfTablePlan(rows)
 	if cols == 0 {
 		return y, nil
@@ -266,7 +271,7 @@ func pdfDrawTable(pdf *gopdf.GoPdf, rows [][]string, y, contentW, x0, contentBot
 	for i := 0; i < cols; i++ {
 		head := ""
 		if i < len(rows[0]) {
-			head = rows[0][i]
+			head = fx.text(rows[0][i])
 		}
 		table.AddColumn(head, colW, "center")
 	}
@@ -274,7 +279,7 @@ func pdfDrawTable(pdf *gopdf.GoPdf, rows [][]string, y, contentW, x0, contentBot
 		cells := make([]string, cols)
 		for i := 0; i < cols; i++ {
 			if i < len(row) {
-				cells[i] = row[i]
+				cells[i] = fx.text(row[i])
 			}
 		}
 		table.AddRow(cells)

@@ -88,23 +88,37 @@ func TestBlocksStripMarkdownAndClassify(t *testing.T) {
 // PDF
 // ---------------------------------------------------------------------------
 
-// PDF 只有一个内嵌字体，项目符号必须选字体里真有字形的那个，
-// 否则 gopdf 会静默渲染成空格（Bug G 那类）。
-func TestPDFBulletGlyphExistsInFont(t *testing.T) {
+// PDF 只有一个内嵌字体：文档里会出现、而字体**没有字形**的字符必须换成等效字符，
+// 否则 gopdf 不报错、直接画成空格（Bug G 那类；线上实测缺「•」和「¥」）。
+func TestPDFFontFixerReplacesMissingGlyphs(t *testing.T) {
 	fp, _ := resolvePDFFont()
 	if fp == "" {
 		t.Skip("本机没有可用的 CJK 字体")
 	}
-	glyph := pdfBulletGlyph(fp)
-	miss, err := probeFontCoverage(fp, glyph)
+	fx := newPDFFontFixer(fp)
+
+	// 1. 换过之后画出去的文本，不该再有缺字形的字符。
+	sample := fx.text("• 项目符号 ¥12,000 €100")
+	miss, err := probeFontCoverage(fp, sample)
 	if err != nil {
 		t.Fatalf("探测字体失败: %v", err)
 	}
-	if len(miss) > 0 {
-		t.Fatalf("选出来的项目符号 %q 在字体 %s 里没有字形（会静默变空格）", glyph, fp)
+	// 本机字体缺 €（欧洲号，没有等效汉字），这一条不该被算进来——
+	// 只要求「本表覆盖的字符」都被修好。
+	for _, r := range miss {
+		if r == '•' || r == '¥' {
+			t.Fatalf("修字后仍缺字形 %q（会静默变空格）：%q", string(r), sample)
+		}
 	}
-	if glyph != "•" {
-		t.Logf("字体不含 •，PDF 已退回 %q", glyph)
+
+	// 2. 本机字体确实缺 • 和 ¥（否则这条测试就没在测东西），且修字器把它们换掉了。
+	if miss, err := probeFontCoverage(fp, "•¥"); err == nil && len(miss) == 2 {
+		if !strings.Contains(fx.text("• x"), "●") {
+			t.Errorf("字体缺「•」但修字器没换：%q", fx.text("• x"))
+		}
+		if !strings.Contains(fx.text("¥ 12"), "￥") {
+			t.Errorf("字体缺「¥」但修字器没换：%q", fx.text("¥ 12"))
+		}
 	}
 }
 

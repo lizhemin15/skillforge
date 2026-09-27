@@ -242,6 +242,40 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 2a-pre1. 要出文件，但分类器**一个技能都没命中**（skill_slug 为空）。
+	//
+	// 线上取证（2026-09-27 验收连跑两次，各咬一口，两次都是「要文件，拿到一屏文字」）：
+	//   「给我一份会议通知的Word文档模板」   → intent=docgen action=template_only skill=-
+	//   「帮我生成请假申请单Word文档并填入…」→ intent=docgen action=fill         skill=-
+	// 两条都从「命中技能」那段旁边绕过去了：上面那道纠偏闸门建在 `if eval.SkillSlug != ""`
+	// **里面**，而这一格压根没进那道门，于是直接落到「3. plain chat (no skill)」——
+	// 用户要 Word，拿到一屏文字，没有文件、没有报错、也没有一句说明。
+	//
+	// 意图是模型给的（docgen = 本轮要出文件），技能却是空的。这时正确的兜底是
+	// 拿一个能出文件的技能接着干，而不是当作「用户想聊天」。
+	// 「明说只要正文」照例让路（ExplicitTextOnly）——交付形态是用户亲手写的判据。
+	if eval.SkillSlug == "" && !agent.ExplicitTextOnly(req.Message) &&
+		strings.EqualFold(strings.TrimSpace(eval.Intent), "docgen") {
+		dsc := h.eng.PickDocGenSkill(req.Message)
+		if dsc != nil {
+			fmt.Fprintf(os.Stderr, "[route] intent=docgen 但分类器没命中技能 → 兜底到文档生成技能 %s\n", dsc.Slug)
+			// needs 是照「空技能」算出来的（本来就是空的），保险起见清一遍
+			eval.Needs = nil
+			eval.SkillSlug = dsc.Slug
+			// 换路由必须让用户看见（前端 meta.note 有「说明」渲染通道）
+			write(evMeta, jsonSafe(map[string]string{
+				"reason": eval.Reason, "skill": dsc.Slug, "intent": eval.Intent, "mode": mode,
+				"note": "本轮要交付文件，已用「" + dsc.Name + "」生成。",
+			}))
+		} else {
+			// 一个能出文件的技能都没有：把话说明白，别把「要文件」当「要正文」。
+			fmt.Fprintf(os.Stderr, "[route] intent=docgen 但技能库里没有可用的文档生成技能（且分类器没命中技能）\n")
+			write(evDelta, jsonSafe(map[string]string{
+				"t": "当前技能库里没有可用的「文档生成」技能，无法产出 Word/Excel 文件；下面输出正文。\n\n",
+			}))
+		}
+	}
+
 	if eval.SkillSlug != "" {
 		sc, lerr := h.eng.LoadSkill(eval.SkillSlug)
 		if lerr != nil {
