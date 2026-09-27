@@ -642,8 +642,13 @@
   function addAssistant(skillName) {
     const wrap = el('div', 'ch-msg assistant');
     const av = avatarNode('a');
-    const right = el('div');
-    right.style.flex = '1';
+    // 右侧正文槽用 .ch-body 而不是内联 flex:1：
+    //   内联 flex:1 的 flex 项默认 min-width:auto，**不肯缩到内容最小宽度以下**。
+    //   正文里出现单行很长的代码块时，最小内容宽度 = 那一整行（实测 3941px），
+    //   于是这个槽被撑到 4000px、气泡 max-width:78% 也跟着算到 3105px，
+    //   整个对话列被横向拉长（.ch-scroll 出现横向滚动条，输入框宽度不变但正文全飞出去）。
+    //   .ch-body 里补了 min-width:0 —— 槽可以收缩，气泡回到 78% 上限。
+    const right = el('div', 'ch-body');
     if (skillName) {
       const p = el('div', 'ch-pill');
       p.innerHTML = '✦ <em>正在使用技能</em> · <span>' + esc(skillName) + '</span>';
@@ -1362,8 +1367,7 @@
     // 文件以独立、可见的 assistant 侧消息出现（有头像、不受气泡/折叠面板影响）
     const wrap = el('div', 'ch-msg assistant');
     const av = avatarNode('a');
-    const right = el('div');
-    right.style.flex = '1';
+    const right = el('div', 'ch-body');   // 同 addAssistant：flex:1 + min-width:0，别用内联 flex
     const box = el('div', 'atx');
     box.innerHTML = downloadLinkHtml(obj);
     right.appendChild(box);

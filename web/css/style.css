@@ -705,6 +705,12 @@ select.ch-field-ctl { appearance: none; }
 
 /* message bubbles */
 .ch-msg { display: flex; margin: 26px 0; animation: ch-in .3s ease; align-items: flex-start; }
+/* 正文列（头像右边的槽）。flex:1 只是"填满剩余宽度"，
+   min-width:0 才是"允许被压到比内容更窄" —— 少了它，正文里一条超长代码行
+   的最小内容宽度会把整个槽撑到 4000px，对话列横向拉长（见 js/chat.js addAssistant）。
+   2026-09-27 实测：加之前 bubble=3105px / .ch-col=860 / docScroll 正常但列内横向滚动 4170px；
+   加之后 bubble=599（78% 上限）、pre 内部自动换行。 */
+.ch-body { flex: 1 1 0%; min-width: 0; }
 .ch-msg.user { justify-content: flex-end; }
 .ch-avatar {
   width: 32px; height: 32px; border-radius: 10px; flex-shrink: 0;
@@ -788,6 +794,13 @@ select.ch-field-ctl { appearance: none; }
   margin: .7em 0; padding: 11px 14px; overflow-x: auto;
   background: var(--bg-soft); border: 1px solid var(--line-soft); border-radius: 8px;
   line-height: 1.6; font-size: 12.5px;
+  /* 长行一律**换行**，不横向溢出。
+     `white-space: pre-wrap` 保留代码的换行与缩进、同时允许在行尾折行；
+     `overflow-wrap: anywhere` 让"一整行没有一个空格"的长 token（超长 SQL、
+     一长串 base64/URL）也能从任意字符处断开 —— 否则它照样能把气泡顶出去。
+     只留 overflow-x:auto 是旧行为：代码块内部横向滚动条，用户看到的是
+     "整块代码被裁掉一半、要左右拖"，2026-09-27 按要求改为自动换行。 */
+  white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
 }
 .ch-bubble pre code { padding: 0; background: none; border: none; font-size: inherit; }
 .ch-bubble blockquote {
