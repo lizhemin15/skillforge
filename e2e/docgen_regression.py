@@ -29,6 +29,10 @@ import urllib.request
 
 # ---------- 可命中 docgen 的请求模板（不同格式, 含填写场景） ----------
 # (标签, 用户消息, 期望格式, 期望签名校验函数, 关键词)
+#
+# 带「公文版式」标记的用例额外校验：正文里必须**同时**出现仿宋_GB2312 与
+# 首行缩进 2 字符，且不许出现 markdown 记号。这是 2026-09-27 用户反馈
+# 「生成 word 没按公文格式、直接把 markdown 放进去了」的线上判据。
 REQUESTS = [
     # --- 空白模板下发（无数据 → 空表） ---
     ("Excel空白模板", "帮我生成一份员工信息登记表的Excel空白模板，列：姓名、部门、岗位、入职日期",
@@ -40,6 +44,8 @@ REQUESTS = [
      "excel", None, ["张三", "李四", "技术部"]),
     ("Word填写生成", "帮我生成请假申请单Word文档并填入：张伟，请假2天，2026年9月10日到11日，事假，理由家里有事",
      "word", None, ["张伟"]),
+    ("Word公文版式", "生成一份Word：《关于开展2026年度安全生产大检查工作的通知》，要有主送单位、正文分一二三四部分、落款单位和日期",
+     "word", None, ["检查"], True),
     ("PDF填写生成", "生成一份供货商对账单的PDF文档，列：供应商、采购单号、到货日期、应付金额",
      "pdf", None, ["供应商", "采购单号"]),
     ("PPT演示文稿", "生成一份季度汇报的PPT演示文稿",
@@ -107,6 +113,27 @@ def is_valid_office(data, fmt):
     return False, f"未知格式 {fmt}"
 
 
+def check_gongwen(data):
+    """公文版式校验：正文仿宋_GB2312 + 首行缩进 2 字符 + 无 markdown 记号。"""
+    try:
+        z = zipfile.ZipFile(io.BytesIO(data))
+        x = z.read("word/document.xml").decode("utf-8", "replace")
+    except Exception as e:
+        return False, f"读 document.xml 失败: {e}"
+    if "仿宋_GB2312" not in x:
+        return False, "正文不是仿宋_GB2312（没有按公文版式排）"
+    if 'firstLineChars="200"' not in x:
+        return False, "正文没有首行缩进 2 字符"
+    if "方正小标宋简体" not in x:
+        return False, "标题不是小标宋（公文标题字体）"
+    import re as _re
+    text = "".join(_re.findall(r"<w:t[^>]*>(.*?)</w:t>", x, _re.S))
+    for bad in ("##", "**", "| ---"):
+        if bad in text:
+            return False, f"markdown 记号 {bad!r} 原样进了文档"
+    return True, "公文版式 OK"
+
+
 def check_content(data, fmt, keywords):
     """填写生成路径校验：关键数据是否真实写入文件。
 
@@ -135,7 +162,7 @@ def check_content(data, fmt, keywords):
     return True, ""
 
 
-def run_case(base, label, msg, fmt, _sign, keywords, timeout=160):
+def run_case(base, label, msg, fmt, _sign, keywords, gongwen=False, timeout=160):
     """执行单个用例，返回 (通过, 详情dict)。"""
     body = json.dumps({"session_id": f"e2e-{fmt}-{datetime.datetime.now().microsecond}",
                        "message": msg}).encode()
@@ -157,6 +184,10 @@ def run_case(base, label, msg, fmt, _sign, keywords, timeout=160):
     ok2, msg2 = check_content(data, fmt, keywords)
     if not ok2:
         return False, {"error": msg2, "name": fname, "bytes": len(data)}
+    if gongwen:
+        ok3, msg3 = check_gongwen(data)
+        if not ok3:
+            return False, {"error": msg3, "name": fname, "bytes": len(data)}
     return True, {"name": fname, "bytes": len(data), "sig": sig}
 
 
@@ -182,8 +213,8 @@ def main():
     rows = []
 
     # 功能用例
-    for label, msg, fmt, _s, kws in REQUESTS:
-        ok, detail = run_case(base, label, msg, fmt, None, kws)
+    for label, msg, fmt, _s, kws, *rest in REQUESTS:
+        ok, detail = run_case(base, label, msg, fmt, None, kws, bool(rest and rest[0]))
         if ok:
             passed += 1
             rows.append(f"  ✅ {label:<18} name={detail['name']}  bytes={detail['bytes']}  {detail['sig']}")
