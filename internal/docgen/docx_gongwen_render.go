@@ -126,118 +126,30 @@ func docxTable(rows [][]string, shade string) string {
 	return b.String()
 }
 
-// renderWordBody 把 parags 按公文规则铺成正文块。
+// renderWordBody 把 parags 铺成 Word 正文块。
 //
-// title 用来做去重：模型经常把标题同时写进 title 字段和第一条 parags，
-// 用户看到的是一份标题出现两遍的文档。
+// 结构判定全部在 gongwenBlocks（gongwen_block.go）里做完，这里只负责
+// 「把这一块画成什么 Word 样式」——PDF / PPT 用的是同一份块，见那边的注释。
 func renderWordBody(W func(string), parags []string, title string) {
-	lines := flattenLines(parags)
-	titleNorm := mdPlainText(title)
-
-	// 落款识别：末尾最多两行里，形如单位名或成文日期的行右对齐。
-	signFrom := -1
-	{
-		nonEmpty := make([]int, 0, len(lines))
-		for i, l := range lines {
-			if strings.TrimSpace(l) != "" {
-				nonEmpty = append(nonEmpty, i)
-			}
+	for _, b := range gongwenBlocks(parags, title) {
+		switch b.kind {
+		case blockTable:
+			W(docxTable(b.rows, ""))
+		case blockRecipient:
+			W(docxPara(b.runs, paraOpt{}))
+		case blockSignoff:
+			W(docxPara(b.runs, paraOpt{align: "right"}))
+		case blockH1:
+			W(docxPara(b.runs, paraOpt{font: fontH1, indent: true}))
+		case blockH2:
+			W(docxPara(b.runs, paraOpt{font: fontH2, indent: true}))
+		case blockH3:
+			W(docxPara(b.runs, paraOpt{indent: true}))
+		case blockBullet, blockOrdered:
+			W(docxPara(b.runs, paraOpt{indent: true}))
+		default:
+			W(docxPara(b.runs, paraOpt{indent: true}))
 		}
-		if n := len(nonEmpty); n >= 2 {
-			start := nonEmpty[n-2]
-			ok := true
-			for _, idx := range nonEmpty[n-2:] {
-				t := mdPlainText(lines[idx])
-				if !reDateLine.MatchString(t) && !(len([]rune(t)) <= 30 && reSignUnit.MatchString(t)) {
-					ok = false
-					break
-				}
-			}
-			if ok {
-				signFrom = start
-			}
-		}
-	}
-
-	bodyStarted := false
-	for i := 0; i < len(lines); i++ {
-		raw := strings.TrimSpace(lines[i])
-		if raw == "" || reHRule.MatchString(raw) {
-			continue
-		}
-
-		// markdown 表格：连续若干 | 行合成一张真表格
-		if isTableRow(raw) {
-			rows := make([][]string, 0, 4)
-			j := i
-			for j < len(lines) && isTableRow(lines[j]) {
-				if !isTableSep(lines[j]) {
-					rows = append(rows, splitTableRow(lines[j]))
-				}
-				j++
-			}
-			W(docxTable(rows, ""))
-			bodyStarted = true
-			i = j - 1
-			continue
-		}
-
-		// 引用：去掉 > 记号，按正文排
-		if m := reQuote.FindStringSubmatch(raw); m != nil {
-			raw = strings.TrimSpace(m[1])
-			if raw == "" {
-				continue
-			}
-		}
-
-		text := mdPlainText(raw)
-
-		// 标题去重：与 title 完全一致的行不再重复排一遍；
-		// 「标题：xxx」这类行同样是重复信息（文档已经有标题了），整行丢掉。
-		if reTitlePref.MatchString(raw) || text == titleNorm || (titleNorm != "" && strings.HasPrefix(titleNorm, text) && len([]rune(text)) >= 8) {
-			continue
-		}
-
-		// 主送单位：正文开始前、以冒号结尾的短行，顶格排，不缩进。
-		if !bodyStarted && strings.HasSuffix(text, "：") && len([]rune(text)) <= 40 && !reH1CN.MatchString(text) {
-			W(docxPara(mdInlineRuns(raw), paraOpt{}))
-			continue
-		}
-
-		if i >= signFrom && signFrom >= 0 {
-			W(docxPara(mdInlineRuns(raw), paraOpt{align: "right"}))
-			continue
-		}
-
-		switch headingKind(raw) {
-		case 1:
-			W(docxPara(mdInlineRuns(strings.TrimSpace(reHeadingMD.ReplaceAllString(raw, "$2"))), paraOpt{font: fontH1, indent: true}))
-			bodyStarted = true
-			continue
-		case 2:
-			W(docxPara(mdInlineRuns(strings.TrimSpace(reHeadingMD.ReplaceAllString(raw, "$2"))), paraOpt{font: fontH2, indent: true}))
-			bodyStarted = true
-			continue
-		case 3:
-			W(docxPara(mdInlineRuns(strings.TrimSpace(reHeadingMD.ReplaceAllString(raw, "$2"))), paraOpt{indent: true}))
-			bodyStarted = true
-			continue
-		}
-
-		// 无序列表：marker 换成圆点，整段左缩进两个字符
-		if m := reListItem.FindStringSubmatch(raw); m != nil {
-			W(docxPara(append([]mdRun{{Text: "• "}}, mdInlineRuns(m[1])...), paraOpt{indent: true}))
-			bodyStarted = true
-			continue
-		}
-		if m := reOrdered.FindStringSubmatch(raw); m != nil {
-			W(docxPara(append([]mdRun{{Text: m[1] + ". "}}, mdInlineRuns(m[2])...), paraOpt{indent: true}))
-			bodyStarted = true
-			continue
-		}
-
-		W(docxPara(mdInlineRuns(raw), paraOpt{indent: true}))
-		bodyStarted = true
 	}
 }
 

@@ -25,6 +25,7 @@ import io
 import zipfile
 import argparse
 import datetime
+import shutil
 import urllib.request
 
 # ---------- 可命中 docgen 的请求模板（不同格式, 含填写场景） ----------
@@ -47,9 +48,11 @@ REQUESTS = [
     ("Word公文版式", "生成一份Word：《关于开展2026年度安全生产大检查工作的通知》，要有主送单位、正文分一二三四部分、落款单位和日期",
      "word", None, ["检查"], True),
     ("PDF填写生成", "生成一份供货商对账单的PDF文档，列：供应商、采购单号、到货日期、应付金额",
-     "pdf", None, ["供应商", "采购单号"]),
+     "pdf", None, ["供应商", "采购单号"], "pdf"),
+    ("PDF公文版式", "生成一份PDF：《数据治理专项培训安排》，正文用 markdown 写：## 一、培训对象；## 二、时间安排；并附一张「分组/人数」表",
+     "pdf", None, ["培训"], "pdf"),
     ("PPT演示文稿", "生成一份季度汇报的PPT演示文稿",
-     "ppt", None, []),
+     "ppt", None, [], "ppt"),
 ]
 
 
@@ -134,6 +137,54 @@ def check_gongwen(data):
     return True, "公文版式 OK"
 
 
+def check_pdf_text(data):
+    """PDF 版式校验（有 pdftotext 才做）：正文不许带 markdown 记号。
+
+    为什么要读渲染后的文字：PDF 是 CID 编码，Go 单测里读不出文字，
+    「## 一、」到底有没有画到页面上，只有把产物解出来看才算数。
+    """
+    exe = shutil.which("pdftotext")
+    if not exe:
+        return True, "跳过（本机没有 pdftotext）"
+    import tempfile, subprocess, os
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(data)
+        path = f.name
+    try:
+        out = subprocess.run([exe, "-layout", path, "-"], capture_output=True, timeout=60)
+        text = out.stdout.decode("utf-8", "replace")
+    except Exception as e:
+        return False, f"pdftotext 失败: {e}"
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if not text.strip():
+        return False, "PDF 里读不出任何文字（字体没嵌进去？）"
+    for bad in ("##", "**", "| ---"):
+        if bad in text:
+            return False, f"markdown 记号 {bad!r} 画到了 PDF 页面上"
+    return True, "PDF 版式 OK"
+
+
+def check_ppt(data):
+    """PPT 校验：解包看每张幻灯片上的文字，不许带 markdown 记号。"""
+    try:
+        z = zipfile.ZipFile(io.BytesIO(data))
+    except Exception as e:
+        return False, f"解 pptx 失败: {e}"
+    import re as _re
+    text = ""
+    for n in z.namelist():
+        if _re.match(r"^ppt/slides/slide\d+\.xml$", n):
+            text += z.read(n).decode("utf-8", "replace")
+    for bad in ("##", "**", "| ---"):
+        if bad in text:
+            return False, f"幻灯片上残留 markdown 记号 {bad!r}"
+    return True, "PPT 版式 OK"
+
+
 def check_content(data, fmt, keywords):
     """填写生成路径校验：关键数据是否真实写入文件。
 
@@ -162,7 +213,7 @@ def check_content(data, fmt, keywords):
     return True, ""
 
 
-def run_case(base, label, msg, fmt, _sign, keywords, gongwen=False, timeout=160):
+def run_case(base, label, msg, fmt, _sign, keywords, extra=None, timeout=160):
     """执行单个用例，返回 (通过, 详情dict)。"""
     body = json.dumps({"session_id": f"e2e-{fmt}-{datetime.datetime.now().microsecond}",
                        "message": msg}).encode()
@@ -184,8 +235,16 @@ def run_case(base, label, msg, fmt, _sign, keywords, gongwen=False, timeout=160)
     ok2, msg2 = check_content(data, fmt, keywords)
     if not ok2:
         return False, {"error": msg2, "name": fname, "bytes": len(data)}
-    if gongwen:
+    if extra == "gongwen":
         ok3, msg3 = check_gongwen(data)
+        if not ok3:
+            return False, {"error": msg3, "name": fname, "bytes": len(data)}
+    elif extra == "pdf":
+        ok3, msg3 = check_pdf_text(data)
+        if not ok3:
+            return False, {"error": msg3, "name": fname, "bytes": len(data)}
+    elif extra == "ppt":
+        ok3, msg3 = check_ppt(data)
         if not ok3:
             return False, {"error": msg3, "name": fname, "bytes": len(data)}
     return True, {"name": fname, "bytes": len(data), "sig": sig}
@@ -214,7 +273,7 @@ def main():
 
     # 功能用例
     for label, msg, fmt, _s, kws, *rest in REQUESTS:
-        ok, detail = run_case(base, label, msg, fmt, None, kws, bool(rest and rest[0]))
+        ok, detail = run_case(base, label, msg, fmt, None, kws, rest[0] if rest else None)
         if ok:
             passed += 1
             rows.append(f"  ✅ {label:<18} name={detail['name']}  bytes={detail['bytes']}  {detail['sig']}")
