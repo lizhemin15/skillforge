@@ -246,18 +246,24 @@ func readUpload(h *multipart.FileHeader) ([]byte, bool) {
 	return b, len(b) > 0
 }
 
-// TrainLite 是「极简创建」通道：用户只给一份写作指南 + 若干篇范文。
+// TrainLite 是「极简创建」通道：用户只给一份（或几份）素材文档，里面同时含写作
+// 指南和范文——哪段是指南、哪几段是范文由服务端自解析（skillgen.SplitLiteMaterial），
+// 前端不再分两个输入框。
 //
-// multipart 字段（前四项都是普通表单值，后两项是文件）：
-// name/slug（可空，空则从材料推断）、guide（粘贴的指南正文）、
-// examples（粘贴的范文，多篇用一行 --- 分隔）、guide_doc（指南文件，单份）、
-// example_files（范文文件，多份，前端同名多选）。
-// 范文的文本与文件用**不同字段名**：同名虽然 multipart 能分开存，但下一个看代码的
-// 人一定会以为 examples 是文件列表，改错一处就是「范文读不出来」这种哑故障。
+// multipart 字段：
+//
+//	name / slug —— 普通表单值，都可空（空则从材料推断）；
+//	material    —— 粘贴的素材全文（指南 + 范文可以混在一起）；
+//	material_files —— 上传的素材文档（多份，前端同名多选）。
+//
+// 为什么粘贴与上传用**不同字段名**：同名虽然 multipart 能分开存，但下一个看代码的
+// 人一定会以为 material 是文件列表，改错一处就是「素材读不出来」这种哑故障。
+// 两边都给时不是二选一：粘贴的和上传的都会参与自解析（见 collectLiteMaterial），
+// 常见用法就是「把指南粘进框里 + 拖几篇范文文件进来」。
 //
 // 为什么单开一个端点而不是给 Train 加个 mode 参数：
 //  1. 必填规则正好相反——Train 缺 name/requirement 直接 400，而极简通道这两项都由
-//     材料推断（用户手上只有指南和范文，逼他先想技能名是本末倒置）。塞进同一个
+//     材料推断（用户手上只有素材，逼他先想技能名是本末倒置）。塞进同一个
 //     handler，两套必填规则会在同一个 if 里互相打架。
 //  2. 失败语义不同——极简通道允许「AI 精炼失败但技能已经可用」，那是 done 帧不是
 //     error 帧；混在一起最容易在某个分支上把「可用」报成「失败」。
@@ -272,20 +278,10 @@ func (a *Admin) TrainLite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "表单过大或无效")
 		return
 	}
-	// 指南只取第一份：两份指南的硬约束常常互相矛盾（一份说 800 字、一份说 1500 字），
-	// 静默挑一份合并比直接报错危险得多。
-	guideFileName := ""
+	// 上传件不再分「这是指南 / 这是范文」：每一份都当成一份可能同时含指南和范文的
+	// 材料，交给 SplitLiteMaterial 自解析。所以这里只做搬运，不做分类判断。
 	var files []*skillgen.UploadedFile
-	for _, h := range r.MultipartForm.File["guide_doc"] {
-		b, ok := readUpload(h)
-		if !ok {
-			continue
-		}
-		guideFileName = h.Filename
-		files = append(files, &skillgen.UploadedFile{Filename: h.Filename, Content: string(b)})
-		break
-	}
-	for _, h := range r.MultipartForm.File["example_files"] {
+	for _, h := range r.MultipartForm.File["material_files"] {
 		b, ok := readUpload(h)
 		if !ok {
 			continue
@@ -298,27 +294,18 @@ func (a *Admin) TrainLite(w http.ResponseWriter, r *http.Request) {
 	// 从指南标题推断名字——技能名和目录名就双双退化成时间戳。别在传参层替它做决定。
 	slugRaw := strings.TrimSpace(r.FormValue("slug"))
 	in := &skillgen.LiteInput{
-		Name:      strings.TrimSpace(r.FormValue("name")),
-		Guide:     strings.TrimSpace(r.FormValue("guide")),
-		Examples:  skillgen.SplitLiteExamples(r.FormValue("examples")),
-		Files:     files,
-		GuideFile: guideFileName,
+		Name:     strings.TrimSpace(r.FormValue("name")),
+		Material: strings.TrimSpace(r.FormValue("material")),
+		Files:    files,
 	}
 	if slugRaw != "" {
 		in.Slug = skillgen.Slugify(slugRaw)
 	}
-	// 预检只看「材料给没给」，不看「够不够长」：长度是素材门禁的判据，它要在 SSE 里
-	// 报出来（用户需要看到是「指南太短」还是「范文读不出来」），而不是一个 400 就没了。
-	exFileN := len(files)
-	if guideFileName != "" {
-		exFileN--
-	}
-	if in.Guide == "" && guideFileName == "" {
-		writeErr(w, http.StatusBadRequest, "缺写作指南：请粘贴指南正文，或上传指南文件")
-		return
-	}
-	if len(in.Examples) == 0 && exFileN <= 0 {
-		writeErr(w, http.StatusBadRequest, "缺范文：请粘贴至少一篇范文（多篇用一行 --- 分隔），或上传范文文件")
+	// 预检只看「材料给没给」，不看「够不够长 / 切不切得开」：长度和切法是素材门禁的
+	// 判据，要在 SSE 里报出来（用户需要看到是「指南不足」还是「范文读不出来」、
+	// 这次是怎么判读的），而不是一个 400 就没了。
+	if in.Material == "" && len(files) == 0 {
+		writeErr(w, http.StatusBadRequest, "缺素材：请粘贴含写作指南和范文的内容，或上传素材文档")
 		return
 	}
 

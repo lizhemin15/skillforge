@@ -404,20 +404,24 @@ def main():
             post_json(base, '/api/admin/llms/active', {'id': cid}, tok)
         print('假模型已配为当前 LLM ✓ id=%s' % cid)
 
-        # ---- ① 极简创建：一份指南 + 两篇范文 ----
+        # ---- ① 极简创建：**一份**材料里同时含指南和范文（用户的主要用法）----
+        # 素材侧只剩一个字段（material）：哪段是指南、哪几段是范文由服务端自解析。
+        # 这里刻意把两者写在同一个字符串里，逼自解析真跑一遍 —— 分成两个字段喂进去
+        # 就绕过了这次改动的全部风险点（切错时技能照样生成，只是硬约束少一半）。
         guide = ('# 会议纪要写作指南\n\n'
                  '1. 首段写清会议主题、时间、地点、参会人。\n'
                  '2. 决议事项必须写清责任人与完成时限，缺一不可。\n'
                  '3. 不得描写会议气氛，不得出现主观评价。\n'
                  '4. 不得出现素材里没有的日期、人名和数字。\n'
                  '5. 全篇 400~800 字。\n' * 3)
-        examples = ('---\n# 示例纪要一\nQ3 复盘会于 9 月 1 日在三楼会议室召开，产品与研发共 12 人参加。'
+        examples = ('## 范文\n\n'
+                    '# 示例纪要一\nQ3 复盘会于 9 月 1 日在三楼会议室召开，产品与研发共 12 人参加。'
                     '会议决定：由张工在 9 月 20 日前完成接口对齐。\n'
                     '---\n# 示例纪要二\n安全例会于 9 月 8 日召开，安全组 6 人参加。'
                     '会议决定：由李四在 9 月 30 日前完成隐患排查。\n')
+        material = guide + '\n' + examples
         n0 = fake.mark()
-        resp = post_multipart(base, '/api/admin/train/lite',
-                              {'guide': guide, 'examples': examples}, tok)
+        resp = post_multipart(base, '/api/admin/train/lite', {'material': material}, tok)
         lite = read_train_sse(resp)
         if not check('L1 极简创建成功（done 帧带 slug）', bool(lite['done'].get('slug')),
                      'error=%r 帧类型=%s 步骤=%s' % (lite['error'], lite['types'], lite['steps'][-3:])):
@@ -428,6 +432,24 @@ def main():
         check('L2 极简创建这一步只花 1 次模型调用（内网 token 慢）',
               [r['kind'] for r in fake.since(n0)] == ['lite'],
               [r['kind'] for r in fake.since(n0)])
+        # 自解析必须自己把指南/范文切开：切错的后果是技能「看起来正常但少一半硬约束」，
+        # 所以这里盯步骤原文里的两个数（指南字数 / 范文篇数），不只看「有没有 done」。
+        parse_steps = [s for s in lite['steps'] if '素材自解析' in s or '范文' in s]
+        check('L3 单文档素材被自解析成「指南 + 2 篇范文」',
+              any('范文 2 篇' in s for s in parse_steps),
+              '步骤原文=%s' % parse_steps)
+        check('L4 自解析说清了是怎么切的（切法可见）',
+              any('显式' in s or '分隔' in s or '判为' in s for s in parse_steps),
+              '步骤原文=%s' % parse_steps)
+        # 切错时最危险的形态不是报错，而是「整篇当指南」：技能照样生成、范文 0 篇，
+        # 用户以为成了。所以这里断言报出的指南字数就是素材里那段指南的字数 ——
+        # 切歪了（把范文并进指南）这个数会明显偏大。
+        m5 = re.search(r'指南 (\d+) 字', ' '.join(parse_steps))
+        guide_chars = int(m5.group(1)) if m5 else -1
+        check('L5 指南字数与素材里的指南段一致（没把范文并进指南）',
+              0 < guide_chars <= len(guide) * 1.1,
+              'SSE 报 %d 字；素材里指南 %d 字、材料总长 %d 字'
+              % (guide_chars, len(guide), len(material)))
 
         # ---- ② 零材料一轮：一句话指令，分类器一条 needs 都不报 ----
         sid = 'zg-' + uuid.uuid4().hex[:8]

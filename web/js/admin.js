@@ -490,20 +490,19 @@
     selectedFiles = []; renderTags();
   });
 
-  // ---------- lite: 极简创建（写作指南 + 范文 → 秒级可用）----------
-  // 只要求两样东西：一份写作指南、至少一篇范文。技能名由材料推断（用户手上就这两份
-  // 东西，逼他先想技能名是本末倒置）。后端的做法是先本地装盘让技能立刻能用，
-  // 再用 1 次模型调用精炼措辞 —— 内网 token 慢，用户不该为了「等 AI 想名字」而卡住。
-  let liteFiles = [];      // 范文文件（可多份）
-  let liteGuideDoc = null; // 指南文件（只留一份，两份指南的硬约束会互相打架）
+  // ---------- lite: 极简创建（一份素材 → 秒级可用）----------
+  // 只要一样东西：一份素材。写作指南和范文可以混在同一份文档里（用户原话：「这些可能
+  // 都是混在一个文档里面的……技能创建的时候自行解析」），所以这里只有一个输入框 +
+  // 一个多文件拖放区，不再要求用户区分「哪份是指南、哪份是范文」——我们自己切。
+  // 技能名同样由材料推断（用户手上就这一份文档，逼他先想技能名是本末倒置）。
+  // 后端的做法是先本地装盘让技能立刻能用，再用 1 次模型调用精炼措辞 —— 内网 token 慢，
+  // 用户不该为了「等 AI 想名字」而卡住。
+  let liteFiles = []; // 素材文件（可多份：一份含指南+范文的文档，或一份指南+N 篇范文）
   function renderLiteTags() {
     $('lt-tags').innerHTML = liteFiles.map((f, i) =>
       `<span class="file-tag">${esc(f.name)} <button onclick="liteRmFile(${i})">✕</button></span>`).join('');
-    $('lt-guide-tag').innerHTML = liteGuideDoc
-      ? `<span class="file-tag">${esc(liteGuideDoc.name)} <button onclick="liteRmGuide()">✕</button></span>` : '';
   }
   window.liteRmFile = (i) => { liteFiles.splice(i, 1); renderLiteTags(); };
-  window.liteRmGuide = () => { liteGuideDoc = null; $('lt-guide-file').value = ''; renderLiteTags(); };
   function liteAddFiles(files) {
     for (const f of files) liteFiles.push(f);
     renderLiteTags();
@@ -515,21 +514,23 @@
     d.addEventListener('dragleave', () => d.classList.remove('over'));
     d.addEventListener('drop', e => { e.preventDefault(); d.classList.remove('over'); liteAddFiles(e.dataTransfer.files); });
     fi.addEventListener('change', () => liteAddFiles(fi.files));
-    $('lt-guide-pick').addEventListener('click', () => $('lt-guide-file').click());
-    $('lt-guide-file').addEventListener('change', () => {
-      const f = $('lt-guide-file').files[0];
-      if (f) { liteGuideDoc = f; renderLiteTags(); }
-    });
   }
 
   $('lite-form').addEventListener('submit', async (e) => {
     e.preventDefault();
+    // 素材是唯一必填项：粘贴的和拖进来的都算，两样都空就别白跑一趟（后端也会拦，
+    // 但本地拦一下能让用户立刻看到原因，而不是等一次 SSE 往返）。
+    const material = ($('lt-material').value || '').trim();
+    if (!material && liteFiles.length === 0) {
+      const log = $('lt-log');
+      log.style.display = 'block';
+      log.innerHTML = '<div class="line bad">🟡 先给点素材：把写作指南和范文贴进来，或者拖入文档（指南和范文混在一份里也行）</div>';
+      return;
+    }
     const fd = new FormData();
     fd.append('name', $('lt-name').value || '');
-    fd.append('guide', $('lt-guide').value || '');
-    fd.append('examples', $('lt-examples').value || '');
-    if (liteGuideDoc) fd.append('guide_doc', liteGuideDoc);
-    for (const f of liteFiles) fd.append('example_files', f);
+    fd.append('material', material);
+    for (const f of liteFiles) fd.append('material_files', f);
     await runTrainStream({
       url: '/api/admin/train/lite', fd,
       makePinner: () => makeLivePinner($('skill-new'), $('lt-log')),
@@ -560,7 +561,7 @@
         loadManageSkills();
       },
     });
-    liteFiles = []; liteGuideDoc = null; renderLiteTags();
+    liteFiles = []; $('lt-file').value = ''; renderLiteTags();
   });
 
   // ---------- skill management ----------
@@ -1375,7 +1376,9 @@
   window.newSkillView = () => {
     $('skill-new-mask').style.display = 'flex';
     $('skill-new-mask').classList.remove('hidden');
-    nsTab('train');
+    // 默认落在极简创建：它是唯一一条「点下去就有东西能用」的通道，内网慢 token
+    // 环境下另外两条都要等模型，不该让用户一进来先面对等。
+    nsTab('lite');
     // clear train form
     try { $('train-form').reset(); } catch (_) {}
     selectedFiles = []; try { renderTags(); } catch (_) {}
@@ -1386,11 +1389,11 @@
     // clear manual form
     $('ns-slug').value = ''; $('ns-name').value = ''; $('ns-cat').value = ''; $('ns-desc').value = ''; $('ns-prompt').value = '';
     $('ns-msg').textContent = ''; $('ns-msg').className = 'msg';
-    // clear lite form：极简通道有自己的文件列表（liteFiles/liteGuideDoc），
-    // 不跟着 train 的 selectedFiles 走，复位必须单独清 —— 否则上一场选的范文
-    // 会跟着下一次提交一起传上去，用户会以为新技能里混进了旧材料。
+    // clear lite form：极简通道有自己的文件列表（liteFiles），不跟着 train 的
+    // selectedFiles 走，复位必须单独清 —— 否则上一场选的素材会跟着下一次提交一起
+    // 传上去，用户会以为新技能里混进了旧材料。
     try { $('lite-form').reset(); } catch (_) {}
-    liteFiles = []; liteGuideDoc = null; try { renderLiteTags(); } catch (_) {}
+    liteFiles = []; try { renderLiteTags(); } catch (_) {}
     $('lt-log').style.display = 'none'; $('lt-log').innerHTML = '';
     $('lt-result').style.display = 'none';
     $('lt-go').disabled = false;
