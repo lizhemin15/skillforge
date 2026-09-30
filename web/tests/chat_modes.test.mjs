@@ -100,13 +100,19 @@ const TYPE_META = (() => {
 const quickExample = bind(CHAT_JS, 'function quickExample(', ['TYPE_META'], [TYPE_META]);
 const askFor = bind(CHAT_JS, 'function askFor(', ['quickExample'], [quickExample]);
 const shortAskLabel = bind(CHAT_JS, 'function shortAskLabel(');
+// MODES 也从出货文件抠：chipPlan 用它把脏档位归一成 quick（三档的兜底规则）
+const MODES = (() => {
+  const m = CHAT_JS.match(/const\s+MODES\s*=\s*\[[^\]]*\]/);
+  if (!m) throw new Error('抽不到常量：MODES');
+  return new Function(m[0] + '\nreturn MODES;')();
+})();
 // allSkills 是运行态闭包变量 —— 这里当成参数注入，等价于"索引已加载"的状态。
 const buildChipPlan = (allSkills = []) => {
   const askedFor = bind(CHAT_JS, 'function askedFor(',
     ['askFor', 'allSkills', 'shortAskLabel'], [askFor, allSkills, shortAskLabel]);
   return bind(CHAT_JS, 'function chipPlan(',
-    ['CHIP_HINT', 'askedFor', 'askFor', 'quickExample'],
-    [CHIP_HINT, askedFor, askFor, quickExample]);
+    ['CHIP_HINT', 'MODES', 'askedFor', 'askFor', 'quickExample'],
+    [CHIP_HINT, MODES, askedFor, askFor, quickExample]);
 };
 // runChip 依赖 pickSkill/clearSkill/setMode/setInput/submit 这些动作，这里全部换成
 // 探针 —— 测的是"点了 chip 有没有接到该接的动作"，不是那几个动作自身的行为。
@@ -165,6 +171,12 @@ console.log('聊天方式 · 请求体（Bug U）');
   check('自动模式 mode=auto', a.mode === 'auto', JSON.stringify(a));
   check('自动模式不残留 skill', a.skill === '', JSON.stringify(a));
 
+  // 极速档：系统提示词直驱，跟技能库无关 —— skill 必须干净，
+  // 否则后端会按"带了 slug"升技能，两阶段链路整个走错。
+  const q = JSON.parse(chatPayload('s1', 'quick', { slug: '采购合同', name: '采购合同' })('写段招聘启事'));
+  check('极速档 mode=quick', q.mode === 'quick', JSON.stringify(q));
+  check('★ 极速档不残留 skill（残留=后端误判成技能调度）', q.skill === '', JSON.stringify(q));
+
   // 手动但没选技能：不许把空 slug 当"指定技能"发出去
   const n = JSON.parse(chatPayload('s1', 'manual', null)('随便'));
   check('手动未选技能时 skill 为空', n.skill === '');
@@ -175,6 +187,8 @@ console.log('聊天方式 · 发送守卫（Bug W）');
   check('手动+未选技能 → 拦住', sendBlocked('manual', null) === true);
   check('手动+已选技能 → 放行', sendBlocked('manual', { slug: 'x' }) === false);
   check('自动+未选技能 → 放行', sendBlocked('auto', null) === false);
+  // 极速档没有"先选技能"这一步：任何残留都不许挡住发送
+  check('★ 极速档永远放行（没有前置选择）', sendBlocked('quick', null) === false && sendBlocked('quick', { slug: 'x' }) === false);
 
   // Bug X（升级版）：被拦住那一帧必须让用户看见"差一步"，而且要**给出出路**。
   // 面板重做之后，"出路"就是勾选层 —— 抖只是"看这里"，开层才是"这里能解决"。
@@ -456,7 +470,7 @@ console.log('技能勾选层 · 接线（层会不会被清掉 / 关掉）');
     /skQ\.addEventListener\('keydown'[\s\S]{0,400}?filterSkills\(allSkills, skQ\.value\)\[0\]/.test(CHAT_JS));
   // ★ 手动档没选技能点发送 → 除了抖，还要把层打开（否则用户还是不知道去哪选）
   check('★ 发送被拦时打开勾选层', /sendBlocked\(chatMode, pickedSkill\)[\s\S]{0,300}?openSkLayer\(\)/.test(CHAT_JS));
-  check('切回自动档时收掉层', /chatMode === 'auto'\)\s*closeSkLayer\(\)/.test(CHAT_JS));
+  check('切回 quick/auto 档时收掉层', /chatMode !== 'manual'\) closeSkLayer\(\);/.test(CHAT_JS));
   check('发出去之后收掉层', /input\.value = ''[\s\S]{0,120}?closeSkLayer\(\)/.test(CHAT_JS));
   check('技能库到货时补渲染层（用户手快先开了层）', /if \(skOpen\) renderSkLayer\(\)/.test(CHAT_JS));
   check('层有页脚说明"勾了会怎样"（不写就像个多选过滤器）', /skFoot\.textContent/.test(CHAT_JS));
@@ -487,26 +501,27 @@ console.log('推荐行 · LLM 精修是"可失败的旁路"');
     || /renderChips\(\);?\s*\n\s*refineChips\(\);/.test(CHAT_JS));
 }
 
-console.log('聊天界面 · 单胶囊双档');
+console.log('聊天界面 · 单胶囊三档');
 {
-  for (const id of ['ch-switch', 'ch-switch-thumb', 'mode-auto', 'mode-manual', 'chips', 'chat-input', 'chat-send']) {
+  for (const id of ['ch-switch', 'ch-switch-thumb', 'mode-quick', 'mode-auto', 'mode-manual', 'chips', 'chat-input', 'chat-send']) {
     check(`index.html 有 #${id}`, INDEX_HTML.includes('id="' + id + '"'));
   }
-  check('两种方式都有文案', INDEX_HTML.includes('自动调度') && INDEX_HTML.includes('指定技能'));
+  check('三档文案齐全', INDEX_HTML.includes('快速开始') && INDEX_HTML.includes('自动调度') && INDEX_HTML.includes('指定技能'));
+  // 极速档必须排第一：它既是默认档，也是这一站的主体功能
+  const iQ = INDEX_HTML.indexOf('id="mode-quick"'), iA = INDEX_HTML.indexOf('id="mode-auto"');
+  check('★ 快速开始排在最前（默认主体功能）', iQ > 0 && iA > 0 && iQ < iA, `quick@${iQ} auto@${iA}`);
   // ⚠️ 不能假设属性顺序：HTML 里 class 写在 id 前面，按 id 在前拼正则会恒假红。
   const tagOf = (id) => (INDEX_HTML.match(new RegExp('<button[^>]*id="' + id + '"[^>]*>')) || [''])[0];
-  const autoTag = tagOf('mode-auto'), manualTag = tagOf('mode-manual');
-  check('两档按钮都在', !!autoTag && !!manualTag);
-  check('默认档=自动调度', /\bis-on\b/.test(autoTag));
-  check('另一档默认不亮', manualTag && !/\bis-on\b/.test(manualTag));
-  check('两档默认 aria-selected 与视觉一致',
-    /aria-selected="true"/.test(autoTag) && /aria-selected="false"/.test(manualTag));
+  const quickTag = tagOf('mode-quick'), autoTag = tagOf('mode-auto'), manualTag = tagOf('mode-manual');
+  check('三档按钮都在', !!quickTag && !!autoTag && !!manualTag);
+  check('默认档=快速开始', /\bis-on\b/.test(quickTag));
+  check('另外两档默认不亮', manualTag && !/\bis-on\b/.test(manualTag) && !/\bis-on\b/.test(autoTag));
+  check('三档默认 aria-selected 与视觉一致',
+    /aria-selected="true"/.test(quickTag) && /aria-selected="false"/.test(autoTag) && /aria-selected="false"/.test(manualTag));
+  // 档位开关的数据源必须包含三档全集（setMode 归一化靠它）
+  check('chat.js 有 MODES 三档常量', /const MODES = \['quick', 'auto', 'manual'\]/.test(CHAT_JS));
+  check('★ chatMode 初始值走 savedMode()（localStorage 不可用也落回 quick）', /let chatMode = savedMode\(\);/.test(CHAT_JS));
 
-  // ★ 选中态漏网之鱼（补防）：上面几条只断言了**静态 HTML 的初始态**，
-  // 而 JS 切换时 toggle 的是另一个类名（'on'），CSS 认的却是 'is-on' →
-  // 滑块照滑、aria 照改，文字选中态一动不动，HTML 预置的 is-on 谁也摘不掉，
-  // 界面就永远像停在「自动调度」上：不报错、控制台干净，只有人眼能发现。
-  // 断言不看注释怎么写，类名两侧都从出货文件里读真值 —— 改一边不改另一边即红。
   {
     const mm = CHAT_JS.match(/const ON_CLASS\s*=\s*'([^']+)'/);
     const ON = mm ? mm[1] : '';
@@ -514,13 +529,14 @@ console.log('聊天界面 · 单胶囊双档');
     check('★ 该类名在 style.css 里有对应选择器',
       !!ON && STYLE_CSS.includes('.ch-switch-opt.' + ON), 'ON=' + ON);
     const clsOf = (tag) => ((tag.match(/class="([^"]*)"/) || [])[1] || '').split(/\s+/).filter(Boolean);
-    const autoCls = clsOf(autoTag), manCls = clsOf(manualTag);
-    check('静态初始态：自动档只带「基础类+选中类」两个 token',
-      autoCls.length === 2 && autoCls.includes('ch-switch-opt') && autoCls.includes(ON), autoCls.join(' '));
-    check('静态初始态：另一档不带选中类',
-      manCls.length === 1 && manCls[0] === 'ch-switch-opt', manCls.join(' '));
+    const qCls = clsOf(quickTag), autoCls = clsOf(autoTag), manCls = clsOf(manualTag);
+    check('静态初始态：快速档只带「基础类+选中类」两个 token',
+      qCls.length === 2 && qCls.includes('ch-switch-opt') && qCls.includes(ON), qCls.join(' '));
+    check('静态初始态：另外两档不带选中类',
+      autoCls.length === 1 && autoCls[0] === 'ch-switch-opt' && manCls.length === 1 && manCls[0] === 'ch-switch-opt',
+      autoCls.join(' ') + ' / ' + manCls.join(' '));
 
-    // 跑真函数而不是抄一份：两档各切一次，看类名跟不跟着走、旧档摘没摘干净
+    // 跑真函数而不是抄一份：三档各切一次，看类名跟不跟着走、旧档摘没摘干净
     const mkBtn = () => {
       const set = new Set();
       return { set, attrs: {},
@@ -528,46 +544,58 @@ console.log('聊天界面 · 单胶囊双档');
         setAttribute(k, v) { this.attrs[k] = v; } };
     };
     const run = (mode) => {
-      const A = mkBtn(), M = mkBtn();
-      bind(CHAT_JS, 'function paintMode(', ['ON_CLASS'], [ON])(mode, A, M);
-      return { A, M };
+      const Q = mkBtn(), A = mkBtn(), M = mkBtn();
+      bind(CHAT_JS, 'function paintMode(', ['ON_CLASS'], [ON])(mode, Q, A, M);
+      return { Q, A, M };
     };
+    const rq = run('quick');
+    check('快速档：选中档带上 CSS 类', rq.Q.set.has(ON));
+    check('快速档：另两档不亮', !rq.A.set.has(ON) && !rq.M.set.has(ON));
     const ra = run('auto');
     check('自动档：选中档带上 CSS 类', ra.A.set.has(ON));
-    check('自动档：另一档不亮', !ra.M.set.has(ON));
+    check('自动档：另两档不亮', !ra.Q.set.has(ON) && !ra.M.set.has(ON));
     const rm = run('manual');
     check('指定技能档：选中档带上 CSS 类', rm.M.set.has(ON));
-    check('★ 切档后旧档选中态被摘掉（否则两档同时亮）', !rm.A.set.has(ON));
+    check('★ 切档后旧档选中态被摘干净（不许两档同时亮）', !rm.Q.set.has(ON) && !rm.A.set.has(ON));
+    check('aria-selected 跟着视觉走（快速档）',
+      rq.Q.attrs['aria-selected'] === 'true' && rq.A.attrs['aria-selected'] === 'false' && rq.M.attrs['aria-selected'] === 'false');
     check('aria-selected 跟着视觉走（自动档）',
-      ra.A.attrs['aria-selected'] === 'true' && ra.M.attrs['aria-selected'] === 'false');
+      ra.A.attrs['aria-selected'] === 'true' && ra.Q.attrs['aria-selected'] === 'false');
     check('aria-selected 跟着视觉走（指定技能档）',
-      rm.M.attrs['aria-selected'] === 'true' && rm.A.attrs['aria-selected'] === 'false');
+      rm.M.attrs['aria-selected'] === 'true' && ra.Q.attrs['aria-selected'] === 'false');
 
     // 视觉同步只能有一处：setMode 必须调 paintMode，不能再悄悄 toggle 别的类名
     const sm = extractFn(CHAT_JS, 'function setMode(');
-    check('setMode 走 paintMode', /paintMode\(chatMode, modeAuto, modeManual\)/.test(sm || ''));
+    check('setMode 走 paintMode（三档全量传入）', /paintMode\(chatMode, modeQuick, modeAuto, modeManual\)/.test(sm || ''));
     check('setMode 里不再直接 toggle 别的类名', !!sm && !/classList\.toggle\('on'/.test(sm));
+    check('★ setMode 把脏档位归一到 quick（localStorage 里的旧值不会炸）', /MODES\.includes\(m\) \? m : 'quick'/.test(sm || ''));
+    check('★ 切到 quick/auto 档时收掉技能层', /chatMode !== 'manual'\) closeSkLayer\(\);/.test(sm || ''));
   }
 
   // 滑块几何必须实测：写死 50% 在字体回退/窄屏下会错位（滑块压住文字/留半格）
   check('滑块宽度用实测 offsetWidth', /thumb\.style\.width = [^;]*offsetWidth/.test(CHAT_JS));
   check('滑块位移用实测 offsetLeft', /translateX\([^)]*offsetLeft/.test(CHAT_JS));
-  check('宽度为 0 时不动（字体未就绪不写死错值）', /if \(!thumb \|\| !modeAuto \|\| !modeAuto\.offsetWidth\) return;/.test(CHAT_JS));
-  // 直接跑：两档宽度不同 → 位移应等于两按钮左缘之差，宽度应等于当前档按钮宽度
+  check('宽度为 0 时不动（字体未就绪不写死错值）', /if \(!thumb \|\| !modeQuick \|\| !modeQuick\.offsetWidth\) return;/.test(CHAT_JS));
+  // 直接跑：三档宽度不同 → 位移以第一颗（quick）为基准，宽度应等于当前档按钮宽度
   {
     const mk = (w, left) => ({ offsetWidth: w, offsetLeft: left, style: {} });
-    const A = mk(84, 3), M = mk(90, 87);
+    const Q = mk(72, 3), A = mk(84, 78), M = mk(90, 165);
     const thumbStub = { style: {} };
-    const run = (mode) => new Function('chatMode', 'thumb', 'modeAuto', 'modeManual',
-      'return ' + extractFn(CHAT_JS, 'function syncThumb('))(mode, thumbStub, A, M)();
+    const run = (mode) => new Function('chatMode', 'thumb', 'modeQuick', 'modeAuto', 'modeManual',
+      'return ' + extractFn(CHAT_JS, 'function syncThumb('))(mode, thumbStub, Q, A, M)();
     // ⚠️ 上面那两个括号不是手滑：new Function(...) 拿到的是「返回该函数的工厂」，
     // 少调一次就等于把 syncThumb 当无参函数跑掉，样式对象永远空 —— 看着像功能坏了。
+    run('quick');
+    check('快速档：滑块基准=0（它在最左，位移必须是 0px）',
+      thumbStub.style.width === '72px' && thumbStub.style.transform === 'translateX(0px)',
+      JSON.stringify(thumbStub.style));
     run('auto');
-    check('自动档：滑块宽=该档宽、位移=0', thumbStub.style.width === '84px' && thumbStub.style.transform === 'translateX(0px)',
+    check('自动档：滑块宽=该档宽、位移=quick与auto左缘之差',
+      thumbStub.style.width === '84px' && thumbStub.style.transform === 'translateX(75px)',
       JSON.stringify(thumbStub.style));
     run('manual');
-    check('手动档：滑块宽=该档宽、位移=两档左缘之差',
-      thumbStub.style.width === '90px' && thumbStub.style.transform === 'translateX(84px)',
+    check('手动档：滑块宽=该档宽、位移以 quick 为基准',
+      thumbStub.style.width === '90px' && thumbStub.style.transform === 'translateX(162px)',
       JSON.stringify(thumbStub.style));
   }
   // role=tablist 的可达性：方向键也要能切档
@@ -631,6 +659,83 @@ console.log('聊天方式 · 技能失效降级说明');
     CHAT_JS.split('appendText(bubble, metaNoteLine(obj))').length - 1 === 1);
   check('不再直接用 obj.note 拼引用行（免得又挪回 trace 里面）',
     !CHAT_JS.includes('if (obj.note) appendText(bubble'));
+}
+
+console.log('极速档 · 推荐行（quick 分支）');
+{
+  // 极速档的推荐行必须与技能库解耦：不掺技能 = 不暗示"这里也能选技能"。
+  const q0 = chipPlan({ skills: SKILLS, mode: 'quick', picked: null, turns: 0 });
+  check('空态给三条"最可能要写的"问话', q0.items.filter((c) => c.kind === 'ask').length === 3,
+    JSON.stringify(q0.items.map((c) => c.label)));
+  check('空态不掺任何技能类 chip', !q0.items.some((c) => c.kind === 'pick' || c.kind === 'again' || c.kind === 'skillpick'),
+    JSON.stringify(q0.items.map((c) => c.kind)));
+  check('空态抬头用 quick 档文案', q0.hint === CHIP_HINT.quick, q0.hint);
+
+  const q2 = chipPlan({ skills: SKILLS, mode: 'quick', picked: null, turns: 2 });
+  check('有产出后给修改方向的快捷句', q2.items.some((c) => /精简/.test(c.label)) && q2.items.some((c) => /正式/.test(c.label)));
+  check('对话中也不超过 4 颗', q2.items.length <= 4, 'len=' + q2.items.length);
+  const qa = chipPlan({ skills: SKILLS, mode: 'quick', picked: null, turns: 2, askedBack: true });
+  check('模型追问时第一条是"就按你的思路写"', qa.items[0].kind === 'ask' && /按你的思路/.test(qa.items[0].send));
+
+  // 脏数据/残缺状态不炸：skills 没到、mode 缺省时 quick 兜底（归一化的意义）
+  const bare = chipPlan({ mode: 'quick', turns: 0 });
+  check('skills 缺省不炸', bare.items.length === 3);
+  const dirty = chipPlan({ skills: SKILLS, mode: 'QUICK', turns: 0 });
+  check('大写脏档位归一成 quick（不落进 auto 分支）', dirty.hint === CHIP_HINT.quick, dirty.hint);
+  const undef = chipPlan({ skills: SKILLS, turns: 0 });
+  check('mode 缺省时归一成 quick（默认主体功能）', undef.hint === CHIP_HINT.quick, undef.hint);
+}
+
+console.log('极速档 · 接线（输入框 / MCP / 轨迹面板）');
+{
+  // 输入框占位语按档切换：quick 档的第一句话就该是"直接开写"
+  check('PLACEHOLDER 有 quick 档', /quick:\s*'说说你想写什么，直接开写/.test(CHAT_JS));
+  check('CHIP_HINT 有 quick 档', CHIP_HINT.quick && typeof CHIP_HINT.quick === 'string');
+  check('setMode 会把占位语切过去', /input\.placeholder = PLACEHOLDER\[chatMode\]/.test(CHAT_JS));
+
+  // MCP 入口在 quick 档必须隐藏：后端闸门不开，入口还在就是空头承诺
+  const rmc = extractFn(CHAT_JS, 'function renderMCP(');
+  check('★ renderMCP 在 quick 档整段隐藏 MCP 入口',
+    /if \(chatMode === 'quick'\) \{ mcpBox\.hidden = true; closeMCPLayer\(\); return; \}/.test(rmc || ''), String(rmc && rmc.slice(0, 400)));
+  check('setMode 切档会重算 MCP 可见性', /renderMCP\(\);[\s\S]{0,80}renderChips\(\);/.test(extractFn(CHAT_JS, 'function setMode(') || ''));
+
+  // 轨迹面板：quick 档的徽章表必须与后端 phase 逐字对齐（generate/review）
+  const aq = CHAT_JS.match(/const AGENTS_QUICK = \{[\s\S]*?\n  \};/);
+  check('有 AGENTS_QUICK 表', !!aq);
+  check('★ AGENTS_QUICK 覆盖后端两相 generate/review',
+    !!aq && /generate:/.test(aq[0]) && /review:/.test(aq[0]), aq && aq[0]);
+  check('★ renderTrace 按档选徽章表（quick 走 AGENTS_QUICK）',
+    /trace\.dataset\.mode === 'quick'\s*\n\s*\? AGENTS_QUICK/.test(CHAT_JS));
+
+  // wireModes 绑定了三颗按钮（少绑一颗=那档点不动）
+  check('wireModes 绑定 quick 按钮', /modeQuick\.addEventListener\('click', \(\) => setMode\('quick'\)\)/.test(CHAT_JS));
+  check('initModes 从 localStorage 恢复失败时落回 quick', /const m = savedMode\(\);/.test(CHAT_JS)
+    && /\(m === 'auto' \|\| m === 'manual' \|\| m === 'quick'\) \? m : 'quick'/.test(CHAT_JS));
+  check('存档的旧档位（auto/manual）仍被 MODES 认可', /const MODES = \['quick', 'auto', 'manual'\]/.test(CHAT_JS));
+}
+
+console.log('极速档 · 管理端配置系统提示词');
+{
+  const ADMIN_HTML = readFileSync(join(WEB, 'admin.html'), 'utf8');
+  const ADMIN_JS = readFileSync(join(WEB, 'js', 'admin.js'), 'utf8');
+
+  // 管理端表单骨架
+  for (const id of ['quick-prompt', 'quick-form', 'quick-save', 'quick-reset', 'quick-count', 'quick-msg']) {
+    check(`admin.html 有 #${id}`, ADMIN_HTML.includes('id="' + id + '"'), id);
+  }
+  check('管理端卡片标题明确是系统提示词', ADMIN_HTML.includes('极速写作') && ADMIN_HTML.includes('系统提示词'));
+  check('说明里讲清了"清空=恢复默认"（不写没人敢清空）', /清空保存 = 恢复内置默认/.test(ADMIN_HTML));
+
+  // 前后端契约：上限 8000 字必须两端一致（上次 20000/8000 不一致就是从这漏出去的）
+  check('★ 管理端字数上限与后端一致（8000）', /\/ 8000 字/.test(ADMIN_HTML)
+    && /v\.length > 8000/.test(ADMIN_JS));
+  check('超限当场红字（不发请求才叫当场）', /超过 8000 字/.test(ADMIN_JS));
+  // 保存前剥 \r：后端 cleanPromptText 拒 CR，Windows 记事本粘贴必踩
+  check('★ 保存前把 \\r 剥掉（后端拒 CR，Windows 粘贴必踩）', /\.replace\(\/\\r\/g, ''\)/.test(ADMIN_JS));
+  check('GET /api/admin/quick 拉取', /fetch\('\/api\/admin\/quick'[,}]/.test(ADMIN_JS));
+  check('PUT /api/admin/quick 保存', /fetch\('\/api\/admin\/quick', \{\s*method: 'PUT'/.test(ADMIN_JS));
+  check('拉取回显 is_custom（用户看得见现在是不是内置默认）', /is_custom/.test(ADMIN_JS));
+  check('进入管理页就拉一次配置', /loadQuick\(\);/.test(ADMIN_JS));
 }
 
 if (failures) { console.log(`\n${failures} 项失败`); process.exit(1); }

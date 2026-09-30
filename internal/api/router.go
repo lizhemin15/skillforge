@@ -30,6 +30,7 @@ type Handler struct {
 	Auth   *Auth
 	Acc    *Account
 	Site   *Site
+	Quick  *Quick
 	Chat   *chatHandler
 	Eng    *agent.Engine // exposed so admin can hot-swap the engine LLM
 	gen    *genCache     // one-time generated-file store for docgen delivery
@@ -86,7 +87,7 @@ func NewHandler(s *store.SkillStore, l *llm.Client, secret string) (*Handler, er
 	}
 
 	return &Handler{
-		Skills: skills, Admin: admin, Auth: auth, Acc: NewAccount(s, auth), Site: NewSite(s),
+		Skills: skills, Admin: admin, Auth: auth, Acc: NewAccount(s, auth), Site: NewSite(s), Quick: NewQuick(s),
 		Chat: &chatHandler{eng: eng, gen: genCache, tools: toolReg, mcp: mcpMgr, maxRound: toolMaxRounds()}, Eng: eng,
 		gen: genCache,
 	}, nil
@@ -178,6 +179,11 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/site", h.Site.Get)
 	mux.HandleFunc("GET /api/admin/site", h.Auth.Middleware(h.Site.GetAdmin))
 	mux.HandleFunc("PUT /api/admin/site", h.Auth.Middleware(h.Site.Update))
+	// 极速写作·系统提示词：与 site 同一套「读现值 + 写生效」的对称契约，
+	// 但 GET/PUT 都要鉴权——site 的 GET 必须公开（未登录也要看到站名），
+	// 提示词没有这个约束，访客不需要也不应该读到它（生成时服务端现读）。
+	mux.HandleFunc("GET /api/admin/quick", h.Auth.Middleware(h.Quick.GetAdmin))
+	mux.HandleFunc("PUT /api/admin/quick", h.Auth.Middleware(h.Quick.UpdateAdmin))
 	// 管理员账号：页面里改用户名/密码。改密要验当前密码（见 account.go 注释）。
 	mux.HandleFunc("GET /api/admin/account", h.Auth.Middleware(h.Acc.Get))
 	mux.HandleFunc("PUT /api/admin/account", h.Auth.Middleware(h.Acc.Update))

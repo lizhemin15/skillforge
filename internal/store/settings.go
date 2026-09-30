@@ -15,6 +15,9 @@ import (
 const (
 	SettingSiteName    = "site_name"
 	SettingSiteTagline = "site_tagline"
+	// SettingQuickPrompt 极速写作模式（首页「快速开始」档）的系统提示词。
+	// 管理端可改；用户端每次生成都按它起草 + 自检，改完全站立即生效（服务端现读现用）。
+	SettingQuickPrompt = "quick_prompt"
 )
 
 // 站点名称默认值。
@@ -23,11 +26,27 @@ const (
 	DefaultSiteTagline = "智能写作工坊"
 )
 
+// DefaultQuickPrompt 极速写作的默认系统提示词。
+//
+// 设计取舍：管理员把它当「写作规范」来配（文体、口吻、结构要求），而不是当
+// 角色扮演词。所以默认值给的是**可执行的成稿要求清单**，方便照着改；
+// 自检阶段拿同一份提示词当评分标准，判断成稿是否达标。
+const DefaultQuickPrompt = `你是一名写作助手。请根据用户的材料和要求直接写出成稿。
+
+写作要求：
+1. 开门见山，先给结论或正文，不要输出"好的，我来帮您"之类的开场白
+2. 语言简洁自然，用短句，少用形容词堆砌
+3. 结构清晰：篇幅超过 300 字时分段或使用小标题
+4. 只写用户要求的内容，不添加未经要求的分析、总结或免责声明
+5. 用户没给的信息用【待补充：xxx】标注，不要自行编造事实、数字、人名
+6. 成稿末尾不要输出任何"希望对您有帮助"式的收尾语`
+
 // settingsDefaults 是「DB 里没有这个键时」的兜底值。
 // 只有列在这里的键才有默认值；不在表里的键读出来是空串。
 var settingsDefaults = map[string]string{
 	SettingSiteName:    DefaultSiteName,
 	SettingSiteTagline: DefaultSiteTagline,
+	SettingQuickPrompt: DefaultQuickPrompt,
 }
 
 // GetSettings 读出给定的设置项，缺失的键用默认值兜底（没有默认值则为空串）。

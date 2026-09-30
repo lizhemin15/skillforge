@@ -76,16 +76,20 @@
       <div class="ch-chips" id="chips" aria-live="polite"></div>
     </div>
 
-    <!-- 输入区：框内只有一个胶囊，滑动在「自动调度 / 指定技能」两档之间 -->
+    <!-- 输入区：框内只有一个胶囊，滑动在「快速开始 / 自动调度 / 指定技能」三档之间 -->
     <div class="ch-input-bar">
       <div class="ch-input-box">
         <!-- 对话方式胶囊独占第一行（.ch-mrow 是整行）。
              它原来和 textarea 挤在同一行 → 输入框被推到右边、宽度只剩 630/860，
              用户要求「输入框应当占据所有的位置」，所以拆行。 -->
         <div class="ch-mrow">
-          <div class="ch-switch" id="ch-switch" data-mode="auto">
+          <!-- 三档对话方式，快速开始在最前且默认选中：这一站的主体功能就是「帮忙写作」，
+               极速版 = 管理端配置的系统提示词直接起草 + 自检两步，不绕技能库/意图分类/MCP。
+               自动调度/指定技能是完整版能力，按钮保留，用户想要再切过去。 -->
+          <div class="ch-switch" id="ch-switch" data-mode="quick">
             <span class="ch-switch-thumb" id="ch-switch-thumb" aria-hidden="true"></span>
-            <button type="button" class="ch-switch-opt is-on" id="mode-auto" data-mode="auto" role="tab" aria-selected="true">自动调度</button>
+            <button type="button" class="ch-switch-opt is-on" id="mode-quick" data-mode="quick" role="tab" aria-selected="true">快速开始</button>
+            <button type="button" class="ch-switch-opt" id="mode-auto" data-mode="auto" role="tab" aria-selected="false">自动调度</button>
             <button type="button" class="ch-switch-opt" id="mode-manual" data-mode="manual" role="tab" aria-selected="false">指定技能</button>
           </div>
           <!-- MCP 数据源入口：只在管理员开了至少一台、且这台握手成功时出现（JS 控制 hidden）。
@@ -116,6 +120,6 @@
 
 <script src="/assets/vendor/marked/marked.min.js?v=20260909I"></script>
 <script src="/assets/js/site.js?v=20260911M"></script>
-<script src="/assets/js/chat.js?v=20260927A"></script>
+<script src="/assets/js/chat.js?v=20260930A"></script>
 </body>
 </html>

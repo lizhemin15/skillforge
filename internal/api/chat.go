@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -133,6 +134,14 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if manualSkill != nil {
 		seed = agent.ManualSteps(manualSkill)
 	}
+	// 极速档骨架：没有意图分析（没有技能可分）。两步 = 这一档的全部流程，
+	// t≈0 就把「起草 → 自检」画出来，用户知道它在干什么、还剩几步。
+	if mode == "quick" {
+		seed = []agent.TraceStep{
+			{Phase: "generate", Label: "① 极速起草", Detail: "按站点的写作要求直接动笔…", Status: "active"},
+			{Phase: "review", Label: "② 自检", Detail: "对照要求核对这版成稿", Status: "pending"},
+		}
+	}
 	clock := newTraceClock(write, seed)
 	defer clock.Freeze() // 兜底：任何分支（含 error 早退）都必须让心跳停下
 
@@ -151,6 +160,14 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// recovery: a follow-up "把部门改成市场部" must still see the prior fill
 	// markers even after a long conversation trimmed the in-memory window.
 	fullHist := h.eng.FullSession(req.SessionID)
+
+	// 1. 极速写作档：到此分叉，不再往下走技能/工具那套编排。
+	//    fullHist 原样传下去（fill 续编辑场景不适用这档，但传着无害），
+	//    history 用于多轮：用户按自检提示补充信息后，下一轮能接着上一版改。
+	if mode == "quick" {
+		h.serveQuick(write, clock, ctx, req, history, mode)
+		return
+	}
 
 	// 1. orchestrator: decide skill
 	//    手动模式下技能已经定了，直接合成 Eval —— 这一步是「指定技能」按钮的全部价值：
@@ -733,13 +750,87 @@ plainPath:
 	write(evDone, jsonSafe(map[string]string{"skill": ""}))
 }
 
+// serveQuick 极速写作档（mode=quick）：用户点「快速开始」后的全部流程。
+//
+// 只有两跳，全部绕开技能库 / 意图分类 / MCP 工具：
+//
+//	① QuickDraft  拿管理端配置的系统提示词当写作要求直接起草（流式进气泡）；
+//	② QuickReview 拿同一份提示词当评分标准自检：
+//	  达标 → 结束；不达标 → 稿子照给，把「不足 + 需补充」清单追加在稿子后面
+//	  （用户要求的行为原样：告知不足与需要补充的信息，而不是自动重写一遍）。
+//
+// trace 骨架（t≈0 已画好的 ①起草/②自检）在这里逐步定格，字段与
+// AGENTS_QUICK（web/js/chat.js）按 mode=quick 对齐。
+func (h *chatHandler) serveQuick(write func(string, string), clock *traceClock, ctx context.Context, req chatReq, history []agent.Message, mode string) {
+	// meta：前端轨迹面板按 mode=quick 切角色表；intent=write 只影响
+	// 「没给 skill 时的兜底徽章」，极速档徽章恒空，无副作用。
+	write(evMeta, jsonSafe(map[string]string{
+		"reason": "极速写作：按站点的系统提示词直接起草并自检", "skill": "", "intent": "write",
+		"mode": mode, "note": "",
+	}))
+
+	prompt := h.eng.QuickPrompt()
+
+	// ① 起草：正文流式进气泡；关思考链（极速档的意义，见 QuickDraft 注释）。
+	draft, err := h.eng.QuickDraft(ctx, req.SessionID, req.Message, history, prompt, func(delta string) {
+		write(evDelta, jsonSafe(map[string]string{"t": delta}))
+	})
+	if err != nil {
+		write(evError, jsonSafe(map[string]string{"error": "生成失败: " + err.Error()}))
+		return
+	}
+	// 起草收口、自检开跑。Set 会清掉上一阶段攒的材料（换阶段语义，见 traceClock.Set）。
+	genDone := []agent.TraceStep{
+		{Phase: "generate", Label: "① 极速起草", Detail: "成稿已生成", Status: "done"},
+		{Phase: "review", Label: "② 自检", Detail: "对照站点的写作要求核对这版成稿…", Status: "active"},
+	}
+	clock.Set(genDone)
+
+	// ② 自检。QuickReview 内部把一切失败都消化成 nil（=当通过），
+	// 这里拿到的只有三种：nil / Pass / 不达标清单。
+	verdict := h.eng.QuickReview(ctx, req.Message, draft, prompt)
+	full := draft
+	switch {
+	case verdict == nil:
+		genDone[1].Status = "done"
+		genDone[1].Detail = "自检未返回结论，成稿已直接交付"
+		clock.Set(genDone)
+	case verdict.Pass:
+		genDone[1].Status = "done"
+		genDone[1].Detail = "自检通过：成稿满足站点的写作要求"
+		clock.Set(genDone)
+	default:
+		note := agent.QuickReviewNote(verdict)
+		genDone[1].Status = "done"
+		genDone[1].Detail = "自检未通过：不足与需补充的信息已附在成稿后"
+		clock.Set(genDone)
+		full = draft + note
+		// 稿子已经在气泡里流完了，附注部分单独补流进去 ——
+		// 前端 appendText 是全量重渲染 markdown，追加即可。
+		write(evDelta, jsonSafe(map[string]string{"t": note}))
+	}
+
+	// 成稿（含自检附注）落历史：下一轮「补充信息」要能接着这一版改，
+	// 而不是从零再写。Kind 沿用产物标记（续编辑要把正文逐字找回）。
+	h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: full, Kind: agent.ArtifactKind(full), At: time.Now()})
+	clock.Finish()
+	write(evDone, jsonSafe(map[string]string{"skill": ""}))
+}
+
 // resolveMode 把手动模式解析成"真正要用的技能 + 生效模式 + 给用户的一句说明"。
 // 抽成纯函数是为了能单独测：这里错一步，用户要么会看到"锁定了 A 技能却按 B 出结果"，
 // 要么会看到"技能已经没了，界面一声不吭地换了技能"。
 // load 传 nil 或返回错误都当成"技能不可用"，退回自动调度并给出原因。
+//
+// quick（极速写作）必须**原样直通**而不是回落 auto：它是独立的执行路径
+// （不走技能库、不走意图分类），回落 auto 等于把用户「点快速开始」这个动作
+// 静默丢掉，改跑意图分类那套慢流程——界面显示的还是「快速开始」，货不对板。
 func resolveMode(mode, slug string, load func(string) (*agent.SkillContent, error)) (*agent.SkillContent, string, string) {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	slug = strings.TrimSpace(slug)
+	if mode == "quick" {
+		return nil, "quick", ""
+	}
 	if mode != "manual" || slug == "" || load == nil {
 		return nil, "auto", ""
 	}

@@ -78,6 +78,33 @@ func TestResolveModeNilLoaderDoesNotPanic(t *testing.T) {
 	}
 }
 
+// 极速档直通：不碰技能库、不产生降级说明，slug 传了也不理。
+// 这是全站默认档（前端 chatMode 初始值就是 quick），它要是被归一化成
+// auto，用户的第一次对话就会莫名其妙走进意图分类——「快速开始」直接失效。
+func TestResolveModeQuickPassThrough(t *testing.T) {
+	cases := []struct {
+		name, mode, slug string
+	}{
+		{"标准 quick", "quick", ""},
+		{"脏输入也要认", "  QUICK ", "采购合同"},
+		{"带了 slug 也不许升技能", "quick", "公司新闻通稿"},
+	}
+	for _, c := range cases {
+		sc, mode, note := resolveMode(c.mode, c.slug, func(s string) (*agent.SkillContent, error) {
+			return &agent.SkillContent{Slug: s}, nil
+		})
+		if sc != nil {
+			t.Fatalf("%s: 极速档不许带技能（带了就变成多智能体调度，链路全错）: %v", c.name, sc)
+		}
+		if mode != "quick" {
+			t.Fatalf("%s: 模式应为 quick，实际 %q", c.name, mode)
+		}
+		if note != "" {
+			t.Fatalf("%s: 极速档不该有降级说明，实际 %q", c.name, note)
+		}
+	}
+}
+
 // 降级原因要出现在 t≈0 那一帧（步骤骨架），不能拖到几十秒后的 meta 事件。
 // 用户在锁定的技能失效时，第一秒就该知道"现在跑的是自动调度"。
 func TestAnalyzeDetailCarriesDegradeReason(t *testing.T) {

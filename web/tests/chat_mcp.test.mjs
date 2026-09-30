@@ -255,9 +255,9 @@ function runRenderMCP(serversIn, pickedIn, initialHidden = true) {
   const storage = fakeStorage(pickedIn ? { 'skillforge.mcp': JSON.stringify(pickedIn) } : {});
   const currentMCPIds = () => mcpPayloadIds(readMCPPick(storage), serversIn);
   const fn = bind(CHAT_JS, 'function renderMCP()',
-    ['mcpBox', 'mcpBtn', 'mcpLabel', 'mcpList', 'mcpFoot', 'mcpServers', 'el',
+    ['chatMode', 'mcpBox', 'mcpBtn', 'mcpLabel', 'mcpList', 'mcpFoot', 'mcpServers', 'el',
       'currentMCPIds', 'mcpBtnText', 'closeMCPLayer'],
-    [dom.mcpBox, dom.mcpBtn, dom.mcpLabel, dom.mcpList, dom.mcpFoot, serversIn,
+    ['auto', dom.mcpBox, dom.mcpBtn, dom.mcpLabel, dom.mcpList, dom.mcpFoot, serversIn,
       fakeEl, currentMCPIds, mcpBtnText, () => { spy.closed++; }]);
   fn();
   return Object.assign(dom, { spy });

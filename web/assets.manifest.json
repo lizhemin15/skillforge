@@ -10,15 +10,15 @@
       ]
     },
     "/assets/js/admin.js": {
-      "v": "20260928A",
-      "sha256": "679f9973f46bb4848ce24f75386384a9fdc95a4e168829a97c64f3a558407679",
+      "v": "20260930A",
+      "sha256": "d175d4945e3dba292411696cc49c19180f2ae0d9da7ee4593521de33162d1b2a",
       "in": [
         "admin.html"
       ]
     },
     "/assets/js/chat.js": {
-      "v": "20260927A",
-      "sha256": "897e5f1a17e6ab5ad40978372e520aafe2b77ae3a0d5bde1dd8d7a19e65cc34d",
+      "v": "20260930A",
+      "sha256": "916c39c1dc4a13b48da9fb41e61a51674048b3a86b3d5eab60812bb293a859e7",
       "in": [
         "index.html"
       ]

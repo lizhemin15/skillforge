@@ -48,6 +48,7 @@
     loadMCP();
     loadManageSkills();
     loadSite();
+    loadQuick();
     loadAccount();
   }
 
@@ -1611,6 +1612,68 @@
     siteResetBtn.addEventListener('click', () => {
       $('site-name').value = ''; $('site-tagline').value = '';
       saveSite({ name: '', tagline: '' }, '已恢复默认');
+    });
+  }
+
+  // ---------- quick（极速写作 · 系统提示词）----------
+  // 用户端「快速开始」档的唯一能力来源：管理端这段话会在每次对话里当系统提示词用，
+  // 起草、自检两步都对照它。GET /api/admin/quick 返回 { prompt, is_custom, default }。
+  // 与 site 同一个坑位设计：清空保存 = 用回内置默认（default 字段回填，前端不硬编码）。
+  function showQuickMsg(text, cls) {
+    const m = $('quick-msg');
+    if (!m) return;
+    m.className = 'msg ' + (cls || '');
+    m.textContent = text;
+  }
+
+  function quickCount() {
+    const ta = $('quick-prompt'), c = $('quick-count');
+    if (!ta || !c) return;
+    c.textContent = String(ta.value.length);
+    c.style.color = ta.value.length > 8000 ? 'var(--bad,#c0392b)' : '';
+  }
+
+  async function loadQuick() {
+    if (!$('quick-prompt')) return;
+    try {
+      const r = await fetch('/api/admin/quick', { headers: authHdr() });
+      const j = await r.json();
+      if (!r.ok) { showQuickMsg(j.error || '读取失败', 'err'); return; }
+      $('quick-prompt').value = j.prompt || '';
+      quickCount();
+      showQuickMsg(j.is_custom ? '当前为自定义提示词' : '当前为内置默认提示词');
+    } catch (err) { showQuickMsg('网络错误', 'err'); }
+  }
+
+  async function saveQuick(payload, okText) {
+    showQuickMsg('保存中…');
+    try {
+      const r = await fetch('/api/admin/quick', { method: 'PUT', headers: authHdr(), body: JSON.stringify(payload) });
+      const j = await r.json();
+      if (!r.ok) { showQuickMsg(j.error || '保存失败', 'err'); return; }
+      $('quick-prompt').value = j.prompt || '';
+      quickCount();
+      showQuickMsg(j.is_custom ? '已保存（自定义提示词）' : (okText || '已保存'));
+      toast(okText || '已保存', 'ok');
+    } catch (err) { showQuickMsg('网络错误', 'err'); }
+  }
+
+  const quickForm = $('quick-form');
+  if (quickForm) {
+    quickForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      // \r 一律剥掉：后端 cleanPromptText 拒 CR（粘贴自 Windows 记事本的文本常带），
+      // 不剥的话用户第一次粘贴保存就吃一个莫名其妙 400。
+      const v = $('quick-prompt').value.replace(/\r/g, '').trim();
+      if (v.length > 8000) { showQuickMsg('超过 8000 字上限', 'err'); return; }
+      saveQuick({ prompt: v });
+    });
+    $('quick-prompt').addEventListener('input', quickCount);
+  }
+  const quickResetBtn = $('quick-reset');
+  if (quickResetBtn) {
+    quickResetBtn.addEventListener('click', () => {
+      saveQuick({ prompt: '' }, '已恢复默认');
     });
   }
 

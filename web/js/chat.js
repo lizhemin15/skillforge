@@ -12,18 +12,28 @@
   // 技能勾选层（「指定技能」档的下拉面板）
   const skLayer = $('#sk-layer'), skQ = $('#sk-q'), skList = $('#sk-list'), skFoot = $('#sk-foot');
   const switchBox = $('#ch-switch');
-  const modeAuto = $('#mode-auto'), modeManual = $('#mode-manual');
+  const modeQuick = $('#mode-quick'), modeAuto = $('#mode-auto'), modeManual = $('#mode-manual');
   const thumb = $('#ch-switch-thumb');
   // MCP 数据源勾选入口（输入框正上方那一行，JS 按服务端清单决定露不露）
   const mcpBox = $('#mcp-box'), mcpBtn = $('#mcp-btn'), mcpLabel = $('#mcp-label');
   const mcpLayer = $('#mcp-layer'), mcpList = $('#mcp-list'), mcpFoot = $('#mcp-foot');
 
-  // —— 两种对话方式 ——
-  // auto   : 让引擎自己理解意图，从技能库里挑（默认，适合"我也不知道该用哪个"）
+  // —— 三种对话方式 ——
+  // quick  : 快速开始（默认）。管理端配置的系统提示词直接驱动：起草 → 自检两步，
+  //          不走技能库/意图分类/MCP —— 这就是「极速」的含义：砍路径，不是砍质量。
+  // auto   : 让引擎自己理解意图，从技能库里挑（适合"我也不知道该用哪个"）
   // manual : 用户点名技能，后端整跳过一次意图分类 —— 不只是更准，也快得多
   const MODE_KEY = 'skillforge.chatmode';
   const SKILL_KEY = 'skillforge.chatskill';
-  let chatMode = 'auto';
+  const MODES = ['quick', 'auto', 'manual'];   // 三档全集：归一化与键盘循环都用它
+  // 老访客 localStorage 里存的还是 auto/manual：尊重旧值，别把人硬拽回 quick；
+  // 新访客（没有存值）落在 quick —— 站点定位就是写作，默认档必须是写作档。
+  function savedMode() {
+    let m = '';
+    try { m = localStorage.getItem(MODE_KEY) || ''; } catch (e) {}
+    return (m === 'auto' || m === 'manual' || m === 'quick') ? m : 'quick';
+  }
+  let chatMode = savedMode();
   let pickedSkill = null;   // { slug, name } —— manual 模式下锁定发送的技能
   let allSkills = [];       // /api/skills 缓存（推荐行与技能候选共用）
   let skFetched = false;
@@ -33,12 +43,15 @@
   let chipToken = 0;        // 丢弃过期的一次 LLM 精修响应（连发几轮时防止旧结果覆盖新界面）
 
   const PLACEHOLDER = {
+    quick: '说说你想写什么，直接开写…（Enter 发送，Shift+Enter 换行）',
     auto: '说说你想写什么…（Enter 发送，Shift+Enter 换行）',
     manual: '把材料和要求直接写在这里…（Enter 发送，Shift+Enter 换行）',
   };
   // 推荐行的抬头也得跟档走：自动档说"我推荐"，手动档不能说"我推荐" ——
   // 手动档是用户在点名技能，此时抬头的职责是提醒他"先选一个"。
+  // quick 档说"快速开始"：这一档没有技能概念，抬头就是模式名本身。
   const CHIP_HINT = {
+    quick: '快速开始',
     auto: '试试',
     manual: '指定技能',
   };
@@ -389,11 +402,30 @@
     const skills = Array.isArray(s.skills) ? s.skills : [];
     const core = skills.filter((k) => k.is_core);
     const biz = skills.filter((k) => !k.is_core);
-    const mode = s.mode === 'manual' ? 'manual' : 'auto';
+    const mode = MODES.includes(s.mode) ? s.mode : 'quick';
     const picked = s.picked || null;
     const turns = Number(s.turns) || 0;
     const items = [];
     const cap = 4;
+
+    // —— 极速写作档 ——
+    // 这一档的能力全部来自管理端配置的系统提示词，推荐行不掺技能库
+    // （掺了就等于暗示"这里也能选技能"，跟这一档"直接开写"的定位打架）。
+    // 空态给三个"最可能要写的东西"；有产出后给两个修改方向的快捷句。
+    if (mode === 'quick') {
+      if (turns === 0) {
+        items.push({ kind: 'ask', label: '写一篇产品介绍', send: '写一段给客户看的产品介绍，200 字左右' });
+        items.push({ kind: 'ask', label: '润色一段文字', send: '帮我把这段话润色得更通顺、更有说服力：' });
+        items.push({ kind: 'ask', label: '写一封邮件', send: '帮我写一封工作邮件，说明项目进度延迟一周，语气诚恳' });
+        return { hint: CHIP_HINT.quick, items };
+      }
+      if (s.askedBack) {
+        items.push({ kind: 'ask', label: '就按你的思路写', send: '按你的思路先出一版，缺的信息我后面补' });
+      }
+      items.push({ kind: 'ask', label: '再精简一半', send: '把上面这份内容压缩到一半长度，保留关键信息' });
+      items.push({ kind: 'ask', label: '换个更正式的语气', send: '语气改得更正式一些，适合直接发给客户' });
+      return { hint: CHIP_HINT.quick, items: items.slice(0, cap) };
+    }
 
     // —— 指定技能档 ——
     // 这一档没选技能就发不出去（见 sendBlocked），所以推荐行必须给出入口。
@@ -720,33 +752,37 @@
   // 界面不报错、控制台干净，只有人眼能发现。测试见 chat_modes.test.mjs 的
   // 「选中类名必须与 CSS 对得上」一节（改一侧不改另一侧就变红）。
   const ON_CLASS = 'is-on';
-  function paintMode(mode, auto, manual) {
-    auto.classList.toggle(ON_CLASS, mode === 'auto');
-    manual.classList.toggle(ON_CLASS, mode === 'manual');
-    auto.setAttribute('aria-selected', String(mode === 'auto'));
-    manual.setAttribute('aria-selected', String(mode === 'manual'));
+  function paintMode(mode, quick, auto, manual) {
+    [quick, auto, manual].forEach((btn) => {
+      const m = btn === quick ? 'quick' : (btn === auto ? 'auto' : 'manual');
+      btn.classList.toggle(ON_CLASS, mode === m);
+      btn.setAttribute('aria-selected', String(mode === m));
+    });
   }
 
   function setMode(m, silent) {
-    chatMode = m === 'manual' ? 'manual' : 'auto';
+    chatMode = MODES.includes(m) ? m : 'quick';
     try { localStorage.setItem(MODE_KEY, chatMode); } catch (e) {}
     if (switchBox) switchBox.dataset.mode = chatMode;   // 滑块位置由 CSS 读这个属性
-    paintMode(chatMode, modeAuto, modeManual);
+    paintMode(chatMode, modeQuick, modeAuto, modeManual);
     syncThumb();
     input.placeholder = PLACEHOLDER[chatMode];
-    // 切回自动档时层必须收掉：那一档不需要指定技能，层挂在屏幕上只会误导
-    if (chatMode === 'auto') closeSkLayer();
+    // 只有指定技能档才有"选技能"这一步；quick/auto 档层挂在屏幕上只会误导
+    if (chatMode !== 'manual') closeSkLayer();
+    renderMCP();   // quick 档不露 MCP 入口（renderMCP 内部按档过滤）
     renderChips();
     if (chatMode === 'manual' && !pickedSkill && !silent) nudgeChips();
   }
 
-  // 滑块几何：thumb 的宽度与位移都按两个按钮的实测位置算。
-  // 两档文字宽度不同，写死 50% 会在字体回退/窄屏下错位。
+  // 滑块几何：thumb 的宽度与位移都按按钮的实测位置算。
+  // 各档文字宽度不同，写死百分比会在字体回退/窄屏下错位。
+  // 基准点取第一颗按钮（quick）：它永远在最左，offsetLeft 最小、不会算出负位移。
   function syncThumb() {
-    if (!thumb || !modeAuto || !modeAuto.offsetWidth) return;
-    const from = chatMode === 'auto' ? modeAuto : modeManual;
+    if (!thumb || !modeQuick || !modeQuick.offsetWidth) return;
+    const map = { quick: modeQuick, auto: modeAuto, manual: modeManual };
+    const from = map[chatMode] || modeQuick;
     thumb.style.width = from.offsetWidth + 'px';
-    thumb.style.transform = 'translateX(' + (from.offsetLeft - modeAuto.offsetLeft) + 'px)';
+    thumb.style.transform = 'translateX(' + (from.offsetLeft - modeQuick.offsetLeft) + 'px)';
   }
 
   // 手动档还没选技能 → 推荐行抖一下 + 高亮。
@@ -764,11 +800,9 @@
   }
 
   function initModes() {
-    let m = 'auto', slug = '';
-    try {
-      m = localStorage.getItem(MODE_KEY) || 'auto';
-      slug = localStorage.getItem(SKILL_KEY) || '';
-    } catch (e) {}
+    const m = savedMode();
+    let slug = '';
+    try { slug = localStorage.getItem(SKILL_KEY) || ''; } catch (e) {}
     // 技能是后加载的：先记下 slug，等索引回来再对齐（技能可能已被删/停用）
     setMode(m, true);
     if (slug) pendingSlug = slug;
@@ -848,6 +882,9 @@
 
   function renderMCP() {
     if (!mcpBox) return;
+    // 极速写作档不调度任何 MCP（后端闸门同样不开）：入口也不该出现，
+    // 否则用户勾了半天，实际这档根本用不上 —— 界面在承诺它做不到的事。
+    if (chatMode === 'quick') { mcpBox.hidden = true; closeMCPLayer(); return; }
     // 管理员一台都没开 / 一台都没连通：按钮不存在，别让用户点开一个空面板
     if (!mcpServers.length) { mcpBox.hidden = true; closeMCPLayer(); return; }
     mcpBox.hidden = false;
@@ -1128,12 +1165,17 @@
   }
 
   function wireModes() {
+    modeQuick.addEventListener('click', () => setMode('quick'));
     modeAuto.addEventListener('click', () => setMode('auto'));
     modeManual.addEventListener('click', () => setMode('manual'));
-    // role=tablist 的可达性要求：左右方向键也能切档
+    // role=tablist 的可达性要求：左右方向键也能切档（三档循环）
     if (switchBox) switchBox.addEventListener('keydown', (e) => {
-      if (e.key === 'ArrowLeft') { setMode('auto'); modeAuto.focus(); }
-      if (e.key === 'ArrowRight') { setMode('manual'); modeManual.focus(); }
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      const i = MODES.indexOf(chatMode);
+      const d = e.key === 'ArrowLeft' ? -1 : 1;
+      const nm = MODES[(i + d + MODES.length) % MODES.length];
+      setMode(nm);
+      ({ quick: modeQuick, auto: modeAuto, manual: modeManual })[nm].focus();
     });
     // 字体没就绪时 offsetWidth 可能为 0 → 滑块停在起点（视觉上等于没切档）。
     // 字体加载完和窗口尺寸变化时各校正一次。
@@ -1438,6 +1480,13 @@
     params:   { n: '3', role: '参数校对', act: '核对要素是否齐备' },
     generate: { n: '4', role: '直接执行', act: '按该技能的约定处理' },
   };
+  // 极速写作档（mode=quick）：后端只下发 generate/review 两相（见 chat.go serveQuick），
+  // 字段名必须与后端 trace 事件的 phase 逐字对齐 —— 对不上的那一步徽章就是空白。
+  // 与其他档不同：这一档不是"调度"，是"起草 + 对照要求自检"两步直给。
+  const AGENTS_QUICK = {
+    generate: { n: '1', role: '极速起草', act: '按站点的写作要求直接动笔' },
+    review:   { n: '2', role: '自检', act: '对照要求核对这版成稿' },
+  };
   const MARK = {
     done: '<span class="ctk-dot ok">✓</span>',
     active: '<span class="ctk-dot live"></span>',
@@ -1553,7 +1602,9 @@
       const row = el('div', 'ctk-step ' + st + (i === steps.length - 1 ? ' last' : ''));
       const agents = trace.dataset.mode === 'manual'
         ? AGENTS_MANUAL
-        : ((trace.dataset.stype === 'query' || trace.dataset.stype === 'template') ? AGENTS_QUERY : AGENTS);
+        : (trace.dataset.mode === 'quick'
+          ? AGENTS_QUICK
+          : ((trace.dataset.stype === 'query' || trace.dataset.stype === 'template') ? AGENTS_QUERY : AGENTS));
       const agent = agents[s.phase] || { role: '', act: '' };
       const mark = MARK[st] || MARK.pending;
       row.innerHTML =
