@@ -43,9 +43,9 @@ INJECTIONS = [
     # —— 上一轮留下的（档位胶囊）——
     ('1) 档位选中类名改回错的那个（is-on → on）',
      JS, "const ON_CLASS = 'is-on';", "const ON_CLASS = 'on';"),
-    ('2) 切档时旧档不清除（两档同时亮）',
-     JS, "    auto.classList.toggle(ON_CLASS, mode === 'auto');",
-     "    auto.classList.toggle(ON_CLASS, true);"),
+    ('2) 切档时旧档不清除（两/三档同时亮）',
+     JS, "      btn.classList.toggle(ON_CLASS, mode === m);",
+     "      btn.classList.toggle(ON_CLASS, true);"),
     ('3) CSS 选择器改掉（只改一边，另一侧必须发现）',
      CSS, ".ch-switch-opt.is-on { color: var(--text); font-weight: 600; }",
      ".ch-switch-opt.on { color: var(--text); font-weight: 600; }"),

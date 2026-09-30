@@ -81,11 +81,11 @@
       <div class="ch-input-box">
         <!-- 对话方式胶囊独占第一行（.ch-mrow 是整行）。
              它原来和 textarea 挤在同一行 → 输入框被推到右边、宽度只剩 630/860，
-             用户要求「输入框应当占据所有的位置」，所以拆行。 -->
+             用户要求「输入框应当占据所有的位置」，所以拆行。
+             三档对话方式，快速开始在最前且默认选中：这一站的主体功能就是「帮忙写作」，
+             极速版 = 管理端配置的系统提示词直接起草 + 自检两步，不绕技能库/意图分类/MCP。
+             自动调度/指定技能是完整版能力，按钮保留，用户想要再切过去。 -->
         <div class="ch-mrow">
-          <!-- 三档对话方式，快速开始在最前且默认选中：这一站的主体功能就是「帮忙写作」，
-               极速版 = 管理端配置的系统提示词直接起草 + 自检两步，不绕技能库/意图分类/MCP。
-               自动调度/指定技能是完整版能力，按钮保留，用户想要再切过去。 -->
           <div class="ch-switch" id="ch-switch" data-mode="quick">
             <span class="ch-switch-thumb" id="ch-switch-thumb" aria-hidden="true"></span>
             <button type="button" class="ch-switch-opt is-on" id="mode-quick" data-mode="quick" role="tab" aria-selected="true">快速开始</button>

@@ -66,8 +66,8 @@ INJECTIONS = [
     ('3) 胶囊行包裹被拆掉（回滚修复：胶囊又和输入框同行）',
      HTML,
      '        <div class="ch-mrow">\n'
-     '          <div class="ch-switch" id="ch-switch" data-mode="auto">\n',
-     '        <div class="ch-switch" id="ch-switch" data-mode="auto">\n',
+     '          <div class="ch-switch" id="ch-switch" data-mode="quick">\n',
+     '        <div class="ch-switch" id="ch-switch" data-mode="quick">\n',
      '直系子元素'),
     # ④ 全局 textarea{min-height:96px} 重新漏回输入框。
     #    改前 .ch-input 显式写 min-height:0（为了压掉全局 96）；20260917 起改成显式 3 行 88px。
