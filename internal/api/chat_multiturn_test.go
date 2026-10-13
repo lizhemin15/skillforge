@@ -76,7 +76,7 @@ func TestSecondTurnCarriesPreviousArticleVerbatim(t *testing.T) {
 		eng.Push(session, agent.Message{Role: "user", Content: userMsg, At: time.Now()})
 		clock := newTraceClockBeat(write, nil, time.Hour) // 心跳调到 1h：测试不该被节拍影响
 		if !h.runManualWrite(context.Background(), write, clock, sc, pack,
-			map[string]string{}, userMsg, session, eng.Session(session)) {
+			map[string]string{}, nil, userMsg, session, eng.Session(session)) {
 			t.Fatalf("runManualWrite 未处理本轮请求（userMsg=%q）", userMsg)
 		}
 	}

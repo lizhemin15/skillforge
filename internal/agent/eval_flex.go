@@ -38,6 +38,7 @@ type rawEval struct {
 	Steps      json.RawMessage `json:"steps"`
 	Action     json.RawMessage `json:"action"`
 	NeedsTools json.RawMessage `json:"needs_tools"`
+	Files      json.RawMessage `json:"files"`
 }
 
 // UnmarshalJSON 宽容解析分类结果：字段形状不标准时降级继续，而不是整轮失败。
@@ -55,7 +56,68 @@ func (e *Eval) UnmarshalJSON(b []byte) error {
 	e.NeedsTools = flexTruthy(r.NeedsTools)
 	e.Needs = flexParams(r.Needs)
 	e.Steps = flexSteps(r.Steps)
+	e.Files = flexNames(r.Files)
 	return nil
+}
+
+// flexNames 宽容解析 files：期望是字符串数组，但模型的实际形态远不止一种 ——
+// 线上见过的写法有 ["报名表.docx"]、单独一个字符串 "报名表.docx"、
+// 顿号/逗号揉在一句里 "报名表.docx、汇总表.xlsx"、以及 [{"name":"报名表.docx"}]。
+// 全都是「想表达同一个意思、格式没照契约」，没有一种是该让整轮路由失败的
+// （files 解析失败=整轮退化成通用写作，用户拿到了正文却拿不到文件）。
+//
+// 与同族三条边界一致：只宽容形状、不丢数据、单项坏不掉整列。
+func flexNames(raw json.RawMessage) []string {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return nil
+	}
+	// ① 正常形状：字符串数组。
+	var arr []string
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		return trimAll(arr)
+	}
+	// ② 被双重编码的数组字符串，或单个人类句子。先取字符串再按分隔符切。
+	var one string
+	if err := json.Unmarshal(raw, &one); err == nil {
+		inner := strings.TrimSpace(one)
+		if inner == "" || inner == "null" {
+			return nil
+		}
+		var arr2 []string
+		if err := json.Unmarshal([]byte(inner), &arr2); err == nil {
+			return trimAll(arr2)
+		}
+		return splitNames(inner)
+	}
+	// ③ 对象数组（模型自带 name/rel 包装）或混合数组：逐项取 name/rel/file 键，
+	//    取不到该键就跳过那一项。
+	var objs []json.RawMessage
+	if err := json.Unmarshal(raw, &objs); err == nil {
+		out := make([]string, 0, len(objs))
+		for _, it := range objs {
+			out = append(out, flexText(it))
+		}
+		return trimAll(out)
+	}
+	// ④ 单个对象（省略了方括号）。
+	if t := flexText(raw); t != "" && t != "{}" {
+		return splitNames(t)
+	}
+	return nil
+}
+
+// splitNames 把「报名表.docx、汇总表.xlsx」这类揉在一句里的多个文件名切开。
+// 逗号也切：模型常把中文顿号写成英文逗号。切完不报错、空项丢弃。
+func splitNames(s string) []string {
+	f := strings.FieldsFunc(s, func(r rune) bool {
+		switch r {
+		case '、', ',', '，', ';', '；', '|', '\n', '\r':
+			return true
+		}
+		return false
+	})
+	return trimAll(f)
 }
 
 // flexText 把任意 JSON 值收敛成短文本字段（字符串原样；数字/布尔还原；其余走紧凑 JSON）。

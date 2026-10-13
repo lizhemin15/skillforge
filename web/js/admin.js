@@ -658,8 +658,8 @@
   //   reviewer —「审稿清单」：reviewer.md，审稿人逐条核对的判据，可编辑。
   //   fidelity —「质量报告」：fidelity.md，机器产出的裁判试跑报告，**只读**（后端 editable=false）。
   // 图标刻意与既有 8 个不撞车：📚 分类手册 / 🔍 逐条核对 / 📊 试跑报告。
-  const KIND_LABEL = { prompt: '核心提示词', template: '写作模板', templatefile: '模板文件（可填）', requirement: '训练需求', category: '分类要求', style: '风格画像', example: '参考范文', source: '原始素材', reviewer: '审稿清单', fidelity: '质量报告', other: '其他' };
-  const KIND_ICON = { prompt: '🧠', template: '📋', templatefile: '📃', requirement: '📐', category: '📚', style: '🎯', example: '📄', source: '📁', reviewer: '🔍', fidelity: '📊', other: '📎' };
+  const KIND_LABEL = { prompt: '核心提示词', template: '写作模板', templatefile: '模板文件（可填）', attach: '下发附件', requirement: '训练需求', category: '分类要求', style: '风格画像', example: '参考范文', source: '原始素材', reviewer: '审稿清单', fidelity: '质量报告', other: '其他' };
+  const KIND_ICON = { prompt: '🧠', template: '📋', templatefile: '📃', attach: '📥', requirement: '📐', category: '📚', style: '🎯', example: '📄', source: '📁', reviewer: '🔍', fidelity: '📊', other: '📎' };
   // 空分组也要显示的 kind（用户来这里就是为了找模板/加范文，隐藏空组等于把入口藏了）
   // category 进这张表是**有意的**：它是本轮核心新功能，用户是专门来找「分类要求」的，
   // 而分类由训练流程抽取后才有文件 —— 如果空着就藏起来，用户看到的就是「这功能是不是没上线」，
@@ -670,6 +670,11 @@
   // 空着显示只会占屏（内容生成后分组自然出现）。
   const KIND_EMPTY_HINT = {
     templatefile: '暂无模板文件，点上方「上传模板」加一个（.docx/.xlsx，同名重传即替换）',
+    // attach 进这张表是**有意的**：这是本轮新能力（源文档里带的附件会被自动拆出来、
+    // 随回答下发给用户），而绝大多数手册本来就不带内嵌附件 —— 空着就藏起来，
+    // 管理员永远发现不了「原来这里能自动拆附件」，只能从用户反馈里反推。
+    // 一句说明的成本是一行字，收益是功能可发现。
+    attach: '暂无下发附件。训练时若源文档（手册/通知）里带内嵌附件，会自动拆到这里，随回答下发给用户；这类附件通常就是源文件里的那个附件',
     example: '暂无，下方添加',
     category: '暂无分类。分类由训练从手册抽出，各技能不一样；要加手册里没有的，点上面的「+ 新增分类」（categories/_index.md 是分类路由表）',
   };
@@ -716,13 +721,14 @@
   function renderSkillFiles(body, files) {
     // 分组显示顺序。**必须与后端 store.orderOf() 逐项一致**，否则同一个技能目录
     // 在接口里是一种顺序、在树上又是另一种，用户会以为「两处内容不一样」。
-    // 后端 orderOf：prompt=1, template=2, templatefile=3, requirement=4, category=5,
-    //               style=6, example=7, source=8, reviewer=9, fidelity=10。
-    // 语义：核心提示词 → 模板类 → 需求/分类（「要什么」与「各类别怎么写」是一段叙事，挨着放）
+    // 后端 orderOf：prompt=1, template=2, templatefile=3, attach=4, requirement=5,
+    //               category=6, style=7, example=8, source=9, reviewer=10, fidelity=11。
+    // 语义：核心提示词 → 模板类（含从源文档拆出来、要下发给用户的附件 attach）
+    //       → 需求/分类（「要什么」与「各类别怎么写」是一段叙事，挨着放）
     //       → 风格 → 范文/素材 → 审稿清单 → 质量报告垫底（机器产物，放最后看）。
     // 这个数组同时是「哪些 kind 会出现在树上」的**白名单**：不在这里的 kind 一律不渲染
     // （other 故意不在其中）。所以后端新加 kind 时，这里不补上 = 用户在界面上根本看不到那个文件。
-    const groups = ['prompt', 'template', 'templatefile', 'requirement', 'category', 'style', 'example', 'source', 'reviewer', 'fidelity'];
+    const groups = ['prompt', 'template', 'templatefile', 'attach', 'requirement', 'category', 'style', 'example', 'source', 'reviewer', 'fidelity'];
     // LEFT: file tree; RIGHT: editor
     let tree = '', right = '';
     // top action row (new example / upload source) pinned above tree
@@ -762,6 +768,8 @@
           // 前端多给一个删除按钮 = 承诺一个点下去只会报错的操作。
           // fidelity（质量报告）与 style（风格锚点）是只读的**质量证据**，既不可编辑也不可删，
           // 所以两个入口都不能有 —— 这里靠身不在白名单里达成，不要顺手加进去。
+          // attach（下发附件）**故意也不在**白名单里：删文件不会同步清掉 DB 里的附件声明，
+          // 声明还在而文件没了 = 用户拿到点开就 404 的卡（后端同样拒绝，见 store.fileKind 的注释）。
           const canDel = f.kind === 'example' || f.kind === 'source' || f.kind === 'templatefile';
           // 分类行的「改名 / 删除」入口。判据是后端下发的 category_name **有没有值**，
           // 而不是「路径是不是以 categories/ 开头」：前缀猜法等于把 store 的命名规则

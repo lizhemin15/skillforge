@@ -27,10 +27,31 @@ type Skill struct {
 	// "query"    -> return a办事流程/answers from the reference (no article)
 	// "template" -> return the流程 + push the declared attachment file for download
 	SkillType string `json:"skill_type,omitempty"`
-	// Attachment is a file (relative to <data>/skills/<slug>/) that should be
-	// delivered to the user when this skill is hit (e.g. "source/form.docx").
-	// Empty means no downloadable attachment.
+	// Attachments is the list of files this skill can push to the user on
+	// demand (typically templates extracted out of the uploaded source file:
+	// "附件：1.报名表 2.汇总表" is two files, not one). Each Rel is relative to
+	// <data>/skills/<slug>/ and is served through AttachmentPath.
+	Attachments []Attachment `json:"attachments,omitempty"`
+	// Attachment is the legacy single-file field (the whole office file an
+	// admin uploaded as the source). Read path folds it into Attachments when
+	// the array is empty (see store.decodeAttachments), so **runtime code only
+	// needs to look at Attachments**; new writes leave this empty and use
+	// Attachments as the single source of truth.
 	Attachment string `json:"attachment,omitempty"`
+}
+
+// Attachment is one file a skill delivers to the user.
+//
+// Why a struct instead of a bare string: the user-facing question is not just
+// "which file" but "where did it come from" — when extraction misfires they need
+// to see that 报名表.docx came out of 关于开展XX工作的通知.docx, and How records
+// which container path it was pulled from (docx:embeddings>ole:Package).
+type Attachment struct {
+	Name   string `json:"name"`             // 展示名（含扩展名）
+	Rel    string `json:"rel"`              // 相对 <data>/skills/<slug>/ 的路径，如 attachments/报名表.docx
+	Origin string `json:"origin,omitempty"` // 从哪份源文件里拆出来的
+	Size   int64  `json:"size,omitempty"`   // 字节数，0=未知
+	How    string `json:"how,omitempty"`    // 提取路径，排查用
 }
 
 // Skill type constants.

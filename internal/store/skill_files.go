@@ -67,6 +67,24 @@ func fileKind(rel string) (kind string, editable bool) {
 		// raw reference material — binary files are previewable but not text-editable.
 		return "source", !isBinaryExt(rel)
 	}
+	if strings.HasPrefix(rel, "attachments/") {
+		// 从源文档里**拆出来的内嵌附件**（要随回答下发给用户的模板/表格）。
+		//
+		// 为什么必须在这里放行：不列出来的后果是「拆是拆了、技能也真能下发，
+		// 但管理员在界面上看不到究竟拆出了什么」——用户报「说好有模板却打不开」
+		// 时，管理员只能 SSH 翻目录核对。本模块的产品价值就是"把源文件里的
+		// 附件变成可下发的产品"，产品看不见等于没做。
+		//
+		// editable 按扩展名：docx/xlsx/pdf 不可文本编辑（二进制），
+		// 万一拆出来的是 .txt/.csv 则允许编辑（改的是下发给用户的正文）。
+		//
+		// ⚠️ 刻意**不允许删除**（DeleteFile 的 kind 白名单里没有 attach）：
+		// 删文件不会同步清掉 DB 里声明的附件，声明留着而文件没了，用户就会
+		// 拿到一张点开 404 的卡（正是 api/validDeliverables 要防的那种）。
+		// 要做到"能删且一致"，得让删除同时改 DB 声明——那是另一件事，
+		// 在没做之前，宁可不给删除入口，也不给一个能造出坏卡片的按钮。
+		return "attach", !isBinaryExt(rel)
+	}
 	if isTopTemplateFile(rel) {
 		// 可填模板（顶层 .docx/.xlsx）：二进制，不可文本编辑，但**必须可下载/替换/删除**。
 		// 它们既不在上面的白名单 md 里，也不在 source/ 里，早先落进 "other" ——
@@ -264,6 +282,17 @@ func (s *SkillStore) ListFiles(slug string) ([]model.SkillFile, error) {
 			add(filepath.Join(dir, "source", en.Name()), "source/"+en.Name(), "source")
 		}
 	}
+	// attachments/*：从源文档里拆出来的内嵌附件（本技能要下发的产品）。
+	// 只扫一层（跟 source/ 同口径）：附件都是扁平落盘的，没有子目录语义；
+	// 深扫只会把临时/备份目录里的杂文件当附件列出来。
+	if entries, err := os.ReadDir(filepath.Join(dir, "attachments")); err == nil {
+		for _, en := range entries {
+			if en.IsDir() {
+				continue
+			}
+			add(filepath.Join(dir, "attachments", en.Name()), "attachments/"+en.Name(), "attach")
+		}
+	}
 	// 顶层可填模板（.docx/.xlsx）：单独扫一遍。
 	// 白名单只列 4 个 md，不扫这一层的话模板文件永远进不了清单 ——
 	// 而模板是用户最想换的东西（换字体/表头/页边距），必须能看见、能下载、能替换。
@@ -302,25 +331,34 @@ func orderOf(kind string) int {
 		// 紧跟在写作模板（template.md）后面：一个是「怎么写的骨架」，
 		// 一个是「真正被填充的源文件」，用户找模板时两处要挨着。
 		return 3
-	case "requirement":
+	case "attach":
+		// 内嵌附件（源文档里拆出来、要随回答下发的那些表格/模板）。
+		// 紧挨 templatefile：两者是同一类东西的两种用法——「要填的模板」
+		// 与「要发给用户的成品」，管理员核对时眼睛不用在树里来回找。
+		//
+		// 插进来时把后面的数值**整体 +1**（不是重排）：所有既有 kind 之间的
+		// 相对顺序逐个不变，只是腾出一个号位。相对顺序不变 = 老用户习惯的
+		// 分组先后完全不动，所以这不是这条注释警告的那种"插队重排"。
 		return 4
+	case "requirement":
+		return 5
 	case "category":
 		// 紧跟 requirement：用户的行为顺序是先看「训练需求（要什么）」，
 		// 再看「分类要求（各类别怎么写）」，两者是同一段叙事，挨着才找得到。
-		return 5
-	case "style":
 		return 6
-	case "example":
+	case "style":
 		return 7
-	case "source":
+	case "example":
 		return 8
-	case "reviewer":
-		// 新 kind 一律追加到末尾（reviewer=9、fidelity=10），
-		// 不插队去改既有 order 的数值——既有的相对顺序一变，
-		// 老用户习惯的树形分组顺序就全乱了，那是没必要的回归。
+	case "source":
 		return 9
-	case "fidelity":
+	case "reviewer":
+		// 新 kind 一律追加（reviewer、fidelity），
+		// 不插队去改既有 order 的相对顺序——既有的相对顺序一变，
+		// 老用户习惯的树形分组顺序就全乱了，那是没必要的回归。
 		return 10
+	case "fidelity":
+		return 11
 	}
 	// 未知 kind（如 "other"）排在最后。这里必须大于所有已知 kind：
 	// 早先返回 9，加入 reviewer=9 后会和未知项撞号，撞号会让 sort 的

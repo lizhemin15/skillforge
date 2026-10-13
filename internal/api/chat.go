@@ -553,18 +553,23 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// (short-circuit before any content generation — a "发我个空白模板" request
 		// should hand back the file immediately, not stream unrelated prose).
 		if action == "template_only" {
-			if sc.Attachment == "" {
+			// 空白模板下发：先按**点名口径**取件（Deliverables），不是老的「有就发」。
+			// 多附件技能（源文档里拆出多份表格）时，用户说「发我附件2报名表」必须只发那一份——
+			// 老写法固定发主附件，会稳定地发错对象（要报名表给汇总表，比不发更坏）。
+			dels := sc.Deliverables(eval.Files, action)
+			if len(dels) == 0 {
 				action = "" // no template file to deliver → normal text generation
 			} else {
 				// Reuse the existing public attachment endpoint, which serves
 				// the raw blank template file with a proper filename.
-				write(evDelta, jsonSafe(map[string]string{"t": "这是「" + sc.Name + "」的空白模板，可直接下载使用。"}))
-				write(evFile, jsonSafe(map[string]string{
-					"slug": eval.SkillSlug, "name": sc.Attachment,
-					"url": "/api/chat/attachment/" + eval.SkillSlug,
-				}))
+				if len(dels) == 1 {
+					write(evDelta, jsonSafe(map[string]string{"t": "这是「" + sc.Name + "」的空白模板，可直接下载使用。"}))
+				} else {
+					write(evDelta, jsonSafe(map[string]string{"t": fmt.Sprintf("这是「%s」的空白模板（共 %d 份），逐份列出可下载：", sc.Name, len(dels))}))
+				}
+				deliverAttachments(write, eval.SkillSlug, dels)
 				clock.Finish()
-				h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: "已下发「" + sc.Name + "」空白模板。", SkillSlug: eval.SkillSlug, At: time.Now()})
+				h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: "已下发「" + sc.Name + "」空白模板：" + agent.AttachNames(dels), SkillSlug: eval.SkillSlug, At: time.Now()})
 				write(evDone, jsonSafe(map[string]string{"skill": eval.SkillSlug}))
 				return
 			}
@@ -625,7 +630,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if pack != nil {
-				if h.runManualWrite(ctx, write, clock, sc, pack, args, req.Message, req.SessionID, history) {
+				if h.runManualWrite(ctx, write, clock, sc, pack, args, eval.Files, req.Message, req.SessionID, history) {
 					return
 				}
 			}
@@ -683,13 +688,11 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// 上下文注入时必须逐字保留（见 agent/compact.go 的产物层）。
 		h.eng.Push(req.SessionID, agent.Message{Role: "assistant", Content: full, SkillSlug: eval.SkillSlug, Kind: agent.KindArtifact, At: time.Now()})
 		clock.Finish()
-		// typed flow skill with a declared template file → dispatch it for download
-		if sc.Attachment != "" {
-			write(evFile, jsonSafe(map[string]string{
-				"slug": eval.SkillSlug, "name": sc.Attachment,
-				"url": "/api/chat/attachment/" + eval.SkillSlug,
-			}))
-		}
+		// 正文之外的交付物（模板/附件）走同一个取件口径。
+		// 清单里只有一份时行为与老版本一致（一直随回答下发）；多份则只在
+		// 用户点名要那几份（eval.Files）或本轮是在要模板时才发——用户问
+		// 「怎么报名」不该收到一叠表格，那是这次改造要消掉的噪音。
+		deliverAttachments(write, eval.SkillSlug, sc.Deliverables(eval.Files, action))
 		write(evDone, jsonSafe(map[string]string{"skill": eval.SkillSlug}))
 		return
 	}
@@ -944,9 +947,14 @@ func numberedQuestions(qs []string) string {
 }
 
 // Attachment serves a skill's declared template/policy file for public download.
-// It is intentionally single-file whitelisted: only the exact relative path the
-// skill records in its `attachment` column is served, resolved against the
-// skill directory with a path-traversal guard — arbitrary files are never exposed.
+//
+// 白名单口径（本次改造后的唯一口径）：`?file=<展示名>` 必须命中该技能
+// **声明的附件清单**（sk.Attachments，store 读取时已把旧单字段折进来）。
+// 不带 file= 时发第一份——这是给旧卡片/旧前端留的兼容路，不能让它们 404。
+//
+// 为什么坚持白名单而不是"按名字拼路径"：这是**公开、无鉴权**端点（模板要能直接
+// 点开下载），任何把用户输入拼进路径的写法都等于把技能目录开放给任意文件名。
+// 认不出来的名字一律 404，并把清单回印在响应体里（便于排查，也不泄露目录内容）。
 func (h *chatHandler) Attachment(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 	if slug == "" {
@@ -963,18 +971,38 @@ func (h *chatHandler) Attachment(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if sk == nil || sk.Attachment == "" {
+	if sk == nil {
+		http.Error(w, "no attachment", http.StatusNotFound)
+		return
+	}
+	declared := declaredOf(sk)
+	if len(declared) == 0 {
 		http.Error(w, "no attachment", http.StatusNotFound)
 		return
 	}
 
-	path, ok := h.eng.AttachmentPath(slug, sk.Attachment)
+	rel := declared[0].Rel
+	who := declared[0]
+	if want := strings.TrimSpace(r.URL.Query().Get("file")); want != "" {
+		picked, _ := agent.MatchAttachments(declared, []string{want})
+		if len(picked) == 0 {
+			// 出声报清单：用户/前端拿到 404 时最想知道的是"到底有哪些能下"。
+			// 只印展示名，不印磁盘路径。
+			http.Error(w, "no such attachment; available: "+agent.AttachNames(declared), http.StatusNotFound)
+			return
+		}
+		rel, who = picked[0].Rel, picked[0]
+	}
+
+	path, ok := h.eng.AttachmentPath(slug, rel)
 	if !ok {
 		http.Error(w, "attachment unavailable", http.StatusNotFound)
 		return
 	}
 
-	name := filepath.Base(path)
+	// 下载名用**展示名**而不是磁盘 basename：老技能落盘时可能只有兜底名（附件1.docx），
+	// 而展示名是源文档里那份文件的原名（附件2-报名表.docx）——用户要认的是后者。
+	name := agent.AttachDisplayName(who)
 	w.Header().Set("Content-Disposition", "attachment; filename="+quoteEscaped(name))
 	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeFile(w, r, path)

@@ -103,6 +103,11 @@ func migrate(db *sql.DB) error {
 	addCols := []struct{ tbl, ddl string }{
 		{"skills", "ALTER TABLE skills ADD COLUMN skill_type TEXT NOT NULL DEFAULT 'write'"},
 		{"skills", "ALTER TABLE skills ADD COLUMN attachment TEXT NOT NULL DEFAULT ''"},
+		// attachments holds a JSON array of model.Attachment. It coexists with
+		// the legacy single-value `attachment` column on purpose: existing
+		// deployments already have rows in the old shape, and the read path
+		// folds those into the array rather than requiring a data migration.
+		{"skills", "ALTER TABLE skills ADD COLUMN attachments TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, c := range addCols {
 		if _, err := db.Exec(c.ddl); err != nil {

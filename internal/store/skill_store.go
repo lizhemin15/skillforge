@@ -36,18 +36,19 @@ func (s *SkillStore) skillDir(slug string) string { return filepath.Join(s.skill
 
 // List returns all skills with their metadata + light content stats.
 func (s *SkillStore) List() ([]model.Skill, error) {
-	rows, err := s.db.Query(`SELECT slug,name,description,category,version,enabled,is_core,created_at,updated_at,COALESCE(skill_type,''),COALESCE(attachment,'') FROM skills ORDER BY is_core DESC, name ASC`)
+	rows, err := s.db.Query(`SELECT slug,name,description,category,version,enabled,is_core,created_at,updated_at,COALESCE(skill_type,''),COALESCE(attachment,''),COALESCE(attachments,'') FROM skills ORDER BY is_core DESC, name ASC`)
 	if err != nil {
 		return nil, err
 	}
 	var out []model.Skill
 	for rows.Next() {
 		var sk model.Skill
-		var ct, ut string
-		if err := rows.Scan(&sk.Slug, &sk.Name, &sk.Description, &sk.Category, &sk.Version, &sk.Enabled, &sk.IsCore, &ct, &ut, &sk.SkillType, &sk.Attachment); err != nil {
+		var ct, ut, attsRaw string
+		if err := rows.Scan(&sk.Slug, &sk.Name, &sk.Description, &sk.Category, &sk.Version, &sk.Enabled, &sk.IsCore, &ct, &ut, &sk.SkillType, &sk.Attachment, &attsRaw); err != nil {
 			rows.Close()
 			return nil, err
 		}
+		sk.Attachments = decodeAttachments(attsRaw, sk.Attachment)
 		sk.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", ct)
 		sk.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", ut)
 		out = append(out, sk)
@@ -78,16 +79,17 @@ func (s *SkillStore) List() ([]model.Skill, error) {
 // 就能把「技能不存在」当成可降级的情况处理，而不是当成系统故障。
 func (s *SkillStore) Get(slug string) (*model.Skill, error) {
 	var sk model.Skill
-	var ct, ut string
+	var ct, ut, attsRaw string
 	var enabled int
-	err := s.db.QueryRow(`SELECT slug,name,description,category,version,enabled,is_core,created_at,updated_at,COALESCE(skill_type,''),COALESCE(attachment,'') FROM skills WHERE slug=?`, slug).
-		Scan(&sk.Slug, &sk.Name, &sk.Description, &sk.Category, &sk.Version, &enabled, &sk.IsCore, &ct, &ut, &sk.SkillType, &sk.Attachment)
+	err := s.db.QueryRow(`SELECT slug,name,description,category,version,enabled,is_core,created_at,updated_at,COALESCE(skill_type,''),COALESCE(attachment,''),COALESCE(attachments,'') FROM skills WHERE slug=?`, slug).
+		Scan(&sk.Slug, &sk.Name, &sk.Description, &sk.Category, &sk.Version, &enabled, &sk.IsCore, &ct, &ut, &sk.SkillType, &sk.Attachment, &attsRaw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", ErrSkillNotFound, slug)
 	}
 	if err != nil {
 		return nil, err
 	}
+	sk.Attachments = decodeAttachments(attsRaw, sk.Attachment)
 	sk.Enabled = enabled == 1
 	sk.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", ct)
 	sk.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", ut)
@@ -213,8 +215,10 @@ func (s *SkillStore) Create(sk *model.Skill, params []model.Param) error {
 	if stype == "" {
 		stype = model.SkillTypeWrite
 	}
-	if _, err := tx.Exec(`INSERT INTO skills(slug,name,description,category,version,enabled,is_core,skill_type,attachment) VALUES(?,?,?,?,?,?,?,?,?)`,
-		sk.Slug, sk.Name, sk.Description, sk.Category, sk.Version, bool2int(sk.Enabled), bool2int(sk.IsCore), stype, sk.Attachment); err != nil {
+	// 附件清单编码：数组列是唯一事实来源，旧单值列只在数组为空时保留。
+	attsJSON, legacyAtt := encodeAttachments(sk.Attachments, sk.Attachment)
+	if _, err := tx.Exec(`INSERT INTO skills(slug,name,description,category,version,enabled,is_core,skill_type,attachment,attachments) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		sk.Slug, sk.Name, sk.Description, sk.Category, sk.Version, bool2int(sk.Enabled), bool2int(sk.IsCore), stype, legacyAtt, attsJSON); err != nil {
 		return err
 	}
 	for i, p := range params {

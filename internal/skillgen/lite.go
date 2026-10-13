@@ -59,6 +59,10 @@ const (
 	// 样本只用来观察文风与结构；内网慢 token 下，输入同样要省。
 	liteGuideSampleChars   = 4000
 	liteExampleSampleChars = 3000
+	// liteBodyEmbedChars 是材料正文内嵌进提示词的上限（字符数）。
+	// 超长只截断、不报错：极简通道的底线是「先交付一份能用的」，整篇 5 万字公文
+	// 塞进去会把每轮上下文额度吃光，反而让模型忽略真正相关的那几段。
+	liteBodyEmbedChars = 6000
 	// liteDefaultCategory 是极简技能落库时的分类列。极简通道不讲分类体系
 	// （一个技能就一类），也没让用户选过，所以固定填 general —— 之前这里错填了
 	// in.Name（技能名），用户在名称框里打字就会把「分类」写成技能名。
@@ -420,6 +424,29 @@ type liteMaterial struct {
 	How      string
 	Warn     string
 	Examples []string
+
+	// Body 是材料的正文（有指南就是指南，没有就是范文拼起来的原文）。
+	//
+	// 为什么和 Guide 分两个字段：写作型里 Guide 是「硬约束」（字数、结构、禁用词），
+	// 下游的校验、保真核对都按规则读它；而查询/模板型要的是「事实来源」，两者在
+	// 提示词里的位置完全不同（一个当规则、一个当唯一依据）。混成一个字段，就得靠
+	// Type 去猜这段文字当前扮演什么角色，读代码的人永远猜不对。
+	Body string
+
+	// Type 是产物类型判定（write | query | template），TypeWhy 是判定理由。
+	// 两者必须一起落进 steps 与 meta.json：用户看到「template」才知道自己拿到的是
+	// 「发文件的技能」，而不是「写稿的技能」，也才知道该不该点重训。
+	Type    string
+	TypeWhy string
+
+	// Extracted 是取材阶段从源文件里拆出的内嵌附件（**尚未落盘**）。
+	// Attachments 是落盘后的登记（rel/大小/来源），由调用方在 land 之后回填。
+	//
+	// 为什么要拆成两个字段：A 段的提示词在落盘**之前**就得知道「有哪些附件」才能
+	// 写清单、定类型，而那时技能目录还不存在（落盘只能等 land）；等 land 写完再
+	// 回头改提示词，就得多写一次文件、还得处理「写了一半失败」的中间态。
+	Extracted   []ExtractedAttachment
+	Attachments []model.Attachment
 }
 
 // GenerateLite 跑极简通道：本地装盘（0 调用）→ AI 精炼（1 调用）→ 校验注册（0 调用）。
@@ -463,9 +490,20 @@ func (g *Generator) GenerateLite(ctx context.Context, in *LiteInput, onStep func
 		steps("② ❌ " + err.Error())
 		return nil, err
 	}
-	steps(fmt.Sprintf("② 素材自解析：指南 %d 字（%s；%s），范文 %d 篇（共 %d 字）",
-		runeLen(mat.Guide), mat.GuideFrom, mat.How,
-		len(mat.Examples), runeLen(strings.Join(mat.Examples, ""))))
+	// 这一步的文案按类型给：写作型报「指南/范文」是用户能对上的口径；查询/模板型报
+	// 「指南 0 字」只会让人以为素材有问题（可这类素材本来就没有指南，报 0 是误导）。
+	if mat.Type == model.SkillTypeWrite {
+		steps(fmt.Sprintf("② 素材自解析：类型=写作；指南 %d 字（%s；%s），范文 %d 篇（共 %d 字）",
+			runeLen(mat.Guide), mat.GuideFrom, mat.How,
+			len(mat.Examples), runeLen(strings.Join(mat.Examples, ""))))
+	} else {
+		txt := fmt.Sprintf("② 素材自解析：类型=%s（%s）；材料正文 %d 字（%s）",
+			liteTypeLabel(mat.Type), mat.TypeWhy, runeLen(mat.Body), mat.How)
+		if n := len(mat.Extracted); n > 0 {
+			txt += fmt.Sprintf("；拆出内嵌附件 %d 个：%s", n, liteAttachNameList(mat.Extracted))
+		}
+		steps(txt)
+	}
 	if mat.Warn != "" {
 		steps("② ⚠️ " + mat.Warn)
 	}
@@ -483,57 +521,87 @@ func (g *Generator) GenerateLite(ctx context.Context, in *LiteInput, onStep func
 	}
 	dir := filepath.Join(g.skillsDir, slug)
 
-	sysPrompt := liteLocalPrompt(mat.SkillName, mat.CatName, mat.Guide, len(mat.Examples))
-	if err := g.validate(sysPrompt, "", nil, len(mat.Examples), model.SkillTypeWrite); err != nil {
-		// 极简通道的提示词是本地模板 + 用户指南直接拼的，走到这里说明指南短到
+	// 类型判定是**本地**做的（见 liteDecideType），提示词、校验口径、落盘注册全部
+	// 跟着这个类型走：三处只要有一处还写死 write，产物就会出现「提示词是查办件的、
+	// 管理端显示是写作技能」这种自相矛盾的技能，用户按类型找技能时会找不到。
+	sysPrompt := litePromptFor(mat)
+	if err := g.validate(sysPrompt, "", nil, len(mat.Examples), mat.Type); err != nil {
+		// 极简通道的提示词是本地模板 + 用户材料直接拼的，走到这里说明材料短到
 		// 连模板都撑不起硬门——如实说清是哪一头的问题，别让用户以为是系统坏了。
-		return nil, fmt.Errorf("极简创建未过本地校验：%w（写作指南请给足%s字以上）", err, fmt.Sprint(liteMinGuideChars))
+		return nil, fmt.Errorf("极简创建未过本地校验：%w（极简创建的材料请给足 %d 字以上）", err, liteMinGuideChars)
 	}
 
 	mp := &manualPack{
 		Structure: &Structure{Categories: []Category{{
 			Name:        mat.CatName,
-			Trigger:     "需要撰写" + mat.CatName,
-			Requirement: mat.Guide,
+			Trigger:     liteCategoryTrigger(mat.Type, mat.CatName),
+			Requirement: liteRequirement(mat),
 		}}},
 		Examples: map[string][]string{mat.CatName: mat.Examples},
 		Paths:    map[string][]string{},
 		// 极简模式的审稿清单还没提炼出来（那是阶段 B 的事），此处留空；
-		// reviewer.md 缺失时运行时照常写稿，只是没有自动核对这一环。
+		// reviewer.md 缺失时运行时照常执行，只是没有自动核对这一环。
 		Reviewer: "",
 		Source:   strings.Join(mat.Examples, "\n\n"),
+		// 拆出来的内嵌附件挂在这里，land 据此落盘并在 mp.Attachments 里登记。
+		// **必须传**：land 内部会优先复用 mp.Extracted（避免落盘用的字节与提示词里
+		// 承诺的文件不是同一份）。不传就会重新拆一次，两处结果一旦有细微差异，
+		// 用户拿到的就是「提示词说有三份、实际只落了两份」这种当场就穿帮的技能。
+		Extracted: mat.Extracted,
 		// 极简说明挂在这里，由 writeFidelity 置顶渲染成「这份技能是怎么来的」。
 		LiteNote: liteFidelityNote(),
 	}
 	in2 := &Input{
-		Slug: slug, Name: mat.SkillName, Description: liteLocalDescription(mat.CatName),
-		Category: liteDefaultCategory, Requirement: mat.Guide, Files: base.Files,
+		Slug: slug, Name: mat.SkillName, Description: liteLocalDescription(mat),
+		Category: liteDefaultCategory, Requirement: liteRequirement(mat), Files: base.Files,
 	}
-	dtype := &typeOut{Type: model.SkillTypeWrite, Rationale: "极简创建：用户直接提供了写作指南与范文"}
+	// Attachment（单个）是完整流水线那套「官方模板」字段，极简通道拆出来的多附件走
+	// Attachments（数组列 + meta.json）。这里留空，避免同一概念在库里有两个互相打架
+	// 的来源——下游只认 Attachments，旧列清了才好回滚（见 store/skill_attachments.go）。
+	dtype := &typeOut{Type: mat.Type, Rationale: mat.TypeWhy}
 	if err := g.land(dir, sysPrompt, "", nil, in2, "", dtype, mp); err != nil {
 		return nil, fmt.Errorf("落盘失败: %w", err)
 	}
+	// land 里已完成附件落盘与登记，取回来给 steps / meta / DB 用同一份清单。
+	mat.Attachments = mp.Attachments
 	res := &Result{
-		Slug: slug, Name: mat.SkillName, Description: liteLocalDescription(mat.CatName),
+		Slug: slug, Name: mat.SkillName, Description: liteLocalDescription(mat),
 		Category: liteDefaultCategory,
 		Params:   nil, PromptLen: runeLen(sysPrompt), ExampleN: len(mat.Examples),
-		SkillType: model.SkillTypeWrite,
-		Mode:      modeLite,
+		// 类型与理由都回给前端：用户看到「查询 + 下发文件 / 素材里拆出 2 个内嵌附件」
+		// 才知道自己拿到的是消耗他素材的那件东西，而不是一个长得像写作技能的技能。
+		SkillType:   mat.Type,
+		Attachments: mat.Attachments,
+		Mode:        modeLite,
 		// 极简模式**没有**跑裁判验收，标记必须是无条件的：让「未经验收」和
 		// 「验收通过」在管理端长得一样，正是这个模块反复踩过的坑。
 		Degraded:      true,
 		DegradeReason: liteDegradeReason(),
 	}
 	sk := &model.Skill{
-		Slug: slug, Name: mat.SkillName, Description: liteLocalDescription(mat.CatName),
+		Slug: slug, Name: mat.SkillName, Description: liteLocalDescription(mat),
 		Category: liteDefaultCategory, Version: 1, Enabled: true,
-		SkillType: model.SkillTypeWrite,
+		SkillType: mat.Type,
+		// 附件登记必须进技能记录：运行时的下发按 DB 里的清单走（store.Create 从
+		// sk.Attachments 编码数组列）。只落盘不登记，就是「文件在磁盘上、用户下载不到」，
+		// 而且产物页面看起来一切正常——这类静默错最难被发现，也最像「这功能是假的」。
+		Attachments: mat.Attachments,
 	}
 	if err := g.store.Create(sk, nil); err != nil {
 		return nil, fmt.Errorf("register: %w", err)
 	}
-	steps("③ 已按素材装盘并注册（此刻技能就能用了）：范文 " + fmt.Sprint(len(mat.Examples)) +
-		" 篇逐字落 examples/" + safeCatFileName(mat.CatName) + "/，指南原文进 categories/")
+	if mat.Type == model.SkillTypeWrite {
+		steps("③ 已按素材装盘并注册（此刻技能就能用了）：类型=写作；范文 " + fmt.Sprint(len(mat.Examples)) +
+			" 篇逐字落 examples/" + safeCatFileName(mat.CatName) + "/，指南原文进 categories/")
+	} else {
+		steps("③ 已按素材装盘并注册（此刻技能就能用了）：类型=" + liteTypeLabel(mat.Type) +
+			"；材料正文进 categories/ 与提示词")
+	}
+	if len(mat.Attachments) > 0 {
+		// 附件单独占一行：它是这类技能的主要交付物，用户最需要在这里就确认「拆到了哪几份」。
+		steps("③ 随技能下发的内嵌附件 " + fmt.Sprint(len(mat.Attachments)) + " 份（已落 " +
+			AttachDir + "/ 并登记）：" + liteAttachNameList(mat.Extracted))
+	}
 
 	// ---- 阶段 B：1 次模型调用做精炼 ----
 	// 这一段失败**不算创建失败**（见文件头不变量 1）：A 段的东西已经落盘注册，
@@ -580,8 +648,13 @@ func (g *Generator) GenerateLite(ctx context.Context, in *LiteInput, onStep func
 // 运行时按需注入，模型这一步的职责是「读文风、提炼约束」，不是复述全文。
 func (g *Generator) refineLite(ctx context.Context, mat *liteMaterial) (*liteRefineOut, error) {
 	var ex strings.Builder
-	for i, e := range mat.Examples {
-		ex.WriteString(fmt.Sprintf("\n--- 范文 %d ---\n%s\n", i+1, truncateRunes(e, liteExampleSampleChars/len(mat.Examples)+1)))
+	// 范文为空是**合法**的（查询/模板型素材本来就没有范文），所以先判空再除：
+	// `liteExampleSampleChars/len(mat.Examples)` 在 0 篇时是整数除零 panic，
+	// 而 panic 恰好发生在新开的「非写作素材」这条路径上——本地能复现一个技能都建不出来。
+	if n := len(mat.Examples); n > 0 {
+		for i, e := range mat.Examples {
+			ex.WriteString(fmt.Sprintf("\n--- 范文 %d ---\n%s\n", i+1, truncateRunes(e, liteExampleSampleChars/n+1)))
+		}
 	}
 	sys := `你是写作技能的提示词工程师。给你一份写作指南和若干篇范文，产出一个可以直接投产的写作技能定义。只输出 JSON：
 {
@@ -599,8 +672,38 @@ func (g *Generator) refineLite(ctx context.Context, mat *liteMaterial) (*liteRef
 3. input_params 只列「写这类文章必须知道、但用户可能忘记提供」的信息项，最多 4 项，只把真正必须的标为 required；确实不需要就输出 []。
 4. system_prompt_md 里不要写分类路由，不要要求成稿附带核对清单/自证附录/写作过程说明。
 5. 只输出 JSON，不要任何解释。`
-	user := "## 写作指南（原文）\n" + truncateRunes(mat.Guide, liteGuideSampleChars) +
-		"\n\n## 范文样本（原文已存进技能，供运行时按需注入）\n" + ex.String()
+	// 写作型继续用上面这份提示词（措辞反复调过，不动）；非写作型换一份 schema 说明——
+	// 拿写作型的提示词去精炼附件型素材，模型会把「回答依据」写成「写作要求」。
+	if mat.Type != model.SkillTypeWrite {
+		sys = liteRefineSystemPrompt(mat.Type)
+	}
+	// 交「材料」而不是交「指南」：查询/模板型素材本就没有写作指南（凭正文与附件成事），
+	// 沿用 Guide 会送出一个空字符串，模型只能凭空编这个技能是干嘛的。
+	var material strings.Builder
+	if mat.Type == model.SkillTypeWrite {
+		material.WriteString("## 写作指南（原文）\n")
+	} else {
+		material.WriteString("## 材料（原文）\n")
+	}
+	if s := strings.TrimSpace(mat.Body); s != "" {
+		material.WriteString(truncateRunes(s, liteGuideSampleChars))
+	} else {
+		material.WriteString("（源文件没有解析出可用文本）")
+	}
+	if len(mat.Extracted) == 0 {
+		material.WriteString("\n\n## 随技能下发的文件清单\n无\n")
+	} else {
+		// 清单进精炼输入，模型才可能把「文件名要逐字一致」写进提示词；不给清单而要求
+		// 它别编文件名，等于让它猜。
+		material.WriteString("\n\n## 随技能下发的文件清单（已落盘，运行时按此下发）\n")
+		for _, a := range mat.Extracted {
+			material.WriteString("- " + a.Name + "（" + humanSize(a.Size) + "）\n")
+		}
+	}
+	if ex.Len() > 0 {
+		material.WriteString("\n## 范文样本（原文已存进技能，供运行时按需注入）\n" + ex.String())
+	}
+	user := liteRefineUserPrompt(mat, material.String())
 
 	out, err := g.chatWithMaterial(withoutThinking(ctx), sys, user, true)
 	if err != nil {
@@ -625,11 +728,19 @@ func (g *Generator) writeLiteRefinement(dir string, mat *liteMaterial, out *lite
 	sys := strings.TrimSpace(out.SystemPromptMD)
 	// 交互协议由本地追加（不交给模型）：这五条是「和用户多轮交互」的落点，
 	// 模型漏写一次，技能就退化成一次性模板机，且管理员从产物上看不出来。
-	sys = strings.TrimRight(sys, "\n") + liteInteractionProtocol(mat.CatName)
+	sys = strings.TrimRight(sys, "\n") + liteInteractionProtocol(mat.Type, mat.CatName)
 	if len([]rune(sys)) < 300 {
 		// 精炼版比本地模板还短到过不了硬门：宁可保留 A 段版本，也不交付一份
 		// 过不了校验的提示词（本地模板一定 ≥300 字，这是它的下限保证）。
 		return fmt.Errorf("精炼后的提示词仅 %d 字，未过校验下限", len([]rune(sys)))
+	}
+	// 文件名卫生：模型偶尔会在提示词里"承诺"一个技能里并不存在的文件（把材料里提到的
+	// 「报名表」当成已落盘的附件来写）。用户照着问却下不到东西，而这个错从产物上完全
+	// 看不出来（提示词读起来一切正常）。附件登记是唯一权威：越界就丢弃这次精炼、
+	// 保留 A 段按素材直装的版本——A 段永远不会犯这个错，它是本地拼的。
+	if bad := liteInventedDocNames(sys, mat); bad != "" {
+		return fmt.Errorf("精炼稿提到了技能里没有的文件 %q（附件登记：%s），已保留按素材直装的版本",
+			bad, liteAttachOrNone(mat))
 	}
 	if err := os.WriteFile(filepath.Join(dir, "system_prompt.md"), []byte(sys), 0o644); err != nil {
 		return err
@@ -763,6 +874,16 @@ const (
 // 排序口径与 manualSourceText 一致（文件名序）：范文在 categories/*.md 的
 // 「参考范文」里要跟落盘顺序对得上。
 func collectLiteMaterial(in *LiteInput, files []*UploadedFile) (*liteMaterial, error) {
+	// 内嵌附件**在取材阶段**就拆出来（纯本地解析字节，0 次模型调用）：
+	// 类型判定要用它（有附件 → 查询 + 下发文件型）、提示词要把文件名写进清单、
+	// 门禁要在「既没有指南也没有范文」时靠它决定放宽。三件事都发生在落盘之前。
+	//
+	// 传一份空 pack：extractFromFiles 只在 pack 里已有结果时当缓存复用，此刻还没有 pack。
+	// 落盘时 land 会复用 mat.Extracted 传过去的那一份，保证「提示词里承诺的文件」与
+	// 「磁盘上真落的文件」是同一批字节——拆两次就可能不一致（解压路径里的时间戳、
+	// 重名去重顺序），用户看到清单是三份、实际只落了两份。
+	atts := extractFromFiles(files, &manualPack{})
+
 	var pieces []*litePiece
 	if t := strings.TrimSpace(liteNormalizeNewlines(in.Material)); t != "" {
 		pieces = append(pieces, liteParsePiece("粘贴的素材", t))
@@ -823,31 +944,84 @@ func collectLiteMaterial(in *LiteInput, files []*UploadedFile) (*liteMaterial, e
 	}
 	how := strings.Join(howParts, "；")
 
-	if runeLen(guide) < liteMinGuideChars {
-		// 这条错误必须写成「怎么改」：自解析是猜的，用户看到「指南不足」时最需要的
-		// 是「怎么告诉我哪段是指南」，而不是再猜一次。
-		return nil, fmt.Errorf("没找到够长的写作指南（%d 字，至少要 %d 字）——指南是硬约束的唯一来源，"+
-			"缺了它生成的技能会跟素材脱节。如果指南和范文混在同一份文档里，在范文前面单独一行写"+
-			"「## 范文」（或「范文一」），或者用一行 --- 把两者分开，就能被准确切开。本次判读：%s",
-			runeLen(guide), liteMinGuideChars, how)
+	// 材料正文：没有指南时它是唯一的材料来源（查询/模板型就靠它答问、列要件）。
+	body := strings.TrimSpace(guide)
+	if body == "" {
+		body = strings.TrimSpace(strings.Join(examples, "\n\n"))
 	}
 	total := 0
 	for _, e := range examples {
 		total += runeLen(e)
 	}
-	if len(examples) == 0 || total < liteMinExampleChars {
+	guideShort := runeLen(guide) < liteMinGuideChars
+	examplesShort := len(examples) == 0 || total < liteMinExampleChars
+
+	// 硬门的松紧：**只有**从源文件里拆出内嵌附件时才放宽。
+	//
+	// 起因是旧门禁只认「指南 + 范文」，等于只支持「写作」这一件事。素材是
+	// 「一份制度文件 + 里面内嵌的报名表」时，制度正文既不是写作指南、也没有范文，
+	// 旧口径会把一件明明能做好的素材判成「素材不合格」——用户的原话是
+	// 「现在都是写作，不能满足我的需求」。
+	//
+	// 为什么只认「有附件」、不认「材料有正文」：正文够长就放行的话，用户上传一份
+	// 只有指南没有范文的素材也会被放行、然后被判成查询型技能——他要的是写作，
+	// 拿到的是答问，比直接报错更让人摸不着头脑。放宽必须有一个客观、可核对的依据，
+	// 「字节流里真躺着一个附件」就是这个依据。
+	//
+	// 放宽的代价必须显性付清：判定理由进 steps + meta.json，缺了什么进 Warn。
+	// 缺什么说什么，不做静默降级（这是本模块反复踩的坑）。
+	relaxed := len(atts) > 0
+	if !relaxed && guideShort {
+		// 这条错误必须写成「怎么改」：自解析是猜的，用户看到「指南不足」时最需要的
+		// 是「怎么告诉我哪段是指南」，而不是再猜一次。
+		return nil, fmt.Errorf("没找到够长的写作指南（%d 字，至少要 %d 字）——指南是硬约束的唯一来源，"+
+			"缺了它生成的技能会跟素材脱节。如果指南和范文混在同一份文档里，在范文前面单独一行写"+
+			"「## 范文」（或「范文一」），或者用一行 --- 把两者分开，就能被准确切开。"+
+			"如果你要的本来就不是写作技能（例如「回答这份制度里的问题」「把源文件里的附件发给用户」），"+
+			"请把**原始文件**原样上传（docx/PDF 直接传，不要另存成 txt 再传）：源文件里带的附件会被一并拆出来。"+
+			"本次判读：%s",
+			runeLen(guide), liteMinGuideChars, how)
+	}
+	if !relaxed && examplesShort {
 		return nil, fmt.Errorf("没找到范文（当前 %d 篇 / %d 字，至少要 1 篇合计 %d 字）。"+
 			"范文决定了技能学到的是不是你想要的文风。同一份文档里可以把范文放在指南后面，"+
 			"在前面加一行「## 范文」或「---」隔开；范文是好几篇时，篇与篇之间也用一行 --- 分开。"+
+			"如果你要的本来就不是写作技能（例如「回答这份制度里的问题」「把源文件里的附件发给用户」），"+
+			"请把**原始文件**原样上传（docx/PDF 直接传，不要另存成 txt 再传）：源文件里带的附件会被一并拆出来。"+
 			"本次判读：%s",
 			len(examples), total, liteMinExampleChars, how)
 	}
+	var relaxNotes []string
+	if guideShort {
+		relaxNotes = append(relaxNotes, fmt.Sprintf("没有成篇的写作指南（%d 字，低于 %d 字）", runeLen(guide), liteMinGuideChars))
+	}
+	if examplesShort {
+		relaxNotes = append(relaxNotes, fmt.Sprintf("没有可用范文（%d 篇 / %d 字）", len(examples), total))
+	}
+	if len(relaxNotes) > 0 {
+		if warn != "" {
+			warn += "；"
+		}
+		warn += "材料里" + strings.Join(relaxNotes, "、") +
+			"——本次按素材实际内容判定类型后继续生成（这是极简通道对「非写作素材」的放宽：源文件里确实带着可下发的附件）；" +
+			"补齐指南与范文后可在管理端重训成完整技能"
+	}
 
 	name, cat := inferLiteNames(in.Name, guide, fromFiles, examples)
+	typ, why := liteDecideType(len(atts), guide, len(examples), total, runeLen(body))
+	if typ != model.SkillTypeWrite && strings.TrimSpace(in.Name) == "" {
+		// 非写作型不能顶着「XX写作」的名字：名字是用户唯一一眼能看到的产物说明，
+		// 叫「XX写作」而实际只会答问/发文件，等于在名字上撒谎。只在名字是本地推断
+		// 出来的时候改——用户自己填的名字，错了也是他的选择。
+		if base := strings.TrimSuffix(strings.TrimSpace(name), "写作"); strings.TrimSpace(base) != "" {
+			name = strings.TrimSpace(base)
+		}
+	}
 	return &liteMaterial{
 		SkillName: name, CatName: cat,
 		Guide: guide, GuideFrom: guideFrom, How: how, Warn: warn,
-		Examples: examples,
+		Examples: examples, Body: body,
+		Type: typ, TypeWhy: why, Extracted: atts,
 	}, nil
 }
 
@@ -989,7 +1163,24 @@ func liteLocalPrompt(skillName, catName, guide string, exampleN int) string {
 // liteInteractionProtocol 是「和用户多轮交互」的落点，**每轮都追加**（阶段 B 精炼
 // 之后也要再拼一次）：模型漏写一次，技能就退化成一次性模板机，而这件事管理员从
 // 产物文件上完全看不出来。
-func liteInteractionProtocol(catName string) string {
+func liteInteractionProtocol(typ, catName string) string {
+	// 查询/模板型的协议与写作型**不共用**：写作型那五条讲的是「怎么成稿、怎么改稿」，
+	// 对答问类技能全是废话；而答问类最要紧的一条（材料没有就直说，不要硬答）在写作型里
+	// 根本不存在。共用一份，等于交付一个把「查办件」当「写文章」的技能。
+	if typ == model.SkillTypeQuery || typ == model.SkillTypeTemplate {
+		p := "\n\n---\n\n## 交互协议（每轮都必须遵守）\n\n" +
+			"1. **一次答清**：材料里有依据就直接给结论 + 原文依据，不要只说一句就反问。\n" +
+			"2. **缺关键信息才问**：只有当" + catName + "的办理要件（如办理主体、事项类型）在材料里确实找不到依据时才先提问；一次最多 3 条，每条都带上你的默认理解，用户回「就按你的」即可继续。\n" +
+			"3. **问过就记住**：用户回答过的信息当既定事实，后续轮次不得再问同一件事，也不要重列一遍通用要件清单。\n"
+		if typ == model.SkillTypeTemplate {
+			p += "4. **要文件就直接给**：不解释技术细节、不说「请自行下载」，也不把表格里的内容抄成正文代替文件。\n" +
+				"5. **没有的别答应**：材料与文件清单里都没有的，如实说这份技能里没有，并指出最接近的一份；不许用「已发送」搪塞。\n"
+		} else {
+			p += "4. **越界就直说**：用户问的事材料里完全没有、不属于" + catName + "时，说明这份技能只依据这份材料，" +
+				"不要拿通用知识硬答。\n"
+		}
+		return p
+	}
 	return "\n\n---\n\n## 交互协议（每轮都必须遵守）\n\n" +
 		"1. **一次成稿**：信息够就直接交付完整成稿，不要写一段就反问。\n" +
 		"2. **缺关键信息才问**：只有当" + catName + "的必备要素（如主体、时间、核心事实）确实没有依据时才先提问；一次最多 3 条，每条都带上你的默认理解，用户回「就按你的」即可继续。\n" +
@@ -999,8 +1190,18 @@ func liteInteractionProtocol(catName string) string {
 }
 
 // liteLocalDescription 是阶段 A 的描述兜底（B 段会覆盖）。
-func liteLocalDescription(catName string) string {
-	return "按你提供的写作指南与范文撰写" + catName + "（极简模式）"
+//
+// 按类型给不同说法：描述是技能列表里唯一的说明行，写成「按写作指南撰写」而技能实际
+// 只会答问、发文件，用户在自己的技能列表里根本认不出它——而它明明正是他要的那个。
+func liteLocalDescription(mat *liteMaterial) string {
+	switch mat.Type {
+	case model.SkillTypeQuery:
+		return "回答" + mat.CatName + "材料里的问题，只依据材料原文（极简模式）"
+	case model.SkillTypeTemplate:
+		return "回答" + mat.CatName + "材料里的问题，并按需下发随技能的 " +
+			fmt.Sprint(len(mat.Extracted)) + " 份表格模板（极简模式）"
+	}
+	return "按你提供的写作指南与范文撰写" + mat.CatName + "（极简模式）"
 }
 
 // modeLite 是极简通道写入 meta.json 的模式标记。
@@ -1051,3 +1252,301 @@ func liteShortErr(err error) string {
 
 // runeLen 数的是字符数：中文素材按字节算会让「300 字下限」变成 100 字。
 func runeLen(s string) int { return len([]rune(s)) }
+
+// ---------------------------------------------------------------------------
+// 极简通道：产物类型判定 + 非写作型（查询 / 查询+下发文件）的本地提示词
+//
+// 背景：极简通道原来只支持「写作」——门禁要指南 + 范文，提示词全是「怎么写得像范文」，
+// 类型写死 model.SkillTypeWrite。于是素材是「一份制度文件 + 里面内嵌的报名表」时，
+// 用户要的是「能问、能拿表」，拿到的却是一个写作技能（或者干脆被判素材不合格）。
+// 下面这组函数是「按素材实际内容定类型」的落地，全部纯本地、0 次模型调用。
+// ---------------------------------------------------------------------------
+
+// liteDecideType 判定产物类型，纯本地（0 次模型调用）。
+//
+// 为什么不复用完整流水线的 detectType：那是一步模型调用，而极简通道的立身之本
+// 是「阶段 A 不等模型也能交付」（见文件头不变量）。用一次调用定类型，用户点完按钮的
+// 秒级交付就没了。而定类型这件事本地判据比模型更可靠——「拆出内嵌附件」是个字节层面的
+// 客观事实，不需要模型「感觉」一下。
+//
+// 判据（自上而下，先命中先定）：
+//  1. 拆出内嵌附件、且素材不构成写作技能 → template（查询 + 下发文件）：
+//     源文件里带着要发给用户的文件，技能的核心交付物就是那几个文件。
+//  2. 素材构成写作技能（有指南 + 有范文）→ write：即使带了附件也仍是写作技能，
+//     附件一并下发。上传「写作指南 + 参考模板」是很常见的组合，不能因为拆出附件
+//     就把用户要的写作能力判没了。
+//  3. 无附件但材料有正文 → query：能答问；产不出稿件，也不该假装能写。
+//  4. 兜底 → write（走到这里说明有指南有范文，见 collectLiteMaterial 的门禁）。
+//
+// why 是给人看的（进 steps 与 meta.json）：类型判定是这次交付里最需要被解释的决策，
+// 用户看到「为什么给我生成一个查询技能」时，答案就在这一行里。
+func liteDecideType(attachN int, guide string, exampleN, exampleChars, bodyChars int) (string, string) {
+	writing := runeLen(strings.TrimSpace(guide)) >= liteMinGuideChars &&
+		exampleN > 0 && exampleChars >= liteMinExampleChars
+	// 顺序不是随手排的：**先判写作，再判附件，最后才看正文长度**。
+	//
+	// 写作必须排第一：Body 在「有指南」时就等于指南本身（见 liteMaterial.Body 的注释），
+	// 所以一份正常的写作素材必然满足 bodyChars >= liteMinGuideChars。把正文长度放前面，
+	// 每一次正常的写作创建都会被判成查询型——技能列表里看不出异常，只是用户让他写稿时
+	// 收到的是一段答问。这条是写测试时抓出来的（lite_type_test.go 的矩阵里有一格红了）。
+	switch {
+	case writing && attachN > 0:
+		return model.SkillTypeWrite, fmt.Sprintf(
+			"素材有写作指南与范文（按写作生成），同时拆出 %d 个内嵌附件，会随技能一起下发给用户", attachN)
+	case writing:
+		return model.SkillTypeWrite, "用户直接提供了写作指南与范文，按「写作」生成"
+	case attachN > 0:
+		// 附件排在正文长度之前：附件是**客观事实**（字节流里真躺着一份文件），
+		// 而「正文够长」只说明材料有内容、不说明该怎么用。两者都不是写作素材时，
+		// 以附件定类型——不然用户按提示去要文件，技能却只会答问。
+		return model.SkillTypeTemplate, fmt.Sprintf(
+			"素材里拆出 %d 个内嵌附件，且素材不是写作类（没有成篇的写作指南/范文），按「查询 + 下发文件」生成", attachN)
+	case bodyChars >= liteMinGuideChars:
+		return model.SkillTypeQuery, fmt.Sprintf(
+			"素材有正文（%d 字）但没有成篇的写作指南与范文，按「查询」生成", bodyChars)
+	}
+	return model.SkillTypeWrite, "素材既没有写作指南范文也没有可下发的附件，按「写作」生成（可在管理端补齐指南与范文后重训）"
+}
+
+// liteTypeLabel 把类型码翻成人话，只用在给人看的步骤 / 元数据里。
+func liteTypeLabel(typ string) string {
+	switch typ {
+	case model.SkillTypeQuery:
+		return "查询"
+	case model.SkillTypeTemplate:
+		return "查询 + 下发文件"
+	case model.SkillTypeWrite:
+		return "写作"
+	}
+	return typ
+}
+
+// liteCategoryTrigger 是分类的触发语（运行时按需求找技能的那句话）。
+//
+// 写作型沿用「需要撰写X」的老口径；查询型绝不能写「需要撰写」——那会把
+// 「这个手续怎么办」这类问题导向一个不会写文章的技能，用户拿到答非所问的回复，
+// 而这从产物上完全看不出来（技能列表里只是多了一行字）。
+func liteCategoryTrigger(typ, catName string) string {
+	switch typ {
+	case model.SkillTypeQuery, model.SkillTypeTemplate:
+		return "需要查询/了解" + catName + "的办理要求，或索取相关表格模板"
+	}
+	return "需要撰写" + catName
+}
+
+// liteRequirement 是分类里的「硬约束」文本（写进 categories/ 与 meta.json）。
+//
+// 查询/模板型的硬约束不是文风，而是「只依据材料原文」+「文件怎么给」这两条。它们必须
+// 落到这里，而不是只躺在 system_prompt.md 里：管理员在左树里打开这份技能时，看到的
+// 应该是它凭什么答、给什么文件——那里空着，他就只能点进去读提示词才知道。
+func liteRequirement(mat *liteMaterial) string {
+	switch mat.Type {
+	case model.SkillTypeQuery:
+		return "只依据材料原文回答用户关于「" + mat.CatName + "」的问题：材料里有的照原文答，" +
+			"材料里没写的直接说没写，不得编造条款号，也不得凭常识补齐。"
+	case model.SkillTypeTemplate:
+		return "只依据材料原文回答用户关于「" + mat.CatName + "」的问题，并按用户点名把随技能下发的文件发给他：" +
+			"材料里有的照原文答、没写的说没写；文件以技能内的附件登记为准，不得改名或自行虚构文件名。"
+	}
+	return strings.TrimSpace(mat.Guide)
+}
+
+// litePromptFor 按类型挑阶段 A 的本地兜底提示词。
+//
+// 阶段 B（精炼）会覆盖它，但 B 失败时它是唯一还在线的提示词（极简模式允许 B 失败，
+// 见文件头不变量），所以三种类型都得给足、不能是半成品。
+func litePromptFor(mat *liteMaterial) string {
+	if mat.Type == model.SkillTypeWrite {
+		base := liteLocalPrompt(mat.SkillName, mat.CatName, mat.Guide, len(mat.Examples))
+		// 写作技能也可能带着附件（「指南 + 参考模板」的组合）：清单必须进提示词，
+		// 否则模型根本不知道手上有文件，用户要模板时它只会把表格内容抄一遍当交付物。
+		if len(mat.Extracted) > 0 {
+			base += liteAttachSection(mat)
+		}
+		return base
+	}
+	return liteMaterialPrompt(mat)
+}
+
+// liteMaterialPrompt 生成查询/模板型的本地提示词。
+//
+// 为什么不复用 liteLocalPrompt：写作型模板的骨架是「怎么写得像范文」，查询型的骨架是
+// 「说得准 + 文件给到位」，两者的硬约束没有一条重合。硬套写作模板会丢掉「只依据材料
+// 原文」这条最要紧的规矩，技能就会开始凭常识编条款——办事场景里最不能接受的一种错。
+func liteMaterialPrompt(mat *liteMaterial) string {
+	var b strings.Builder
+	b.WriteString("# " + mat.SkillName + "\n\n")
+	if n := len(mat.Extracted); n > 0 {
+		b.WriteString("你是「" + mat.CatName + "」的办事助手。你手上有这份材料的原文，还带着 " +
+			fmt.Sprint(n) + " 个可下发的文件。用户来找你通常是两类事：**问材料里的事**、" +
+			"**要一份能填的表/模板**。\n\n")
+	} else {
+		b.WriteString("你是「" + mat.CatName + "」的办事助手。用户来找你，是要**问清楚材料里的事**。\n\n")
+	}
+	b.WriteString("## 工作方式（硬约束）\n\n")
+	b.WriteString("1. **只依据下面「材料原文」回答**：条款、时限、金额、要件、办理地点，材料里怎么写的就怎么说，不得凭常识补齐。\n")
+	b.WriteString("2. 材料里没写的，直接说「材料里没写」，并指出最接近的那一节；**不要编条款号**，也不要给一个听起来合理的数字。\n")
+	b.WriteString("3. 能一句话答的就别凑三段；用户问哪一条就答哪一条。\n")
+	b.WriteString("4. 用户问「我要办某事，需要准备什么」时，先把材料里该事项的**要件清单**照原文列出来" +
+		"（有几项列几项），再问他要不要对应的表格。\n")
+	b.WriteString("5. 材料里有好几套流程/好几类情形时，先确认他属于哪一类再答；他描述不清就照材料把分类列出来让他选。\n")
+	b.WriteString("\n## 材料原文（回答的唯一依据）\n\n")
+	b.WriteString(liteEmbedBody(mat.Body))
+	b.WriteString(liteAttachSection(mat))
+	b.WriteString(liteInteractionProtocol(mat.Type, mat.CatName))
+	return b.String()
+}
+
+// liteEmbedBody 把材料正文内嵌进提示词。
+//
+// 内嵌而不是「留给运行时按需注入」：阶段 B 失败时（极简模式允许失败）这份提示词是唯一
+// 还在线的产物，材料不在里面，技能就退化成一台只会寒暄的空壳——而用户从产物上只能看到
+// 「提示词 800 字、看着挺像样」。
+func liteEmbedBody(body string) string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return "（材料原文缺失：源文件没有解析出可用文本，请管理员重新上传原始文件）\n"
+	}
+	if runeLen(body) > liteBodyEmbedChars {
+		// 超长只截断，不报错：极简通道的底线是「先交付一份能用的」。整篇 5 万字公文塞进去
+		// 会把每一轮的上下文额度吃光，模型反而更容易忽略真正相关的那几段。
+		return truncateRunes(body, liteBodyEmbedChars) +
+			"\n\n（原文较长，此处截断；材料原文的完整副本已存入技能的 source/ 目录，可下载核对）\n"
+	}
+	return body + "\n"
+}
+
+// liteAttachSection 生成「随技能一起下发的文件」清单段（没有附件时返回空串）。
+//
+// 为什么清单必须进提示词，而不是只存数据库：下发动作由运行时执行（chat.go 的附件下发），
+// 但**对话里的措辞是模型写的**。模型不知道有哪几个文件时会做两件都很糟的事——把表格内容
+// 抄成正文（用户要的是能填的表，抄一段文字等于没给），或者说「已为你发送」而系统其实一份
+// 都没发。清单进提示词，这两件事就都堵住了。
+func liteAttachSection(mat *liteMaterial) string {
+	if mat == nil || len(mat.Extracted) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n## 随技能下发的文件（用户点名要哪个就发哪个）\n\n")
+	for _, a := range mat.Extracted {
+		b.WriteString("- " + a.Name + "（" + humanSize(a.Size) + "）\n")
+	}
+	b.WriteString("\n发文件的规矩：\n")
+	b.WriteString("1. 称呼文件名时与上面**逐字一致**：不要翻译、不要改扩展名、不要自己另起一个名字。\n")
+	b.WriteString("2. 正文只写一两句「这次发的是哪一份、能用来做什么」；**不要**用文字把表格/条款复述一遍当作交付物。\n")
+	b.WriteString("3. 只有上面清单里的文件才可以说「已发送/已附上」；清单里没有的，如实说技能里没有这份，并指出最接近的那一份。\n")
+	b.WriteString("4. 用户没点名而要哪份时，先把清单列出来让他挑一行，不要猜着发。\n")
+	return b.String()
+}
+
+// liteAttachNameList 把内嵌附件压成「报名表.docx(12KB)、汇总表.xlsx(3KB)」这类一行文案，
+// 只用于步骤日志（带大小是为了在日志里一眼看出是否拆错了层级）。
+func liteAttachNameList(atts []ExtractedAttachment) string {
+	parts := make([]string, 0, len(atts))
+	for _, a := range atts {
+		parts = append(parts, a.Name+"("+humanSize(a.Size)+")")
+	}
+	return strings.Join(parts, "、")
+}
+
+// liteRefineSystemPrompt 是阶段 B 那唯一一次调用的系统提示词，按类型给两份。
+//
+// 为什么不能共用一份：写作型要求「不得丢掉指南里的硬约束」，查询型要求「不得把材料事实
+// 改写成通用常识」，这两条红线不重合。拿写作型的提示词去精炼一份附件型素材，模型会把
+// 「回答依据」写成「写作要求」，产物一眼看过去就错位。
+func liteRefineSystemPrompt(typ string) string {
+	if typ == model.SkillTypeWrite {
+		return `你是写作技能的提示词工程师。给你一份写作指南和若干篇范文，产出一个可以直接投产的写作技能定义。只输出 JSON：
+{
+  "skill_name": "技能名，不超过 12 字，如「新闻稿写作」",
+  "description": "一句话说明这个技能写什么，不超过 40 字",
+  "trigger": "什么需求该用这个技能，不超过 40 字",
+  "input_params": [{"name":"英文小写下划线","label":"表单标签","type":"text|textarea|select|number","required":true,"placeholder":"示例","help":"一句提示"}],
+  "style_profile_md": "Markdown：文风 / 结构骨架 / 长度 / 禁忌，不超过 600 字",
+  "reviewer_md": "Markdown 审稿清单，每条以「- [ ] 」开头、能用是/否判定，不超过 800 字",
+  "system_prompt_md": "system prompt 正文，不超过 1500 字：角色 + 工作方式 + 硬约束 + 范文用法 + 交付物卫生"
+}
+硬性要求：
+1. **不得丢掉指南里的任何硬约束**（字数上限、必含要素、禁用词、格式要求）。可以压缩措辞，不能省略规则。
+2. 不得新增指南与范文里没有的要求。
+3. input_params 只列「写这类文章必须知道、但用户可能忘记提供」的信息项，最多 4 项，只把真正必须的标为 required；确实不需要就输出 []。
+4. system_prompt_md 里不要写分类路由，不要要求成稿附带核对清单/自证附录/写作过程说明。
+5. 只输出 JSON，不要任何解释。`
+	}
+	return `你是「办事问答」类技能的提示词工程师。给你一份材料原文（可能带若干可下发的文件），产出可以直接投产的助理技能定义。只输出 JSON：
+{
+  "skill_name": "技能名，不超过 12 字，如「公租房申请咨询」",
+  "description": "一句话说明这个技能能回答什么、能给什么文件，不超过 40 字",
+  "trigger": "什么需求该用这个技能，不超过 40 字",
+  "input_params": [{"name":"英文小写下划线","label":"表单标签","type":"text|textarea|select|number","required":false,"placeholder":"示例","help":"一句提示"}],
+  "style_profile_md": "Markdown：回答口径（怎么答、答多长、要不要先列要件清单），不超过 600 字",
+  "reviewer_md": "Markdown 回答自检清单，每条以「- [ ] 」开头、能用是/否判定（例：是否只依据材料原文、是否编了材料里没有的条款号、文件名是否与清单逐字一致），不超过 800 字",
+  "system_prompt_md": "system prompt 正文，不超过 1500 字：角色 + 只依据材料原文 + 要件清单怎么列 + 文件怎么给 + 交付物卫生"
+}
+硬性要求：
+1. **不得丢掉材料里的任何可答事实**（条款、时限、金额、要件、办理地点）。可以重排结构，不能省略事实。
+2. 不得新增材料里没有的规则或常识；材料没写的，要引导成「材料里没写」而不是给一个像样的答案。
+3. input_params 只列「回答必须知道、但用户可能忘记提供」的信息项（如办理主体、事项类型），最多 3 项，确实不需要就输出 []。
+4. system_prompt_md 里必须保留「只依据材料原文回答、材料没写就说没写、不编条款号」这条硬约束；不要写分类路由，不要要求回复附带自证附录。
+5. 文件清单原样保留：**不得新增、改名或猜测文件名**；清单为空时不要凭空提任何文件。
+6. 只输出 JSON，不要任何解释。`
+}
+
+// liteRefineUserPrompt 把「产出类型 + 判定理由 + 材料」拼成阶段 B 的用户侧提示词。
+func liteRefineUserPrompt(mat *liteMaterial, material string) string {
+	kind := "查询型：只回答材料里的事，不下发文件"
+	if n := len(mat.Extracted); n > 0 {
+		kind = fmt.Sprintf("查询 + 下发文件型：回答材料里的事，并在用户点名时下发随技能的 %d 份文件", n)
+	}
+	if mat.Type == model.SkillTypeWrite {
+		kind = "写作型：按指南与范文写作（材料里若带可下发文件，按清单原样保留）"
+	}
+	return "## 本技能的产出类型（已判定，不要改）\n" + kind +
+		"\n\n## 判定理由\n" + mat.TypeWhy + "\n\n" + material
+}
+
+// liteDocNameRe 抓提示词里被当成可下载文件提到的正文档名（带常见交付格式后缀）。
+var liteDocNameRe = regexp.MustCompile(`[A-Za-z0-9_\p{Han}\-（）()]{1,40}\.(?:docx?|xlsx?|pptx?|pdf|zip|rar|txt|csv)`)
+
+// liteInventedDocNames 返回精炼稿里「技能里没有、材料里也没提过」的文件名，空串表示没问题。
+//
+// 为什么要查材料原文：材料本身完全可能提到外部文件名（「填写《报名表》后交回」），
+// 那是材料的事实、不是模型编的。只有附件登记与材料正文两处都查不到的名字才算虚构。
+func liteInventedDocNames(prompt string, mat *liteMaterial) string {
+	body := mat.Body
+	for _, n := range liteDocNameRe.FindAllString(prompt, -1) {
+		if liteInAttachments(n, mat.Attachments) || strings.Contains(body, n) {
+			continue
+		}
+		stem := strings.TrimSuffix(n, filepath.Ext(n))
+		// 材料里提过「报名表」而提示词写成「报名表.docx」：是同一份东西的完整写法，
+		// 不算虚构。反过来材料里从没出现过的名字才是真编的。
+		if stem != "" && strings.Contains(body, stem) {
+			continue
+		}
+		return n
+	}
+	return ""
+}
+
+// liteInAttachments 判断某个名字是否已在附件登记里（忽略大小写，允许带目录前缀的写法）。
+func liteInAttachments(name string, regs []model.Attachment) bool {
+	for _, r := range regs {
+		if strings.EqualFold(strings.TrimSpace(r.Name), name) || strings.HasSuffix(r.Rel, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// liteAttachOrNone 给出附件登记的一句话清单，用于报错文案。
+func liteAttachOrNone(mat *liteMaterial) string {
+	if len(mat.Attachments) == 0 {
+		return "无"
+	}
+	ns := make([]string, 0, len(mat.Attachments))
+	for _, a := range mat.Attachments {
+		ns = append(ns, a.Name)
+	}
+	return strings.Join(ns, "、")
+}

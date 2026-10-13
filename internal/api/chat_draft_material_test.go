@@ -69,7 +69,7 @@ func TestManualWriteStreamsDraftAsMaterial(t *testing.T) {
 	defer clock.Freeze()
 
 	done := h.runManualWrite(context.Background(), rec.write, clock, sc, pack,
-		map[string]string{"主题": "数据中台3.0上线"}, "帮我写一份数据中台上线的新闻通稿", "sess-draft-mat", nil)
+		map[string]string{"主题": "数据中台3.0上线"}, nil, "帮我写一份数据中台上线的新闻通稿", "sess-draft-mat", nil)
 	if !done {
 		t.Fatal("runManualWrite 应返回 true（本轮已处理完毕）")
 	}

@@ -21,6 +21,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/lizhemin15/skillforge/internal/model"
 	"github.com/lizhemin15/skillforge/internal/ocrsvc"
 	"github.com/lizhemin15/skillforge/internal/tlsconf"
 )
@@ -964,6 +965,17 @@ type manualPack struct {
 	// 文件，是「裁判验收」这一环的证据，而报告必须把这件事说清楚
 	// （写成「未启用裁判评分」会让管理员以为只是没开开关，其实这一版根本没验过）。
 	LiteNote string
+	// Extracted 是**已在取材阶段拆出来**的内嵌附件（见 lite.go）。
+	//
+	// 由 land 负责落盘、并把登记结果写回 Attachments——两件事必须分开：
+	// 取材阶段就得知道「有没有附件」才能定类型、写提示词，但那时技能目录还不存在，
+	// 落盘只能等到 land。挂在 manualPack 上带过去，就不会出现「判定说有附件、
+	// 落盘却没拆」这种半成品。
+	Extracted []ExtractedAttachment
+	// Attachments 是落盘后的附件登记（相对路径 + 大小 + 来源），进 meta.json
+	// 的 attachments 字段与 DB 的 skill_attachments 列。运行时靠它把文件真正
+	// 发给用户——只写进提示词而没落盘，模型会一本正经地告诉用户「已发送」。
+	Attachments []model.Attachment
 }
 
 // ExampleCount 返回成功切出的范文总数。

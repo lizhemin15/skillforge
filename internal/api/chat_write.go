@@ -27,6 +27,9 @@ const maxReviewRounds = 2
 
 // runManualWrite 执行手册模式的三段式写作。返回 true 表示本轮已处理完毕
 // （已下发 done 或 error），handler 应直接 return。
+//
+// files 是分类器给出的「用户点名要的附件展示名」（已过白名单归一，见 agent 的
+// EvalTurn）；它只影响交尾阶段的附件下发（Deliverables），不影响写作本身。
 func (h *chatHandler) runManualWrite(
 	ctx context.Context,
 	write func(ev, data string),
@@ -34,6 +37,7 @@ func (h *chatHandler) runManualWrite(
 	sc *agent.SkillContent,
 	pack *agent.WritePack,
 	args map[string]string,
+	files []string,
 	userMsg, sessionID string,
 	history []agent.Message,
 ) bool {
@@ -144,12 +148,10 @@ func (h *chatHandler) runManualWrite(
 	}
 	h.eng.Push(sessionID, agent.Message{Role: "assistant", Content: final, SkillSlug: sc.Slug, Kind: agent.KindArtifact, At: time.Now()})
 	clock.Finish()
-	if strings.TrimSpace(sc.Attachment) != "" {
-		write(evFile, jsonSafe(map[string]string{
-			"slug": sc.Slug, "name": sc.Attachment,
-			"url": "/api/chat/attachment/" + sc.Slug,
-		}))
-	}
+	// 手册写作链路的交付物同样走 Deliverables（口径与技能链、模板短路一致）。
+	// action 传空：手册模式本轮的意图是「写稿」，用户没有点名要文件；
+	// 于是单附件技能照旧随稿下发（老行为不变），多附件技能只有点名才发。
+	deliverAttachments(write, sc.Slug, sc.Deliverables(files, ""))
 	write(evDone, jsonSafe(map[string]string{"skill": sc.Slug}))
 	return true
 }

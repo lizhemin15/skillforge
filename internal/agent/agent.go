@@ -64,6 +64,16 @@ type Eval struct {
 	//   "write"         → free-form writing via a write skill → Generate
 	//   "answer"        → plain chat / QA, no file → Generate (general)
 	Action string `json:"action"`
+	// Files 是本轮用户**点名要的附件文件名**（照抄 roster 里「可下发附件」那行）。
+	//
+	// 为什么让分类器来选，而不是运行时自己猜：用户说「发我报名表」，这句话的指代
+	// 只在"技能清单里有哪些文件"的语境下才有意义——分类器是唯一同时看到用户原话和
+	// 清单的地方。运行时若自己按关键词匹配正文，等于把已经做过的语义判断重做成字符串
+	// 比较，而关键词表永远缺一格（"那份汇总的"、"附件2"）。
+	//
+	// 硬约束：这里是**请求**，不是结论。运行时必须拿技能声明的附件做白名单核对
+	// （见 agent.MatchAttachments），模型编出来的名字不许直接变成下载。
+	Files []string `json:"files,omitempty"`
 	// NeedsTools 表示这个任务必须先拿到外部实时数据或做真实计算才能完成。
 	// 为 true 时走 Agent 工具循环（http_request / run_python），而不是让模型
 	// 凭记忆编内容——编造 star 数、销量、汇率这类「看起来合理」的数字是最坏的结果。
@@ -518,6 +528,11 @@ func (e *Engine) EvalTurn(ctx context.Context, id, user string, history []Messag
 当命中 write 技能时 action="write"。
 只有当没有专门技能匹配时才落到通用能力（action="write"/"answer"）。
 
+可下发附件（files：**只有用户点名要某个附件文件时才填**）：
+- 技能清单里带"可下发附件:"那行的技能，能把列出的那些文件直接发给用户（多为源文档拆出来的附件，如报名表/汇总表）。
+- 用户点名要其中某一份时（"发我报名表"、"把附件2发我"、"给我那份汇总表"）→ action="template_only"，命中该技能，files 填**照抄清单里的原名**：清单里没有的名字一个都不许写（运行时按白名单核对，编的名字发不出去，用户会以为拆分漏了）。
+- 用户没点名要文件（只问怎么办理、要正文、要新文档）→ files 留空 []。**不要预判性地填**：要不要附发由运行时按技能决定。
+
 优先级：用户要求"填/起草/生成"某个明确表单或文档，且清单里有带专用模板的 template 技能精确匹配（如用户说"采购验收单"）时，必须优先选它且 action="fill"，绝不能退而选通用 docgen 技能。只有当没有专门 template 匹配时，才选通用 docgen/write 技能。
 
 需求要点：
@@ -530,8 +545,8 @@ func (e *Engine) EvalTurn(ctx context.Context, id, user string, history []Messag
    - detail 一句话、面向用户，别用内部术语。
 
 只输出一个 JSON 对象，不要任何其他文字。照下面这个长度写，全篇 ≤220 字：
-{"intent":"docgen","action":"fill","skill_slug":"采购合同","needs_tools":false,"reason":"命中模板，开始填充","params":{"party":"星禾科技"},"needs":[],"steps":[{"phase":"analyze","detail":"docgen/fill"},{"phase":"match","detail":"命中 采购合同"},{"phase":"params","detail":"已提取 1 项"},{"phase":"generate","detail":"填充模板"}]}
-（字段说明：intent=write|docgen|query|chat，action=fill|template_only|gen|write|answer，skill_slug=**必须照抄下面「技能清单」里某个 slug 的原文，未命中就填空字符串 ""**（清单里没有的名字一个都不许写，尤其不许写「通用能力」「通用写作」这类词），reason ≤12 字；params 是对象、needs 是数组，没有内容就给 {} / []，不要写占位话术。）
+{"intent":"docgen","action":"fill","skill_slug":"采购合同","files":[],"needs_tools":false,"reason":"命中模板，开始填充","params":{"party":"星禾科技"},"needs":[],"steps":[{"phase":"analyze","detail":"docgen/fill"},{"phase":"match","detail":"命中 采购合同"},{"phase":"params","detail":"已提取 1 项"},{"phase":"generate","detail":"填充模板"}]}
+（字段说明：intent=write|docgen|query|chat，action=fill|template_only|gen|write|answer，skill_slug=**必须照抄下面「技能清单」里某个 slug 的原文，未命中就填空字符串 ""**（清单里没有的名字一个都不许写，尤其不许写「通用能力」「通用写作」这类词），reason ≤12 字；files 是**用户点名要的附件原名数组**（照抄清单、没点名就 []），params 是对象、needs 是数组，没有内容就给 {} / []，不要写占位话术。）
 
 needs_tools 判断（很重要，判错会导致答案里的数字是编的）：
 - true：任务必须先拿到**外部实时数据**（查接口/API、抓网页、查实时行情、查仓库/订单/库存等外部系统数据），或需要对数据做**真实计算/统计**（求和、占比、同比、排序汇总）才能给出正确答案。
@@ -641,7 +656,57 @@ action 必须根据上面「意图→动作」映射严格输出，不要省略�
 		eval.SkillSlug = ""
 		eval.Reason = "分类器命中的技能不在可用清单，按未命中处理"
 	}
+	// ── files 的同一把守卫：点名要的文件必须真是这个技能声明的附件 ──────────
+	//
+	// files 和 skill_slug 是同一类东西：**模型给的指代**。skill_slug 编错了会在
+	// LoadSkill 撞库炸整轮（见上面那段取证），files 编错了更隐蔽——运行时若照单
+	// 全收，用户点「报名表」会拿到一个路径拼出来的 404 卡片，或者更糟：拿到别的技能
+	// 目录里的同名文件。所以这里在进入执行链之前，把名字按**该技能声明的附件**
+	// 过一遍，能对上的归一成清单里的原名（下游只认这一份口径），对不上的当场丢掉
+	// 并出声报「清单里有哪几份」，让用户能立刻改口再要。
+	//
+	// 只在命中技能时校验：没命中技能就没有"本技能声明的附件"这个语境，
+	// files 一律清空（它本来就是"在这个技能里要哪份文件"的意思）。
+	if eval.SkillSlug == "" {
+		eval.Files = nil
+	} else {
+		declared := declaredAttachments(skills, eval.SkillSlug)
+		picked, unknown := MatchAttachments(declared, eval.Files)
+		if len(unknown) > 0 {
+			note := UnknownFileNote(unknown, declared)
+			fmt.Fprintf(os.Stderr, "[route] 用户点名的附件有 %d 份对不上清单（skill=%s）：%s\n",
+				len(unknown), eval.SkillSlug, strings.Join(unknown, "、"))
+			// 出声而不是静默丢掉：否则用户说完"发我报名表"收到一句正文，
+			// 根本不知道是名字叫错了还是系统没拆出来。
+			ReportProgress(ctx, note)
+		}
+		names := make([]string, 0, len(picked))
+		for _, a := range picked {
+			names = append(names, displayName(a))
+		}
+		if len(unknown) > 0 && len(picked) == 0 {
+			// 一份都没对上：清空 files，让运行时走"没点名"的规则。
+			// 不清空的话下游会拿着编出来的名字去拼下载地址（404 卡片）。
+			eval.Files = nil
+		} else {
+			eval.Files = names
+		}
+	}
 	return eval, nil
+}
+
+// declaredAttachments 从「可用清单」里取出某个技能声明的可下发附件。
+//
+// 为什么从 skills 数组里找而不是再查一次库：buildRoster 那一次 List 拿到的就是
+// 这一轮模型实际看到的清单，校验必须**与模型看到的那份逐字一致**——另起一次查询
+// 会把"管理员在这几秒里改了技能"变成一个说不清的竞态（校验通过、下载失败）。
+func declaredAttachments(skills []model.Skill, slug string) []model.Attachment {
+	for _, sk := range skills {
+		if sk.Slug == slug && sk.Enabled {
+			return sk.Attachments
+		}
+	}
+	return nil
 }
 
 // rosterHasSlug 判断 slug 是否是**当前可用**（启用）的技能。
@@ -842,12 +907,47 @@ func skillshort(s string) string {
 
 // SkillContent bundles everything needed to generate with a skill.
 type SkillContent struct {
-	Slug         string
-	Name         string
-	SkillType    string // write | query | template
-	Attachment   string // relative path for template skills (may be empty)
+	Slug      string
+	Name      string
+	SkillType string // write | query | template
+	// Attachment 是**主附件**（单字段口径），保留它是因为填充链路（FillDoc）、
+	// 需求闸门的空白模板判定、模板版本命名都按「一份模板」建模，改它们超出本次范围。
+	//
+	// 兼容口径：新技能在库里只写数组列（store.encodeAttachments 会清空旧列），
+	// 于是 sk.Attachment 是空串——若不做兜底，这些老链路对**所有新技能**都会
+	// 直接判定「没有模板」而静默失效（模板技能不再能填、不再发空白模板）。
+	// 所以 LoadSkill 把「数组第一份」补进 Attachment（见 LoadSkill 内注释）。
+	Attachment   string
+	Attachments  []model.Attachment // 可下发的全部附件（运行时下发的唯一口径）
 	SystemPrompt string
 	Template     string
+}
+
+// Deliverables 定出本轮该下发给用户的附件（含兼容规则），是 chat 层唯一的取件入口。
+//
+// 为什么放在 SkillContent 上而不是让调用方各自算：下发点有三处（技能链尾、
+// 手册写作链尾、template_only 短路），三处各写一遍必然漂移——历史上"同一份技能
+// 在不同链路发不同文件"就是这么来的。收敛到一个方法，加规则只改一处。
+func (sc *SkillContent) Deliverables(files []string, action string) []model.Attachment {
+	if sc == nil {
+		return nil
+	}
+	// 直接把 SkillContent 当 Skill 用：ResolveDeliverables 只读 Attachments 一个字段。
+	// 这里的 Attachments 已在 LoadSkill 里做过「主附件补进数组」的归一，
+	// 所以单附件技能和数组技能走的是同一条规则，不会出现两套行为。
+	return ResolveDeliverables(&model.Skill{Attachments: sc.attachmentsOrPrimary()}, files, action)
+}
+
+// attachmentsOrPrimary 归一附件清单：数组为空而主附件非空时（老数据/兜底路径），
+// 把主附件当成唯一一份。两条来源合并后就只有一份口径给下游用。
+func (sc *SkillContent) attachmentsOrPrimary() []model.Attachment {
+	if len(sc.Attachments) > 0 {
+		return sc.Attachments
+	}
+	if strings.TrimSpace(sc.Attachment) == "" {
+		return nil
+	}
+	return []model.Attachment{{Name: filepath.Base(filepath.FromSlash(sc.Attachment)), Rel: sc.Attachment}}
 }
 
 // HasDocJSONContract 判断一份技能提示词是否带文档生成契约（能让 parseDocJSON 解析成功的
@@ -1029,8 +1129,20 @@ func (e *Engine) LoadSkill(slug string) (*SkillContent, error) {
 	if stype == "" {
 		stype = model.SkillTypeWrite
 	}
+	// 主附件兜底：库里新技能的附件只写在数组列（store.encodeAttachments 在有数组时
+	// 会清空旧单值列），于是 sk.Attachment 为空。而填充链路 / 空白模板判定 / 模板版本
+	// 命名都还按单字段走，不补这一下它们对**所有新建技能**都会静默失效。
+	// 只取第一份：这些链路本质是「用一份模板做填充」，多附件技能该填哪份本身无定义，
+	// 取第一份是稳定且可预期的口径；真正的多份下发走 Deliverables（按数组）。
+	var primary string
+	if strings.TrimSpace(sk.Attachment) != "" {
+		primary = sk.Attachment
+	} else if len(sk.Attachments) > 0 {
+		primary = sk.Attachments[0].Rel
+	}
 	return &SkillContent{
-		Slug: slug, Name: sk.Name, SkillType: stype, Attachment: sk.Attachment,
+		Slug: slug, Name: sk.Name, SkillType: stype, Attachment: primary,
+		Attachments:  sk.Attachments,
 		SystemPrompt: sys, Template: tpl,
 	}, nil
 }
@@ -1072,9 +1184,31 @@ func (e *Engine) buildRoster() (string, []model.Skill, error) {
 			}
 			fmt.Fprintf(&roster, "%s\n", strings.Join(names, ", "))
 		}
+		// 可下发附件清单：分类器**只有看到这一行**才可能把用户那句「发我报名表」
+		// 落到具体文件上（files 字段）。清单不印，模型手里就没有可照抄的名字，
+		// 只能凭正文猜 —— 猜出来的名字在运行时会被白名单挡掉，用户那头表现为
+		// 「说了要文件、什么都没收到」，而日志里只有一行「附件名对不上」。
+		//
+		// 只印**展示名**（Name），不印 rel：rel 是磁盘布局（attachments/xxx），
+		// 对判断"用户要哪一份"毫无帮助，纯占 prompt；真要 rel 时由运行时按名字回查。
+		if len(sk.Attachments) > 0 {
+			names := make([]string, 0, len(sk.Attachments))
+			for _, a := range sk.Attachments {
+				if n := displayName(a); n != "" {
+					names = append(names, n)
+				}
+			}
+			if len(names) > 0 {
+				fmt.Fprintf(&roster, "    可下发附件: %s\n", strings.Join(names, "、"))
+			}
+		}
 	}
 	if roster.Len() == 0 {
-		roster.WriteString("（当前没有可用的写作技能）")
+		// 措辞别提「写作」：技能库里不止写作类（查询/模板/出文件），
+		// 空库时说「没有可用的写作技能」会让模型把「这系统只会写文章」当成前提，
+		// 用户问「有没有能把附件发我的技能」时它会一口否认——库确实是空的，
+		// 但否认的理由要是「库是空的」，不是「本系统只写作」。
+		roster.WriteString("（当前没有可用的技能）")
 	}
 	return roster.String(), skills, nil
 }
@@ -1324,8 +1458,17 @@ func (e *Engine) generateSys(sc *SkillContent) string {
 			"交一份满是 {xxx} 的稿子等同于没干活。"
 	}
 	// For typed flow skills, remind the model to point at the downloadable file.
-	if sc.SkillType != model.SkillTypeWrite && strings.TrimSpace(sc.Attachment) != "" {
-		sys += "\n\n注意：有一个模板文件《" + sc.Attachment + "》会随本次回答下发，请在回答中明确指引用户下载使用。"
+	// 印**展示名**而不是 sc.Attachment：后者是磁盘相对路径（attachments/xxx.docx），
+	// 印进 prompt 会被模型原样抄到正文里，用户看到的是路径而不是文件名。
+	// 多份就列全——只提第一份时，用户根本不知道还有别的能下。
+	if atts := sc.attachmentsOrPrimary(); sc.SkillType != model.SkillTypeWrite && len(atts) > 0 {
+		if len(atts) == 1 {
+			sys += "\n\n注意：有一个文件《" + displayName(atts[0]) + "》会随本次回答下发，请在回答中明确指引用户下载使用。"
+		} else {
+			sys += "\n\n注意：有以下 " + strconv.Itoa(len(atts)) + " 个文件会随本次回答下发：《" +
+				strings.Join(attachDisplayNames(atts), "》《") +
+				"》。请在回答中明确指引用户可以下载，并在用户只要其中某几份时按名字说明。"
+		}
 	}
 	return sys
 }

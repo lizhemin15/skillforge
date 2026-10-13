@@ -217,7 +217,11 @@ type Result struct {
 	PromptLen   int           `json:"prompt_len"`
 	ExampleN    int           `json:"example_count"`
 	SkillType   string        `json:"skill_type,omitempty"`
-	Attachment  string        `json:"attachment,omitempty"`
+	// Attachments 是随技能下发的内嵌附件清单（可能多个）。单独一个字段而不是复用
+	// Attachment（单个、完整流水线的官方模板）：前端要把「拆到了哪几份、各多大」列出来，
+	// 用户才敢信这份技能真能发文件——只给一个布尔或计数，拆错了层级也看不出来。
+	Attachments []model.Attachment `json:"attachments,omitempty"`
+	Attachment  string             `json:"attachment,omitempty"`
 	// Mode 标出这份技能是哪条通道生成的：
 	//   ""     = 通用流水线（9 步 + 裁判循环）
 	//   "lite" = 极简创建（本地装盘 + 1 次精炼，不跑裁判）
@@ -421,6 +425,12 @@ func (g *Generator) Generate(ctx context.Context, in *Input, onStep func(string)
 		SkillType:  dtype.Type,
 		Attachment: dtype.Attachment,
 	}
+	// 内嵌附件登记必须落到技能记录上：store.Create 从 sk.Attachments 编码数组列。
+	// 只把结果留在 mp.Attachments 里，落盘的文件就永远进不了 DB——而运行时的下发是
+	// 按 DB 里的清单走的，于是文件明明在磁盘上、用户却下载不到，且产物看起来一切正常。
+	if mp != nil {
+		sk.Attachments = mp.Attachments
+	}
 	if err := g.store.Create(sk, meta.Params); err != nil {
 		return nil, fmt.Errorf("register: %w", err)
 	}
@@ -431,7 +441,8 @@ func (g *Generator) Generate(ctx context.Context, in *Input, onStep func(string)
 		Params:   meta.Params, Steps: nil,
 		PromptLen: len(sysPrompt), ExampleN: len(exFiles) + mp.ExampleCount(),
 		SkillType: dtype.Type, Attachment: dtype.Attachment,
-		Degraded: degraded, DegradeReason: degradeReason,
+		Attachments: mp.Attachments,
+		Degraded:    degraded, DegradeReason: degradeReason,
 	}, nil
 }
 
@@ -512,6 +523,30 @@ func (g *Generator) land(dir, sysPrompt, tpl string, exFiles []string, in *Input
 		}
 		_ = os.WriteFile(filepath.Join(dir, "source", fn), []byte(uf.Content), 0o644)
 	}
+	// 内嵌附件：源文件（docx / PDF / 老式 .doc）里**内嵌**的附件（OLE 对象 / zip 里的
+	// 嵌入件）拆出来单独落 attachments/。
+	//
+	// 为什么落在 land 而不是各通道各拆一遍：两个通道（完整流水线 / 极简）都经过这里，
+	// 只写一处就不可能漏。极简通道在取材阶段已经拆过一次（它必须先知道有没有附件，
+	// 才好定类型、写提示词），那份结果挂在 mp.Extracted 上被直接复用。
+	//
+	// 拆不出来**不是错误**（绝大多数素材文档本来就不带附件），所以这里不报错、只留一行
+	// 日志：用户问「为什么没收到附件」时，要从日志里一眼分清是「没拆到」还是「没落盘」。
+	extracted := extractFromFiles(in.Files, mp)
+	var attachRegs []model.Attachment
+	if len(extracted) > 0 {
+		regs, aerr := WriteAttachments(dir, extracted)
+		if aerr != nil {
+			// 附件是这个技能的主要交付物：少一个就意味着用户按提示去下载却下不到，
+			// 所以落盘失败要硬失败（用户重试一次），不交付「说得出、拿不到」的技能。
+			return fmt.Errorf("落盘内嵌附件: %w", aerr)
+		}
+		attachRegs = regs
+		if mp != nil {
+			mp.Attachments = regs
+		}
+		log.Printf("[attach] 技能 %s 拆出 %d 个内嵌附件: %s", filepath.Base(dir), len(regs), attachNames(regs))
+	}
 	for i, ex := range exFiles {
 		fname := fmt.Sprintf("example%02d.md", i+1)
 		if err := os.WriteFile(filepath.Join(dir, "examples", fname), []byte(ex), 0o644); err != nil {
@@ -555,8 +590,31 @@ func (g *Generator) land(dir, sysPrompt, tpl string, exFiles []string, in *Input
 	if dtype != nil {
 		meta["skill_type"] = dtype.Type
 		meta["rationale"] = dtype.Rationale
+		// 主附件（attachment）**只有一个值**，而这个技能可能带好几个附件，所以
+		// 「谁是主附件」必须有个明确口径，不能让每个读它的人各猜一套：
+		//   ① 显式指名过（完整流水线的 detectType 指了模板文件 / 极简通道选的主附件）
+		//   ② 只有一个附件 → 就是它（一份公文里就挂一张表，没有歧义）
+		//   ③ 多个附件且没指名 → **留空**。空是有意义的：运行时据此走「让分类器
+		//      从清单里挑」，而不是被一个瞎猜的主附件带偏（纠偏闸门会拿它当交付物判据）。
+		if dtype.Attachment == "" && len(attachRegs) == 1 {
+			dtype.Attachment = attachRegs[0].Name
+		}
 		if dtype.Attachment != "" {
-			meta["attachment"] = "source/" + dtype.Attachment
+			dtype.Attachment = resolveAttachRel(dtype.Attachment, attachRegs)
+			meta["attachment"] = dtype.Attachment
+			// 归一之后**当场验一次存在性**：这个值会进 DB 并被运行时当下载路径用，
+			// 写进去的是个不存在的路径，用户点下载才报错——那时候离这一次生成已经
+			// 很远了，排查成本高得多。这里当场对不上就留着日志（不让本次创建失败：
+			// 技能主体是好的，附件缺一个不该连技能一起废掉），运维能看到、能补文件。
+			if _, serr := os.Stat(filepath.Join(dir, filepath.FromSlash(dtype.Attachment))); serr != nil {
+				log.Printf("[attach] 主附件路径在技能目录里不存在: %s（技能 %s）", dtype.Attachment, filepath.Base(dir))
+			}
+		}
+		// 全量附件清单：运行时 roster 读的就是它（模型据此知道「这个技能能发哪些文件」）。
+		// 只登记不落盘的情况不存在（落盘失败在上面已经硬失败），所以这里写进 meta 的
+		// 每一项都对应磁盘上一个真实文件。
+		if len(attachRegs) > 0 {
+			meta["attachments"] = attachRegs
 		}
 	}
 	mb, _ := json.MarshalIndent(meta, "", "  ")
