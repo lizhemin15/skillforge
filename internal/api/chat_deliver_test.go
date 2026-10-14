@@ -101,6 +101,22 @@ func TestAttachmentEndpointFuzzyNameStillServesRightFile(t *testing.T) {
 	}
 }
 
+// TestAttachmentEndpointUnknownSkillIs404 钉住「技能不存在」是 404 而不是 500。
+//
+// 这条是补一个真实存在的洞：store 层把 sql.ErrNoRows 转成了 ErrSkillNotFound
+// （见 store/skill_store.go 的约定），而处理器原先写的是 `err == sql.ErrNoRows`，
+// 直接比较永远不成立 → 线上请求一个不存在的 slug 得到的是 **500**。
+// 对公共无鉴权端点来说，500 会让人以为「本站服务挂了」，还会引来看不到的排障成本；
+// 而它真实含义只是「你点的这个技能没有」。断言必须钉死 404。
+func TestAttachmentEndpointUnknownSkillIs404(t *testing.T) {
+	e := newDeliverEnv(t, "tongzhi", model.SkillTypeQuery, "附件2-报名表.docx")
+	rec := e.getAttachment(t, "/api/chat/attachment/meiyouzhege?file="+url.QueryEscape("附件2-报名表.docx"))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("不存在的技能必须 404（500 会被读成服务故障），实际 %d（body=%q）",
+			rec.Code, rec.Body.String())
+	}
+}
+
 // TestAttachmentEndpointRejectsUnknown 钉住认不出的名字 404 且**报出清单**。
 func TestAttachmentEndpointRejectsUnknown(t *testing.T) {
 	e := newDeliverEnv(t, "tongzhi", model.SkillTypeQuery,

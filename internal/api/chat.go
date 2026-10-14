@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/lizhemin15/skillforge/internal/agent"
 	"github.com/lizhemin15/skillforge/internal/model"
+	"github.com/lizhemin15/skillforge/internal/store"
 	"github.com/lizhemin15/skillforge/internal/tools"
 )
 
@@ -964,7 +966,13 @@ func (h *chatHandler) Attachment(w http.ResponseWriter, r *http.Request) {
 
 	sk, err := h.eng.Skill(slug)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		// 用 errors.Is(ErrSkillNotFound)，**不能**用 err == sql.ErrNoRows：
+		// store 层刻意把「技能不存在」统一成 ErrSkillNotFound 并包了 slug
+		// （见 store/skill_store.go 的约定），所以和 sql.ErrNoRows 直接比较永远不成立，
+		// 结果是「没这个技能」被报成 500「服务器错误」——公共下载端点报 500 会让人
+		// 以为服务挂了，还以为是本站的问题，实际只是 slug 不存在。这是 404 的语义。
+		// 保守起见两个都认：万一将来有路径漏包，也还是 404 而不是 500。
+		if errors.Is(err, store.ErrSkillNotFound) || errors.Is(err, sql.ErrNoRows) {
 			http.Error(w, "no such skill", http.StatusNotFound)
 		} else {
 			http.Error(w, "skill error", http.StatusInternalServerError)

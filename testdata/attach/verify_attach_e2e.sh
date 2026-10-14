@@ -103,6 +103,13 @@ if [ "$DLMD5" = "$INNER1" ] || [ "$DLMD5" = "$INNER2" ]; then ok "下载到的�
 # 越界：目录穿越
 curl -s -o /dev/null -w '%{http_code}' "$BASE/api/chat/attachment/$SLUG?file=..%2F..%2Fskillforge.db" > code2.txt
 if [ "$(cat code2.txt)" != "200" ]; then ok "目录穿越被拒（HTTP $(cat code2.txt)）"; else bad "目录穿越竟然 200 —— 严重安全问题"; fi
+
+# 技能不存在：必须是 404。这条是补线上的洞 —— 曾经这里返 500，
+# 因为 store 把 sql.ErrNoRows 转成了 ErrSkillNotFound，处理器却拿 == sql.ErrNoRows 去比。
+# 500 会被运营/用户读成「服务挂了」，实际只是 slug 不存在；而且 500 不会触发前端
+# 的「没这个文件」提示。线上复现过，所以钉在这里。
+code_ns=$(curl -s -o body_ns.txt -w '%{http_code}' "$BASE/api/chat/attachment/meiyouzhege?file=x.docx")
+chk "不存在的技能是 404（不是 500）" "$code_ns" "404"
 # 越界：清单里没有的名字
 curl -s -o /dev/null -w '%{http_code}' "$BASE/api/chat/attachment/$SLUG?file=no-such-file.docx" > code3.txt
 if [ "$(cat code3.txt)" != "200" ]; then ok "清单外文件名被拒（HTTP $(cat code3.txt)）"; else bad "清单外文件名返回 200 —— 白名单失效"; fi
