@@ -11,7 +11,10 @@
 """
 import zipfile, os, io
 
-OUT = "{os.environ.get('ATTACH_E2E_DIR', '/tmp/sf-attach-e2e')}"
+# 这里必须是 f-string：写成普通字符串的话 {} 不会被求值，OUT 就变成那串字面文本，
+# 后面 open() 会直接 FileNotFoundError —— 脚本从头到尾跑不起来，而报错指向的是
+# 「路径不存在」这种看起来像环境问题的错，很容易被误当成「目录没建」。
+OUT = f"{os.environ.get('ATTACH_E2E_DIR', '/tmp/sf-attach-e2e')}"
 CT = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
