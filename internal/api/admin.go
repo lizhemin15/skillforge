@@ -162,6 +162,16 @@ func (a *Admin) Train(w http.ResponseWriter, r *http.Request) {
 	in := &skillgen.Input{
 		Name: name, Category: cat, Description: desc, Requirement: req,
 	}
+	// 用户选的产物类型（可空 = 自动判定）。认不出的值直接拒绝：静默当「自动」会生成一个
+	// 类型与用户所选不符的技能，而这件事在产物上完全看不出来。
+	if st, ok := model.ParsePickedSkillType(r.FormValue("skill_type")); !ok {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf(
+			"无法识别的技能类型 %q（可选：%s，留空=自动判定）",
+			r.FormValue("skill_type"), strings.Join(model.PickedSkillTypes, " / ")))
+		return
+	} else {
+		in.SkillType = st
+	}
 	// collect uploaded reference files
 	for _, h := range r.MultipartForm.File["files"] {
 		f, err := h.Open()
@@ -293,10 +303,20 @@ func (a *Admin) TrainLite(w http.ResponseWriter, r *http.Request) {
 	// （`skill-1790401421` 这种），于是 GenerateLite 以为「用户指定了 slug」而放弃
 	// 从指南标题推断名字——技能名和目录名就双双退化成时间戳。别在传参层替它做决定。
 	slugRaw := strings.TrimSpace(r.FormValue("slug"))
+	// 产物类型同样是用户选的（为空 = 自动判定）。非法值拒绝而不是当自动：
+	// 「我选了查询型，结果给我个写作技能」在产物上看不出来，必须在入口挡住。
+	skillType, okType := model.ParsePickedSkillType(r.FormValue("skill_type"))
+	if !okType {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf(
+			"无法识别的技能类型 %q（可选：%s，留空=自动判定）",
+			r.FormValue("skill_type"), strings.Join(model.PickedSkillTypes, " / ")))
+		return
+	}
 	in := &skillgen.LiteInput{
-		Name:     strings.TrimSpace(r.FormValue("name")),
-		Material: strings.TrimSpace(r.FormValue("material")),
-		Files:    files,
+		Name:      strings.TrimSpace(r.FormValue("name")),
+		Material:  strings.TrimSpace(r.FormValue("material")),
+		Files:     files,
+		SkillType: skillType,
 	}
 	if slugRaw != "" {
 		in.Slug = skillgen.Slugify(slugRaw)

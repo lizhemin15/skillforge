@@ -91,6 +91,14 @@ type LiteInput struct {
 	//   b. 一个文件夹：一份指南 + 每篇范文各一个文件（没有标记可分）。
 	// 所以「哪份是指南」由 collectLiteMaterial 按可信度选，而不是由前端字段指定。
 	Files []*UploadedFile
+
+	// SkillType 是**创建者在界面上亲手选的**产物类型（write | query | template）。
+	// 空串 = 自动判定（走 liteDecideType 的本地判据）。
+	//
+	// 为什么这个字段在两个通道里各有一份而不是共用：极速通道（LiteInput）与完整通道
+	// （Input）本来就是两套入参——前者只有「素材」，后者要需求/分类/描述。硬抽公共基类
+	// 会把两边的字段语义搅在一起，而这里一共就一个字段。
+	SkillType string
 }
 
 // liteExamplesSep 是粘贴框里多篇范文的分隔符：单独一行的 3 个及以上短横线。
@@ -970,7 +978,18 @@ func collectLiteMaterial(in *LiteInput, files []*UploadedFile) (*liteMaterial, e
 	//
 	// 放宽的代价必须显性付清：判定理由进 steps + meta.json，缺了什么进 Warn。
 	// 缺什么说什么，不做静默降级（这是本模块反复踩的坑）。
-	relaxed := len(atts) > 0
+	// 放宽有两个**客观依据**，满足任一即可：
+	//   a. 源文件里真拆出了内嵌附件（附件本身就是交付物）；
+	//   b. 创建者在界面上亲手选了非写作型（query/template）。
+	//
+	// 为什么 (b) 也能放宽，而这跟上面那条「不认正文够长」不冲突：那条反对的是**系统自己
+	// 猜**用户意图——正文够长就替他决定「你要的是答问」，于是上传「只有指南没有范文」的
+	// 用户被静默改成答问技能。(b) 不是猜，是用户明说的：他要的是答问/发文件，那么
+	// 「没找到写作指南」「没找到范文」这两条要求本身就问错了题——查询型技能的素材是
+	// 事实来源，不是文风样板。少了 (b)，用户在界面上选了「查询型」却仍被回一句
+	// 「没找到够长的写作指南」，等于选了个不起作用的按钮。
+	pickedNonWrite := in.SkillType == model.SkillTypeQuery || in.SkillType == model.SkillTypeTemplate
+	relaxed := len(atts) > 0 || pickedNonWrite
 	if !relaxed && guideShort {
 		// 这条错误必须写成「怎么改」：自解析是猜的，用户看到「指南不足」时最需要的
 		// 是「怎么告诉我哪段是指南」，而不是再猜一次。
@@ -978,7 +997,8 @@ func collectLiteMaterial(in *LiteInput, files []*UploadedFile) (*liteMaterial, e
 			"缺了它生成的技能会跟素材脱节。如果指南和范文混在同一份文档里，在范文前面单独一行写"+
 			"「## 范文」（或「范文一」），或者用一行 --- 把两者分开，就能被准确切开。"+
 			"如果你要的本来就不是写作技能（例如「回答这份制度里的问题」「把源文件里的附件发给用户」），"+
-			"请把**原始文件**原样上传（docx/PDF 直接传，不要另存成 txt 再传）：源文件里带的附件会被一并拆出来。"+
+			"两个办法：①把上方的产物类型选成「查询型」或「模板型」——那样就不要求写作指南和范文了；"+
+			"②把**原始文件**原样上传（docx/PDF 直接传，不要另存成 txt 再传）：源文件里带的附件会被一并拆出来。"+
 			"本次判读：%s",
 			runeLen(guide), liteMinGuideChars, how)
 	}
@@ -987,7 +1007,8 @@ func collectLiteMaterial(in *LiteInput, files []*UploadedFile) (*liteMaterial, e
 			"范文决定了技能学到的是不是你想要的文风。同一份文档里可以把范文放在指南后面，"+
 			"在前面加一行「## 范文」或「---」隔开；范文是好几篇时，篇与篇之间也用一行 --- 分开。"+
 			"如果你要的本来就不是写作技能（例如「回答这份制度里的问题」「把源文件里的附件发给用户」），"+
-			"请把**原始文件**原样上传（docx/PDF 直接传，不要另存成 txt 再传）：源文件里带的附件会被一并拆出来。"+
+			"两个办法：①把上方的产物类型选成「查询型」或「模板型」——那样就不要求写作指南和范文了；"+
+			"②把**原始文件**原样上传（docx/PDF 直接传，不要另存成 txt 再传）：源文件里带的附件会被一并拆出来。"+
 			"本次判读：%s",
 			len(examples), total, liteMinExampleChars, how)
 	}
@@ -1002,13 +1023,40 @@ func collectLiteMaterial(in *LiteInput, files []*UploadedFile) (*liteMaterial, e
 		if warn != "" {
 			warn += "；"
 		}
+		// 放宽依据必须按**实际**来源写。原来这里写死「源文件里确实带着可下发的附件」，
+		// 那是当时唯一的放宽依据；现在用户手选非写作型也会走到这里，写死就成了假话——
+		// 而这条正是管理端事后追查「这个技能凭什么放宽了」的唯一线索，它不能撒谎。
+		basis := "源文件里确实带着可下发的附件"
+		typHow := "按素材实际内容判定类型"
+		if pickedNonWrite {
+			basis = "创建者已明确指定产物类型为「" + liteTypeLabel(in.SkillType) + "」"
+			typHow = "按创建者指定的类型"
+		}
 		warn += "材料里" + strings.Join(relaxNotes, "、") +
-			"——本次按素材实际内容判定类型后继续生成（这是极简通道对「非写作素材」的放宽：源文件里确实带着可下发的附件）；" +
+			"——本次" + typHow + "后继续生成（这是极简通道对「非写作素材」的放宽：" + basis + "）；" +
 			"补齐指南与范文后可在管理端重训成完整技能"
 	}
 
 	name, cat := inferLiteNames(in.Name, guide, fromFiles, examples)
 	typ, why := liteDecideType(len(atts), guide, len(examples), total, runeLen(body))
+	// 用户亲手选了的类型优先，本地判据只在「用户没说」时兜底。
+	//
+	// 为什么不是「用户选了也仍按判据复核一遍」：判据再准也只是启发式，而用户是拿着
+	// 用途来的——同一份素材，他想让技能答问还是出稿，素材本身答不了这个题。反过来
+	// 若他要的是查询型而判据给了写作型，产出的技能会在第一次被使用时才露馅。
+	if want := strings.TrimSpace(in.SkillType); want != "" {
+		typ, why = want, "创建时由用户指定为「"+liteTypeLabel(want)+"」（未走素材自动判定）"
+		// 指定「模板型」但素材里一个附件都没拆出来：技能会承诺下发文件而实际拿不出。
+		// 不硬失败（可在管理端补传模板源文件后重训），但必须留痕——静默的承诺落差
+		// 就是这个技能唯一的缺陷，而它在产物文件里看不见。
+		if typ == model.SkillTypeTemplate && len(atts) == 0 {
+			if warn != "" {
+				warn += "；"
+			}
+			warn += "已指定为模板型，但当前素材里没有拆出任何可下发的附件——" +
+				"用户索要文件时技能拿不出来，请在管理端补传模板源文件后重训"
+		}
+	}
 	if typ != model.SkillTypeWrite && strings.TrimSpace(in.Name) == "" {
 		// 非写作型不能顶着「XX写作」的名字：名字是用户唯一一眼能看到的产物说明，
 		// 叫「XX写作」而实际只会答问/发文件，等于在名字上撒谎。只在名字是本地推断

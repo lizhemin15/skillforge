@@ -190,6 +190,12 @@ type Input struct {
 	Category    string
 	Description string
 	Requirement string
+	// SkillType 是**创建者在界面上亲手选的**产物类型（write | query | template）。
+	//
+	// 空串 = 没选（老前端 / 用户选了「自动判断」）→ 交给系统判定：完整通道用一次模型
+	// 调用、极速通道用本地判据（见 liteDecideType）。非空时必须被尊重：用户既然亲手
+	// 点了，就不该再被模型或启发式覆盖——他比任何判据都清楚自己要的是「能答问」还是「能出稿」。
+	SkillType string
 	// Files are uploaded reference documents (article samples, style guides...).
 	Files []*UploadedFile
 }
@@ -674,6 +680,14 @@ type typeOut struct {
 // office-process assistant — it returns the迟程序 flow (and optionally pushes a
 // downloadable form template). The agent uses this to pick the right behavior.
 func (g *Generator) detectType(ctx context.Context, in *Input) (*typeOut, error) {
+	// 用户在创建时亲手选了类型 → 直接采用，**不做**这次判定调用。
+	//
+	// 两重理由：(1) 尊重用户——他拿着用途来的，模型不该有否决权；(2) 省一次模型调用，
+	// 而这次调用本来就是个「猜」，猜的还是用户已经说过的事。
+	// Rationale 写明来源，好让管理端分得清「用户选的」和「模型判的」。
+	if want := strings.TrimSpace(in.SkillType); want != "" {
+		return &typeOut{Type: want, Rationale: "创建时由用户指定（未走模型判定）"}, nil
+	}
 	corpus := in.Requirement + "\n\n===== 参考文件 =====\n"
 	for _, f := range in.Files {
 		corpus += "\n<<文件: " + f.Filename + ">>\n" + truncate(f.Content, 20000) + "\n"

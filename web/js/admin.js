@@ -7,6 +7,14 @@
   const token = () => localStorage.getItem(TOKEN_KEY);
   const authHdr = () => ({ 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token() });
 
+  // 读取用户在创建表单里手选的「产物类型」（默认选项是 auto = 自动判断）。
+  // 拿不到选中项时返回 'auto'：宁可走自动判定，也不能因为选择器被谁改坏了就发个假类型过去。
+  // 认不出的值不在这里兜底——后端会拒绝；这里兜底会把「选错了」变成「悄悄用了别的类型」。
+  const pickedSkillType = (groupId) => {
+    const el = document.querySelector('#' + groupId + ' input:checked');
+    return el ? el.value : 'auto';
+  };
+
   let toastTimer;
   // module-level CodeMirror editor instance (nullable), plus which behavior the current editor is bound to
   let cmEditor = null;
@@ -457,6 +465,7 @@
     fd.append('category', $('tr-cat').value || '');
     fd.append('description', $('tr-desc').value || '');
     fd.append('requirement', $('tr-req').value || '');
+    fd.append('skill_type', pickedSkillType('tr-type'));
     for (const f of selectedFiles) fd.append('files', f);
     await runTrainStream({
       url: '/api/admin/train', fd,
@@ -525,12 +534,19 @@
     if (!material && liteFiles.length === 0) {
       const log = $('lt-log');
       log.style.display = 'block';
-      log.innerHTML = '<div class="line bad">🟡 先给点素材：把写作指南和范文贴进来，或者拖入文档（指南和范文混在一份里也行）</div>';
+      // 提示随类型变：查询/模板型要的是事实来源，不是指南范文；说错了会把用户带偏。
+      const tk = pickedSkillType('lt-type');
+      const need = (tk === 'query' || tk === 'template')
+        ? '把要问的内容所在的文件/正文放进来（源文件里带的附件会被一并拆出来）'
+        : '把写作指南和范文贴进来，或者拖入文档（指南和范文混在一份里也行）';
+      log.innerHTML = '<div class="line bad">🟡 先给点素材：' + esc(need) + '</div>';
       return;
     }
     const fd = new FormData();
     fd.append('name', $('lt-name').value || '');
     fd.append('material', material);
+    // 手选的产物类型：'auto' 由后端按素材判定；非空则必须被尊重（用户比我更清楚要干什么）。
+    fd.append('skill_type', pickedSkillType('lt-type'));
     for (const f of liteFiles) fd.append('material_files', f);
     await runTrainStream({
       url: '/api/admin/train/lite', fd,

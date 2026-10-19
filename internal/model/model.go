@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Skill is the central unit: a curated "type-of-article writing" knowledge pack.
 // Content files (system_prompt, template, examples) live in <data>/skills/<slug>/,
@@ -61,6 +64,32 @@ const (
 	SkillTypeTemplate = "template" // 流程 + downloadable template attachment
 	SkillTypeDocGen   = "docgen"   // fill/generate an office file (word/excel/ppt/pdf) and deliver it
 )
+
+// PickedSkillTypes 是**创建者在界面上能亲手选**的类型，顺序即界面上从上到下的顺序。
+//
+// 为什么要有这份「可选清单」而不是直接复用上面全部常量：docgen 目前没有独立提示词与
+// 交付协议（会被当写作型走），把它摆到选择器上等于让用户选一个选了也没区别的按钮。
+// 只有真能按类型改变行为的，才配出现在界面上。
+var PickedSkillTypes = []string{SkillTypeWrite, SkillTypeQuery, SkillTypeTemplate}
+
+// ParsePickedSkillType 把界面上传来的类型字符串收敛成合法值。
+//
+// 空串（含用户什么都没选、老前端没这个字段）→ ""，表示**交给系统自动判定**。
+// 认不出的值返回 ok=false，由上层报错：静默降级成「自动」会让用户以为自己选的那项
+// 生效了，而技能实际按另一种类型生成——这类「选了但没用」的 bug 在产物上完全看不出来，
+// 只能靠拒绝非法输入挡住。
+func ParsePickedSkillType(s string) (string, bool) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" || s == "auto" {
+		return "", true
+	}
+	for _, t := range PickedSkillTypes {
+		if s == t {
+			return s, true
+		}
+	}
+	return "", false
+}
 
 // Param defines a dynamic form field for a skill. Rendered by the frontend
 // so each skill's UI doesn't need hand-written code.

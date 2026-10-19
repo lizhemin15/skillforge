@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SkillForge · 管理端</title>
-  <link rel="stylesheet" href="/assets/css/style.css?v=20260927A">
+  <link rel="stylesheet" href="/assets/css/style.css?v=20261015A">
   <link rel="stylesheet" href="/assets/vendor/codemirror/lib/codemirror.min.css?v=20260908A">
   <link rel="stylesheet" href="/assets/vendor/codemirror/addon/fold/foldgutter.min.css?v=20260908A">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23111418'/><rect x='9' y='9' width='6' height='14' rx='2' fill='%23c8ccd2'/><rect x='17' y='9' width='6' height='14' rx='2' fill='%23757c86'/></svg>">
@@ -287,6 +287,18 @@
           <div id="ns-view-lite">
             <p class="card-sub" style="margin-top:8px">给一份素材就行——写作指南和范文可以混在同一份文档里，系统自己分开（想快点用就选这个）</p>
             <form id="lite-form">
+              <!-- 产物类型：放在素材框**上方**，因为选什么类型直接决定素材该怎么给
+                   （写作型要指南+范文；查询/模板型只要有正文或源文件）。
+                   报错文案里也是说「把上方的产物类型选成…」，文案与位置必须对得上。 -->
+              <div class="field">
+                <label>产物类型</label>
+                <div class="type-pick" id="lt-type">
+                  <label class="tp"><input type="radio" name="lt-type" value="auto" checked><span>自动判断<b>按素材内容判断，不确定就选这个</b></span></label>
+                  <label class="tp"><input type="radio" name="lt-type" value="write"><span>写作型<b>产出稿件：通知、通稿、报告等（需要写作指南 + 范文）</b></span></label>
+                  <label class="tp"><input type="radio" name="lt-type" value="query"><span>查询型<b>答问、讲流程：按素材内容回答，不只写稿</b></span></label>
+                  <label class="tp"><input type="radio" name="lt-type" value="template"><span>模板型<b>答问 + 把源文件里带的附件（如 Word 模板）发给用户</b></span></label>
+                </div>
+              </div>
               <div class="field">
                 <label>素材</label>
                 <div class="drop" id="lt-drop">点击或拖入素材文档（写作指南 + 范文，可多份；扫描件走 OCR）</div>
@@ -308,6 +320,15 @@
           <div id="ns-view-train" style="display:none">
             <p class="card-sub" style="margin-top:8px">上传参考文件 + 描述需求，AI 自动提炼成完整写作技能（需 1–2 分钟）</p>
             <form id="train-form">
+              <div class="field">
+                <label>产物类型</label>
+                <div class="type-pick" id="tr-type">
+                  <label class="tp"><input type="radio" name="tr-type" value="auto" checked><span>自动判断<b>由 AI 按需求与参考文件判断</b></span></label>
+                  <label class="tp"><input type="radio" name="tr-type" value="write"><span>写作型<b>产出稿件：通知、通稿、报告等</b></span></label>
+                  <label class="tp"><input type="radio" name="tr-type" value="query"><span>查询型<b>答问、讲流程：按素材内容回答，不只写稿</b></span></label>
+                  <label class="tp"><input type="radio" name="tr-type" value="template"><span>模板型<b>答问 + 把源文件里带的附件（如 Word 模板）发给用户</b></span></label>
+                </div>
+              </div>
               <div class="field"><label>技能名称</label><input type="text" id="tr-name" placeholder="如 公司新闻通稿" required></div>
               <div class="field"><label>分类（可选）</label><input type="text" id="tr-cat" placeholder="如 企业宣传"></div>
               <div class="field"><label>一句话描述</label><input type="text" id="tr-desc" placeholder="这个技能用来写什么" required></div>
@@ -360,6 +381,6 @@
 <script src="/assets/vendor/codemirror/addon/fold/foldcode.min.js?v=20260908A"></script>
 <script src="/assets/vendor/codemirror/addon/fold/foldgutter.min.js?v=20260908A"></script>
 <script src="/assets/js/site.js?v=20260911M"></script>
-<script src="/assets/js/admin.js?v=20261013A"></script>
+<script src="/assets/js/admin.js?v=20261015A"></script>
 </body>
 </html>

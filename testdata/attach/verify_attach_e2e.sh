@@ -149,8 +149,94 @@ tally() {
   if [ $((okn + badn)) -eq 0 ]; then
     FAIL=$((FAIL + 1)); echo "  FAIL $2：本节零断言输出（没跑起来，不算通过）"; fi
 }
+
+echo "== 7. 创建时手选产物类型（查询型/写作型），选了就必须生效 =="
+# 这一节钉的是用户在界面上那个选择。为什么必须走真接口而不是只看代码：选择器自身不产生
+# 任何效果，效果全在「后端认不认这个值」+「生成时有没有被覆盖」。前端选得好好的、后端
+# 当没看见，只有真发一次请求才能发现——而产物上完全看不出来（附件、文件树、下载都正常）。
+#
+# 请求形状照抄前端：multipart 表单字段（处理器用 r.FormValue 读，发 JSON 体读不到）。
+lite_post() {  # $1=skill_type|auto $2=slug $3=material → 存 $2.sse / $2.code
+  curl -sS -N -X POST "$BASE/api/admin/train/lite" -H @$WORK/hdr.txt \
+    --form-string "skill_type=$1" --form-string "slug=$2" --form-string "material=$3" \
+    --max-time 240 -o "$2.sse" -w '%{http_code}' > "$2.code" 2>/dev/null
+}
+
+# 素材故意用「**没有指南也没有范文**的纯正文」：这在自动判定下会被素材门挡掉。
+# 而这正是查询/模板型技能要传的东西——一份制度、一份手册，不是写作范本。
+PLAIN_MAT='关于设备报修流程的规定 第一条 使用部门在工作时间通过内部系统提交报修单，注明设备编号、故障现象和影响范围。第二条 后勤保障部接到报修单后两小时内联系使用部门确认上门时间。第三条 单次维修费用低于五千元的由后勤保障部负责人审批，超过五千元报分管领导审批。第四条 维修完成后使用部门在系统内确认，未确认的视为未完成。第五条 紧急故障可先电话通知再补报修单。'
+
+lite_post query e2e-type-query "$PLAIN_MAT"
+lite_post auto  e2e-type-auto  "$PLAIN_MAT"
+lite_post docgen e2e-type-bogus "$PLAIN_MAT"
+
+SKILLFORGE_E2E_WORK="$WORK" python3 - <<'PY' | tee sec7.out
+import json, os, sys
+W = os.environ['SKILLFORGE_E2E_WORK']
+res = []
+def out(cond, msg):
+    print(('  ok   ' if cond else '  FAIL ') + msg); res.append(cond)
+
+def events(slug):
+    ev = []
+    for ln in open(os.path.join(W, slug + '.sse'), encoding='utf-8', errors='replace'):
+        ln = ln.strip()
+        if not ln.startswith('data: '): continue
+        try: ev.append(json.loads(ln[6:]))
+        except Exception: pass
+    return ev
+
+def payload(slug, want):
+    for e in events(slug):
+        if e.get('type') == want:
+            try: return json.loads(e.get('data') or '{}')
+            except Exception: return {}
+    return None
+
+# —— 手选查询型：纯正文素材，以前必然被门挡，现在必须成 ——
+done = payload('e2e-type-query', 'done')
+out(done is not None, '手选查询型 + 纯正文素材：创建成功（收到 done 事件）')
+if done is None:
+    errs = [e.get('data','') for e in events('e2e-type-query') if e.get('type') == 'error']
+    print('     实际错误：' + (errs[0][:300] if errs else '（没有任何 error/done，流是空的）'))
+else:
+    out(done.get('skill_type') == 'query',
+        f"产物类型 = query（实际 {done.get('skill_type')!r}）—— 用户选的必须压过自动判定")
+
+# —— 留痕：必须写明「是用户指定的」，不能写成「按素材判定」——
+mp = os.path.join(W, 'data-dev', 'skills', 'e2e-type-query', 'meta.json')
+if os.path.exists(mp):
+    m = json.load(open(mp, encoding='utf-8'))
+    out(m.get('skill_type') == 'query', f"落盘 meta.skill_type = query（实际 {m.get('skill_type')!r}）")
+    why = str(m.get('rationale') or '')
+    out('指定' in why or '手选' in why,
+        '判定理由写明「用户指定」而不是「按素材判定」—— 事后追查放宽依据靠这一行，它不能撒谎')
+    print('     rationale：' + why[:200])
+else:
+    out(False, f'没找到落盘产物 {mp}')
+
+# —— 反向：同一份素材，不选类型（auto）必须仍然被挡 ——
+# 这条是防「为了让新功能能用，把素材门整体拆了」。门是写作型的硬约束，不能一起放宽。
+ev = events('e2e-type-auto')
+out(any(e.get('type') == 'error' for e in ev),
+    'auto + 纯正文素材：仍被挡下（门没被拆，只是对「用户明说非写作型」开了口子）')
+emsg = ' '.join(e.get('data','') for e in ev if e.get('type') == 'error')
+out('产物类型' in emsg, '报错文案指向出口（提到「产物类型」），用户知道下一步该点哪')
+if emsg: print('     报错：' + emsg[:220])
+
+# —— 非法值必须被拒，不能悄悄当自动 ——
+code = open(os.path.join(W, 'e2e-type-bogus.code'), encoding='utf-8').read().strip()
+out(code == '400', f'无法识别的类型值被拒 400（实际 {code}）—— 静默当自动会生成一个看不出来的错类型技能')
+bsse = open(os.path.join(W, 'e2e-type-bogus.sse'), encoding='utf-8', errors='replace').read()
+out('query' in bsse and 'template' in bsse, '400 回包里列出可选值，用户知道合法值有哪些')
+
+print('  —— 本节 9 项断言')
+sys.exit(0 if all(res) else 1)
+PY
+
 tally sec5.out "运行时下发"
 tally sec6.out "不预判反向用例"
+tally sec7.out "手选产物类型"
 tally sec1.out "文件树可见性"
 tally sec2.out "落盘字节比对"
 

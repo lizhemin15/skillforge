@@ -221,6 +221,23 @@ footer .container { display: flex; justify-content: space-between; gap: 12px; fl
 .field { margin-bottom: 16px; }
 .field label { display: block; font-size: 12.5px; font-weight: 600; color: var(--text-dim); margin-bottom: 7px; }
 .field .hint { font-size: 11.5px; color: var(--text-faint); margin-top: 5px; }
+
+/* —— 产物类型选择（创建技能时手选写作型/查询型/模板型）——
+   纵向逐行排，跟本页其它勾选项一致；选中态只用边框 + 极淡品牌色底，不引入新配色、
+   不加渐变。每一项跟一行小字说明，因为「查询型 / 模板型」这两个词单看不足以让人
+   选对（差别在于会不会把附件发给用户），选错了要等到第一次用才暴露。 */
+.type-pick { display: flex; flex-direction: column; gap: 6px; }
+.type-pick .tp {
+  display: flex; align-items: flex-start; gap: 9px; margin: 0; padding: 9px 11px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm); cursor: pointer;
+  background: var(--bg-soft); font-weight: 400; font-size: 13px; color: var(--text);
+  transition: border-color .14s, background .14s;
+}
+.type-pick .tp:hover { border-color: rgba(77,107,254,.45); background: var(--panel-2); }
+.type-pick .tp:has(input:checked) { border-color: var(--brand); background: var(--brand-soft); }
+.type-pick .tp input { margin: 2px 0 0; flex: 0 0 auto; accent-color: var(--brand); }
+.type-pick .tp span { display: block; line-height: 1.35; }
+.type-pick .tp b { display: block; font-weight: 400; font-size: 11.5px; color: var(--text-faint); margin-top: 2px; }
 input[type=text], input[type=password], input[type=url], textarea, select {
   width: 100%; padding: 10px 12px; background: var(--bg-soft);
   border: 1px solid var(--line); border-radius: var(--radius-sm); color: var(--text);
