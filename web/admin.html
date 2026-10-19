@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SkillForge · 管理端</title>
-  <link rel="stylesheet" href="/assets/css/style.css?v=20261015A">
+  <link rel="stylesheet" href="/assets/css/style.css?v=20261019A">
   <link rel="stylesheet" href="/assets/vendor/codemirror/lib/codemirror.min.css?v=20260908A">
   <link rel="stylesheet" href="/assets/vendor/codemirror/addon/fold/foldgutter.min.css?v=20260908A">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23111418'/><rect x='9' y='9' width='6' height='14' rx='2' fill='%23c8ccd2'/><rect x='17' y='9' width='6' height='14' rx='2' fill='%23757c86'/></svg>">
@@ -285,18 +285,23 @@
                素材里哪段是指南、哪几段是范文，由服务端 SplitLiteMaterial 自行解析，
                不要求用户先分好（他也不一定分得开：指南和范文常常就在一份文档里）。 -->
           <div id="ns-view-lite">
-            <p class="card-sub" style="margin-top:8px">给一份素材就行——写作指南和范文可以混在同一份文档里，系统自己分开（想快点用就选这个）</p>
+            <p class="card-sub" style="margin-top:8px;margin-bottom:14px">给一份素材就行——写作指南和范文可以混在同一份文档里，系统自己分开（想快点用就选这个）</p>
             <form id="lite-form">
-              <!-- 产物类型：放在素材框**上方**，因为选什么类型直接决定素材该怎么给
+              <!-- 产物类型：下拉选择，放在素材框**上方**，因为选什么类型直接决定素材该怎么给
                    （写作型要指南+范文；查询/模板型只要有正文或源文件）。
-                   报错文案里也是说「把上方的产物类型选成…」，文案与位置必须对得上。 -->
+                   报错文案里也是说「把上方的产物类型选成…」，文案与位置必须对得上。
+                   用下拉而非四张竖排卡片：后者在表单里占掉一大截，而四项极短。
+                   每型的具体含义放在下方一行 hint 里，随选中项变化（见 admin.js）。 -->
               <div class="field">
                 <label>产物类型</label>
                 <div class="type-pick" id="lt-type">
-                  <label class="tp"><input type="radio" name="lt-type" value="auto" checked><span>自动判断<b>按素材内容判断，不确定就选这个</b></span></label>
-                  <label class="tp"><input type="radio" name="lt-type" value="write"><span>写作型<b>产出稿件：通知、通稿、报告等（需要写作指南 + 范文）</b></span></label>
-                  <label class="tp"><input type="radio" name="lt-type" value="query"><span>查询型<b>答问、讲流程：按素材内容回答，不只写稿</b></span></label>
-                  <label class="tp"><input type="radio" name="lt-type" value="template"><span>模板型<b>答问 + 把源文件里带的附件（如 Word 模板）发给用户</b></span></label>
+                  <select name="lt-type" aria-describedby="lt-type-hint">
+                    <option value="auto" selected>自动判断</option>
+                    <option value="write">写作型</option>
+                    <option value="query">查询型</option>
+                    <option value="template">模板型</option>
+                  </select>
+                  <p class="hint" id="lt-type-hint">按素材内容自动判断，不确定就选这个</p>
                 </div>
               </div>
               <div class="field">
@@ -318,15 +323,18 @@
 
           <!-- AI train view -->
           <div id="ns-view-train" style="display:none">
-            <p class="card-sub" style="margin-top:8px">上传参考文件 + 描述需求，AI 自动提炼成完整写作技能（需 1–2 分钟）</p>
+            <p class="card-sub" style="margin-top:8px;margin-bottom:14px">上传参考文件 + 描述需求，AI 自动提炼成完整写作技能（需 1–2 分钟）</p>
             <form id="train-form">
               <div class="field">
                 <label>产物类型</label>
                 <div class="type-pick" id="tr-type">
-                  <label class="tp"><input type="radio" name="tr-type" value="auto" checked><span>自动判断<b>由 AI 按需求与参考文件判断</b></span></label>
-                  <label class="tp"><input type="radio" name="tr-type" value="write"><span>写作型<b>产出稿件：通知、通稿、报告等</b></span></label>
-                  <label class="tp"><input type="radio" name="tr-type" value="query"><span>查询型<b>答问、讲流程：按素材内容回答，不只写稿</b></span></label>
-                  <label class="tp"><input type="radio" name="tr-type" value="template"><span>模板型<b>答问 + 把源文件里带的附件（如 Word 模板）发给用户</b></span></label>
+                  <select name="tr-type" aria-describedby="tr-type-hint">
+                    <option value="auto" selected>自动判断</option>
+                    <option value="write">写作型</option>
+                    <option value="query">查询型</option>
+                    <option value="template">模板型</option>
+                  </select>
+                  <p class="hint" id="tr-type-hint">由 AI 按需求与参考文件判断</p>
                 </div>
               </div>
               <div class="field"><label>技能名称</label><input type="text" id="tr-name" placeholder="如 公司新闻通稿" required></div>
@@ -381,6 +389,6 @@
 <script src="/assets/vendor/codemirror/addon/fold/foldcode.min.js?v=20260908A"></script>
 <script src="/assets/vendor/codemirror/addon/fold/foldgutter.min.js?v=20260908A"></script>
 <script src="/assets/js/site.js?v=20260911M"></script>
-<script src="/assets/js/admin.js?v=20261015A"></script>
+<script src="/assets/js/admin.js?v=20261019A"></script>
 </body>
 </html>

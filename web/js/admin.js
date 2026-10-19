@@ -11,8 +11,31 @@
   // 拿不到选中项时返回 'auto'：宁可走自动判定，也不能因为选择器被谁改坏了就发个假类型过去。
   // 认不出的值不在这里兜底——后端会拒绝；这里兜底会把「选错了」变成「悄悄用了别的类型」。
   const pickedSkillType = (groupId) => {
-    const el = document.querySelector('#' + groupId + ' input:checked');
+    const el = document.querySelector('#' + groupId + ' select');
     return el ? el.value : 'auto';
+  };
+
+  // 每个类型具体是什么意思。原来是印在四张竖排卡片上的小字；改成下拉之后，
+  // 这些说明不能丢——「查询型 / 模板型」单看词不足以选对（差别在会不会把附件发给用户），
+  // 选错了要等到第一次真正使用才暴露。所以挂在下方一行 hint 上，随选中项改写。
+  const SKILL_TYPE_HINT = {
+    auto:     '按素材内容自动判断，不确定就选这个',
+    write:    '产出稿件：通知、通稿、报告等（需要写作指南 + 范文）',
+    query:    '答问、讲流程：按素材内容回答，不只写稿',
+    template: '答问 + 把源文件里带的附件（如 Word 模板）发给用户',
+  };
+  // auto 在两个表单里的措辞不同：完整通道是 AI 判定，极速通道是按素材内容判定。
+  const SKILL_TYPE_HINT_AUTO = {
+    'lt-type': SKILL_TYPE_HINT.auto,
+    'tr-type': '由 AI 按需求与参考文件判断',
+  };
+
+  // 把某个表单的类型 hint 同步成当前选中项的解释。
+  const syncSkillTypeHint = (groupId) => {
+    const hint = $({ 'lt-type': 'lt-type-hint', 'tr-type': 'tr-type-hint' }[groupId]);
+    if (!hint) return;
+    const v = pickedSkillType(groupId);
+    hint.textContent = (v === 'auto' && SKILL_TYPE_HINT_AUTO[groupId]) || SKILL_TYPE_HINT[v] || SKILL_TYPE_HINT.auto;
   };
 
   let toastTimer;
@@ -458,6 +481,13 @@
   }
 
   // ---------- train: submit ----------
+  // 产物类型下拉：选中项变了就把下方那行解释同步过去（初始文案写在 HTML 里，这里只管以后）。
+  for (const gid of ['lt-type', 'tr-type']) {
+    const sel = document.querySelector('#' + gid + ' select');
+    if (sel) sel.addEventListener('change', () => syncSkillTypeHint(gid));
+    syncSkillTypeHint(gid);
+  }
+
   $('train-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData();

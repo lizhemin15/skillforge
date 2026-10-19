@@ -34,13 +34,25 @@ console.log('— 选择器存在且选项与后端白名单对齐 —');
 for (const gid of ['lt-type', 'tr-type']) {
   const m = html.match(new RegExp(`id="${gid}"([\\s\\S]*?)</div>`));
   ok(!!m, `admin.html 里有 ${gid} 选择器`);
-  const vals = m ? [...m[1].matchAll(/value="([^"]+)"/g)].map((x) => x[1]) : [];
+  // 形态钉死：必须是 <select>（用户嫌四个竖排卡片太长，改成下拉了）。
+  // 这条顺带挡住「改回卡片但忘了同步测试」——卡片没有 <option>，下面的取值会直接为空。
+  ok(!!m && /<select\b/.test(m[1]), `${gid} 是下拉框（<select>）而不是竖排卡片`);
+  const opts = m ? [...m[1].matchAll(/<option\s+value="([^"]+)"([^>]*)>/g)] : [];
+  const vals = opts.map((x) => x[1]);
   ok(vals.length === BACKEND_ALLOWED.length,
     `${gid} 选项数 = 后端白名单数（${vals.length} vs ${BACKEND_ALLOWED.length}）`);
   ok(vals.join(',') === BACKEND_ALLOWED.join(','),
     `${gid} 选项值顺序与内容都对齐后端：${vals.join(',')}`);
-  ok(/name="([a-z-]+)"[^>]*value="auto" checked|value="auto" checked/.test(m ? m[1] : ''),
+  // 下拉框的默认值靠 selected 属性；缺了它浏览器会默认选第一项（恰好是 auto），
+  // 但那是「碰巧对」，不该依赖 —— 显式选中才在将来重排选项时仍然安全。
+  const autoOpt = opts.find((x) => x[1] === 'auto');
+  ok(!!autoOpt && /\bselected\b/.test(autoOpt[2]),
     `${gid} 默认选中 auto（不点也得跟以前一样）`);
+  // 每型的解释必须有地方落，不能因为压缩成下拉就把说明丢了。
+  ok(new RegExp(`id="${gid}-hint"`).test(m ? m[1] : ''),
+    `${gid} 保留了一行说明（hint），四个词单看不足以选对`);
+  ok(/aria-describedby="[a-z-]+-hint"/.test(m ? m[1] : ''),
+    `${gid} select 用 aria-describedby 关联那行说明（读屏也能拿到）`);
 }
 
 console.log('— 提交流程真的带上了所选值 —');
@@ -52,8 +64,10 @@ ok(/fd\.append\(['"]skill_type['"],\s*pickedSkillType\(['"]tr-type['"]\)\)/.test
 ok(js.includes(`'${BACKEND_FIELD}'`), `字段名与后端一致：${BACKEND_FIELD}`);
 
 console.log('— 取值函数不会造出后端不认的值 —');
-ok(/const el = document\.querySelector\('#' \+ groupId \+ ' input:checked'\)/.test(js),
+ok(/const el = document\.querySelector\('#' \+ groupId \+ ' select'\)/.test(js),
   '按 group 精确取选中项（不靠全局 name 查询，两个表单同名也不会串）');
+ok(/SKILL_TYPE_HINT/.test(js) && /syncSkillTypeHint/.test(js),
+  '下拉选中项变化时同步下方说明（压缩成下拉后，每型的含义仍能读到）');
 ok(/return el \? el\.value : 'auto'/.test(js),
   '取不到时回落 auto（选择器坏掉也不发假类型）');
 
