@@ -48,7 +48,7 @@ func TestLiteDecideType_Matrix(t *testing.T) {
 		bodyChar int
 		want     string
 	}{
-		{"拆出附件且没有写作指南范文 → 模板型", 2, "", 0, 0, 0, model.SkillTypeTemplate},
+		{"拆出附件且没有写作指南范文 → 问答型（可下发文件）", 2, "", 0, 0, 0, model.SkillTypeQuery},
 		{"拆出附件但素材本身就是写作素材 → 仍是写作型", 1, longGuide, 2, 500, 500, model.SkillTypeWrite},
 		{"没有附件、只有正文 → 查询型", 0, "", 0, 0, len([]rune(longBody)), model.SkillTypeQuery},
 		{"有指南有范文 → 写作型", 0, longGuide, 2, 500, 500, model.SkillTypeWrite},
@@ -74,8 +74,8 @@ func TestLiteDecideType_Matrix(t *testing.T) {
 // （那会让用户拿不到文件）。这是本次需求的核心断言。
 func TestLiteDecideType_AttachmentOutranksBodyLength(t *testing.T) {
 	typ, _ := liteDecideType(1, "", 0, 0, 5000)
-	if typ != model.SkillTypeTemplate {
-		t.Fatalf("类型 = %q，want template：有附件时不能被更长的正文抢走类型", typ)
+	if typ != model.SkillTypeQuery {
+		t.Fatalf("类型 = %q，want query：有附件时不能被更长的正文抢走类型（且两种模式里只有 query 能带附件下发）", typ)
 	}
 }
 

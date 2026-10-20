@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SkillForge · 管理端</title>
-  <link rel="stylesheet" href="/assets/css/style.css?v=20261019A">
+  <link rel="stylesheet" href="/assets/css/style.css?v=20261020A">
   <link rel="stylesheet" href="/assets/vendor/codemirror/lib/codemirror.min.css?v=20260908A">
   <link rel="stylesheet" href="/assets/vendor/codemirror/addon/fold/foldgutter.min.css?v=20260908A">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23111418'/><rect x='9' y='9' width='6' height='14' rx='2' fill='%23c8ccd2'/><rect x='17' y='9' width='6' height='14' rx='2' fill='%23757c86'/></svg>">
@@ -290,16 +290,17 @@
               <!-- 产物类型：下拉选择，放在素材框**上方**，因为选什么类型直接决定素材该怎么给
                    （写作型要指南+范文；查询/模板型只要有正文或源文件）。
                    报错文案里也是说「把上方的产物类型选成…」，文案与位置必须对得上。
-                   用下拉而非四张竖排卡片：后者在表单里占掉一大截，而四项极短。
+                   只有「写作 / 问答」两项：原本还有「模板型」，但它只是「问答 + 能发附件」，
+                   不该让用户多判断一次；附件下发已并入问答（有附件且用户点名就发）。
+                   用下拉而非竖排卡片：后者在表单里占掉一大截，而选项极短。
                    每型的具体含义放在下方一行 hint 里，随选中项变化（见 admin.js）。 -->
               <div class="field">
                 <label>产物类型</label>
                 <div class="type-pick" id="lt-type">
                   <select name="lt-type" aria-describedby="lt-type-hint">
                     <option value="auto" selected>自动判断</option>
-                    <option value="write">写作型</option>
-                    <option value="query">查询型</option>
-                    <option value="template">模板型</option>
+                    <option value="write">写作</option>
+                    <option value="query">问答</option>
                   </select>
                   <p class="hint" id="lt-type-hint">按素材内容自动判断，不确定就选这个</p>
                 </div>
@@ -330,9 +331,8 @@
                 <div class="type-pick" id="tr-type">
                   <select name="tr-type" aria-describedby="tr-type-hint">
                     <option value="auto" selected>自动判断</option>
-                    <option value="write">写作型</option>
-                    <option value="query">查询型</option>
-                    <option value="template">模板型</option>
+                    <option value="write">写作</option>
+                    <option value="query">问答</option>
                   </select>
                   <p class="hint" id="tr-type-hint">由 AI 按需求与参考文件判断</p>
                 </div>
@@ -389,6 +389,6 @@
 <script src="/assets/vendor/codemirror/addon/fold/foldcode.min.js?v=20260908A"></script>
 <script src="/assets/vendor/codemirror/addon/fold/foldgutter.min.js?v=20260908A"></script>
 <script src="/assets/js/site.js?v=20260911M"></script>
-<script src="/assets/js/admin.js?v=20261019A"></script>
+<script src="/assets/js/admin.js?v=20261020A"></script>
 </body>
 </html>

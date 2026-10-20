@@ -330,7 +330,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// 手动模式下用户已经点名了技能，接力逻辑必须让位（否则会被悄悄换掉）。
 		if tslug := agent.TemplateFillSkillInHistory(fullHist, req.Message); manualSkill == nil && tslug != "" && tslug != eval.SkillSlug {
 			tsc, terr := h.eng.LoadSkill(tslug)
-			if terr == nil && tsc.SkillType == model.SkillTypeTemplate && tsc.Attachment != "" {
+			if terr == nil && tsc.SkillType != model.SkillTypeWrite && tsc.Attachment != "" {
 				sc = tsc
 				eval.SkillSlug = tslug
 				// keep the history on this skill so the fill logic can recover past values
@@ -547,7 +547,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// omitted/blanked action and the phrasing still clearly asks to fill,
 		// do the smart-fill anyway instead of silently dropping the attachment.
 		action := strings.ToLower(strings.TrimSpace(eval.Action))
-		if action == "" && sc.SkillType == model.SkillTypeTemplate && agent.WantsFill(req.Message) && sc.Attachment != "" {
+		if action == "" && sc.SkillType != model.SkillTypeWrite && agent.WantsFill(req.Message) && sc.Attachment != "" {
 			action = "fill"
 		}
 
@@ -663,7 +663,7 @@ func (h *chatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// 正好填住这段——这也回答了「为什么不让旁白晚点开」：晚一秒就是多一秒死屏。
 		facts := noteFacts(sc, args, history).note()
 		stopPlanNarr := clock.Narrate(narrateLines("", facts))
-		plan, _ := h.eng.PlanEssay(ctx, sc, args, req.Message)
+		plan, _ := h.eng.PlanEssayWithHistory(ctx, req.SessionID, history, sc, args, req.Message)
 		stopPlanNarr()
 		if plan != "" {
 			tb.Close(planIdx, "要点已定，按它落笔")
@@ -727,7 +727,7 @@ plainPath:
 	// 旁白先于构思跳开，理由同上面技能链路那条：构思跳关思考链 → provider reason=0
 	// → 这一跳全程静默（线上实测 50.0s / 首 token 45.5s）。
 	stopPlanNarr := clock.Narrate(narrateLines("", plainFacts))
-	plan, _ := h.eng.PlanEssay(ctx, nil, nil, req.Message)
+	plan, _ := h.eng.PlanEssayWithHistory(ctx, req.SessionID, history, nil, nil, req.Message)
 	stopPlanNarr()
 	if plan != "" {
 		tb.Close(planIdx, "要点已定，按它落笔")

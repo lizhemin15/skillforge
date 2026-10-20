@@ -1347,8 +1347,11 @@ func liteDecideType(attachN int, guide string, exampleN, exampleChars, bodyChars
 		// 附件排在正文长度之前：附件是**客观事实**（字节流里真躺着一份文件），
 		// 而「正文够长」只说明材料有内容、不说明该怎么用。两者都不是写作素材时，
 		// 以附件定类型——不然用户按提示去要文件，技能却只会答问。
-		return model.SkillTypeTemplate, fmt.Sprintf(
-			"素材里拆出 %d 个内嵌附件，且素材不是写作类（没有成篇的写作指南/范文），按「查询 + 下发文件」生成", attachN)
+		// 生成成 query 而不是 template：用户侧只有「写作 / 问答」两种模式，
+		// 「能下发附件」是问答能力的一部分（运行时按「有没有附件 + 用户有没有点名」发），
+		// 不是一个需要单独选的类型。理由里仍写清「会下发文件」，便于管理员核对。
+		return model.SkillTypeQuery, fmt.Sprintf(
+			"素材里拆出 %d 个内嵌附件，且素材不是写作类（没有成篇的写作指南/范文），按「问答（可下发文件）」生成", attachN)
 	case bodyChars >= liteMinGuideChars:
 		return model.SkillTypeQuery, fmt.Sprintf(
 			"素材有正文（%d 字）但没有成篇的写作指南与范文，按「查询」生成", bodyChars)

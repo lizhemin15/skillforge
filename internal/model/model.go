@@ -58,24 +58,38 @@ type Attachment struct {
 }
 
 // Skill type constants.
+//
+// 用户侧**只有两种模式**：写作（write）与问答（query）。用户原话：
+// 「原本的是写作模式嘛，现在想做一个问答模式……你不要分那么多模式，就两种」。
+//
+// 早先还有 template（问答 + 下发附件）与 docgen（生成 Word/Excel）。两者都保留为
+// **内部能力**而不是用户可选的模式：
+//   - Template 并入 Query：问答模式下，只要素材里拆出了附件、且用户点名要，就下发。
+//     用户不再需要为了「能发模板」去挑一个单独的类型 —— 那本来就不是一种「模式」，
+//     而是问答能力的一部分。const 保留是因为在线库里仍有历史数据与判定逻辑引用它；
+//     运行时它被 NormalizeSkillType 折算成 Query。
+//   - DocGen 是「办公文档管家」这类内核技能的专属通道（提示词里带 DOCJSON 契约），
+//     从来不在选择器上出现，保持隐藏。
 const (
-	SkillTypeWrite    = "write"    // generate a document/article
-	SkillTypeQuery    = "query"    // return a办事流程/answer from references
-	SkillTypeTemplate = "template" // 流程 + downloadable template attachment
-	SkillTypeDocGen   = "docgen"   // fill/generate an office file (word/excel/ppt/pdf) and deliver it
+	SkillTypeWrite    = "write"    // 写作：产出稿件（系统提示词 / 极速写作）
+	SkillTypeQuery    = "query"    // 问答：依据材料回答，必要时下发材料
+	SkillTypeTemplate = "template" // 历史值，等价于 query（见 NormalizeSkillType）
+	SkillTypeDocGen   = "docgen"   // 内部技能通道，不是用户可选模式
 )
 
 // PickedSkillTypes 是**创建者在界面上能亲手选**的类型，顺序即界面上从上到下的顺序。
 //
-// 为什么要有这份「可选清单」而不是直接复用上面全部常量：docgen 目前没有独立提示词与
-// 交付协议（会被当写作型走），把它摆到选择器上等于让用户选一个选了也没区别的按钮。
-// 只有真能按类型改变行为的，才配出现在界面上。
-var PickedSkillTypes = []string{SkillTypeWrite, SkillTypeQuery, SkillTypeTemplate}
+// 只有两种。docgen 是内部通道（见上），template 已并入 query —— 都不要再往这里加：
+// 每多一项，用户就要在一个本来只有「写稿 / 答问」二选一的场景里多判断一次。
+var PickedSkillTypes = []string{SkillTypeWrite, SkillTypeQuery}
 
-// ParsePickedSkillType 把界面上传来的类型字符串收敛成合法值。
+// ParsePickedSkillType 把界面上传来的类型字符串收敛成合法值（自动判定 / write / query）。
+//
+// `template` 作为历史值仍被接受并折算成 query：老前端、老脚本可能还在传它，
+// 而它的语义（问答 + 下发附件）正是现在 query 的语义，折算不会造成行为变化。
 //
 // 空串（含用户什么都没选、老前端没这个字段）→ ""，表示**交给系统自动判定**。
-// 认不出的值返回 ok=false，由上层报错：静默降级成「自动」会让用户以为自己选的那项
+// 其它认不出的值返回 ok=false，由上层报错：静默降级成「自动」会让用户以为自己选的那项
 // 生效了，而技能实际按另一种类型生成——这类「选了但没用」的 bug 在产物上完全看不出来，
 // 只能靠拒绝非法输入挡住。
 func ParsePickedSkillType(s string) (string, bool) {
@@ -83,12 +97,31 @@ func ParsePickedSkillType(s string) (string, bool) {
 	if s == "" || s == "auto" {
 		return "", true
 	}
+	if s == SkillTypeTemplate {
+		return SkillTypeQuery, true
+	}
 	for _, t := range PickedSkillTypes {
 		if s == t {
 			return s, true
 		}
 	}
 	return "", false
+}
+
+// NormalizeSkillType 把**库里存量**的类型值折算成当前口径（write / query / docgen）。
+//
+// 读的时候折算而不是只在迁移脚本里改一次，是因为折算必须对「迁移前就载入内存的
+// 老数据」也成立：启动迁移只覆盖库里的行，而进程内可能已经拿着旧值在跑了。
+// docgen 原样返回 —— 它是内核技能的类型，不该被折成 query。
+func NormalizeSkillType(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case SkillTypeQuery, SkillTypeTemplate:
+		return SkillTypeQuery
+	case SkillTypeDocGen:
+		return SkillTypeDocGen
+	default:
+		return SkillTypeWrite
+	}
 }
 
 // Param defines a dynamic form field for a skill. Rendered by the frontend

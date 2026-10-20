@@ -117,5 +117,14 @@ func migrate(db *sql.DB) error {
 			}
 		}
 	}
+	// 技能类型收敛为「写作 / 问答」两种：存量的 template 折成 query。
+	//
+	// 语义上没有变化 —— template 本来就是「问答 + 能下发附件」，而这正是现在 query
+	// 的行为（附件下发改由「素材里有没有附件、用户有没有点名」决定，不再靠类型）。
+	// 改库是为了让管理端列表、导出、以及任何直接读库的地方都只看到两种叫法。
+	// 幂等：第二次跑时已经没有 template 行了，这条 UPDATE 影响 0 行。
+	if _, err := db.Exec(`UPDATE skills SET skill_type='query' WHERE lower(skill_type)='template'`); err != nil {
+		return fmt.Errorf("migrate: 收敛 template→query 失败: %w", err)
+	}
 	return nil
 }

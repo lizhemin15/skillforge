@@ -78,7 +78,19 @@ func (e *Engine) QuickDraft(ctx context.Context, id, user string, history []Mess
 	histBlock := e.ContextBlock(ctx, id, history)
 	combined := user
 	if len(history) > 0 {
-		combined = "对话历史（供参考，你只需回应最新用户消息）：\n" + histBlock + "\n\n最新用户消息：\n" + user
+		// 措辞：早先是「你只需回应最新用户消息」—— 那句话把模型推向了「每条消息都是
+		// 一个独立请求」，于是用户在自检追问后回一句「张老师」，它就把这三个字当成
+		// 新题目重写（实测输出「张老师人物素描」构想）。用户原话：「我补充了，它似乎
+		// 把我补充的话当成了第一句话，忘了我最开始说的以及它自己答的东西了。」
+		//
+		// 现在明确两件事：(1) 先读前情，弄清「这一篇」是什么；(2) 本轮消息多半是补细节，
+		// 短不等于换题目。真正把「本轮是补充」钉死的判据不由这里负责（那是分类器与
+		// 构思跳的事），这一句只负责不误导。
+		combined = "【前情（本次会话已发生的内容）】\n" + histBlock + "\n\n" +
+			"【请先看清前情】用户前面在做什么（例如在写哪一份通知/哪一篇稿），" +
+			"本轮消息多半是在**给那件事补一个细节**（答一个人名、一个日期、一个地址）。\n" +
+			"本轮消息很短不代表换了题目：除非用户明说要改题，否则请继续把前情里那一篇写完。\n\n" +
+			"【本轮用户消息】\n" + user
 	}
 	st := &hopStat{t0: time.Now()}
 	out, err := e.llm.StreamChat(ctx, sys, combined, llm.StreamOpts{

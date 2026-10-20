@@ -19,7 +19,10 @@ const web = join(here, '..');
 
 // 与 internal/model 的 ParsePickedSkillType 白名单保持一致（改后端必须同步改这里，
 // 反之亦然——两边不一致时这个测试就是那道闸门）。
-const BACKEND_ALLOWED = ['auto', 'write', 'query', 'template'];
+//
+// 用户侧只有「写作 / 问答」两种：template 已并入 query（问答模式本来就能发附件，
+// 那是能力不是模式），docgen 是内部通道、从不出现在选择器上。
+const BACKEND_ALLOWED = ['auto', 'write', 'query'];
 const BACKEND_FIELD = 'skill_type';
 
 let failures = 0;

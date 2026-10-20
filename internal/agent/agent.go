@@ -793,7 +793,11 @@ func (e *Engine) classifyWith(ctx context.Context, sys, user string, buildBlock 
 	// 意图识别也吃上下文：用户说「整理成 word」时，识别「这是承接上一轮新闻稿」
 	// 才能路由到正确的技能，而不是当成一句没头没尾的新指令。
 	ctxBlk := buildBlock(ctx)
-	prompt := "对话历史（供参考，重点回应最新消息）：\n" + ctxBlk + "\n\n用户最新消息：\n" + user
+	// 措辞同 QuickDraft：早先「重点回应最新消息」会让极短的补充（「张老师」「下月1号」）
+	// 被读成一个新请求。这里点明「最新消息可能是对前情的补充」。
+	prompt := "【前情（本次会话已发生的内容）】\n" + ctxBlk + "\n\n【用户最新消息】\n" + user +
+		"\n\n（提示：最新消息很短时，多半是在给前情里那件事补一个细节，如一个人名、一个日期；" +
+		"不是换了一个新请求。判断 intent/action 时要延续前情。）"
 	// 这一跳的耗时观测：ttft（预填/排队）与总时长（吐字）拆开，输出字数记下来。
 	// 线上实测（2026-09-19）生效的是 siliconflow/Qwen3.6-27B，吐字 ~50 tok/s，
 	// 所以「让它少写固定文案」直接把这一跳从 10.3s 压到 2.9s。没有这行日志，
@@ -1307,6 +1311,25 @@ func headRunes(s string, n int) string {
 // 它**不碰执笔那一跳**：执笔仍保留思考链（质量优先，见 progress_wiring_test.go 的守卫）。
 // 失败不致命：拿不到要点就照旧直接落笔（返回空串，由调用方决定怎么显示）。
 func (e *Engine) PlanEssay(ctx context.Context, sc *SkillContent, args map[string]string, userMsg string) (string, error) {
+	return e.PlanEssayWithHistory(ctx, "", nil, sc, args, userMsg)
+}
+
+// PlanEssayWithHistory 同 PlanEssay，但把会话历史一并带进构思这一跳。
+//
+// 为什么必须带（用户原话）：
+//
+//	「很多时候我给的信息不完整，它给我意见说要补充啥，我补充了，它似乎把我补充
+//	 的话当成了第一句话，忘了我最开始说的以及它自己答的东西了。」
+//
+// 抓包复现（同一会话两轮：先说「写个员工培训通知，讲师和时间我还没定」，再答「张老师」）：
+//
+//	[分类器] 上下文 = 【最近对话（原文）】用户：写个员工培训通知…  ← 它有历史
+//	[构思]   上下文 = 用户本轮需求：张老师                        ← 历史全没了
+//
+// 分类器判断「这是在续写培训通知」是对的，可真正决定写成什么的构思跳只看到「张老师」
+// 三个字，于是把它当成一篇全新文章的题目（实测输出「张老师人物素描」构思）。执笔跳
+// 拿到的构思要点已经是这个错方向，回头再补历史也救不回来 —— 错的不是记忆，是那一跳的输入。
+func (e *Engine) PlanEssayWithHistory(ctx context.Context, sessionID string, history []Message, sc *SkillContent, args map[string]string, userMsg string) (string, error) {
 	if e == nil || e.llm == nil {
 		return "", nil
 	}
@@ -1322,6 +1345,20 @@ func (e *Engine) PlanEssay(ctx context.Context, sc *SkillContent, args map[strin
 		lead = userRawBlock(sc, userMsg) + argBlockOf(sc, args)
 	} else {
 		lead = "用户本轮需求：\n" + strings.TrimSpace(userMsg)
+	}
+	// 会话历史：只在真有历史时插，且措辞明确「本轮消息是对这些前情的补充」。
+	//
+	// 措辞很关键。极速档那句「你只需回应最新用户消息」正是把「张老师」读成新题目
+	// 的直接诱因（见 quick.go）；这里反过来把它说清：本轮消息往往很短，它的意思是
+	// 「给前面那件事补一个细节」，不是「换一个题目重写」。
+	if len(history) > 0 && sessionID != "" {
+		if blk := e.ContextBlock(ctx, sessionID, history); blk != "" && blk != "（无历史）" {
+			lead = "【前情（本次会话已发生的内容）】\n" + blk + "\n\n" +
+				"【本轮消息】\n" + strings.TrimSpace(userMsg) + "\n" +
+				"注意：本轮消息常常很短（如只答了一个人名、一个日期），它是**对前情的补充**，" +
+				"不是一个新的写作题目。要写的东西仍是前情里商定的那一篇；本轮消息只是把它补全。\n" +
+				lead
+		}
 	}
 	ask := lead + "\n\n# 本轮任务\n先只写这一篇的构思要点，不要写正文：\n" +
 		"1) 3~6 条，每条一行，以「· 」开头；\n" +
@@ -2406,7 +2443,14 @@ func (e *Engine) plainChatWithPlan(ctx context.Context, id, user string, history
 	histBlock := e.ContextBlock(ctx, id, history)
 	combined := user
 	if len(history) > 0 {
-		combined = "对话历史（供参考，你只需回应最新用户消息）：\n" + histBlock + "\n\n最新用户消息：\n" + user
+		// 措辞与 QuickDraft / 构思跳统一（详见 quick.go 同名注释）：早先那句
+		// 「你只需回应最新用户消息」会让极短的补充（「张老师」「下月1号」）被读成一个
+		// 新请求，用户于是看到「我补充了，它把我补充的话当成了第一句话」。
+		combined = "【前情（本次会话已发生的内容）】\n" + histBlock + "\n\n" +
+			"【请先看清前情】用户前面在做什么（例如在写哪一份通知/哪一篇稿），" +
+			"本轮消息多半是在**给那件事补一个细节**（答一个人名、一个日期、一个地址）。\n" +
+			"本轮消息很短不代表换了题目：除非用户明说要改题，否则请继续把前情里那一篇写完。\n\n" +
+			"【本轮用户消息】\n" + user
 	}
 	if strings.TrimSpace(plan) != "" {
 		sys += "\n\n==== 本轮构思要点（按它落笔）====\n" + plan

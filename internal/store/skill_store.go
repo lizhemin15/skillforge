@@ -49,6 +49,10 @@ func (s *SkillStore) List() ([]model.Skill, error) {
 			return nil, err
 		}
 		sk.Attachments = decodeAttachments(attsRaw, sk.Attachment)
+		// 存量行的 template 在这里折成 query（见 model.NormalizeSkillType）：
+		// 读的时候折算而不是只靠启动迁移，是为了让迁移前就已载入内存 / 或迁移失败的
+		// 实例也按新口径跑，不会出现「同一个技能在列表里叫模板、在运行时叫问答」。
+		sk.SkillType = model.NormalizeSkillType(sk.SkillType)
 		sk.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", ct)
 		sk.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", ut)
 		out = append(out, sk)
@@ -90,6 +94,7 @@ func (s *SkillStore) Get(slug string) (*model.Skill, error) {
 		return nil, err
 	}
 	sk.Attachments = decodeAttachments(attsRaw, sk.Attachment)
+	sk.SkillType = model.NormalizeSkillType(sk.SkillType)
 	sk.Enabled = enabled == 1
 	sk.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", ct)
 	sk.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", ut)

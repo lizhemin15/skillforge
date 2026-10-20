@@ -178,7 +178,10 @@ func TestParsePickedSkillType(t *testing.T) {
 		{"AUTO", "", true}, // 大小写不敏感（表单值不该因大小写失效）
 		{" write ", "write", true},
 		{"query", "query", true},
-		{"template", "template", true},
+		// template 已并入 query：老前端/老脚本仍可能传它，接受但折算成 query
+		// （语义不变：问答 + 有附件就下发）。见 model.NormalizeSkillType。
+		{"template", "query", true},
+		{"TEMPLATE", "query", true},
 		{"Query", "query", true},
 		{"docgen", "", false}, // 未开放的类型 → 拒绝，不许默默当自动
 		{"writ", "", false},   // 拼错

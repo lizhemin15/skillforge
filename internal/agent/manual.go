@@ -50,7 +50,7 @@ func ManualEval(sc *SkillContent) *Eval {
 // 「这份合同不要空白模板」这类反话读错），这里能成立是因为用户已经用下拉框
 // 表达了主意图，剩下的只是"填"还是"发空表"这一个二选一。
 func ManualActionFor(sc *SkillContent, msg string) string {
-	if sc == nil || sc.SkillType != model.SkillTypeTemplate || sc.Attachment == "" {
+	if sc == nil || sc.SkillType == model.SkillTypeWrite || sc.Attachment == "" {
 		return ""
 	}
 	if WantsBlankTemplate(msg) {
