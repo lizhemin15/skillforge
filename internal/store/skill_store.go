@@ -141,6 +141,14 @@ func (s *SkillStore) contentStats(slug string) (promptLen, exampleCount int, err
 
 // SystemPrompt returns the system prompt content (with few-shot examples
 // appended) for generating articles.
+//
+// 范文既可能是 examples/*.md（手建技能的老形态），也可能是 examples/<分类>/NN.md
+// （训练流水线建的技能一律是这个形态）。**必须两种都收**：早先只扫顶层 md，
+// 于是流水线建的技能一份范文都拼不进来 —— 而上下文材料（业务流程文档里的表格、
+// 标准表、时限表）恰恰只落在范文里，system_prompt 里只有「照着表格答」的指令
+// 却没有表。模型于是拿自己的常识填数字：实测把「经理住宿 600」答成 500、
+// 「总监 800」答成 600，还编出原文没有的「火车软卧」。这不是模型不听话，
+// 是它手上真的没有数据。
 func (s *SkillStore) SystemPrompt(slug string) (string, error) {
 	dir := s.skillDir(slug)
 	sp := filepath.Join(dir, "system_prompt.md")
@@ -150,20 +158,69 @@ func (s *SkillStore) SystemPrompt(slug string) (string, error) {
 	}
 	var sb strings.Builder
 	sb.Write(b)
-	// Append examples as few-shot
-	ex := filepath.Join(dir, "examples")
-	if entries, err := os.ReadDir(ex); err == nil {
-		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-		for _, en := range entries {
-			if en.IsDir() || !strings.HasSuffix(en.Name(), ".md") {
-				continue
-			}
-			eb, _ := os.ReadFile(filepath.Join(ex, en.Name()))
-			sb.WriteString("\n\n--- 示例范文" + strings.TrimSuffix(en.Name(), ".md") + " ---\n")
-			sb.Write(eb)
+	// Append examples as few-shot（顶层与一级子目录都收；顺序稳定：先顶层，再按名字排子目录）
+	for _, ex := range s.exampleFiles(dir) {
+		eb, err := os.ReadFile(ex.path)
+		if err != nil {
+			continue
 		}
+		sb.WriteString("\n\n--- 示例范文" + ex.label + " ---\n")
+		sb.Write(eb)
 	}
 	return sb.String(), nil
+}
+
+// exampleFile 是一份可以拼进提示词的范文。
+type exampleFile struct {
+	path  string
+	label string // 拼在分隔线里的名字，带分类时形如「（biaozhun/01）」
+}
+
+// exampleFiles 列出技能目录下所有该拼进提示词的范文文件。
+//
+// 只扫一层子目录（examples/<分类>/*.md），不递归到底：分类是这套目录的固定深度，
+// 更深的层级没有语义，递归反而可能把用户自己塞进案例子目录的杂文件带进来。
+func (s *SkillStore) exampleFiles(dir string) []exampleFile {
+	ex := filepath.Join(dir, "examples")
+	entries, err := os.ReadDir(ex)
+	if err != nil {
+		return nil
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+
+	var out []exampleFile
+	// 先顶层：老形态技能的提示词里范文顺序保持不变（分隔线文字也不变），
+	// 避免这次改动把已有技能的 prompt 文本整体挪位。
+	for _, en := range entries {
+		if en.IsDir() || !strings.HasSuffix(en.Name(), ".md") {
+			continue
+		}
+		out = append(out, exampleFile{
+			path:  filepath.Join(ex, en.Name()),
+			label: strings.TrimSuffix(en.Name(), ".md"),
+		})
+	}
+	for _, en := range entries {
+		if !en.IsDir() {
+			continue
+		}
+		sub := filepath.Join(ex, en.Name())
+		subEntries, err := os.ReadDir(sub)
+		if err != nil {
+			continue
+		}
+		sort.Slice(subEntries, func(i, j int) bool { return subEntries[i].Name() < subEntries[j].Name() })
+		for _, se := range subEntries {
+			if se.IsDir() || !strings.HasSuffix(se.Name(), ".md") {
+				continue
+			}
+			out = append(out, exampleFile{
+				path:  filepath.Join(sub, se.Name()),
+				label: "（" + en.Name() + "/" + strings.TrimSuffix(se.Name(), ".md") + "）",
+			})
+		}
+	}
+	return out
 }
 
 // Template returns the skeleton template content (may be empty).

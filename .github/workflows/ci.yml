@@ -438,6 +438,7 @@ jobs:
           python3 -m pip install --quiet --user -r deploy/ocr/test-requirements.txt
           python3 deploy/ocr/test_ocrd_quality.py
           python3 deploy/ocr/test_guard_wait.py
+          python3 deploy/ocr/test_docx_table.py
 
       # A1~A6 判定器（web/tests/judge_stage_streaming_stats.py）自己的尺子。
       # 它此前是本仓库最后一把「CI 里没人碰过」的尺子：判定逻辑只被

@@ -369,6 +369,9 @@ if [ "$QUICK" = 0 ]; then
   selfcheck 'OCR / 质量判据单测'        python3 deploy/ocr/test_ocrd_quality.py
   # 退出前等在飞请求走完（有上限），且不许把自愈路径堵死 —— 也是 0 引用的游离尺子。
   selfcheck 'OCR / 退出等待与自愈单测'  python3 deploy/ocr/test_guard_wait.py
+  # docx 表格还原（行列关系不能丢）。用户报「幻觉严重、表格没提取出来」的根因就在这：
+  # 旧 extract_docx 把单元格段落全平铺，5x4 的标准表摊成 20 行，模型无从知道哪个数属于哪列。
+  selfcheck 'OCR / docx 表格还原'       python3 deploy/ocr/test_docx_table.py
   # 逐页流复验尺子的自证（六方向：真流式 / 攒齐再吐 / 老件一把回 JSON / 缓存命中 /
   # 半途断流 / 接口 404），六个方向各自必须精确命中**它自己那条**判据。
   # 守的是用户投诉「一直卡着计时」这个体验：解析期原来静默 33s 只有裸计时在跳，

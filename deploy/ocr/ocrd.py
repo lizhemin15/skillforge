@@ -329,22 +329,157 @@ def _text_quality(txt: str) -> tuple[bool, str]:
 def _q(tag, ns):
     return "{%s}%s" % (NS[ns], tag)
 
+def _docx_para_text(p) -> str:
+    """一个 w:p 的纯文本。只取本段落的 w:t，**不钻进**嵌套在里面的 w:tbl。"""
+    out = []
+
+    def walk(node):
+        for c in node:
+            if c.tag == _q("tbl", "w"):
+                continue          # 跳过整棵表格子树
+            if c.tag == _q("t", "w"):
+                out.append(c.text or "")
+            else:
+                walk(c)           # 递归（含 w:r / w:hyperlink / w:ins 等包装层）
+    walk(p)
+    return "".join(out).strip()
+
+
+def _docx_cell_text(tc) -> str:
+    """一个 w:tc 单元格的文本：多段落用空格连，压掉换行以免撑破 markdown 行。"""
+    parts = []
+    for child in tc:
+        if child.tag == _q("p", "w"):
+            t = _docx_para_text(child)
+            if t:
+                parts.append(t)
+        elif child.tag == _q("tbl", "w"):
+            # 嵌套表格：降级成一行文字，不去还原多层结构（markdown 表达不了）
+            rows = _docx_table_rows(child)
+            parts.append(" / ".join(" | ".join(r) for r in rows))
+    s = " ".join(parts).replace("\n", " ").replace("|", "\\|").strip()
+    return re.sub(r"\s{2,}", " ", s)
+
+
+def _docx_is_vmerge_continue(tc) -> bool:
+    """该单元格是不是纵向合并的「续格」（w:vMerge 无 val 或 val=continue）。
+    续格在 docx 里是空占位，若原样输出会得到一行全是空格的假数据行。"""
+    tcPr = tc.find(_q("tcPr", "w"))
+    if tcPr is None:
+        return False
+    vm = tcPr.find(_q("vMerge", "w"))
+    if vm is None:
+        return False
+    return (vm.get(_q("val", "w")) or "continue") == "continue"
+
+
+def _docx_table_rows(tbl) -> list:
+    """把一个 w:tbl 取成二维字符串数组，并按 gridSpan 展开横向合并。"""
+    rows = []
+    for tr in tbl.findall(_q("tr", "w")):
+        cells = []
+        for tc in tr.findall(_q("tc", "w")):
+            span = 1
+            tcPr = tc.find(_q("tcPr", "w"))
+            if tcPr is not None:
+                gs = tcPr.find(_q("gridSpan", "w"))
+                if gs is not None:
+                    try:
+                        span = max(1, int(gs.get(_q("val", "w")) or 1))
+                    except ValueError:
+                        span = 1
+            # 纵向合并的续格：内容属于上方那格，这里留**空占位**保持列对齐。
+            # 不能整个丢掉（那会让本行后续列整体左移，数字串到别的列头上），
+            # 也不能照搬内容（那会重复一遍，模型会当成两行真实数据）。
+            txt = "" if _docx_is_vmerge_continue(tc) else _docx_cell_text(tc)
+            cells.append(txt)
+            # 横向合并：补空列，让后续列不整体左移
+            cells.extend([""] * (span - 1))
+        if cells:
+            rows.append(cells)
+    return rows
+
+
+def _render_markdown_table(rows: list) -> str:
+    """二维数组 → markdown 表格。
+
+    为什么一定要输出**有结构的表格**而不是「一行一个单元格」：下游是把这段文本直接
+    喂给模型的。单元格被摊平成独立行之后，模型只能看到「人员级别 / 住宿标准 / 总监 / 800」
+    这一串词，**无从知道 800 属于哪一列**，于是只能猜 —— 实测把「经理住宿 600」答成 350。
+    表格结构一旦保住，模型是照着念，不需要推理。
+    """
+    if not rows:
+        return ""
+    ncol = max(len(r) for r in rows)
+    rows = [r + [""] * (ncol - len(r)) for r in rows]
+    head = rows[0]
+    # 表头整行都空时补占位，否则 markdown 表格不合法
+    if not any(c.strip() for c in head):
+        head = ["列%d" % (i + 1) for i in range(ncol)]
+        body = rows
+    else:
+        body = rows[1:]
+    lines = ["| " + " | ".join(head) + " |",
+             "| " + " | ".join(["---"] * ncol) + " |"]
+    for r in body:
+        lines.append("| " + " | ".join(r) + " |")
+    return "\n".join(lines)
+
+
 def extract_docx(raw: bytes) -> tuple[str, int]:
-    """返回 (text, 段落数)。解析 word/document.xml 的 w:p 段落。"""
+    """返回 (text, 段落数)。解析 word/document.xml。
+
+    正文顺序保持原样；**表格按 w:tbl 还原成 markdown 表格**并留在它原本的位置。
+
+    旧实现是对 root.iter(w:p) 做全平铺 —— 表格单元格里的段落也被当成普通段落，
+    每个单元格单独一行且没有任何分隔符。结果一份 5 行 4 列的标准表被摊成 20 行
+    「人员级别 / 住宿标准(元/晚) / … / 总监及以上 / 800 / 150 / …」，行列关系全丢。
+    对「照着业务文档建技能」这个场景是致命的：模型拿不到「哪个数属于哪一列」，
+    只能编 —— 线上实测把经理住宿标准 600 元答成 350 元，还编出原文没有的
+    「市内通勤凭发票报销 / 飞机经济舱」等条款。
+    """
     with zipfile.ZipFile(io.BytesIO(raw)) as z:
         try:
             xml = z.read("word/document.xml")
         except KeyError:
             raise ValueError("docx 缺少 document.xml")
     root = ET.fromstring(xml)
-    paras = []
-    for p in root.iter(_q("p", "w")):
-        # 取段落内所有 w:t 文本节点
-        texts = [t.text or "" for t in p.iter(_q("t", "w"))]
-        line = "".join(texts).strip()
-        # 表格内单元格段落也随段落流保留
-        paras.append(line)
-    return "\n".join(paras), len(paras)
+
+    # 找到正文容器（w:body）；取不到就退回整棵树的顶层
+    body = root.find(_q("body", "w"))
+    container = body if body is not None else root
+
+    out = []      # 输出行
+    np = 0        # 段落数（表格也算一个块）
+    for child in container:
+        if child.tag == _q("p", "w"):
+            np += 1
+            out.append(_docx_para_text(child))
+        elif child.tag == _q("tbl", "w"):
+            np += 1
+            md = _render_markdown_table(_docx_table_rows(child))
+            if md:
+                out.append(md)
+        elif child.tag == _q("sdt", "w"):
+            # 内容控件（sdt）里可以包段落/表格：递归穿透，但**只遍历它的直接子孙块**，
+            # 用 iter() 会把同一个 w:p 里嵌的 w:tbl 也当成独立块重复输出一遍。
+            def walk(node):
+                for c in node:
+                    if c.tag == _q("tbl", "w"):
+                        yield ("tbl", c)
+                    elif c.tag == _q("p", "w"):
+                        yield ("p", c)
+                    elif c.tag in (_q("sdtContent", "w"), _q("sdt", "w")):
+                        yield from walk(c)
+            for kind, node in walk(child):
+                np += 1
+                if kind == "p":
+                    out.append(_docx_para_text(node))
+                else:
+                    md = _render_markdown_table(_docx_table_rows(node))
+                    if md:
+                        out.append(md)
+    return "\n".join(out), np
 
 def extract_xlsx(raw: bytes) -> tuple[str, int]:
     """返回 (text, sheet数)。解析所有 worksheet, 恢复 sharedStrings, 单元格按行拼接。"""
