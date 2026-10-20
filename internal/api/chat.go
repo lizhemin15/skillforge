@@ -793,7 +793,9 @@ func (h *chatHandler) serveQuick(write func(string, string), clock *traceClock, 
 
 	// ② 自检。QuickReview 内部把一切失败都消化成 nil（=当通过），
 	// 这里拿到的只有三种：nil / Pass / 不达标清单。
-	verdict := h.eng.QuickReview(ctx, req.Message, draft, prompt)
+	// 自检要拿到**用户说过的全部内容**（history 是 Push 之前的，即不含本轮）。
+	// 多轮时最后一条往往只是补充（「张老师」），只拿它当需求审稿会判出自相矛盾的结论。
+	verdict := h.eng.QuickReviewWithHistory(ctx, req.SessionID, req.Message, draft, prompt, history)
 	full := draft
 	switch {
 	case verdict == nil:

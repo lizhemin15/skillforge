@@ -119,22 +119,69 @@ const quickReviewSys = `你是严格的写作审稿人。下面给你「写作�
 判定规则：
 1. 逐条核对写作要求。成稿完全达标：{"pass": true, "items": []}。
 2. 不达标时 pass=false，items 列 1~3 条最重要的不足，按重要度排序，不要凑数。
-3. 「用户没提供的信息」不算成稿的不足——那是需求侧欠的账（成稿应按要求用【待补充：xxx】标注），只判成稿本身是否违反写作要求。
-4. 每条 ask 都必须是用户能直接回答的问题（例如「目标读者是谁」），不能是「写得更好一点」这类无法执行的空话。`
+3. 每条 ask 都必须是用户能直接回答的问题（例如「目标读者是谁」），不能是「写得更好一点」这类无法执行的空话。
+4. **每条问题对应每条 ask，不许复用**：几条不足共用一个 ask（例如三条都写「请提供时间、地点」），
+   用户会拿到一张对不上的条子。特别地——
+   - 文风类问题（开场白、收尾语、分条、篇幅）**不是用户能补的信息**：这类条目的 ask 写
+     「无需补充，下一版我会改正」，不要硬塞一个问题。
+   - 只有「缺具体值」（人名/日期/数字/单位）的条目，ask 才去问那个值。
+
+【关于【待补充：xxx】占位符 —— 这条最容易判错，按硬规则执行】
+写作要求允许甚至要求用【待补充：xxx】标注用户没给的信息，所以：
+- 成稿里**有**占位符 ⇒ **不算**「未完成」「不可直接使用」「缺少信息」，**不得**据此判不达标。
+  占位符是按要求做的正确行为，不是缺陷。
+- 成稿里**该有占位符的地方凭空编了具体值**（用户没给的人名、日期、数字、单位、金额）⇒
+  这**是**缺陷，判不达标，ask 要问出那个值。
+- 两种判法**不得在同一份成稿上同时使用**：不能说「占位符太多」，又不能说「这里没用占位符」。
+  要么它按要求标了（通过），要么它没标而编了（不通过）。
+
+【关于「用户没提供的信息」】
+那是需求侧欠的账，不是成稿的缺陷。判的是：**用户给了的信息用对了吗？该占位的地方占位了吗？**
+不是「用户给的信息全不全」。`
 
 // QuickReview 阶段二：对照系统提示词自检成稿。
 //
-// 独立上下文（与 Review 同一取舍）：不带起草历史，只给「要求 / 需求 / 成稿」，
-// 避免起草者给自己的稿子放行。
+// 独立上下文（与 Review 同一取舍）：**不带起草时的模型自述**，避免起草者给自己的稿子
+// 放行；但**必须带用户自己说过的话**（会话历史）——那是判据，不是自述。
+//
+// 为什么历史必须进（实测矛盾）：多轮时用户先要「员工培训通知」，再补一句「张老师」。
+// 自检只收到 user=「张老师」，于是拿这三个字当全部需求去审一整篇通知，判出
+// 「成稿自行编造了'员工技能培训'这一主题」——用户明明第一轮就说了。这类误判会让
+// 自检在补充信息的那一轮**反而更不通过**，用户观感就是「我越补它越不满」。
 //
 // **返回 nil = 视为通过**（见文件头注释的危害不对称分析）：调用方拿不到
 // 结论时静默结束，绝不能把「自检环节抖了」升级成用户的报错。
 func (e *Engine) QuickReview(ctx context.Context, user, draft, prompt string) *QuickVerdict {
+	return e.QuickReviewWithHistory(ctx, "", user, draft, prompt, nil)
+}
+
+// QuickReviewWithHistory 同 QuickReview，额外把会话历史作为「用户已提供的信息」交给审稿人。
+func (e *Engine) QuickReviewWithHistory(ctx context.Context, sessionID, user, draft, prompt string, history []Message) *QuickVerdict {
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "## 写作要求\n\n%s\n\n", strings.TrimSpace(prompt))
+	// 会话历史：只取**用户说过的部分**。助手自己的话不进判据（那是自述，会让起草者
+	// 给自己的稿子放行），但用户之前提的要求必须进——它们是「用户已提供的信息」。
+	if len(history) > 0 {
+		var said []string
+		for _, m := range history {
+			if !strings.EqualFold(strings.TrimSpace(m.Role), "user") {
+				continue
+			}
+			if t := strings.TrimSpace(m.Content); t != "" {
+				said = append(said, t)
+			}
+		}
+		if len(said) > 0 {
+			fmt.Fprintf(&b, "## 用户在本次会话里先后提出的要求（按时间顺序，都是已提供的信息）\n\n")
+			for i, t := range said {
+				fmt.Fprintf(&b, "%d. %s\n", i+1, t)
+			}
+			b.WriteString("\n（注意：最后一条往往只是对前文的补充，如只答了一个人名/日期。判断「用户提供了什么」要看这一整段，不能只看最后一条。）\n\n")
+		}
+	}
 	fmt.Fprintf(&b, "## 用户这次的写作需求\n\n%s\n\n", strings.TrimSpace(user))
 	fmt.Fprintf(&b, "## 成稿\n\n%s\n", strings.TrimSpace(draft))
 
